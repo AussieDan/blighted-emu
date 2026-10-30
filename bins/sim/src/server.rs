@@ -1247,15 +1247,21 @@ impl Loop {
     }
 
     /// A hit from another sim on an entity of this one; a target that is gone, dead or returning
-    /// drops it (M6-A spec section 7.3).
+    /// drops it (M6-A spec section 7.3). A mob's hit on a player takes its block and dodge here.
     fn hit_in(&mut self, hit: &Hit) {
-        let applied = self.world.apply_hit(
-            hit.target,
-            hit.attacker,
-            hit.amount,
-            hit.threat,
-            self.now_ms(),
-        );
+        let now_ms = self.now_ms();
+        let applied = match hit.block_stamina() {
+            Some(block_stamina) => self.world.remote_mob_hit(
+                hit.target,
+                hit.attacker,
+                hit.amount,
+                block_stamina,
+                now_ms,
+            ),
+            None => self
+                .world
+                .apply_hit(hit.target, hit.attacker, hit.amount, hit.threat, now_ms),
+        };
         if let Some(outcome) = &applied {
             count_mob_death(outcome);
         }

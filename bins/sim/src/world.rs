@@ -5287,8 +5287,8 @@ mod tests {
     const MARGIN_M: f32 = 5.0;
     const RETRY_MS: u64 = 1000;
     const GHOST_TTL_MS: u64 = 1000;
-    const MAX_PLAYERS: u32 = 3;
-    const MANY: usize = 1000;
+    pub(super) const MAX_PLAYERS: u32 = 3;
+    pub(super) const MANY: usize = 1000;
     const TWO: usize = 2;
     const ONE_SECOND_MS: u64 = 1000;
     const A_BIT_LATER_MS: u64 = 100;
@@ -5364,10 +5364,18 @@ mod tests {
 
     /// A world of `sim-a` with the test mob spawns `spawns`.
     pub(super) fn world_with_spawns(spawns: Vec<VitalsSpawn>) -> SimWorld {
+        world_with_spawns_in(settings(MANY, MAX_PLAYERS), spawns)
+    }
+
+    /// [`world_with_spawns`] with `settings`.
+    pub(super) fn world_with_spawns_in(
+        settings: WorldSettings,
+        spawns: Vec<VitalsSpawn>,
+    ) -> SimWorld {
         let mut combat = test_combat();
         combat.spawns = spawns.into();
         SimWorld::new(
-            settings(MANY, MAX_PLAYERS),
+            settings,
             WorldIds::random(0).expect("ids"),
             Arc::new(NoGround),
             slot("sim-a"),

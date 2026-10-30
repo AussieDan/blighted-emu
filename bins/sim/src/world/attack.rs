@@ -48,7 +48,7 @@ use super::hit_shape::{
 };
 use super::mob_timeline::yaw_toward;
 use super::projectile::{AimLine, Shot};
-use super::stamina::Dodge;
+use super::stamina::{Dodge, Guard};
 use super::{Body, MESSAGE_CHANNEL, Outgoing, Placement, Player, Position, SimWorld};
 use crate::combat::{AttackOutcome, AttackRefusal, RemoteHit, RespawnRefusal};
 use crate::mobs::{
@@ -80,6 +80,9 @@ fn armor_share(armor: f64, gear_score: u32) -> f64 {
 const HEAL_SCRIPT: u32 = 0xf7e1_e0d6;
 /// Microseconds per millisecond.
 const US_PER_MS: u64 = 1000;
+/// A blocked hit that breaks the guard takes half its health (newchar-retail 422387: 17.025 of
+/// the same attack's 34.05 unblocked).
+const BROKEN_GUARD_DAMAGE_DIVISOR: u32 = 2;
 
 /// A player's health and attack times.
 #[derive(Component, Debug, Clone, Copy)]
@@ -103,10 +106,12 @@ pub(super) struct Vitals {
     last_shot_frame: Option<u16>,
     /// When the client last asked to fire a spread shot, fired or refused.
     shot_requested_ms: Option<u64>,
-    /// The player holds block (the newest input record, [`ClientInputMsg::blocking`]).
+    /// The player holds the block key (the newest input record, [`ClientInputMsg::blocking`]).
     ///
     /// [`ClientInputMsg::blocking`]: nw_messages::ClientInputMsg::blocking
-    blocking: bool,
+    block_key: bool,
+    /// A blocked hit took the last stamina: the block stays down until the key is let go.
+    guard_broken: bool,
     /// The player held the dodge key in the newest input record.
     dodge_held: bool,
     /// The player pressed quick slot 1 in the newest input record.
@@ -116,9 +121,10 @@ pub(super) struct Vitals {
 }
 
 impl Vitals {
-    /// Whether the player holds block (its newest input).
+    /// Whether the player's block is up: it holds the key (its newest input) and its guard did
+    /// not break since it pressed it.
     pub(super) const fn blocking(&self) -> bool {
-        self.blocking
+        self.block_key && !self.guard_broken
     }
 
     /// The entity the player locks on or homes to in its newest input.
@@ -143,7 +149,8 @@ impl Vitals {
             lock_target: None,
             last_shot_frame: None,
             shot_requested_ms: None,
-            blocking: false,
+            block_key: false,
+            guard_broken: false,
             dodge_held: false,
             quick_slot_held: false,
             invulnerable_ms: None,
@@ -839,6 +846,7 @@ impl SimWorld {
                 number,
                 hit.amount,
                 threat,
+                None,
             )),
         };
         let killed = matches!(outcome, AttackOutcome::Killed { .. });
@@ -1528,9 +1536,15 @@ impl SimWorld {
         let Some(mut vitals) = self.world.get_mut::<Vitals>(entity) else {
             return;
         };
-        let blocking = newest.blocking();
-        let block_released = vitals.blocking && !blocking;
-        vitals.blocking = blocking;
+        let block_key = newest.blocking();
+        let block_released = vitals.block_key && !block_key;
+        if block_key != vitals.block_key {
+            tracing::debug!(player = number, block_key, "block key");
+        }
+        vitals.block_key = block_key;
+        if block_released {
+            vitals.guard_broken = false;
+        }
         let dodge = newest.dodging();
         let dodge_pressed = dodge && !vitals.dodge_held;
         vitals.dodge_held = dodge;
@@ -1545,6 +1559,7 @@ impl SimWorld {
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
         };
+        player.stamina.hold_block(block_key);
         if block_released {
             player.stamina.block_released();
         }
@@ -1868,7 +1883,8 @@ impl SimWorld {
         })
     }
 
-    /// A hit for `owner`, the sim of `target`.
+    /// A hit for `owner`, the sim of `target`; a mob's hit on a player carries the stamina its
+    /// block takes.
     fn remote_hit(
         &self,
         owner: BusId,
@@ -1876,6 +1892,7 @@ impl SimWorld {
         attacker: u64,
         amount: u32,
         threat: u64,
+        block_stamina: Option<f32>,
     ) -> RemoteHit {
         RemoteHit {
             owner,
@@ -1885,6 +1902,7 @@ impl SimWorld {
                 attacker_sim: self.me.id.clone(),
                 amount,
                 threat,
+                block_stamina_milli: block_stamina.map(Hit::milli_of),
             },
         }
     }
@@ -2250,6 +2268,89 @@ impl SimWorld {
         }
     }
 
+    /// How the player `entity` (number `target`) takes a mob's hit of `amount` whose block takes
+    /// `block_stamina`: the health it takes, or `None` when it takes none.
+    ///
+    /// - A player whose client has not spawned into the world yet takes no hit (spawn
+    ///   protection: it would die at the loading screen otherwise).
+    /// - A swing into a dodge roll misses: retail sends no hit message then.
+    /// - A held block with stamina takes the hit's block stamina and no health; in the tutorial
+    ///   retail sends 2218 `blocked` 1 with no 3601, in the open world only the stamina change
+    ///   (newchar-retail 1353915: `cur` 100 to 86.8, no 2218, no 3601).
+    /// - The blocked hit that takes the last stamina breaks the guard: it takes half its health
+    ///   and the block ends until the key is let go (newchar-retail 422387: `cur` 24.265 to 0,
+    ///   2218 `blocked` 1 and a 3601 of 17.025, the same attack unblocked 34.05; `isBlockActive`
+    ///   0 at 422423 while the key stayed held).
+    /// - In the tutorial every other hit comes with 2218 `blocked` 0; retail sent no 2218 in the
+    ///   open world (0 of 34 hits in general-other-01, none in newchar-retail after 764894).
+    fn defend(
+        &mut self,
+        entity: Entity,
+        target: u64,
+        mob: u64,
+        amount: u32,
+        block_stamina: f32,
+        now_ms: u64,
+    ) -> Option<u32> {
+        let vitals = *self.world.get::<Vitals>(entity)?;
+        if !vitals.spawned {
+            return None;
+        }
+        if vitals
+            .invulnerable_ms
+            .is_some_and(|(from, until)| from <= now_ms && now_ms < until)
+        {
+            tracing::debug!(mob, target, "mob swing missed: dodge");
+            return None;
+        }
+        let tutorial = self.is_tutorial();
+        let mut player = self.world.get_mut::<Player>(entity)?;
+        let guard = (vitals.blocking() && player.stamina.current() > 0.0)
+            .then(|| player.stamina.blocked_hit(block_stamina));
+        let stamina = player.stamina.current();
+        let connection = player.connection.clone();
+        tracing::debug!(
+            mob,
+            target,
+            block_key = vitals.block_key,
+            guard_broken = vitals.guard_broken,
+            ?guard,
+            stamina,
+            amount,
+            "mob hit on a player"
+        );
+        if tutorial {
+            self.send_reliable(
+                connection,
+                &ServerMessage::MeleeHit(MeleeHitMsg::on(target, guard.is_some())),
+            );
+        }
+        match guard {
+            Some(Guard::Held) => None,
+            Some(Guard::Broken) => {
+                self.world.get_mut::<Vitals>(entity)?.guard_broken = true;
+                Some(amount / BROKEN_GUARD_DAMAGE_DIVISOR)
+            }
+            None => Some(amount),
+        }
+    }
+
+    /// A mob hit from another sim on player `target` of this one: it takes its block and dodge
+    /// here, where the player's state is, then lands. Returns `None` when it takes no health
+    /// (see [`SimWorld::defend`]) or the player is not here.
+    pub fn remote_mob_hit(
+        &mut self,
+        target: u64,
+        attacker: u64,
+        amount: u32,
+        block_stamina: f32,
+        now_ms: u64,
+    ) -> Option<AttackOutcome> {
+        let entity = self.player_by_number(target)?;
+        let amount = self.defend(entity, target, attacker, amount, block_stamina, now_ms)?;
+        self.apply_hit(target, attacker, amount, 0, now_ms)
+    }
+
     /// Applies the mobs' hits on the players of this sim; a hit on a player ghost goes to its
     /// sim.
     pub(super) fn mob_hits(
@@ -2282,7 +2383,6 @@ impl SimWorld {
                     "mob attack"
                 );
                 if let Some(entity) = defender {
-                    let vitals = *self.world.get::<Vitals>(entity)?;
                     // A swing at a player who moved away misses: retail sends no hit message.
                     let body = self.world.get::<Body>(entity)?.motion.position();
                     if !self.mob_swing_reaches(&intent, at, body) {
@@ -2294,44 +2394,24 @@ impl SimWorld {
                         );
                         return None;
                     }
-                    // Spawn protection: a mob cannot hit a player whose client has not spawned
-                    // into the world yet (it would die at the loading screen otherwise).
-                    if !vitals.spawned {
-                        return None;
-                    }
-                    // A swing into a dodge roll misses: retail sends no hit message then.
-                    if vitals
-                        .invulnerable_ms
-                        .is_some_and(|(from, until)| from <= now_ms && now_ms < until)
-                    {
-                        tracing::debug!(mob = intent.mob, "mob swing missed: dodge");
-                        return None;
-                    }
-                    let mut player = self.world.get_mut::<Player>(entity)?;
-                    // A block holds while the player has stamina; the hit takes some of it (Inferred:
-                    // retail never let a blocked hit find the stamina at 0).
-                    let blocked = vitals.blocking && player.stamina.current() > 0.0;
-                    if blocked {
-                        player.stamina.blocked_hit(style.block_stamina);
-                    }
-                    let connection = player.connection.clone();
-                    self.send_reliable(
-                        connection,
-                        &ServerMessage::MeleeHit(MeleeHitMsg::on(intent.target, blocked)),
-                    );
-                    if blocked {
-                        return None;
-                    }
-                    let outcome = self.apply_hit_with(
+                    let amount = self.defend(
+                        entity,
                         intent.target,
                         intent.mob,
                         hit.amount,
+                        style.block_stamina,
+                        now_ms,
+                    )?;
+                    let outcome = self.apply_hit_with(
+                        intent.target,
+                        intent.mob,
+                        amount,
                         0,
                         now_ms,
                         Some(&style),
                     );
                     if outcome.is_some() {
-                        self.mob_hit_effects(entity, intent.mob, style.row, hit.amount);
+                        self.mob_hit_effects(entity, intent.mob, style.row, amount);
                     }
                     return outcome;
                 }
@@ -2344,6 +2424,7 @@ impl SimWorld {
                         intent.mob,
                         hit.amount,
                         0,
+                        Some(style.block_stamina),
                     ))
                 })
             })
@@ -2363,8 +2444,9 @@ mod tests {
     use crate::mobs::{VitalsSpawn, mob_entity};
     use crate::world::gear::{self, Gear};
     use crate::world::tests::{
-        BORDER_X, CELL_M, NOW, SERVER_TIME, admit_at, connection, join, messages_to, slot, table,
-        test_spawn, tick, world_with_spawns,
+        BORDER_X, CELL_M, MANY, MAX_PLAYERS, NOW, SERVER_TIME, admit_at, connection, join,
+        messages_to, settings, slot, table, test_spawn, tick, world_with_spawns,
+        world_with_spawns_in,
     };
     use crate::world::{MoveError, WorldSettings};
     use nw_bus::{Ghost, MobGhost, Point};
@@ -2407,7 +2489,21 @@ mod tests {
 
     /// A world with one mob and player 1 at `x`.
     fn fight_at(x: f32) -> SimWorld {
-        let mut world = world_with_spawns(vec![test_spawn(MOB_X)]);
+        fight_in(world_with_spawns(vec![test_spawn(MOB_X)]), x)
+    }
+
+    /// [`fight`] on the tutorial level.
+    fn tutorial_fight() -> SimWorld {
+        let mut tutorial = settings(MANY, MAX_PLAYERS);
+        tutorial.level = nw_messages::TUTORIAL_LEVEL;
+        fight_in(
+            world_with_spawns_in(tutorial, vec![test_spawn(MOB_X)]),
+            MOB_X + 2.0,
+        )
+    }
+
+    /// `world` with player 1 at `x`.
+    fn fight_in(mut world: SimWorld, x: f32) -> SimWorld {
         world.set_table(&table(&["sim-a", "sim-b"])).expect("table");
         join(&mut world, 1, x);
         world
@@ -3721,36 +3817,133 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_blocked_mob_hit_does_no_damage() {
-        let mut world = fight();
-        let blocking = InputRecord {
+    /// An input record of a player who holds the block key.
+    fn block_held() -> InputRecord {
+        InputRecord {
             slots: nw_messages::InputSlots {
                 count: 19,
                 values: vec![0, 1 << 62],
                 bytes: [0; 4],
             },
             ..InputRecord::default()
-        };
-        assert!(
-            world
-                .attack_input(&connection(1), &[blocking], NOW)
-                .is_empty()
-        );
-        let mut now = NOW;
-        while now < NOW + LONG_AFTER_MS {
-            let output = tick(&mut world, now);
-            assert!(output.mob_hits.is_empty(), "a blocked hit did damage");
-            let messages = messages_to(&output.messages, 1);
-            if messages.contains(&ServerMessage::MeleeHit(MeleeHitMsg::on(1, true))) {
-                assert_eq!(health_of(&mut world, 1).current(), TEST_PLAYER_HEALTH);
-                let stamina = player_stamina(&mut world, 1);
-                assert!(stamina < 100.0, "the block took stamina: {stamina}");
-                return;
+        }
+    }
+
+    /// Ticks `world` until the mob swings at player 1: that tick's output.
+    fn until_swing(world: &mut SimWorld, from_ms: u64) -> (u64, crate::world::TickOutput) {
+        let mut now = from_ms;
+        loop {
+            let before = player_stamina(world, 1);
+            let output = tick(world, now);
+            if !output.mob_hits.is_empty() || player_stamina(world, 1) < before {
+                return (now, output);
             }
             now += TICK_MS;
+            assert!(now < from_ms + LONG_AFTER_MS, "the mob never swung");
         }
-        panic!("the mob never swung");
+    }
+
+    #[test]
+    fn a_blocked_mob_hit_does_no_damage_and_sends_no_2218_in_the_open_world() {
+        let mut world = fight();
+        assert!(
+            world
+                .attack_input(&connection(1), &[block_held()], NOW)
+                .is_empty()
+        );
+        let (_, output) = until_swing(&mut world, NOW);
+        assert!(output.mob_hits.is_empty(), "a blocked hit did damage");
+        assert_eq!(health_of(&mut world, 1).current(), TEST_PLAYER_HEALTH);
+        let stamina = player_stamina(&mut world, 1);
+        assert!(stamina < 100.0, "the block took stamina: {stamina}");
+        assert!(
+            messages_to(&output.messages, 1)
+                .iter()
+                .all(|message| !matches!(message, ServerMessage::MeleeHit(_))),
+            "retail sends no 2218 in the open world"
+        );
+    }
+
+    #[test]
+    fn a_blocked_mob_hit_sends_2218_blocked_in_the_tutorial() {
+        let mut world = tutorial_fight();
+        world.attack_input(&connection(1), &[block_held()], NOW);
+        let (_, output) = until_swing(&mut world, NOW);
+        assert!(output.mob_hits.is_empty(), "a blocked hit did damage");
+        assert!(
+            messages_to(&output.messages, 1)
+                .contains(&ServerMessage::MeleeHit(MeleeHitMsg::on(1, true)))
+        );
+    }
+
+    #[test]
+    fn the_blocked_hit_that_takes_the_last_stamina_breaks_the_guard() {
+        // Retail newchar 422387: the block took the last 24.265 stamina, the hit did half its
+        // damage and `isBlockActive` went 0 while the key stayed held.
+        const LOW_STAMINA: f32 = 1.0;
+        let mut world = fight();
+        let entity = world.player_by_number(1).expect("player");
+        world
+            .world
+            .get_mut::<Player>(entity)
+            .expect("player")
+            .stamina
+            .blocked_hit(100.0 - LOW_STAMINA);
+        world.attack_input(&connection(1), &[block_held()], NOW);
+        let (now, output) = until_swing(&mut world, NOW);
+        let [AttackOutcome::Hit { amount, .. }] = output.mob_hits.as_slice() else {
+            panic!(
+                "the broken guard lets half the hit through: {:?}",
+                output.mob_hits
+            );
+        };
+        let full = mob_hit(
+            &world.mobs.get(mob()).expect("mob").attack,
+            world.combat.player_armor_share,
+        )
+        .amount;
+        assert_eq!(*amount, full / BROKEN_GUARD_DAMAGE_DIVISOR);
+        assert_eq!(player_stamina(&mut world, 1), 0.0);
+        let vitals = |world: &mut SimWorld| *world.world.get::<Vitals>(entity).expect("vitals");
+        assert!(
+            !vitals(&mut world).blocking(),
+            "the block is down while the key is held"
+        );
+        world.attack_input(&connection(1), &[block_held()], now + TICK_MS);
+        assert!(
+            !vitals(&mut world).blocking(),
+            "holding the key does not raise it again"
+        );
+        world.attack_input(&connection(1), &[InputRecord::default()], now + 2 * TICK_MS);
+        world.attack_input(&connection(1), &[block_held()], now + 3 * TICK_MS);
+        assert!(vitals(&mut world).blocking(), "a new press raises it");
+    }
+
+    #[test]
+    fn a_mob_hit_from_another_sim_takes_the_block_here() {
+        const BLOCK_STAMINA: f32 = 16.5;
+        const AMOUNT: u32 = 40;
+        let mut world = fight();
+        world.attack_input(&connection(1), &[block_held()], NOW);
+        assert!(
+            world
+                .remote_mob_hit(1, mob(), AMOUNT, BLOCK_STAMINA, NOW)
+                .is_none(),
+            "a blocked hit takes no health"
+        );
+        assert_eq!(health_of(&mut world, 1).current(), TEST_PLAYER_HEALTH);
+        assert!((player_stamina(&mut world, 1) - (100.0 - BLOCK_STAMINA)).abs() < 0.01);
+        world.attack_input(&connection(1), &[InputRecord::default()], NOW + TICK_MS);
+        assert!(
+            world
+                .remote_mob_hit(1, mob(), AMOUNT, BLOCK_STAMINA, NOW + TICK_MS)
+                .is_some(),
+            "an open player takes it"
+        );
+        assert_eq!(
+            health_of(&mut world, 1).current(),
+            TEST_PLAYER_HEALTH - AMOUNT
+        );
     }
 
     fn player_stamina(world: &mut SimWorld, number: u64) -> f32 {
@@ -4045,14 +4238,27 @@ mod tests {
                     "{messages:?}"
                 );
                 assert!(
-                    messages.contains(&ServerMessage::MeleeHit(MeleeHitMsg::on(1, false))),
-                    "{messages:?}"
+                    messages
+                        .iter()
+                        .all(|message| !matches!(message, ServerMessage::MeleeHit(_))),
+                    "retail sends no 2218 in the open world: {messages:?}"
                 );
                 return;
             }
             now += TICK_MS;
             assert!(now < NOW + LONG_AFTER_MS, "the mob never hit");
         }
+    }
+
+    #[test]
+    fn a_mob_hit_sends_2218_unblocked_in_the_tutorial() {
+        let mut world = tutorial_fight();
+        let (_, output) = until_swing(&mut world, NOW);
+        assert_eq!(output.mob_hits.len(), 1);
+        assert!(
+            messages_to(&output.messages, 1)
+                .contains(&ServerMessage::MeleeHit(MeleeHitMsg::on(1, false)))
+        );
     }
 
     /// The damage table, rows and weapon of the test paces: the plain swing (slash, block mod

@@ -5,8 +5,11 @@
 //! a mob hit on a blocking player (its block stamina). Each starts the regen delay of 1 s: the
 //! state's `regen` child counts the seconds left down to 0, then `cur` grows by 33.33 per
 //! second to the max. A land dodge starts the delay once more 500 ms after the press (Inferred:
-//! the end of the roll), and so does each release of the block key. Attacks, sprinting and
-//! swimming cost nothing; `winded`, `max` and the rates never change.
+//! the end of the roll), and so does each release of the block key. No regen runs while the
+//! block key is held (newchar-retail: `cur` stayed 54.79 from 418195 to 421256 with block held).
+//! Raising a block costs nothing (no `cur` drop at the block starts at 410572 and 418156,
+//! although `StaminaData` lists `Block` 10). Attacks, sprinting and swimming cost nothing;
+//! `winded`, `max` and the rates never change.
 //!
 //! [`Stamina::tick`] runs once per server tick; [`Stamina::take_change`] gives the children
 //! that changed since the last bundle, as retail sends them: `cur` and `regen` at a spend, `regen`
@@ -35,6 +38,15 @@ const DODGE_RESTART_MS: u64 = 500;
 const REGEN_PER_SECOND: f32 = 100.0 / 3.0;
 /// Milliseconds per second.
 const MS_PER_SECOND: f32 = 1_000.0;
+
+/// What a blocked hit does to the guard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Guard {
+    /// The block holds: stamina is left.
+    Held,
+    /// The hit took the last stamina: the guard breaks.
+    Broken,
+}
 
 /// What a dodge press does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +78,8 @@ pub(super) struct Stamina {
     last_tick_ms: Option<u64>,
     /// The delay ended and regen has not sent its first step yet.
     regen_starting: bool,
+    /// The block key is held: no regen.
+    block_held: bool,
     /// The children that changed since the last [`Stamina::take_change`].
     change: StaminaState,
 }
@@ -78,6 +92,7 @@ impl Default for Stamina {
             restart_at_ms: None,
             last_tick_ms: None,
             regen_starting: false,
+            block_held: false,
             change: StaminaState::default(),
         }
     }
@@ -103,9 +118,17 @@ impl Stamina {
         true
     }
 
-    /// A mob hit on the blocking player takes `loss`, at most all the stamina.
-    pub(super) fn blocked_hit(&mut self, loss: f32) {
+    /// A mob hit on the blocking player takes `loss`, at most all the stamina; the hit that
+    /// takes the last of it breaks the guard (newchar-retail 422387: `cur` 24.265 to 0).
+    pub(super) fn blocked_hit(&mut self, loss: f32) -> Guard {
+        let broken = loss >= self.cur;
         self.spend(loss.min(self.cur), BLOCKED_DELAY_MS);
+        if broken { Guard::Broken } else { Guard::Held }
+    }
+
+    /// Whether the block key is held (the newest input).
+    pub(super) const fn hold_block(&mut self, held: bool) {
+        self.block_held = held;
     }
 
     /// A used consumable gives `amount` (its status effect's `Stamina`), at most to the max.
@@ -150,7 +173,7 @@ impl Stamina {
             self.change.regen = Some(seconds(self.delay_ms));
             return;
         }
-        if self.cur < MAX_STAMINA {
+        if self.cur < MAX_STAMINA && !self.block_held {
             #[allow(clippy::cast_precision_loss, reason = "a tick is a few ms")]
             let step = REGEN_PER_SECOND * elapsed_ms as f32 / MS_PER_SECOND;
             self.cur = (self.cur + step).min(MAX_STAMINA);
@@ -277,11 +300,15 @@ mod tests {
     fn a_blocked_hit_takes_its_loss_and_a_release_starts_the_delay() {
         let mut stamina = Stamina::default();
         stamina.tick(NOW);
-        stamina.blocked_hit(25.55);
+        assert_eq!(stamina.blocked_hit(25.55), Guard::Held);
         let hit = stamina.take_change().expect("hit");
         assert!((hit.cur.expect("cur") - 74.45).abs() < CLOSE, "retail");
         assert_eq!(hit.regen, Some(0.967), "retail");
-        stamina.blocked_hit(1_000.0);
+        assert_eq!(
+            stamina.blocked_hit(1_000.0),
+            Guard::Broken,
+            "the last stamina"
+        );
         assert_eq!(stamina.current(), 0.0, "never below 0");
         stamina.take_change();
         stamina.block_released();
@@ -289,6 +316,24 @@ mod tests {
             stamina.take_change(),
             change(None, Some(1.0)),
             "retail 01 08 3f800000"
+        );
+    }
+
+    #[test]
+    fn no_regen_runs_while_the_block_key_is_held() {
+        // Retail newchar: `cur` stayed 54.79 from 418195 to 421256 with block held.
+        let mut stamina = Stamina::default();
+        stamina.tick(NOW);
+        stamina.blocked_hit(45.0);
+        stamina.hold_block(true);
+        let now = run(&mut stamina, NOW + TICK, NOW + 3 * REGEN_DELAY_MS);
+        assert_eq!(stamina.current(), 55.0, "held: no regen");
+        stamina.hold_block(false);
+        stamina.block_released();
+        run(&mut stamina, now, now + 2 * REGEN_DELAY_MS);
+        assert!(
+            stamina.current() > 55.0,
+            "regen after the release and its delay"
         );
     }
 }

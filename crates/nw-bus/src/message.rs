@@ -937,6 +937,32 @@ pub struct Hit {
     pub amount: u32,
     /// Threat it adds.
     pub threat: u64,
+    /// A mob's hit on a player: the stamina its block takes, in thousandths (the player's sim
+    /// runs the block and the dodge); `None` for a player's hit.
+    #[serde(default)]
+    pub block_stamina_milli: Option<u32>,
+}
+
+/// Thousandths per unit of [`Hit::block_stamina_milli`].
+const MILLI_PER_UNIT: f32 = 1_000.0;
+
+impl Hit {
+    /// `stamina` in the thousandths of [`Hit::block_stamina_milli`].
+    #[must_use]
+    // A block takes at most the full stamina, never below 0.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    pub fn milli_of(stamina: f32) -> u32 {
+        (stamina * MILLI_PER_UNIT).round() as u32
+    }
+
+    /// The stamina a block of this mob hit takes; `None` for a player's hit.
+    #[must_use]
+    // Thousandths of a stamina of at most 100.
+    #[allow(clippy::cast_precision_loss)]
+    pub fn block_stamina(&self) -> Option<f32> {
+        self.block_stamina_milli
+            .map(|milli| milli as f32 / MILLI_PER_UNIT)
+    }
 }
 
 /// The ghosts of one sim for another, every tick (M5 spec section 3.4), in one or more parts
@@ -1608,6 +1634,15 @@ mod tests {
             attacker_sim: sim(),
             amount: 42,
             threat: 43,
+            block_stamina_milli: None,
+        });
+        round_trip(Hit {
+            target: CONNECTION,
+            attacker: MOB_ENTITY_BASE + 7,
+            attacker_sim: sim(),
+            amount: 42,
+            threat: 0,
+            block_stamina_milli: Some(16_500),
         });
     }
 
