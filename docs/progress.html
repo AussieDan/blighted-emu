@@ -98,7 +98,7 @@
 <body>
 <main>
   <h1>Blighted New World Emulator: Progress</h1>
-  <p class="sub">Status on 2026-10-30. Client build 25810808. Last commit <code>4ea518d8</code>.</p>
+  <p class="sub">Status on 2026-10-30. Client build 25810808. Last commit <code>5e8240ad</code>.</p>
 
   <div class="cards" id="summary"></div>
 
@@ -140,7 +140,7 @@
     <li><strong>Make the first open world hours work.</strong>
       <div class="why">After the beach: main story quests, gathering, crafting, shops, fast travel. The code exists, but nobody played it live.</div></li>
     <li><strong>Finish combat: ranged, magic, block, status effects.</strong>
-      <div class="why">Block has gaps (no facing check, no guard break, no ranged block). You put these on hold on 2026-10-01.</div></li>
+      <div class="why">Block now has the guard break, no stamina regen while held, 2218 only in the tutorial and cross-sim hits (2026-10-30, live check needed). Still open: the block rise delay of about 1 s, the facing arc, the 2 dodges retail refused, ranged block (rules Unknown).</div></li>
     <li><strong>Expeditions (dungeons) and instances.</strong>
       <div class="why">The group content of the game. Instance code exists, but it is not tested live.</div></li>
     <li><strong>Companies, territories, wars, invasions.</strong>
@@ -157,6 +157,8 @@
 
   <h2>Done list</h2>
   <ul class="done">
+    <li>✅ Player camps: a placed camp takes 5 wood and 1 flint, stands in the world as the retail capture shows, is a Camp crafting station and is the respawn point (its slice SpawnPoint, within 0.01 m of retail); placement fires <code>BindCamp</code>; <code>!mastery Camping 2</code> sets the rank for tests (<code>5e8240ad</code>, 2026-10-30).</li>
+    <li>✅ Block stops mob hits: the hit that takes the last stamina breaks the guard (half damage, down until the key is released); no stamina regen while held; 2218 only in the tutorial; mob hits from another sim take the block (<code>7eae997a</code>, 2026-10-30).</li>
     <li>✅ Janszoon throws his anchor: his missing tree is built from the great axeman's tree and the undead officer's toss (6 to 10 m, 6 to 9 s cooldown; Inferred from the retail throw at 8.7 m); the toss hits with his table's <code>Anchor_Toss_Windup</code> row (<code>4ea518d8</code>, 2026-10-30).</li>
     <li>✅ Janszoon aggro and leash tests on the real beach ground: he aggroes on a player in his face and keeps a player 10 m away; the sim logs each mob target change (<code>7e2193e1</code>, 2026-10-30).</li>
     <li>✅ Mobs walk home after a lost fight on slopes: a distance check beyond its height limit now counts as far (Janszoon stood 37 m out, 2.3 m below his spawn) (<code>972b150a</code>, 2026-10-29).</li>
@@ -253,7 +255,7 @@ const AREAS = [
       ["Melee hits", 75, "live", "Homing, lag help, retail damage messages.", "Boar hits miss sometimes. Cause: Unknown."],
       ["Target lock", 90, "live", "Lock, release and wheel cycling work live (110ccc0).", "Retail check of the nearest-in-circle pick; lock after a reconnect."],
       ["Dodge and stamina", 90, "tests", "Match retail (review 2026-10-01).", "Live check."],
-      ["Block", 50, "tests", "Block works.", "No facing check, no guard break, no ranged block. On hold."],
+      ["Block", 70, "tests", "Guard break, no regen while held, 2218 only in the tutorial, cross-sim hits.", "Live check. Rise delay, facing arc, ranged block."],
       ["Ranged and magic", 45, "tests", "Staffs, gauntlets, bows, muskets cast along the aim.", "Abilities, mana use, full projectile rules."],
       ["Status effects", 50, "code", "Effects from game data.", "Live check of most effects."],
       ["Death, respawn, revive", 85, "live", "Death screen, 38 respawn points, revive at 1 health.", "Some respawn points."],
@@ -309,6 +311,7 @@ const AREAS = [
     name: "World systems",
     features: [
       ["Fast travel, inns, recall", 40, "code", "Travel rules and saves.", "Not checked live."],
+      ["Player camps", 60, "tests", "Place a camp for its costs, the retail camp entity group, respawn at its SpawnPoint, Camp crafting station, BindCamp event, the camp stands again at login.", "Live check. PvP destruction, how a new character earns the Camping rank (Unknown), guild and faction."],
       ["Mounts", 40, "code", "Mount code and saves.", "Not checked live."],
       ["Social: chat, friends, groups, voice", 50, "tests", "Chat, friends, groups, raids, voice option.", "Live test with many players."],
       ["Companies and territories", 30, "code", "Company code, standing.", "Ownership, taxes, upkeep."],
