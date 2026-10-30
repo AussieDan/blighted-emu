@@ -92,7 +92,7 @@ const VERBS: [Verb; 19] = [
     },
     Verb {
         name: "mastery",
-        usage: "!mastery <mastery id|all> <rank> [player]",
+        usage: "!mastery <progression id|all> <rank> [player]",
         read: |words| {
             let (words, target) = target(words, 2)?;
             let mastery =

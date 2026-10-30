@@ -60,6 +60,7 @@ use uuid::Uuid;
 mod admin;
 mod asset_script;
 mod attack;
+mod camps;
 mod charms;
 mod combat_status;
 mod conversation;
@@ -1739,6 +1740,7 @@ impl SimWorld {
                 tutorial.end(&mut self.mobs);
             }
         }
+        self.despawn_camp(entity);
         self.world.despawn(entity);
     }
 
@@ -4137,6 +4139,7 @@ impl SimWorld {
             ))
             .id();
         self.by_connection.insert(arrival.connection, entity);
+        self.camp_arrived(entity);
     }
 
     fn leave_all(&mut self, connections: &[ConnectionRef]) -> Vec<Departure> {

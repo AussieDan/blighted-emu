@@ -815,7 +815,7 @@ impl SimWorld {
         rank: u16,
     ) -> AdminReply {
         let masteries: Vec<Mastery> = match id {
-            Some(id) => match self.content.progression.mastery(id) {
+            Some(id) => match self.content.progression.categorical(id) {
                 Some(mastery) => vec![mastery.clone()],
                 None => return unknown_mastery(id),
             },
@@ -863,7 +863,7 @@ impl SimWorld {
 
 fn unknown_mastery(id: &str) -> AdminReply {
     AdminReply::Failed {
-        reason: format!("no weapon mastery {id}"),
+        reason: format!("no categorical progression {id}"),
     }
 }
 

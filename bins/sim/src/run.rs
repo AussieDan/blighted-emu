@@ -25,6 +25,7 @@ use nw_content::player_sequences::PlayerSequences;
 use nw_db::{DbError, GLOBAL_MIGRATOR, WORLD_MIGRATOR, check_schema};
 use nw_sim_core::{LevelGround, level_bounds};
 use nw_world::WorldFile;
+use nw_world::camps::{CampSlices, camp_slices_path};
 use nw_world::collision::{LevelCollision, collision_file_path};
 use nw_world::collision_index::CollisionIndex;
 use nw_world::dungeon_scripts::{DungeonScripts, dungeon_scripts_path};
@@ -269,6 +270,20 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
                 DungeonScripts::default()
             }
         };
+    content.camp_slices = match CampSlices::load(&camp_slices_path(&config.content_dir, &build)) {
+        Ok(slices) => {
+            tracing::info!(
+                slices = slices.len(),
+                blueprints = content.camps.len(),
+                "camp slices"
+            );
+            slices
+        }
+        Err(error) => {
+            tracing::warn!(%error, "no camp slices: no camp can be placed");
+            CampSlices::default()
+        }
+    };
     tracing::info!(
         tradable_items = content.trading.len(),
         trading_tax = content.trading_post.trading_tax,

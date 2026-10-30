@@ -63,6 +63,9 @@ pub enum ToolError {
     /// The dungeon script file cannot be built.
     #[error(transparent)]
     DungeonScripts(#[from] DungeonScriptsBuildError),
+    /// The camp slice file cannot be written.
+    #[error(transparent)]
+    CampSlices(#[from] nw_world::camps::CampSlicesError),
     /// The reloaded bundle does not hold what was written.
     #[error("bundle check failed: {what} is {found} after reload, expected {expected}")]
     CountMismatch {

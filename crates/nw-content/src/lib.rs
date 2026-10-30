@@ -3,6 +3,7 @@
 
 pub mod achievements;
 pub mod bundle;
+pub mod camps;
 pub mod catacombs;
 pub mod character_points;
 pub mod charms;

@@ -18,6 +18,7 @@ use content_tool::build::{
     DEFAULT_CONTENT_DIR, DEFAULT_RETAIL_DIR, default_bundle_path, default_retail_bundle_path,
     run_build,
 };
+use content_tool::camp_slices::build_camp_slices;
 use content_tool::capture::CaptureReport;
 use content_tool::catacombs::{
     CatacombCheck, DEFAULT_GAME_MODE as DEFAULT_CATACOMB_MODE,
@@ -289,6 +290,13 @@ enum Command {
         /// Content bundle (default: `local-data/content/bundle-<build>.bin`).
         #[arg(long)]
         bundle: Option<PathBuf>,
+    },
+    /// Writes the camp slice file: the spawn group components, asset id and respawn point of
+    /// every camp slice, from the game paks.
+    CampSlices {
+        /// Output folder for `camp-slices-<build>.json`.
+        #[arg(long, default_value = DEFAULT_CONTENT_DIR)]
+        out_dir: PathBuf,
     },
     /// Worker of `mob-prefabs`: reads one ledger and prints its tally as JSON.
     #[command(name = "mob-prefabs-ledger", hide = true)]
@@ -625,6 +633,17 @@ fn run(cli: Cli) -> Result<(), ToolError> {
                 &client_build,
                 &out_dir,
             )?);
+        }
+        Command::CampSlices { out_dir } => {
+            let source = GameSource::open(game_dir(cli.game_dir.as_deref())?)?;
+            let report = build_camp_slices(&source, &client_build, &out_dir)?;
+            println!(
+                "{}: {} camps ({} PvP) of {} camp folder slices",
+                report.path.display(),
+                report.camps,
+                report.pvp_camps,
+                report.slices
+            );
         }
         Command::MobPrefabsLedger { ledger, entry } => {
             let tally = scan_ledger(

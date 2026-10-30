@@ -2,6 +2,7 @@
 //! Typed New World world data (M1b spec): levels, ground height, spawn and point lists,
 //! capitals, the world file, and the level collision file with its search index.
 
+pub mod camps;
 pub mod capitals;
 pub mod collision;
 pub mod collision_index;

@@ -18,7 +18,7 @@
 //! card and a state per replicated component of the station's slice, at the slice's component
 //! numbers ([`station_members`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use bevy_ecs::entity::Entity;
@@ -50,6 +50,10 @@ use crate::objectives::Event;
 /// First slot key of a crafting station: its index is added. Keys are never sent; they stay
 /// above every player and mob number and below the loot bags.
 pub(super) const STATION_ENTITY_BASE: u64 = 1 << 37;
+/// First slot key of a player's camp: the count of camps placed in this sim is added. The camps
+/// take the upper half of the station range (the level has far fewer than `1 << 36` stations),
+/// below the loot bags (`1 << 38`).
+const CAMP_ENTITY_BASE: u64 = STATION_ENTITY_BASE | (1 << 36);
 /// The component of a spawn card.
 pub(super) const CARD_COMPONENT: u64 = 0;
 /// The status of an accepted and of a refused station interaction.
@@ -68,36 +72,39 @@ const CRAFT_STATUS_GS_ALLOWANCE: u32 = 40;
 /// The values of a built station that no data sets, as the retail campfire and town station
 /// groups have them: no foundation events, a territory whose references are set, a ruin timer
 /// that is not armed, and no guild, owner, raid or faction.
-const CHECK_FOUNDATION_EVENTS: bool = false;
-const TERRITORY_REFS_SET: bool = true;
-const RUIN_DELAY: u16 = 0;
-const RUIN_COMPLETED: bool = false;
-const NO_GUILD_ID: [u8; nw_messages::buildables::GUILD_ID_LEN] =
+pub(super) const CHECK_FOUNDATION_EVENTS: bool = false;
+pub(super) const TERRITORY_REFS_SET: bool = true;
+pub(super) const RUIN_DELAY: u16 = 0;
+pub(super) const RUIN_COMPLETED: bool = false;
+pub(super) const NO_GUILD_ID: [u8; nw_messages::buildables::GUILD_ID_LEN] =
     [0; nw_messages::buildables::GUILD_ID_LEN];
-const NO_RAID: u64 = 0;
-const NO_FACTION: u8 = 0;
+pub(super) const NO_RAID: u64 = 0;
+pub(super) const NO_FACTION: u8 = 0;
 const NO_PERMISSION_OPTIONS: u8 = 0;
 
-/// A crafting station of the level.
+/// A crafting station: one of the level's, or a player's camp.
 #[derive(Debug, Clone, PartialEq)]
-struct Station {
+pub(super) struct Station {
     /// The `GdeRef` its card and the client's interaction name.
-    gde_ref: [u8; RAW_ID_LEN],
+    pub(super) gde_ref: [u8; RAW_ID_LEN],
     /// Where it stands.
-    position: Position,
+    pub(super) position: Position,
     /// Its station type, as recipes list them (`StationType1` to `StationType4`).
-    station_type: String,
+    pub(super) station_type: String,
     /// The name its interaction's answer carries.
-    name: Vec<u8>,
+    pub(super) name: Vec<u8>,
     /// Its spawn group's members.
-    members: Vec<BundleMember>,
+    pub(super) members: Vec<BundleMember>,
 }
 
-/// The crafting stations of one sim.
+/// The crafting stations of one sim: the level's, and the players' camps by slot key.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(super) struct Stations {
     stations: Vec<Station>,
     by_ref: HashMap<[u8; RAW_ID_LEN], usize>,
+    camps: BTreeMap<u64, Station>,
+    /// The camps placed in this sim so far.
+    camps_placed: u64,
 }
 
 /// The `GdeRef` of a level entity with GDE id `id`: the id's little-endian bytes, then the
@@ -129,11 +136,7 @@ fn station_members(
         }),
     }];
     if let Some((component, state)) = slice.buildable {
-        let resources = costs
-            .of(&slice.structure)
-            .iter()
-            .map(|(item, quantity)| CommittedResource::of(item, lowercase_crc32(item), *quantity))
-            .collect();
+        let resources = committed(costs.of(&slice.structure));
         members.push(member(
             component,
             MemberState::BuildableController(BuildableControllerState {
@@ -214,8 +217,16 @@ fn answer_header(request: Option<FacetHeader>, number: u64) -> FacetHeader {
     request.unwrap_or_else(|| FacetHeader::of(component::CRAFTING, number))
 }
 
+/// The committed resources of a structure that costs `costs` (item id, quantity).
+pub(super) fn committed(costs: &[(String, u32)]) -> Vec<CommittedResource> {
+    costs
+        .iter()
+        .map(|(item, quantity)| CommittedResource::of(item, lowercase_crc32(item), *quantity))
+        .collect()
+}
+
 /// A replicated list of `elements` at `version`.
-const fn list_at<T>(version: u64, elements: Vec<T>) -> FullList<T> {
+pub(super) const fn list_at<T>(version: u64, elements: Vec<T>) -> FullList<T> {
     FullList {
         version: Some(version),
         elements,
@@ -243,7 +254,26 @@ impl Stations {
             .enumerate()
             .map(|(index, station)| (station.gde_ref, index))
             .collect();
-        Self { stations, by_ref }
+        Self {
+            stations,
+            by_ref,
+            camps: BTreeMap::new(),
+            camps_placed: 0,
+        }
+    }
+
+    /// Puts the camp that `station` makes for its new slot key in; returns the key. Each camp
+    /// gets a key of its own, so a viewer's client gets a new slot and card for it.
+    pub(super) fn place_camp(&mut self, station: impl FnOnce(u64) -> Station) -> u64 {
+        let number = CAMP_ENTITY_BASE + self.camps_placed;
+        self.camps_placed += 1;
+        self.camps.insert(number, station(number));
+        number
+    }
+
+    /// Takes the camp of slot key `number` away: it leaves every view.
+    pub(super) fn remove_camp(&mut self, number: u64) {
+        self.camps.remove(&number);
     }
 
     /// The slot keys of the stations within `radius_m` of `position`.
@@ -252,17 +282,30 @@ impl Stations {
         position: Position,
         radius_m: f32,
     ) -> impl Iterator<Item = u64> + '_ {
+        let near =
+            move |station: &Station| station.position.horizontal_distance(position) <= radius_m;
         (0_u64..)
             .zip(&self.stations)
-            .filter(move |(_, station)| station.position.horizontal_distance(position) <= radius_m)
+            .filter(move |(_, station)| near(station))
             .map(|(index, _)| STATION_ENTITY_BASE + index)
+            .chain(
+                self.camps
+                    .iter()
+                    .filter(move |(_, camp)| near(camp))
+                    .map(|(number, _)| *number),
+            )
     }
 
     /// The group of the station of slot key `number` in `slot`: its spawn members when the slot
     /// is new (the station came into view), else none.
     pub(super) fn group(&self, number: u64, slot: Slot) -> Option<BundleGroup> {
-        let index = usize::try_from(number.checked_sub(STATION_ENTITY_BASE)?).ok()?;
-        let station = self.stations.get(index)?;
+        let station = match self.camps.get(&number) {
+            Some(camp) => camp,
+            None => {
+                let index = usize::try_from(number.checked_sub(STATION_ENTITY_BASE)?).ok()?;
+                self.stations.get(index)?
+            }
+        };
         slot.new.then(|| BundleGroup {
             interest: u64::from(slot.interest),
             members: station.members.clone(),
@@ -271,7 +314,10 @@ impl Stations {
 
     /// The station whose `GdeRef` is `gde_ref`.
     fn named(&self, gde_ref: &[u8; RAW_ID_LEN]) -> Option<&Station> {
-        self.by_ref.get(gde_ref).map(|index| &self.stations[*index])
+        self.by_ref
+            .get(gde_ref)
+            .map(|index| &self.stations[*index])
+            .or_else(|| self.camps.values().find(|camp| &camp.gde_ref == gde_ref))
     }
 }
 

@@ -92,6 +92,34 @@ pub struct Rotation {
     pub w_negative: bool,
 }
 
+/// The steps of a rotation component's `u16` over `[-1, 1]`.
+const ROTATION_STEPS: f32 = 65_535.0;
+
+impl Rotation {
+    /// The wire form of the unit quaternion `quaternion` (x, y, z, w): a component of exactly 0
+    /// or 1 is its own form, another is `(c + 1) / 2` of [`ROTATION_STEPS`], truncated
+    /// (Observed: the two retail camps of `Hivecamp` and `Hive_camping` sent z 0.874472 as
+    /// 61421 and -0.512169 as 15985, the 2236 rotations their clients asked for).
+    pub fn of_quaternion(quaternion: [f32; 4]) -> Self {
+        let [x, y, z, w] = quaternion;
+        let component = |value: f32| {
+            if value == 0.0 {
+                RotationComponent::Zero
+            } else if value == 1.0 {
+                RotationComponent::One
+            } else {
+                // The share is in [0, 1], so the product is in [0, u16::MAX].
+                let share = ((value + 1.0) / 2.0).clamp(0.0, 1.0);
+                RotationComponent::Value((share * ROTATION_STEPS) as u16)
+            }
+        };
+        Self {
+            components: [component(x), component(y), component(z)],
+            w_negative: w < 0.0,
+        }
+    }
+}
+
 /// The `scale` child.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scale {
@@ -318,6 +346,39 @@ mod tests {
                 values: [1, 2, 3],
             }),
         }
+    }
+
+    #[test]
+    fn a_quaternion_has_the_retail_camp_rotation() {
+        // `Hivecamp` 2236 at 1781367544.661 asked for (0, 0, 0x3f5fdd61, 0xbef85bf1); its camp
+        // group sent z 61421 with w negative.
+        let rotation = Rotation::of_quaternion([
+            0.0,
+            0.0,
+            f32::from_bits(0x3f5f_dd61),
+            f32::from_bits(0xbef8_5bf1),
+        ]);
+        assert_eq!(
+            rotation,
+            Rotation {
+                components: [
+                    RotationComponent::Zero,
+                    RotationComponent::Zero,
+                    RotationComponent::Value(61_421),
+                ],
+                w_negative: true,
+            }
+        );
+        let other = Rotation::of_quaternion([0.0, 1.0, f32::from_bits(0xbf03_1d7c), 0.5]);
+        assert_eq!(
+            other.components,
+            [
+                RotationComponent::Zero,
+                RotationComponent::One,
+                RotationComponent::Value(15_985)
+            ]
+        );
+        assert!(!other.w_negative);
     }
 
     fn encode(state: &PositionInTheWorldReplicatedState) -> Vec<u8> {

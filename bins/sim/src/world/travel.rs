@@ -18,7 +18,8 @@
 //!   (retail asked again 54 s after one and was accepted).
 //! - A map marker (2728) comes back as the waypoints state (4321) in the next bundle.
 //! - Binding a respawn camp (interaction 73) demolishes the player's own camp (6760, every one of
-//!   8 retail binds) and is accepted (3743); checking in at an inn (70, then 18) is accepted.
+//!   8 retail binds; its entity goes and the save forgets it) and is accepted (3743); checking in
+//!   at an inn (70, then 18) is accepted.
 //!   The bound ids are the ids a respawn request (1938) names.
 //! - A door (67) is accepted and its client moves through it on its own, 4.7 to 5.6 m, 134 to
 //!   267 ms after the answer (3 retail doors): that one move is taken.
@@ -43,7 +44,12 @@
 //!   and moved the player 1 s later (or after the fast travel channel for `m_channelDuration`
 //!   0) with 3951 and 3696.
 //! - A camp (2236 from build mode, answered by 441; a former camp goes with 6760, as retail's
-//!   second placement) needs the `Camping` rank (its tier) and a territory with `CanPlaceCamp`.
+//!   second placement) needs the `Camping` rank (its tier), a territory with `CanPlaceCamp`, the
+//!   blueprint the 2236 names (or the default camp of its tier; a PvP-flagged player's is the
+//!   blueprint's `PvPCampVariantID`), an enabled skin whose achievement the player has, and its
+//!   `StructureCost` items in the bag, which it takes. It stands in the world as an entity
+//!   ([`super::camps`]); the camping state (1292) names it and its bind cooldown end (placement
+//!   plus [`CAMP_BIND_COOLDOWN_MS`]), the home points (3652) list its respawn point.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -52,6 +58,7 @@ use bevy_ecs::entity::Entity;
 use nw_bus::{
     ConnectionRef, HomeRecord, HousingItem, OwnedHome, PlacedCamp, PlayerTravel, Point, StoredPoint,
 };
+use nw_content::camps::default_camp;
 use nw_content::progression::AZOTH_PROGRESSION;
 use nw_messages::facet::component as player_component;
 use nw_messages::items::{FIRST_VERSION, FullList};
@@ -60,10 +67,11 @@ use nw_messages::travel::{
     UnstuckDenial, WAYPOINTS_COMPONENT, WAYPOINTS_TYPE_INDEX, WaypointsState, component,
 };
 use nw_messages::travel_states::{
-    CAMPING_COMPONENT, CAMPING_TYPE_INDEX, CampingState, HomePoint, HouseDataRef, NO_PHASED_ENTITY,
-    OwnedHouse, PLAYER_HOME_COMPONENT, PLAYER_HOME_TYPE_INDEX, PLAYER_HOUSING_COMPONENT,
-    PLAYER_HOUSING_TYPE_INDEX, PLAYER_TIME_COMPONENT, PLAYER_TIME_TYPE_INDEX, PlayerHomeState,
-    PlayerHousingState, PlayerTimeState, home_point_id, home_point_kind,
+    CAMPING_COMPONENT, CAMPING_TYPE_INDEX, CampRef, CampingState, HomePoint, HouseDataRef,
+    NO_PHASED_ENTITY, OwnedHouse, PLAYER_HOME_COMPONENT, PLAYER_HOME_TYPE_INDEX,
+    PLAYER_HOUSING_COMPONENT, PLAYER_HOUSING_TYPE_INDEX, PLAYER_TIME_COMPONENT,
+    PLAYER_TIME_TYPE_INDEX, PlayerHomeState, PlayerHousingState, PlayerTimeState, home_point_id,
+    home_point_kind,
 };
 use nw_messages::{
     BundleMember, FacetHeader, InputRecord, InteractionRequest, MemberState, NS_PER_MS, RAW_ID_LEN,
@@ -75,6 +83,7 @@ use crate::charting::CHART_EVENT;
 use crate::objectives::Event;
 use crate::travel_rules::{HousingRules, TravelRules};
 
+use super::camps::{CampEntity, CampPlacement};
 use super::quest_objects::gain_experience;
 use super::{
     Body, Placement, Player, REFUSED_RESYNC_MS, SimWorld, Vitals, gather_answer, send_now, unix_ns,
@@ -128,6 +137,8 @@ const INN_RESPAWN_LANDMARK: u8 = 20;
 /// The categorical progression whose rank is the tier of the camp a player places (`Camping`,
 /// `MaxLevel` 5, ranks `@ui_camping_reward_tier_N`); rank 0 places none.
 const CAMPING_PROGRESSION: &str = "Camping";
+/// The game event of a placed camp.
+const BIND_CAMP_EVENT: &str = "BindCamp";
 /// The 441 result of a placed structure (0 in all 5 retail answers).
 const PLACEMENT_PLACED: u8 = 0;
 /// The 441 result of a refused structure (best guess: the first value after success; the
@@ -137,10 +148,9 @@ const PLACEMENT_REFUSED: u8 = 1;
 const PLACEMENT_VALUE: u32 = 0;
 /// The status of a refused interaction (the crafting station's refusal).
 const INTERACTION_REFUSED: u8 = 2;
-/// The facet entity of a player's camp is this plus the player's number: one camp per player,
-/// in the upper half of the crafting station range (stations count up from `1 << 37`, far
-/// fewer than `1 << 36` of them) and below the loot bags (`1 << 38`).
-const CAMP_ENTITY_BASE: u64 = (1 << 37) | (1 << 36);
+/// How long after a camp's placement its owner may not bind to it (Observed: retail `Hivecamp`
+/// 1292 with the camp at 1781367544.712, `campBindCooldownEndTime` 60 s after the placement).
+const CAMP_BIND_COOLDOWN_MS: u64 = 60_000;
 /// The cooldown of a camp home point (1 s in all 14 retail camp elements).
 const CAMP_COOLDOWN_NS: u64 = 1_000_000_000;
 /// The name of a house home point (all 1,042 retail ones).
@@ -154,6 +164,26 @@ const HOUSE_HANDSHAKE: bool = true;
 /// The decoration score and trophies of a house: the trophy items (house buffs) are not run
 /// here.
 const NO_DECORATION_SCORE: f32 = 0.0;
+
+/// Why a camp placement is refused (the 441 result of each is Unknown: all answer
+/// [`PLACEMENT_REFUSED`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CampRefusal {
+    /// The player is dead or not here.
+    Dead,
+    /// Its `Camping` rank is 0.
+    Rank,
+    /// None of its territories allows camps.
+    Territory,
+    /// The content has neither the named blueprint nor the default camp of its tier.
+    Blueprint,
+    /// The camp's skin is disabled, or the player lacks its achievement.
+    Skin,
+    /// The content has no slice of the blueprint.
+    Slice,
+    /// The bag lacks a cost item.
+    Cost,
+}
 
 /// What a channel is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -225,6 +255,8 @@ pub(super) struct TravelState {
     inside: Option<[u8; RAW_ID_LEN]>,
     /// The states its client does not have yet.
     due: StatesDue,
+    /// Its placed camp's entity in this sim.
+    pub(super) camp: Option<CampEntity>,
     /// The versions of the owned house and home point lists its client has.
     houses_version: u64,
     homes_version: u64,
@@ -333,11 +365,6 @@ fn home_ref(home: &OwnedHome) -> PlotRef {
         },
         extra: home.record.plot_extra,
     }
-}
-
-/// The facet entity of the camp of player `number`.
-const fn camp_entity(number: u64) -> u64 {
-    CAMP_ENTITY_BASE + number
 }
 
 /// Unix nanoseconds of Unix milliseconds `ms`; 0 stays 0 (none).
@@ -506,7 +533,7 @@ impl SimWorld {
                 self.remove_all_furniture(entity, number, now_ms);
             }
             TravelClientMsg::PlaceStructure { placement, .. } => {
-                self.place_camp(entity, number, &placement);
+                self.place_camp(entity, number, &placement, now_ms);
             }
             call @ (TravelClientMsg::CancelPlacingStructure { .. }
             | TravelClientMsg::InteractHousingItem { .. }
@@ -896,15 +923,21 @@ impl SimWorld {
             }
             if due.homes {
                 player.travel.homes_version = player.travel.homes_version.saturating_add(1);
-                let body = home_state(&player.travel, rules, number).body();
+                let body = home_state(&player.travel, rules).body();
                 members.push((PLAYER_HOME_COMPONENT, PLAYER_HOME_TYPE_INDEX, body));
             }
             if due.camping {
+                let travel = &player.travel;
                 let body = CampingState {
-                    current_camp: None,
-                    camp_skin: player.travel.saved.camp_skin,
+                    current_camp: travel.camp.map(|camp| CampRef {
+                        id: camp.gde_ref,
+                        facet: camp.facet(),
+                    }),
+                    camp_skin: travel.saved.camp_skin,
                     under_attack: None,
-                    bind_cooldown_end_ns: None,
+                    bind_cooldown_end_ns: travel.saved.placed_camp.map(|camp| {
+                        unix_ms_ns(camp.placed_ms.saturating_add(CAMP_BIND_COOLDOWN_MS))
+                    }),
                 }
                 .body();
                 members.push((CAMPING_COMPONENT, CAMPING_TYPE_INDEX, Ok(body)));
@@ -1119,8 +1152,12 @@ impl SimWorld {
                 self.send_travel(entity, &[accepted]);
             }
             kind::BIND_TO_CAMP => {
+                self.despawn_camp(entity);
                 if let Some(mut player) = self.world.get_mut::<Player>(entity) {
                     player.travel.saved.camp = Some(request.target_entity);
+                    player.travel.saved.placed_camp = None;
+                    player.travel.due.camping = true;
+                    player.travel.due.homes = true;
                 }
                 let demolish = ServerMessage::Travel(TravelServerMsg::DemolishCamp {
                     header: header(component::CAMPING, number),
@@ -1603,56 +1640,131 @@ impl SimWorld {
         self.refund_furniture(number, &items, now_ms);
     }
 
-    /// Player `number` places its camp (2236): its `Camping` rank is the camp's tier, and its
-    /// territory must allow camps; a former camp goes (6760). Answered by 441.
-    fn place_camp(&mut self, entity: Entity, number: u64, placement: &StructurePlacement) {
-        let unix_ms = self.unix_ms();
-        let rules = &self.content.travel;
-        let progression = &self.content.progression;
-        let dead = self
+    /// What player `entity` places with `placement` (2236): the camp of its `Camping` rank's
+    /// tier, of the blueprint the placement names (the default camp of the tier when it names
+    /// none), in a territory that allows camps, of a skin it may use, with a slice and its costs
+    /// in the bag.
+    fn camp_placement(
+        &self,
+        entity: Entity,
+        placement: &StructurePlacement,
+    ) -> Result<CampPlacement, CampRefusal> {
+        let player = self.world.get::<Player>(entity).ok_or(CampRefusal::Dead)?;
+        if self
             .world
             .get::<Vitals>(entity)
-            .is_none_or(|vitals| vitals.health.is_dead());
-        let Some((placed, had_camp)) = self.world.get_mut::<Player>(entity).map(|mut player| {
-            let tier = player.masteries.rank(progression, CAMPING_PROGRESSION);
-            let allowed = player
-                .territories
+            .is_none_or(|vitals| vitals.health.is_dead())
+        {
+            return Err(CampRefusal::Dead);
+        }
+        let tier = u32::from(
+            player
+                .masteries
+                .rank(&self.content.progression, CAMPING_PROGRESSION),
+        );
+        if tier == 0 {
+            return Err(CampRefusal::Rank);
+        }
+        let rules = &self.content.travel;
+        if !player
+            .territories
+            .iter()
+            .any(|territory| rules.can_place_camp(u32::from(*territory)))
+        {
+            return Err(CampRefusal::Territory);
+        }
+        let camps = &self.content.camps;
+        let named = camps
+            .blueprint_of_crc(placement.skin)
+            .or_else(|| camps.blueprint(&default_camp(tier)))
+            .ok_or(CampRefusal::Blueprint)?;
+        let blueprint = camps.placed(named, player.pvp_flagged);
+        if let Some(skin) = camps.skin_of(blueprint) {
+            let achieved = skin
+                .required_achievement
+                .as_deref()
+                .is_none_or(|achievement| {
+                    player
+                        .flow
+                        .has_achievement(&self.achievement_rules, achievement)
+                });
+            if !skin.enabled || !achieved {
+                return Err(CampRefusal::Skin);
+            }
+        }
+        if self.content.camp_slices.get(&blueprint.id).is_none() {
+            return Err(CampRefusal::Slice);
+        }
+        let in_bag = player.gear.as_ref().is_some_and(|gear| {
+            self.content
+                .structure_costs
+                .of(&blueprint.id)
                 .iter()
-                .any(|territory| rules.can_place_camp(u32::from(*territory)));
-            let placed = !dead && tier > 0 && allowed;
-            let had_camp = player.travel.saved.placed_camp.is_some();
-            if placed {
-                let [x, y, z] = placement.position;
+                .all(|(item, quantity)| gear.bag_count(item) >= *quantity)
+        });
+        if !in_bag {
+            return Err(CampRefusal::Cost);
+        }
+        let [x, y, z] = placement.position;
+        Ok(CampPlacement {
+            blueprint: blueprint.id.clone(),
+            position: Position { x, y, z },
+            rotation: placement.rotation,
+            tier,
+        })
+    }
+
+    /// Player `number` places its camp (2236, [`SimWorld::camp_placement`]): the costs leave its
+    /// bag, a former camp goes (6760), the camp stands in the world and the `BindCamp` game event
+    /// fires. Answered by 441; a refusal changes nothing.
+    fn place_camp(
+        &mut self,
+        entity: Entity,
+        number: u64,
+        placement: &StructurePlacement,
+        now_ms: u64,
+    ) {
+        let unix_ms = self.unix_ms();
+        let placed = self.camp_placement(entity, placement);
+        tracing::info!(player = number, ?placed, "camp placement");
+        let had_camp = self
+            .world
+            .get::<Player>(entity)
+            .is_some_and(|player| player.travel.saved.placed_camp.is_some());
+        let mut answers = Vec::new();
+        if let Ok(camp) = &placed {
+            let costs = self.content.structure_costs.of(&camp.blueprint).to_vec();
+            if let Some(mut player) = self.world.get_mut::<Player>(entity)
+                && let Some(gear) = player.gear.as_mut()
+            {
+                for (item, quantity) in &costs {
+                    gear.take(item, *quantity);
+                }
+            }
+            self.despawn_camp(entity);
+            if had_camp {
+                answers.push(ServerMessage::Travel(TravelServerMsg::DemolishCamp {
+                    header: header(component::CAMPING, number),
+                }));
+            }
+            let spawned = self.spawn_camp(entity, camp);
+            if let Some(mut player) = self.world.get_mut::<Player>(entity) {
+                player.travel.camp = spawned;
                 player.travel.saved.placed_camp = Some(PlacedCamp {
-                    position: StoredPoint::of(Point { x, y, z }),
-                    tier: u8::try_from(tier).unwrap_or(u8::MAX),
+                    position: stored(camp.position),
+                    tier: u8::try_from(camp.tier).unwrap_or(u8::MAX),
                     placed_ms: unix_ms,
                 });
-                player.travel.saved.camp_skin = Some(placement.skin);
                 player.travel.due.camping = true;
                 player.travel.due.homes = true;
             }
-            tracing::info!(
-                player = number,
-                placed,
-                tier,
-                allowed,
-                dead,
-                "camp placement"
-            );
-            (placed, had_camp)
-        }) else {
-            return;
-        };
-        let mut answers = Vec::new();
-        if placed && had_camp {
-            answers.push(ServerMessage::Travel(TravelServerMsg::DemolishCamp {
-                header: header(component::CAMPING, number),
-            }));
+            // Inferred: a placed camp is the player's bind point, the `BindCamp` game event that
+            // the camp tutorial's task counts (`12A_MSQ_12_CampTutorial`, `TaskGameEvent`).
+            self.fire_game_event(number, BIND_CAMP_EVENT, now_ms);
         }
         answers.push(ServerMessage::Travel(TravelServerMsg::PlacementResults {
             header: header(BUILDER_COMPONENT, number),
-            result: if placed {
+            result: if placed.is_ok() {
                 PLACEMENT_PLACED
             } else {
                 PLACEMENT_REFUSED
@@ -1662,18 +1774,16 @@ impl SimWorld {
         self.send_travel(entity, &answers);
     }
 
-    /// Where player `entity` respawns at its own home point `point`: its camp or one of its
-    /// houses.
+    /// Where player `entity` respawns at its own home point `point`: its camp's respawn point or
+    /// one of its houses.
     pub(super) fn own_spawn_point(&self, entity: Entity, point: u64) -> Option<[f32; 3]> {
-        let player = self.world.get::<Player>(entity)?;
-        let saved = &player.travel.saved;
-        if point == camp_entity(player.number) {
-            return saved.placed_camp.map(|camp| {
-                let Point { x, y, z } = camp.position.point();
-                [x, y, z]
-            });
+        let travel = &self.world.get::<Player>(entity)?.travel;
+        if let Some(camp) = travel.camp.filter(|camp| camp.facet() == point) {
+            let Position { x, y, z } = camp.spawn_point;
+            return Some([x, y, z]);
         }
-        saved
+        travel
+            .saved
             .homes
             .iter()
             .find(|home| home_ref(home).facet == point)
@@ -1801,9 +1911,9 @@ fn housing_state(travel: &TravelState) -> PlayerHousingState {
     }
 }
 
-/// The home points of `travel` (player `number`): its bound inn, its houses and its camp, and
+/// The home points of `travel`: its bound inn, its houses and its camp's respawn point, and
 /// the bound inn's id as the chosen point.
-fn home_state(travel: &TravelState, rules: &TravelRules, number: u64) -> PlayerHomeState {
+fn home_state(travel: &TravelState, rules: &TravelRules) -> PlayerHomeState {
     let saved = &travel.saved;
     let point =
         |entity: u64, name: Vec<u8>, position: [f32; 3], cooldown_ns, used_ns, kind| HomePoint {
@@ -1841,16 +1951,24 @@ fn home_state(travel: &TravelState, rules: &TravelRules, number: u64) -> PlayerH
             home_point_kind::HOUSE,
         )
     });
-    let camp = saved.placed_camp.map(|camp| {
-        let Point { x, y, z } = camp.position.point();
-        point(
-            camp_entity(number),
-            format!("@CampT{}_MasterName", camp.tier).into_bytes(),
-            [x, y, z],
-            CAMP_COOLDOWN_NS,
-            0,
-            home_point_kind::CAMP,
-        )
+    let camp = travel.camp.zip(saved.placed_camp).map(|(camp, placed)| {
+        let Position { x, y, z } = camp.spawn_point;
+        HomePoint {
+            entity: PlotRef {
+                id: camp.gde_ref,
+                // The third id of retail's camp element (`40124f2ca3b07621` in `Hivecamp`) is of
+                // unknown meaning.
+                ..entity_ref(camp.facet())
+            },
+            ..point(
+                camp.facet(),
+                format!("@CampT{}_MasterName", placed.tier).into_bytes(),
+                [x, y, z],
+                CAMP_COOLDOWN_NS,
+                0,
+                home_point_kind::CAMP,
+            )
+        }
     });
     PlayerHomeState {
         home_points: Some(FullList {
@@ -2910,7 +3028,7 @@ mod tests {
         ] {
             assert!(classes.contains(&class), "class {class}");
         }
-        let homes = home_state(&player.travel, &world.content.travel, PLAYER);
+        let homes = home_state(&player.travel, &world.content.travel);
         let points = homes.home_points.expect("list").elements;
         assert_eq!(points.len(), 1);
         assert_eq!(
@@ -2976,5 +3094,497 @@ mod tests {
             state.drop_crumb(at(x), 24.0, 3);
         }
         assert_eq!(state.breadcrumbs, [at(30.0), at(60.0), at(90.0)]);
+    }
+
+    /// A player with the `Camping` rank of [`CAMP_TIER`] in the world of [`world`], whose content
+    /// has the retail PvP metalfest camp, its costs and a `camp1` recipe.
+    mod camp {
+        use nw_content::camps::{CampBlueprint, CampRules, CampSkin};
+        use nw_content::crafting::{Ingredient, IngredientKind, Recipe, Recipes, StructureCosts};
+        use nw_content::progression::{Progression, ProgressionSource};
+        use nw_messages::wire::Reader;
+        use nw_world::camps::{CampSlice, CampSlices};
+        use nw_world::stations::StationSlice;
+
+        use super::*;
+        use crate::world::camps::tests::{
+            RETAIL_AT, RETAIL_SPAWN_POINT, SPAWN_POINT_TOLERANCE_M, costs, pvp_slice,
+            retail_rotation,
+        };
+        use crate::world::crafting::CraftChoice;
+        use crate::world::gear;
+        use crate::world::slots::Slot;
+        use crate::world::tests::{SERVER_TIME, admit_at};
+
+        const CAMPER: u64 = 8;
+        const CAMP_TIER: u16 = 5;
+        /// `Camping` (`MaxLevel` 5) with a cap of 100 per rank.
+        const RANK_CAP: i64 = 100;
+        const WOOD: &str = "WoodT1";
+        const PVP_CAMP: &str = "CampSkin_MetalFest02_A_PVP";
+        const CAMP_SKIN_ID: &str = "CampSkin_MetalFest02_A";
+        /// `Hivecamp` 2236 at 1781367544.661 named `CampSkin_MetalFest02_A_PVP`.
+        const PVP_CAMP_CRC: u32 = 0x89a7_af2d;
+        /// A `camp1` recipe of the test content.
+        const RECIPE: &str = "CampTestRecipe";
+        /// The interaction kind of a crafting station (`OpenCraftingOption`).
+        const CRAFTING_KIND: u8 = 20;
+        /// Retail `Hivecamp` 1781367544743: the camping state (1292) of the owner of the new
+        /// camp (component, class and body).
+        const RETAIL_CAMPING: &str =
+            "198c1401096e5ac4808181beaff1f846dcd11b879dafbe818180c45a6e18b8b065f6fa3470";
+        /// The same bundle's home point list (3652, a list delta) adds the camp element: its
+        /// name, its cooldown (1 s) and kind.
+        const RETAIL_CAMP_NAME: &[u8] = b"@CampT5_MasterName";
+
+        fn content(travel: TravelRules) -> PlayerContent {
+            let camp = |id: &str, pvp: bool, variant: Option<&str>| CampBlueprint {
+                id: id.to_owned(),
+                hp: 300,
+                pvp,
+                pvp_variant: variant.map(str::to_owned),
+            };
+            PlayerContent {
+                travel,
+                kits: gear::tests::kits_with(&[(WOOD, "Resource")]),
+                progression: Progression::default().with_progressions([ProgressionSource {
+                    id: CAMPING_PROGRESSION.to_owned(),
+                    max_level: i64::from(CAMP_TIER),
+                    auto_rank_up: true,
+                    ranks: (0..i64::from(CAMP_TIER))
+                        .map(|rank| (rank, RANK_CAP))
+                        .collect(),
+                }]),
+                camps: CampRules::build(
+                    [
+                        camp(CAMP_SKIN_ID, false, Some(PVP_CAMP)),
+                        camp(PVP_CAMP, true, None),
+                    ],
+                    [CampSkin {
+                        id: CAMP_SKIN_ID.to_owned(),
+                        enabled: true,
+                        required_achievement: None,
+                    }],
+                ),
+                camp_slices: CampSlices::of([pvp_slice(), skin_slice()]),
+                structure_costs: StructureCosts::build([(PVP_CAMP.to_owned(), costs())]),
+                recipes: Recipes::build(
+                    [Recipe {
+                        id: RECIPE.to_owned(),
+                        item: WOOD.to_owned(),
+                        quantity: 1,
+                        ingredients: vec![Ingredient {
+                            kind: IngredientKind::Item(gear::tests::FLINT.to_owned()),
+                            quantity: 1,
+                        }],
+                        stations: vec!["camp1".to_owned()],
+                    }],
+                    [],
+                ),
+                ..PlayerContent::default()
+            }
+        }
+
+        /// The camp slice of the metalfest skin without PvP (`campskin_metalfest02_a`, its
+        /// members as `camp-slices-25810808.json` has them).
+        fn skin_slice() -> CampSlice {
+            let pvp = pvp_slice();
+            CampSlice {
+                station: StationSlice {
+                    structure: CAMP_SKIN_ID.to_owned(),
+                    ownership: Some((7, 1)),
+                    ..pvp.station.clone()
+                },
+                vitals: None,
+                damage_receiver: None,
+                delayed_events: vec![4],
+                ..pvp
+            }
+        }
+
+        /// The world and the camper, in a camp territory with the costs of a camp (and `extra`
+        /// flint) in its bag when `items`.
+        fn camp_world(items: bool, extra_flint: u32) -> (SimWorld, Entity) {
+            let mut world = world();
+            world.content = Arc::new(content(world.content.travel.clone()));
+            let mut admit = admit_at(CAMPER, START_X, true);
+            admit.backstory = Some(gear::tests::BACKSTORY.to_owned());
+            world.admit(&admit, NOW, SERVER_TIME).expect("admit");
+            let entity = world.player_by_number(CAMPER).expect("camper");
+            world
+                .world
+                .get_mut::<Vitals>(entity)
+                .expect("vitals")
+                .spawned = true;
+            let content = Arc::clone(&world.content);
+            let mut player = world.world.get_mut::<Player>(entity).expect("player");
+            player.territories = vec![TERRITORY];
+            player.own_card_sent = true;
+            let camping = content
+                .progression
+                .categorical(CAMPING_PROGRESSION)
+                .expect("camping");
+            player.masteries.set(camping, u32::MAX);
+            assert_eq!(
+                player
+                    .masteries
+                    .rank(&content.progression, CAMPING_PROGRESSION),
+                CAMP_TIER
+            );
+            let gear = player.gear.as_mut().expect("gear");
+            let item = |id: &str| content.kits.item(id).cloned().expect("item");
+            let flint_held = gear.bag_count(gear::tests::FLINT);
+            gear.take(gear::tests::FLINT, flint_held);
+            if items {
+                for (id, quantity) in costs() {
+                    assert!(gear.add(&item(&id), quantity));
+                }
+            }
+            if extra_flint > 0 {
+                assert!(gear.add(&item(gear::tests::FLINT), extra_flint));
+            }
+            (world, entity)
+        }
+
+        fn place(world: &mut SimWorld, now_ms: u64) -> Vec<TravelServerMsg> {
+            let [x, y, z] = [RETAIL_AT.x, RETAIL_AT.y, RETAIL_AT.z];
+            let placement = StructurePlacement {
+                position: [x, y, z],
+                rotation: retail_rotation(),
+                skin: PVP_CAMP_CRC,
+                structure: [5; RAW_ID_LEN],
+                owner: [6; RAW_ID_LEN],
+                socket: u32::MAX,
+                value: 50,
+                flag: true,
+            };
+            world.travel_call(
+                &connection(CAMPER),
+                TravelClientMsg::PlaceStructure {
+                    header: header(BUILDER_COMPONENT, CAMPER),
+                    placement,
+                },
+                now_ms,
+            );
+            messages_to(&tick(world, now_ms + 1).messages, CAMPER)
+                .into_iter()
+                .filter_map(|message| match message {
+                    ServerMessage::Travel(answer) => Some(answer),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn placed(result: u8) -> TravelServerMsg {
+            TravelServerMsg::PlacementResults {
+                header: header(BUILDER_COMPONENT, CAMPER),
+                result,
+                value: PLACEMENT_VALUE,
+            }
+        }
+
+        fn camp_of(world: &SimWorld, entity: Entity) -> Option<CampEntity> {
+            world
+                .world
+                .get::<Player>(entity)
+                .expect("player")
+                .travel
+                .camp
+        }
+
+        fn bag(world: &SimWorld, entity: Entity, item: &str) -> u32 {
+            world
+                .world
+                .get::<Player>(entity)
+                .and_then(|player| player.gear.as_ref())
+                .map_or(0, |gear| gear.bag_count(item))
+        }
+
+        fn shown(world: &SimWorld, camp: &CampEntity) -> bool {
+            world
+                .stations
+                .numbers_near(RETAIL_AT, 1.0)
+                .any(|number| number == camp.number)
+        }
+
+        fn retail(bytes: &str) -> MemberState {
+            let bytes = hex::decode(bytes).expect("hex");
+            BundleMember::read_from(&bytes)
+                .expect("retail member")
+                .0
+                .state
+        }
+
+        #[test]
+        fn a_camp_without_its_costs_in_the_bag_is_refused() {
+            let (mut world, entity) = camp_world(false, 0);
+            assert_eq!(place(&mut world, NOW), [placed(PLACEMENT_REFUSED)]);
+            assert_eq!(camp_of(&world, entity), None);
+            let player = world.world.get::<Player>(entity).expect("player");
+            assert!(player.travel.saved.placed_camp.is_none());
+        }
+
+        #[test]
+        fn a_gm_sets_the_camping_rank_by_its_progression_id() {
+            const RANK: u16 = 1;
+            let (mut world, entity) = camp_world(true, 0);
+            assert_eq!(
+                world.set_mastery_rank(CAMPER, Some(CAMPING_PROGRESSION), RANK),
+                nw_bus::AdminReply::Done
+            );
+            let content = Arc::clone(&world.content);
+            let player = world.world.get::<Player>(entity).expect("player");
+            assert_eq!(
+                player
+                    .masteries
+                    .rank(&content.progression, CAMPING_PROGRESSION),
+                RANK
+            );
+        }
+
+        #[test]
+        fn a_placed_camp_takes_its_costs_and_stands_in_the_world() {
+            let (mut world, entity) = camp_world(true, 0);
+            assert_eq!(place(&mut world, NOW), [placed(PLACEMENT_PLACED)]);
+            assert!(
+                world
+                    .take_stat_events()
+                    .iter()
+                    .any(|event| event.game_mode == BIND_CAMP_EVENT),
+                "a placed camp fires BindCamp"
+            );
+            assert_eq!(
+                (
+                    bag(&world, entity, WOOD),
+                    bag(&world, entity, gear::tests::FLINT)
+                ),
+                (0, 0)
+            );
+            let camp = camp_of(&world, entity).expect("camp entity");
+            assert!(shown(&world, &camp));
+            let slot = Slot {
+                interest: 1,
+                new: true,
+            };
+            let group = world.stations.group(camp.number, slot).expect("group");
+            assert_eq!(
+                group.members.first().map(|member| &member.state),
+                Some(&MemberState::GdeMetadata(
+                    nw_messages::GdeMetadataReplicatedState {
+                        asset: Some(nw_messages::gde::AssetId {
+                            id: pvp_slice().asset,
+                            sub_id: pvp_slice().asset_sub_id,
+                        }),
+                        gde_ref: Some(camp.gde_ref),
+                    }
+                ))
+            );
+            // A second camp: the first goes (6760), the new one has a slot key of its own.
+            let (wood, flint) = (item_of(&world, WOOD), item_of(&world, gear::tests::FLINT));
+            {
+                let mut player = world.world.get_mut::<Player>(entity).expect("player");
+                let gear = player.gear.as_mut().expect("gear");
+                assert!(gear.add(&wood, 5) && gear.add(&flint, 1));
+            }
+            assert_eq!(
+                place(&mut world, NOW + 10),
+                [
+                    TravelServerMsg::DemolishCamp {
+                        header: header(component::CAMPING, CAMPER),
+                    },
+                    placed(PLACEMENT_PLACED)
+                ]
+            );
+            let second = camp_of(&world, entity).expect("second camp");
+            assert_ne!(second.number, camp.number);
+            assert!(!shown(&world, &camp) && shown(&world, &second));
+            // A bind to a respawn camp demolishes it: the save forgets it.
+            assert!(world.travel_interaction(
+                entity,
+                CAMPER,
+                request(kind::BIND_TO_CAMP, CAMP),
+                b"@camp",
+                NOW + 20
+            ));
+            assert!(!shown(&world, &second));
+            let player = world.world.get::<Player>(entity).expect("player");
+            assert_eq!(player.travel.camp, None);
+            assert!(player.travel.saved.placed_camp.is_none());
+        }
+
+        fn item_of(world: &SimWorld, id: &str) -> nw_content::starter::KitItem {
+            world.content.kits.item(id).cloned().expect("item")
+        }
+
+        #[test]
+        fn the_camping_state_and_home_points_name_the_camp_as_retail() {
+            let (mut world, entity) = camp_world(true, 0);
+            place(&mut world, NOW);
+            let camp = camp_of(&world, entity).expect("camp");
+            let placed_ms = world
+                .world
+                .get::<Player>(entity)
+                .and_then(|player| player.travel.saved.placed_camp)
+                .expect("saved")
+                .placed_ms;
+            world
+                .world
+                .get_mut::<Player>(entity)
+                .expect("player")
+                .extra_members
+                .clear();
+            world
+                .world
+                .get_mut::<Player>(entity)
+                .expect("player")
+                .travel
+                .due = StatesDue::ALL;
+            world.tick_travel(NOW + 2);
+            let player = world.world.get::<Player>(entity).expect("player");
+            let body = |class| {
+                player
+                    .extra_members
+                    .iter()
+                    .find_map(|member| match &member.state {
+                        MemberState::Recorded { class: found, body } if *found == class => {
+                            Some(body.clone())
+                        }
+                        _ => None,
+                    })
+            };
+            let camping =
+                CampingState::read(&mut Reader::new(&body(CAMPING_TYPE_INDEX).expect("1292")))
+                    .expect("camping state");
+            let MemberState::Camping(retail_camping) = retail(RETAIL_CAMPING) else {
+                panic!("retail 1292");
+            };
+            assert_eq!(
+                camping,
+                CampingState {
+                    current_camp: Some(CampRef {
+                        id: camp.gde_ref,
+                        facet: camp.facet(),
+                    }),
+                    camp_skin: None,
+                    under_attack: None,
+                    bind_cooldown_end_ns: Some(unix_ms_ns(placed_ms + CAMP_BIND_COOLDOWN_MS)),
+                }
+            );
+            let retail_camp = retail_camping.current_camp.expect("retail camp");
+            assert_eq!(
+                (
+                    retail_camp.facet,
+                    retail_camping.camp_skin,
+                    retail_camping.under_attack
+                ),
+                (
+                    u64::from_le_bytes(retail_camp.id[..8].try_into().expect("8")),
+                    None,
+                    None
+                ),
+                "the retail state of a new camp: its ref and bind end only"
+            );
+            let homes = PlayerHomeState::read(&mut Reader::new(
+                &body(PLAYER_HOME_TYPE_INDEX).expect("3652"),
+            ))
+            .expect("home state");
+            let ours = &homes.home_points.expect("ours").elements[0];
+            assert_eq!(
+                (ours.entity.id, ours.entity.facet),
+                (camp.gde_ref, camp.facet())
+            );
+            assert_eq!(ours.id, home_point_id(camp.facet(), SINGLE_POINT));
+            assert_eq!(
+                (ours.name.as_slice(), ours.cooldown_ns, ours.kind),
+                (RETAIL_CAMP_NAME, CAMP_COOLDOWN_NS, home_point_kind::CAMP)
+            );
+            for (ours, theirs) in ours
+                .position
+                .iter()
+                .zip(RETAIL_SPAWN_POINT.map(f32::from_bits))
+            {
+                assert!((ours - theirs).abs() <= SPAWN_POINT_TOLERANCE_M);
+            }
+        }
+
+        #[test]
+        fn a_camp1_recipe_crafts_at_the_camp() {
+            let (mut world, entity) = camp_world(true, 1);
+            place(&mut world, NOW);
+            let camp = camp_of(&world, entity).expect("camp");
+            world.open_station(
+                entity,
+                CAMPER,
+                InteractionRequest {
+                    target: camp.gde_ref,
+                    target_entity: camp.facet(),
+                    interaction: 2,
+                    kind: CRAFTING_KIND,
+                    gatherable: None,
+                },
+            );
+            let station = world
+                .world
+                .get::<Player>(entity)
+                .and_then(|player| player.station.clone());
+            assert_eq!(station.as_deref(), Some("Camp5"));
+            world.craft(
+                entity,
+                CAMPER,
+                lowercase_crc32(RECIPE),
+                1,
+                0,
+                &[],
+                &CraftChoice::default(),
+                NOW,
+            );
+            assert_eq!(world.crafts.len(), 1, "the camp is a station of the recipe");
+        }
+
+        #[test]
+        fn a_respawn_at_the_camp_lands_at_its_respawn_point() {
+            let (mut world, entity) = camp_world(true, 0);
+            place(&mut world, NOW);
+            let camp = camp_of(&world, entity).expect("camp");
+            {
+                let mut vitals = world.world.get_mut::<Vitals>(entity).expect("vitals");
+                let max = vitals.health.max();
+                vitals.health.take(max);
+                vitals.dead_since_ms = Some(NOW);
+            }
+            let later = NOW + world.combat.min_respawn_ms;
+            let at = world
+                .request_respawn(&connection(CAMPER), Some(camp.facet()), later)
+                .expect("respawn");
+            assert_eq!(at, camp.spawn_point);
+            assert!(
+                at.horizontal_distance(RETAIL_AT) < 2.0,
+                "1.7 m from the camp"
+            );
+            let retail = RETAIL_SPAWN_POINT.map(f32::from_bits);
+            assert!((at.x - retail[0]).abs() <= SPAWN_POINT_TOLERANCE_M);
+            assert!((at.y - retail[1]).abs() <= SPAWN_POINT_TOLERANCE_M);
+        }
+
+        #[test]
+        fn a_saved_camp_stands_again_when_its_owner_comes_back() {
+            let (mut world, entity) = camp_world(true, 0);
+            place(&mut world, NOW);
+            let first = camp_of(&world, entity).expect("camp");
+            let departure = world.leave(&connection(CAMPER)).expect("departure");
+            assert!(!shown(&world, &first), "the camp leaves with its owner");
+            let travel = departure.progression.expect("saved").travel;
+            assert!(travel.placed_camp.is_some());
+            let mut admit = admit_at(CAMPER, START_X, true);
+            admit.backstory = Some(gear::tests::BACKSTORY.to_owned());
+            admit.progression.travel = PlayerTravel {
+                camp_skin: Some(lowercase_crc32(CAMP_SKIN_ID)),
+                ..travel
+            };
+            world.admit(&admit, NOW + 30, SERVER_TIME).expect("admit");
+            let entity = world.player_by_number(CAMPER).expect("camper");
+            let again = camp_of(&world, entity).expect("the camp again");
+            assert!(shown(&world, &again));
+        }
     }
 }

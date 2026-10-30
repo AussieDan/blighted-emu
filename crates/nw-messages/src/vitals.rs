@@ -72,12 +72,19 @@ impl VitalsData {
         if health == 0 {
             Self::DEAD
         } else {
-            Self {
-                head: ALIVE_HEAD,
-                a: server_ms.saturating_mul(NS_PER_MS),
-                b: 0,
-                tail: CREATURE_DATA_TAIL,
-            }
+            Self::alive_since(server_ms)
+        }
+    }
+
+    /// The live block of an entity that spawned at server time `server_ms` (ms since
+    /// 2000-01-01): `00 <server ns> 0 ff` (a creature's first state, and a placed camp's:
+    /// `Hivecamp` 1781367544743 sent `0b956388ac0fc109`, its placement time).
+    pub const fn alive_since(server_ms: u64) -> Self {
+        Self {
+            head: ALIVE_HEAD,
+            a: server_ms.saturating_mul(NS_PER_MS),
+            b: 0,
+            tail: CREATURE_DATA_TAIL,
         }
     }
 

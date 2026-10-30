@@ -30,7 +30,7 @@ const TERRITORY_INTERFACE: [u8; UUID_LEN] = uuid(0xe1d7_8b60_b892_4d25_9e5e_5ac8
 /// `Javelin::BuildableGridComponent`: `m_gridHeightsData`.
 const BUILDABLE_GRID: [u8; UUID_LEN] = uuid(0xf25b_009b_5108_84df_4f5b_1019_4fc1_7c6a);
 /// The delayed event component (the station's ruin timer).
-const DELAYED_EVENT: [u8; UUID_LEN] = uuid(0xd353_f7e8_4266_f749_19a1_aa2c_3841_fbca);
+pub(crate) const DELAYED_EVENT: [u8; UUID_LEN] = uuid(0xd353_f7e8_4266_f749_19a1_aa2c_3841_fbca);
 /// The detector filter of a buildable's completion obstruction (the campfire slice has one, a
 /// town station's none; retail `hasCompletionObstruction` 1 and 0).
 const COMPLETION_OBSTRUCTION_FILTER: &str = "CompletionObstructionCast";
@@ -95,7 +95,6 @@ pub struct CraftingStation {
 
 /// The names read, as their name CRCs.
 struct Names {
-    replication_index: u32,
     initial_state: u32,
     structure_name: u32,
     permission_rule: u32,
@@ -113,7 +112,6 @@ struct Names {
 impl Names {
     fn new() -> Self {
         Self {
-            replication_index: lowercase_crc32("m_replicationIndex"),
             initial_state: lowercase_crc32("m_initialState"),
             structure_name: lowercase_crc32("m_structureName"),
             permission_rule: lowercase_crc32("m_initialPermissionRule"),
@@ -155,6 +153,11 @@ fn text(element: Option<&Element>) -> String {
         .to_owned()
 }
 
+/// The replicated component number (`m_replicationIndex`) of component `element`.
+pub(crate) fn replication_index(element: &Element) -> Option<u8> {
+    small(find(element, lowercase_crc32("m_replicationIndex")))
+}
+
 /// A `u32` field as a byte (indexes and enums of a slice are small).
 fn small(element: Option<&Element>) -> Option<u8> {
     element
@@ -173,7 +176,7 @@ impl StationSlice {
                 .copied()
                 .find(|element| &element.type_id == class)
         };
-        let index = |element: &Element| small(find(element, names.replication_index));
+        let index = replication_index;
         let station = component(&CRAFTING_STATION)?;
         let entry = find(station, names.station_reference)
             .and_then(|reference| reference.child(names.station_entry));

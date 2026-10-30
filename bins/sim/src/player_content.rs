@@ -3,6 +3,7 @@
 //! pick, the bit of each achievement, the look of each mob prefab, and the quests.
 
 use nw_bus::MISSION_BOARD_ID_LEN;
+use nw_content::camps::CampRules;
 use nw_content::charms::ItemNames;
 use nw_content::chest_lockouts::ChestLockouts;
 use nw_content::crafting::{Recipes, StructureCosts};
@@ -39,6 +40,7 @@ use nw_content::titles::TitleRules;
 use nw_content::tradeskill_xp::{BonusChances, TradeskillCurves};
 use nw_formats::objectstream::lowercase_crc32;
 use nw_sim_core::{EquipLoad, EquipLoadLimits, Position};
+use nw_world::camps::CampSlices;
 use nw_world::collision::QuestVolume;
 use nw_world::dungeon_scripts::DungeonScripts;
 use nw_world::interact_tags::TagOwner;
@@ -639,6 +641,11 @@ pub struct PlayerContent {
     pub stations: Vec<CraftingStation>,
     /// The resources each structure blueprint costs, for the stations' committed resources.
     pub structure_costs: StructureCosts,
+    /// The camp blueprints and skins.
+    pub camps: CampRules,
+    /// The camp slices, for a placed camp's spawn group; empty until the sim loads the camp
+    /// slice file.
+    pub camp_slices: CampSlices,
     /// The loot value of a player's level by its experience.
     pub player_loot_levels: PlayerLootLevels,
     /// The point-of-interest tags of each territory, for go-to and exit tasks.
@@ -1002,6 +1009,8 @@ impl PlayerContent {
             zone_plots: zone_plots(level),
             stations: level.stations.clone(),
             structure_costs: StructureCosts::from_tables(tables),
+            camps: CampRules::from_tables(tables),
+            camp_slices: CampSlices::default(),
             player_loot_levels: PlayerLootLevels::from_tables(tables),
             poi_tags: PoiTags::from_tables(tables),
             quest_objects,

@@ -15,6 +15,8 @@ pub const ASSET_CATALOG_ENTRY: &str = "assetcatalog.catalog";
 /// The sub id of a `.dynamicslice` asset id (Observed: `slices/characters/boar.dynamicslice` is
 /// `db96d765…` sub 2, the id a boar's spawn card names).
 pub const SLICE_SUB_ID: u32 = 2;
+/// The file extension of a dynamic slice (the slice a spawner or a placement spawns).
+pub const DYNAMIC_SLICE_EXTENSION: &str = ".dynamicslice";
 
 const MAGIC: &[u8; 4] = b"RASC";
 const VERSION: u32 = 1;
@@ -75,6 +77,65 @@ fn string_at(bytes: &[u8], at: usize) -> Result<&str, AssetCatalogError> {
     std::str::from_utf8(&tail[..end]).map_err(|_| AssetCatalogError::NotUtf8 { at })
 }
 
+/// An asset id: its GUID and sub id.
+pub type AssetKey = ([u8; GUID_LEN], u32);
+
+/// The sections of a catalog.
+struct Catalog<'a> {
+    bytes: &'a [u8],
+    guids_at: usize,
+    directories_at: usize,
+    files_at: usize,
+    count: usize,
+}
+
+impl<'a> Catalog<'a> {
+    fn open(bytes: &'a [u8]) -> Result<Self, AssetCatalogError> {
+        if bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice())
+            || u32_at(bytes, VERSION_AT)? != VERSION
+        {
+            return Err(AssetCatalogError::NotACatalog);
+        }
+        Ok(Self {
+            bytes,
+            guids_at: offset_at(bytes, GUID_TABLE_AT)?,
+            directories_at: offset_at(bytes, DIRECTORY_NAMES_AT)?,
+            files_at: offset_at(bytes, FILE_NAMES_AT)?,
+            count: offset_at(bytes, RECORD_COUNT_AT)?,
+        })
+    }
+
+    /// The offset of record `record`.
+    const fn record_at(record: usize) -> usize {
+        RECORDS_AT + record * RECORD_LEN
+    }
+
+    /// The asset id of the record at `at`.
+    fn key(&self, at: usize) -> Result<AssetKey, AssetCatalogError> {
+        let sub_id = u32_at(self.bytes, at + RECORD_SUB_ID)?;
+        let guid_at = self.guids_at + offset_at(self.bytes, at + RECORD_GUID_INDEX)? * GUID_LEN;
+        let guid = self
+            .bytes
+            .get(guid_at..guid_at + GUID_LEN)
+            .and_then(|slice| <[u8; GUID_LEN]>::try_from(slice).ok())
+            .ok_or(AssetCatalogError::Truncated { at: guid_at })?;
+        Ok((guid, sub_id))
+    }
+
+    /// The directory and the file of the record at `at`.
+    fn path(&self, at: usize) -> Result<(&'a str, &'a str), AssetCatalogError> {
+        let directory = string_at(
+            self.bytes,
+            self.directories_at + offset_at(self.bytes, at + RECORD_DIRECTORY)?,
+        )?;
+        let file = string_at(
+            self.bytes,
+            self.files_at + offset_at(self.bytes, at + RECORD_FILE)?,
+        )?;
+        Ok((directory, file))
+    }
+}
+
 /// The paths of the asset ids `wanted` (GUID and sub id) in the catalog `bytes`: directory and
 /// file joined. An asset id the catalog does not have is left out.
 ///
@@ -83,38 +144,46 @@ fn string_at(bytes: &[u8], at: usize) -> Result<&str, AssetCatalogError> {
 /// Returns [`AssetCatalogError`] when the bytes are not a catalog or are cut short.
 pub fn paths_of(
     bytes: &[u8],
-    wanted: &HashSet<([u8; GUID_LEN], u32)>,
-) -> Result<HashMap<([u8; GUID_LEN], u32), String>, AssetCatalogError> {
-    if bytes.get(..MAGIC.len()) != Some(MAGIC.as_slice()) || u32_at(bytes, VERSION_AT)? != VERSION {
-        return Err(AssetCatalogError::NotACatalog);
-    }
-    let guids_at = offset_at(bytes, GUID_TABLE_AT)?;
-    let directories_at = offset_at(bytes, DIRECTORY_NAMES_AT)?;
-    let files_at = offset_at(bytes, FILE_NAMES_AT)?;
-    let count = offset_at(bytes, RECORD_COUNT_AT)?;
-    let guid = |index: usize| -> Result<[u8; GUID_LEN], AssetCatalogError> {
-        let at = guids_at + index * GUID_LEN;
-        bytes
-            .get(at..at + GUID_LEN)
-            .and_then(|slice| <[u8; GUID_LEN]>::try_from(slice).ok())
-            .ok_or(AssetCatalogError::Truncated { at })
-    };
+    wanted: &HashSet<AssetKey>,
+) -> Result<HashMap<AssetKey, String>, AssetCatalogError> {
+    let catalog = Catalog::open(bytes)?;
     let mut paths = HashMap::new();
-    for record in 0..count {
-        let at = RECORDS_AT + record * RECORD_LEN;
-        let sub_id = u32_at(bytes, at + RECORD_SUB_ID)?;
-        let key = (guid(offset_at(bytes, at + RECORD_GUID_INDEX)?)?, sub_id);
+    for record in 0..catalog.count {
+        let at = Catalog::record_at(record);
+        let key = catalog.key(at)?;
         if !wanted.contains(&key) {
             continue;
         }
-        let directory = string_at(
-            bytes,
-            directories_at + offset_at(bytes, at + RECORD_DIRECTORY)?,
-        )?;
-        let file = string_at(bytes, files_at + offset_at(bytes, at + RECORD_FILE)?)?;
+        let (directory, file) = catalog.path(at)?;
         paths.insert(key, format!("{directory}{file}"));
     }
     Ok(paths)
+}
+
+/// The asset ids of the `.dynamicslice` files (sub id [`SLICE_SUB_ID`]) in folder `folder` and
+/// below, by path, in the catalog `bytes`.
+///
+/// # Errors
+///
+/// Returns [`AssetCatalogError`] when the bytes are not a catalog or are cut short.
+pub fn slice_assets_in(
+    bytes: &[u8],
+    folder: &str,
+) -> Result<HashMap<String, AssetKey>, AssetCatalogError> {
+    let catalog = Catalog::open(bytes)?;
+    let mut assets = HashMap::new();
+    for record in 0..catalog.count {
+        let at = Catalog::record_at(record);
+        let key = catalog.key(at)?;
+        if key.1 != SLICE_SUB_ID {
+            continue;
+        }
+        let (directory, file) = catalog.path(at)?;
+        if directory.starts_with(folder) && file.ends_with(DYNAMIC_SLICE_EXTENSION) {
+            assets.insert(format!("{directory}{file}"), key);
+        }
+    }
+    Ok(assets)
 }
 
 #[cfg(test)]
@@ -166,6 +235,24 @@ mod tests {
         assert_eq!(
             paths.get(&(BOAR, SLICE_SUB_ID)).map(String::as_str),
             Some("slices/characters/boar.dynamicslice")
+        );
+    }
+
+    #[test]
+    fn a_folder_lists_its_dynamic_slices() {
+        let assets = slice_assets_in(&catalog(), "slices/").expect("catalog");
+        assert_eq!(
+            assets,
+            HashMap::from([(
+                "slices/characters/boar.dynamicslice".to_owned(),
+                (BOAR, SLICE_SUB_ID)
+            )]),
+            "the other product of the GUID is left out"
+        );
+        assert!(
+            slice_assets_in(&catalog(), "slices/structures/")
+                .expect("catalog")
+                .is_empty()
         );
     }
 

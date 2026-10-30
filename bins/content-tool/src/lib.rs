@@ -8,6 +8,7 @@ pub mod ai_data;
 mod ai_replay;
 pub mod ai_trace;
 pub mod build;
+pub mod camp_slices;
 pub mod capture;
 pub mod catacombs;
 pub mod codegen;

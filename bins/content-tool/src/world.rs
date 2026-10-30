@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 
 use nw_content::ids::{gatherable_ids, lore_ids, npc_ids, vitals_ids};
 use nw_content::{ContainerError, ContentBundle};
-use nw_formats::asset_catalog::{ASSET_CATALOG_ENTRY, AssetCatalogError, paths_of};
+use nw_formats::asset_catalog::{
+    ASSET_CATALOG_ENTRY, AssetCatalogError, DYNAMIC_SLICE_EXTENSION, paths_of,
+};
 use nw_formats::azcs::{AzcsError, decode_azcs, is_azcs};
 use nw_formats::heightmap::{HeightmapError, parse_heightmap};
 use nw_formats::objectstream::{Element, ObjectStreamError, lowercase_crc32, parse_object_stream};
@@ -43,8 +45,6 @@ const METADATA_EXTENSION: &str = ".metadata";
 const CAPITALS_EXTENSION: &str = ".capitals.json";
 /// Each region's list of the slices that slices spawn (GDE id note).
 const SLICE_DATA_FILE: &str = "region.slicedata";
-/// The file extension of a slice that a spawner spawns.
-const DYNAMIC_SLICE_EXTENSION: &str = ".dynamicslice";
 const REGION_FOLDER_PREFIX: &str = "r_+";
 const REGION_FOLDER_SEPARATOR: &str = "_+";
 const PATH_SEPARATOR: char = '/';
@@ -761,7 +761,7 @@ fn object_stream(level: &str, path: &str, bytes: &[u8]) -> Result<Element, World
 }
 
 /// The root element of the ObjectStream `bytes` (AZCS-wrapped or not) of pak entry `path`.
-fn stream_of(path: &str, bytes: &[u8]) -> Result<Element, WorldBuildError> {
+pub(crate) fn stream_of(path: &str, bytes: &[u8]) -> Result<Element, WorldBuildError> {
     let stream = if is_azcs(bytes) {
         Cow::Owned(decode_azcs(bytes).map_err(|source| WorldBuildError::Azcs {
             path: path.to_owned(),
