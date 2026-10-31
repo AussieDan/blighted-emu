@@ -2989,6 +2989,8 @@ mod retail_tests {
 
     /// Janszoon's spawn on the beach of the real level (live 2026-10-29).
     const JANSZOON_SPAWN: [f32; 3] = [7056.03, 3137.94, 41.63];
+    /// How near a level spawn is to [`JANSZOON_SPAWN`] to be his (the level's: 1.7 m).
+    const JANSZOON_SPAWN_MATCH_M: f32 = 3.0;
 
     /// The real ground of Janszoon's level.
     type RealGround = nw_sim_core::LevelGround<Arc<nw_world::WorldFile>>;
@@ -3077,6 +3079,92 @@ mod retail_tests {
         assert!(
             back < 2.0,
             "home: {back} m from spawn, farthest {farthest}; {fragments:?}"
+        );
+    }
+
+    #[test]
+    fn janszoon_keeps_a_player_who_leads_him_downhill_inside_his_leash() {
+        // Live 2026-10-31: the player led Janszoon toward (7075.4, 3155.1); he reset 25.5 m
+        // from his waypoint and 2.1 m below it with the player 1.3 m away and reachable (tree
+        // node 154, `CheckWaypointDistanceLeash`), his `CombatLeashDistance` 45 m.
+        const TOWARD: [f32; 2] = [7075.4, 3155.1];
+        const LEAD_M: f32 = 1.5;
+        const WALK_MPS: f32 = 2.0;
+        const OUT_M: f32 = 30.0;
+        const HOLD_MS: u64 = 10_000;
+        let (mut mobs, ground) = janszoon_on_real_ground();
+        // His spawn's route of the real level: three points by his spawn, 41.9 to 42.5 m high.
+        let build = load_client_build(&repo().join(CLIENT_BUILD_CONFIG)).expect("client build");
+        let content = repo().join("local-data/content");
+        let mut world = nw_world::WorldFile::load(
+            &nw_world::world_file::world_file_path(&content, &build, "newworld_vitaeeterna"),
+            &build,
+        )
+        .expect("world file");
+        let spawn = world
+            .vitals
+            .iter()
+            .position(|vitals| {
+                (vitals.position[0] - JANSZOON_SPAWN[0])
+                    .hypot(vitals.position[1] - JANSZOON_SPAWN[1])
+                    < JANSZOON_SPAWN_MATCH_M
+            })
+            .expect("his spawn");
+        world.vitals_ai = vec![world.vitals_ai[spawn].clone()];
+        let ai = MobAi::new(retail_data(), AiRates::default(), LookAssets::default());
+        mobs.set_ai(crate::mob_ai::resolve_ai(&world, &ai));
+        let route = world.vitals_ai[0]
+            .path
+            .as_ref()
+            .and_then(|path| world.paths.get(path))
+            .expect("his route");
+        let waypoint_z = route
+            .points
+            .iter()
+            .map(|point| point[2])
+            .fold(f32::MIN, f32::max);
+        let home = at(&mobs, 0);
+        let bearing = (TOWARD[1] - JANSZOON_SPAWN[1]).atan2(TOWARD[0] - JANSZOON_SPAWN[0]);
+        let mut trace = (None, Vec::new());
+        let close = in_front_of_janszoon(&mobs, &ground, JANSZOON_IN_FACE_M);
+        run_janszoon(
+            &mut mobs,
+            &ground,
+            |_| Some(close),
+            (0, JANSZOON_AGGRO_MS),
+            &mut trace,
+        );
+        assert_eq!(mobs.target(mob_entity(0)), Some(PLAYER), "aggro");
+        let walk_ms = (OUT_M / WALK_MPS * 1_000.0) as u64;
+        let mut lowest: f32 = 0.0;
+        for now in
+            (JANSZOON_AGGRO_MS..JANSZOON_AGGRO_MS + walk_ms + HOLD_MS).step_by(TICK_MS as usize)
+        {
+            // Seconds of a test run.
+            #[allow(clippy::cast_precision_loss)]
+            let walked =
+                (WALK_MPS * now.saturating_sub(JANSZOON_AGGRO_MS) as f32 / 1_000.0).min(OUT_M);
+            let player = player_near_janszoon(&ground, walked + LEAD_M, bearing);
+            mobs.tick(&[player], now, &ground, 1);
+            played(&mobs, mob_entity(0), &mut trace.0, &mut trace.1);
+            lowest = lowest.min(at(&mobs, 0).z - waypoint_z);
+            assert_eq!(
+                mobs.target(mob_entity(0)),
+                Some(PLAYER),
+                "kept at {now} ms, {} m from home, {} m off its height; {:?}",
+                at(&mobs, 0).horizontal_distance(home),
+                at(&mobs, 0).z - home.z,
+                trace.1
+            );
+        }
+        assert!(
+            at(&mobs, 0).horizontal_distance(home) > 20.0,
+            "he followed: {:?}",
+            trace.1
+        );
+        assert!(
+            lowest < -2.0,
+            "the chase went more than 2 m below home: {lowest}"
         );
     }
 

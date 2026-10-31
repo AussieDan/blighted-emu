@@ -152,6 +152,8 @@ pub enum Command {
         effect: NameId,
         /// Apply or remove.
         apply: bool,
+        /// The `StatusEffectDecorator` node.
+        node: NodeId,
     },
     /// Keep the current target (`LockTargetSelection`).
     LockTarget(bool),
@@ -1172,12 +1174,16 @@ impl<'a, W: World> Ctx<'a, '_, W> {
 
     /// `DistanceCondition`: the left operand is a position, the right a distance; the distance
     /// is the horizontal one from the mob (the client logs "Left operand cannot resolve to
-    /// Vector3" and "Right operand cannot resolve to float"). A point whose height difference
-    /// minus `VerticalOffset` is beyond `VerticalThreshold` is out of reach whatever its
-    /// horizontal distance: a "farther" test (`GreaterThan`, `GreaterThanOrEqual`, `NotEqual`)
-    /// holds for it and a "nearer" one does not (Inferred: `ResetToHome`'s `CheckDistanceLeash`,
-    /// `Spawn_Pos GreaterThan 1.0` with a 2 m threshold, held false for Janszoon 37 m from his
-    /// spawn and 2.3 m below it, so he never walked home, live 2026-10-29).
+    /// Vector3" and "Right operand cannot resolve to float"). For a point whose height
+    /// difference minus `VerticalOffset` is beyond `VerticalThreshold`, the distance counts the
+    /// height too (Inferred). Evidence: no retail mob reset in 53 fights of three captures
+    /// (newchar-retail, newchar-linux, general-other-01; the tutorial club sailor fought 3.7 m
+    /// off its home's height 29 m away), and retail resets came 61 to 73 m from where the mob
+    /// started, so a height gap alone does not pass a leash (live 2026-10-31: the earlier rule,
+    /// "farther" always holds beyond the threshold, reset Janszoon 25 m from his waypoint and
+    /// 2.1 m below it, his leash 45 m); and `ResetToHome`'s `Spawn_Pos GreaterThan 1.0` with a
+    /// 2 m threshold must hold for Janszoon 37 m from his spawn and 2.3 m below it, so that he
+    /// walks home (live 2026-10-29).
     fn distance_holds(
         &self,
         group: &ConditionGroup,
@@ -1207,13 +1213,13 @@ impl<'a, W: World> Ctx<'a, '_, W> {
             let dy = f64::from(point[1] - own[1]);
             let rise = f64::from(point[2] - own[2]) - offset;
             let within = threshold.is_none_or(|limit| rise.abs() <= limit);
-            if within {
-                condition
-                    .op
-                    .compare(Value::Float(dx.hypot(dy) as f32), right)
+            let distance = if within {
+                dx.hypot(dy)
             } else {
-                condition.op.is_farther()
-            }
+                dx.hypot(dy).hypot(rise)
+            };
+            // Distances of a few hundred metres.
+            condition.op.compare(Value::Float(distance as f32), right)
         };
         if group.any {
             group.conditions.is_empty() || group.conditions.iter().any(check)
@@ -1508,6 +1514,7 @@ impl<'a, W: World> Ctx<'a, '_, W> {
                 self.out.push(Command::StatusEffect {
                     effect: *effect,
                     apply: true,
+                    node: id,
                 });
                 State::Entered
             }
@@ -1650,6 +1657,7 @@ impl<'a, W: World> Ctx<'a, '_, W> {
             } => self.out.push(Command::StatusEffect {
                 effect: *effect,
                 apply: false,
+                node: id,
             }),
             NodeKind::LockTargetSelection { .. } => self.out.push(Command::LockTarget(false)),
             NodeKind::ManualTargeting { .. } => self.out.push(Command::ManualTarget(None)),

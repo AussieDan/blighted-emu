@@ -1872,8 +1872,13 @@ impl TreeMind {
                         self.state.stop_moving();
                     }
                 }
-                Command::StatusEffect { effect, apply } => {
+                Command::StatusEffect {
+                    effect,
+                    apply,
+                    node,
+                } => {
                     self.status_effect(ai, effect, apply, thought);
+                    self.log_reset(ai, effect, apply, node, at, now_ms);
                 }
                 Command::LockTarget(locked) => self.state.locked = locked,
                 Command::ManualTarget(point) => self.state.manual = point.map(position_of),
@@ -1903,6 +1908,35 @@ impl TreeMind {
                 Command::Tag { .. } | Command::TrackActionTargets(_) => {}
             }
         }
+    }
+
+    /// Logs the start of a leash reset by tree node `node` (the live check of the leash): what
+    /// the tree's leash conditions read then.
+    fn log_reset(
+        &self,
+        ai: &MobAi,
+        effect: NameId,
+        apply: bool,
+        node: NodeId,
+        at: Position,
+        now_ms: u64,
+    ) {
+        if !apply || (Some(effect) != ai.names.reset && Some(effect) != ai.names.reset_no_heal) {
+            return;
+        }
+        let state = &self.state;
+        tracing::debug!(
+            archetype = state.archetype,
+            node,
+            since_reachable_ms = ?state.reachable_ms.map(|at_ms| now_ms.saturating_sub(at_ms)),
+            from_spawn_m = at.horizontal_distance(state.spawn),
+            from_waypoint_m = ?state.route.as_ref().and_then(RouteWalk::point).map(|point| at.horizontal_distance(point)),
+            target_at = ?state.target_at,
+            x = at.x,
+            y = at.y,
+            z = at.z,
+            "mob leash reset"
+        );
     }
 
     /// The tree applies (`apply`) or removes status effect `effect`. The sim keeps the effects

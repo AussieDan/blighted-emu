@@ -84,14 +84,6 @@ pub enum CompareOp {
 }
 
 impl CompareOp {
-    /// Whether the comparison holds for a value beyond every bound (a distance out of reach).
-    pub const fn is_farther(self) -> bool {
-        matches!(
-            self,
-            Self::GreaterThan | Self::GreaterThanOrEqual | Self::NotEqual
-        )
-    }
-
     /// The operator of a stored number; `None` for 0 (`None`) and out-of-range numbers.
     pub fn from_stored(value: i64) -> Option<Self> {
         Some(match value {
@@ -291,24 +283,6 @@ impl ConditionGroup {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_point_out_of_vertical_reach_is_farther_never_nearer() {
-        for op in [
-            CompareOp::GreaterThan,
-            CompareOp::GreaterThanOrEqual,
-            CompareOp::NotEqual,
-        ] {
-            assert!(op.is_farther(), "{op:?}");
-        }
-        for op in [
-            CompareOp::LessThan,
-            CompareOp::LessThanOrEqual,
-            CompareOp::Equal,
-        ] {
-            assert!(!op.is_farther(), "{op:?}");
-        }
-    }
 
     const DIST_KEY: KeyId = 3;
     const FLAG_KEY: KeyId = 4;
