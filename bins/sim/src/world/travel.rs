@@ -8,8 +8,9 @@
 //!   server then sends the loading screen (3951, flag 1) and the end of the channel (3696) and
 //!   moves the player. A movement key during the channel cancels it with 3042 (7 of 8 cancels of
 //!   the cancel capture came 25 to 30 ms after the first record with the forward key; no travel
-//!   that ended had one). Retail took no Azoth: no `Azoth_Currency` change followed any of 7
-//!   travels of two characters. A destination in another sim's cells hands the player over once
+//!   that ended had one). A travel to a settlement or a shrine takes its azoth at the end of the
+//!   channel, in the ms of the loading screen (travel cost survey of 2026-10-31); an inn recall
+//!   and a home travel take none. A destination in another sim's cells hands the player over once
 //!   the move's own states are out.
 //! - An unstuck (388) is accepted at once (3980, the wait in nanoseconds) and moves the player
 //!   after the wait (2190) to the oldest of its breadcrumbs (Inferred: 31 retail landings were on
@@ -30,9 +31,9 @@
 //!   screen lists (the bound inn, the houses, the placed camp) and the camping state (1292).
 //! - An inn recall is a 3713 of landmark type `InnRespawn` (20; 61 retail recalls): it goes to
 //!   the bound inn, at most once per the inn home point's cooldown (900 s in every retail one).
-//! - The fast travel azoth cost is the client's formula ([`crate::travel_rules::FastTravelCosts`]);
-//!   retail runs it disabled (no azoth left the wallet in 7 travels), and so does this server
-//!   unless a layer sets `javelin.playtest-disable-fast-travel-costs` false.
+//! - The fast travel azoth cost is the client's formula ([`crate::travel_rules::FastTravelCosts`])
+//!   with the values retail charges: 20 azoth, half within the player's territory (203 paid
+//!   retail travels of 256 ledgers). 63 retail travels were free; why is Unknown.
 //! - A house plot's type comes from the level (`HousingPlotComponent.m_houseTypeString`): its
 //!   cost, the level rule of `javelin.housing.house-level-reqs`, one house per territory, the
 //!   weekly tax (due 7 days after the purchase or the last payment), the home fast travel
@@ -419,7 +420,7 @@ impl SimWorld {
                 self.inn_recall(entity, number, now_ms);
             }
             TravelClientMsg::FastTravelLandmark { landmark, .. } => {
-                let to = self
+                let found = self
                     .content
                     .travel
                     .landmark(
@@ -427,11 +428,7 @@ impl SimWorld {
                         landmark.position[0],
                         landmark.position[1],
                     )
-                    .map(|found| Position {
-                        x: found.position[0],
-                        y: found.position[1],
-                        z: found.position[2],
-                    });
+                    .copied();
                 let discovered = self
                     .content
                     .travel
@@ -443,9 +440,11 @@ impl SimWorld {
                                 .has_achievement(&self.achievement_rules, achievement)
                         })
                     });
-                match to.filter(|_| discovered) {
-                    Some(to) => {
-                        let azoth = self.fast_travel_cost(entity, to, landmark.territory);
+                match found.filter(|_| discovered) {
+                    Some(found) => {
+                        let [x, y, z] = found.position;
+                        let to = Position { x, y, z };
+                        let azoth = self.fast_travel_cost(entity, to, found.territory);
                         self.start_channel(entity, number, to, now_ms, Purpose::Landmark { azoth });
                     }
                     None => {
@@ -554,8 +553,10 @@ impl SimWorld {
         }
     }
 
-    /// The azoth of a fast travel of player `entity` to `to` in territory `territory`.
-    fn fast_travel_cost(&self, entity: Entity, to: Position, territory: u16) -> u32 {
+    /// The azoth of a fast travel of player `entity` to `to` in territory `territory` (the
+    /// `IsTerritory` territory of the landmark): half within the territory the player stands in
+    /// (its client's last 2297 of that territory; retail survey: 111 of 111 such travels).
+    fn fast_travel_cost(&self, entity: Entity, to: Position, territory: Option<u32>) -> u32 {
         let costs = &self.content.travel.costs;
         if costs.disabled {
             return 0;
@@ -564,10 +565,14 @@ impl SimWorld {
             .world
             .get::<Body>(entity)
             .map_or(0.0, |body| body.motion.position().horizontal_distance(to));
-        let in_territory = self
-            .world
-            .get::<Player>(entity)
-            .is_some_and(|player| player.territories.contains(&territory));
+        let in_territory = territory.is_some_and(|territory| {
+            self.world.get::<Player>(entity).is_some_and(|player| {
+                player
+                    .territories
+                    .iter()
+                    .any(|&inside| u32::from(inside) == territory)
+            })
+        });
         costs.cost(f64::from(distance), self.bag_load(entity), in_territory)
     }
 
@@ -2028,6 +2033,7 @@ mod tests {
     use crate::travel_rules::{Furniture, HouseType, TravelLandmark, TravelRules};
     use crate::world::level_flow::AchievementRules;
     use crate::world::tests::{NOW, connection, join, messages_to, tick, world_with_spawns};
+    use nw_content::progression::{Mastery, Progression, ProgressionSource};
 
     const PLAYER: u64 = 7;
     const START_X: f32 = 100.0;
@@ -2081,6 +2087,13 @@ mod tests {
     const TELEPORTER_DELAY_MS: u64 = 1_000;
     /// A retail camp placement's skin (`campskin_egyptian02_a`).
     const CAMP_SKIN: u32 = 0xbff6_8c5c;
+    /// The azoth cap (`Azoth_Currency` rank 0 `MaximumInfluence`, content bundle 25810808), the
+    /// test player's balance (less than a home cooldown reset costs) and the retail fast travel
+    /// costs to another territory and within the player's.
+    const AZOTH_CAP: i64 = 2_500;
+    const START_AZOTH: u32 = 50;
+    const AZOTH_TO_ANOTHER_TERRITORY: u32 = 20;
+    const AZOTH_WITHIN_THE_TERRITORY: u32 = 10;
 
     fn world() -> SimWorld {
         let mut world = world_with_spawns(Vec::new());
@@ -2089,6 +2102,7 @@ mod tests {
                 landmark_type: SHRINE_TYPE,
                 position: SHRINE,
                 radius: SHRINE_RADIUS_M,
+                territory: Some(u32::from(TERRITORY)),
             }],
             HashMap::from([(u32::from(HIDDEN_TERRITORY), DISCOVERED.to_owned())]),
             HashMap::from([(INN, INN_AT)]),
@@ -2129,6 +2143,12 @@ mod tests {
         world.content = Arc::new(PlayerContent {
             travel,
             kits: StarterKits::default().with_housing([(BED.to_owned(), Some(1))]),
+            progression: Progression::default().with_progressions([ProgressionSource {
+                id: AZOTH_PROGRESSION.to_owned(),
+                max_level: 0,
+                auto_rank_up: false,
+                ranks: vec![(0, AZOTH_CAP)],
+            }]),
             ..PlayerContent::default()
         });
         world.achievement_rules = AchievementRules::of(
@@ -2136,7 +2156,39 @@ mod tests {
             &[],
         );
         join(&mut world, PLAYER, START_X);
+        set_azoth(&mut world, START_AZOTH);
         world
+    }
+
+    fn azoth_currency(world: &SimWorld) -> Mastery {
+        world
+            .content
+            .progression
+            .categorical(AZOTH_PROGRESSION)
+            .cloned()
+            .expect("azoth")
+    }
+
+    fn set_azoth(world: &mut SimWorld, azoth: u32) {
+        let currency = azoth_currency(world);
+        let entity = entity(world);
+        world
+            .world
+            .get_mut::<Player>(entity)
+            .expect("player")
+            .masteries
+            .set(&currency, azoth);
+    }
+
+    fn azoth(world: &mut SimWorld) -> u32 {
+        let currency = azoth_currency(world);
+        let entity = entity(world);
+        world
+            .world
+            .get::<Player>(entity)
+            .expect("player")
+            .masteries
+            .experience(&currency)
     }
 
     fn entity(world: &mut SimWorld) -> Entity {
@@ -2292,6 +2344,56 @@ mod tests {
             travel_answers(&mut world, NOW + CHANNEL_MS + 2).as_slice(),
             [TravelServerMsg::FastTravelFailed { .. }]
         ));
+    }
+
+    #[test]
+    fn a_landmark_travel_takes_retails_20_azoth_or_10_within_the_territory() {
+        let mut world = world();
+        let travel = |world: &mut SimWorld, now_ms: u64| {
+            call(world, landmark(SHRINE_TERRITORY, SHRINE[0]), now_ms);
+            answers(world, now_ms + CHANNEL_MS)
+        };
+        assert!(matches!(
+            travel(&mut world, NOW).as_slice(),
+            [
+                ServerMessage::TeleportWithLoadingScreen(_),
+                ServerMessage::Travel(TravelServerMsg::FastTravelCompleted { .. })
+            ]
+        ));
+        assert_eq!(azoth(&mut world), START_AZOTH - AZOTH_TO_ANOTHER_TERRITORY);
+        let entity = entity(&mut world);
+        world.territory_changed(entity, TERRITORY, true);
+        travel(&mut world, NOW + 2 * CHANNEL_MS);
+        assert_eq!(
+            azoth(&mut world),
+            START_AZOTH - AZOTH_TO_ANOTHER_TERRITORY - AZOTH_WITHIN_THE_TERRITORY,
+            "half within the player's territory"
+        );
+        // Less azoth than the cost: refused at the end of the channel, nothing taken.
+        let short = AZOTH_WITHIN_THE_TERRITORY - 1;
+        set_azoth(&mut world, short);
+        world.place_player(
+            entity,
+            Position {
+                x: START_X,
+                y: HERE[1],
+                z: HERE[2],
+            },
+            None,
+            Placement::Stand,
+            NOW + 4 * CHANNEL_MS,
+        );
+        assert!(matches!(
+            travel(&mut world, NOW + 4 * CHANNEL_MS).as_slice(),
+            [ServerMessage::Travel(
+                TravelServerMsg::FastTravelFailed { .. }
+            )]
+        ));
+        assert_eq!(azoth(&mut world), short);
+        assert!(
+            (body(&mut world).x - START_X).abs() < f32::EPSILON,
+            "not moved"
+        );
     }
 
     #[test]

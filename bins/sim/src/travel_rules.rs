@@ -52,29 +52,35 @@ const GUID_SEPARATOR: char = '-';
 const MS_PER_MINUTE: u64 = 60_000;
 /// Nanoseconds in a millisecond.
 const NS_PER_MS: u64 = 1_000_000;
-/// The settlement fast travel cost without a key (client default, `FUN_14356a2f0`).
-const DEFAULT_SETTLEMENT_COST: u64 = 500;
+/// The base azoth of a fast travel to a settlement or a shrine when no layer sets it. Observed
+/// (the travel cost survey of 256 retail ledgers, 2026-10-31): 84 travels to another territory
+/// took 20 azoth and 111 within the player's territory took 10, in the ms of the loading screen.
+/// The client default (500, `FUN_14356a2f0`) is not what the retail server charges.
+const OBSERVED_SETTLEMENT_COST: u64 = 20;
 /// The distance a fast travel goes free, metres (client default).
 const DEFAULT_MIN_DISTANCE_M: f64 = 1_500.0;
 /// The metres of one distance cost step (client default).
 const DEFAULT_DISTANCE_STEP_M: f64 = 100.0;
-/// The azoth of one distance cost step (client default).
-const DEFAULT_DISTANCE_COST: u64 = 5;
+/// The azoth of one distance cost step when no layer sets it. Observed: the retail cost does not
+/// grow with the distance (20 azoth from 398 m to 6,944 m, 10 from 256 m to 2,233 m).
+const OBSERVED_DISTANCE_COST: u64 = 0;
 /// The weight of one encumbrance cost step (client default).
 const DEFAULT_ENCUMBRANCE_STEP: u64 = 10;
-/// The azoth of one encumbrance cost step (client default).
-const DEFAULT_ENCUMBRANCE_COST: u64 = 5;
-/// The share taken off a fast travel within the player's territory (client default).
+/// The azoth of one encumbrance cost step when no layer sets it. Observed: no retail travel cost
+/// more than the 20 base (203 paid travels of players with any bag).
+const OBSERVED_ENCUMBRANCE_COST: u64 = 0;
+/// The share taken off a fast travel within the player's territory (client default; Observed:
+/// all 111 retail travels whose landmark lay in the player's territory cost half, and none of the
+/// 84 to another territory did).
 const DEFAULT_TERRITORY_DISCOUNT: f64 = 0.5;
 /// The azoth of a home cooldown reset with the whole cooldown left (client default).
 const DEFAULT_RESET_COST: u64 = 200;
 /// The least azoth of a home cooldown reset (client default).
 const DEFAULT_RESET_COST_MIN: u64 = 10;
-/// Whether fast travel costs no azoth when no layer sets it. Observed: no `Azoth_Currency`
-/// change followed any of 7 retail fast travels of two characters (travel study), while the
-/// client's formula (`FUN_14357bdb0`) with its default keys gives at least 500; the client
-/// returns 0 only under `javelin.playtest-disable-fast-travel-costs`, so retail runs with it set.
-const OBSERVED_COSTS_DISABLED: bool = true;
+/// Whether fast travel costs no azoth when no layer sets it. Observed: retail charges (203 of
+/// 266 retail travels to a settlement or a shrine took azoth; an inn recall or a home travel
+/// never did, 58 and 25 travels).
+const OBSERVED_COSTS_DISABLED: bool = false;
 /// The multiplier of a second and a third house when no layer sets one (the client default 0.0
 /// would make them free; best guess: the table cost, as the first house).
 const BEST_GUESS_HOUSE_MULTIPLIER: f64 = 1.0;
@@ -282,12 +288,12 @@ impl FastTravelCosts {
     fn of(keys: &FastTravelCostKeys) -> Self {
         Self {
             disabled: keys.disabled.unwrap_or(OBSERVED_COSTS_DISABLED),
-            base: keys.settlement_cost.unwrap_or(DEFAULT_SETTLEMENT_COST),
+            base: keys.settlement_cost.unwrap_or(OBSERVED_SETTLEMENT_COST),
             min_distance_m: keys.min_distance_m.unwrap_or(DEFAULT_MIN_DISTANCE_M),
             distance_step_m: keys.distance_step_m.unwrap_or(DEFAULT_DISTANCE_STEP_M),
-            distance_cost: keys.distance_cost.unwrap_or(DEFAULT_DISTANCE_COST),
+            distance_cost: keys.distance_cost.unwrap_or(OBSERVED_DISTANCE_COST),
             encumbrance_step: keys.encumbrance_step.unwrap_or(DEFAULT_ENCUMBRANCE_STEP),
-            encumbrance_cost: keys.encumbrance_cost.unwrap_or(DEFAULT_ENCUMBRANCE_COST),
+            encumbrance_cost: keys.encumbrance_cost.unwrap_or(OBSERVED_ENCUMBRANCE_COST),
             territory_discount: keys
                 .territory_discount
                 .unwrap_or(DEFAULT_TERRITORY_DISCOUNT),
@@ -333,6 +339,8 @@ pub struct TravelLandmark {
     pub position: [f32; 3],
     /// Its radius, metres.
     pub radius: f32,
+    /// The territory (`IsTerritory`) that holds it, of the level's territory ids of its point.
+    pub territory: Option<u32>,
 }
 
 /// The game data and timings of travel.
@@ -447,8 +455,19 @@ impl TravelRules {
             .filter(|row| row.can_place_camp.unwrap_or_default())
             .filter_map(|row| u32::try_from(row.territory_id).ok())
             .collect();
+        let territories: HashSet<u32> = tables
+            .territory_definition
+            .iter()
+            .flat_map(|table| &table.rows)
+            .filter(|row| row.is_territory.unwrap_or_default())
+            .filter_map(|row| u32::try_from(row.territory_id).ok())
+            .collect();
         let mut rules = Self::build(
-            level.landmarks.iter().map(TravelLandmark::of).collect(),
+            level
+                .landmarks
+                .iter()
+                .map(|landmark| TravelLandmark::of(landmark, &territories))
+                .collect(),
             discovered,
             capitals(&level.capitals),
             encumbrance_max,
@@ -457,13 +476,7 @@ impl TravelRules {
         .with_housing(house_types(tables), &level.plots, furniture(tables, kits))
         .with_teleporters(&level.teleporters);
         rules.camp_territories = camp_territories;
-        rules.territories = tables
-            .territory_definition
-            .iter()
-            .flat_map(|table| &table.rows)
-            .filter(|row| row.is_territory.unwrap_or_default())
-            .filter_map(|row| u32::try_from(row.territory_id).ok())
-            .collect();
+        rules.territories = territories;
         rules.housing = HousingRules::of(&gameplay.house_level_reqs, &gameplay.fast_travel_costs);
         rules.costs = FastTravelCosts::of(&gameplay.fast_travel_costs);
         rules
@@ -646,11 +659,18 @@ impl TravelRules {
 }
 
 impl TravelLandmark {
-    fn of(landmark: &Landmark) -> Self {
+    /// The landmark `landmark` of the level, in the first of its territory ids that is one of
+    /// `territories`.
+    fn of(landmark: &Landmark, territories: &HashSet<u32>) -> Self {
         Self {
             landmark_type: landmark.landmark_type,
             position: landmark.position,
             radius: landmark.radius,
+            territory: landmark
+                .territory_ids
+                .iter()
+                .map(|&id| u32::from(id))
+                .find(|id| territories.contains(id)),
         }
     }
 }
@@ -727,11 +747,13 @@ mod tests {
                     landmark_type: SHRINE_TYPE,
                     position: SHRINE,
                     radius: SHRINE_RADIUS_M,
+                    territory: None,
                 },
                 TravelLandmark {
                     landmark_type: 1,
                     position: SHRINE,
                     radius: SHRINE_RADIUS_M,
+                    territory: None,
                 },
             ],
             HashMap::from([(20_422, "Discovered_Shrine".to_owned())]),
@@ -815,20 +837,58 @@ mod tests {
     }
 
     #[test]
-    fn the_fast_travel_cost_is_the_client_formula_and_retail_runs_it_disabled() {
-        assert_eq!(FastTravelCosts::default().cost(9_000.0, 500.0, false), 0);
-        let costs = FastTravelCosts {
-            disabled: false,
-            ..FastTravelCosts::default()
-        };
+    fn the_fast_travel_cost_is_the_client_formula_with_retails_values() {
+        /// The retail costs (travel cost survey, 203 paid travels).
+        const TO_ANOTHER_TERRITORY: u32 = 20;
+        const WITHIN_THE_TERRITORY: u32 = 10;
+        let retail = FastTravelCosts::default();
+        assert!(!retail.disabled);
+        for (distance_m, load) in [(256.0, 0.0), (6_944.0, 900.0)] {
+            assert_eq!(retail.cost(distance_m, load, false), TO_ANOTHER_TERRITORY);
+            assert_eq!(retail.cost(distance_m, load, true), WITHIN_THE_TERRITORY);
+        }
+        let keyed = FastTravelCosts::of(&FastTravelCostKeys {
+            settlement_cost: Some(500),
+            distance_cost: Some(5),
+            encumbrance_cost: Some(5),
+            ..FastTravelCostKeys::default()
+        });
         // 500 base; 3,550 m is 2,050 m past the free 1,500 m: 21 steps of 5; a load of 95 is
         // 10 steps of 5.
-        assert_eq!(costs.cost(3_550.0, 95.0, false), 500 + 21 * 5 + 10 * 5);
-        assert_eq!(costs.cost(1_000.0, 0.0, false), 500);
+        assert_eq!(keyed.cost(3_550.0, 95.0, false), 500 + 21 * 5 + 10 * 5);
+        assert_eq!(keyed.cost(1_000.0, 0.0, false), 500);
         assert_eq!(
-            costs.cost(1_000.0, 0.0, true),
+            keyed.cost(1_000.0, 0.0, true),
             250,
             "half within the territory"
+        );
+        let disabled = FastTravelCosts::of(&FastTravelCostKeys {
+            disabled: Some(true),
+            ..FastTravelCostKeys::default()
+        });
+        assert_eq!(disabled.cost(9_000.0, 500.0, false), 0);
+    }
+
+    #[test]
+    fn a_level_landmark_is_in_its_first_territory_that_is_a_territory() {
+        /// A shrine of Everfall (territory 4) in its area 40300 (synthetic ids order).
+        const EVERFALL: u16 = 4;
+        const AREA: u16 = 40_300;
+        let landmark = Landmark {
+            landmark_type: SHRINE_TYPE,
+            landmark_data: String::new(),
+            position: SHRINE,
+            radius: SHRINE_RADIUS_M,
+            territory_ids: vec![AREA, EVERFALL],
+        };
+        let territories = HashSet::from([u32::from(EVERFALL)]);
+        assert_eq!(
+            TravelLandmark::of(&landmark, &territories).territory,
+            Some(u32::from(EVERFALL))
+        );
+        assert_eq!(
+            TravelLandmark::of(&landmark, &HashSet::new()).territory,
+            None
         );
     }
 
