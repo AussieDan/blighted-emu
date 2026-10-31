@@ -3,7 +3,9 @@
 //! `registration` (the default) stays connected, then checks that the same ticket is refused a
 //! second time. `pair` runs two clients in the world (M4 spec section 9). `swarm` runs many bots
 //! across a sim border (M5 spec section 11). `hunt` runs many bots that fight mobs (M6-B spec
-//! section 9). Prints one line per step; exits with 0 only when every step passed.
+//! section 9). `chat` says one line in area chat and waits for the server's answer (system lines
+//! for a GM chat command such as `!help` of a game master account, else the line itself). Prints one line per step; exits with
+//! 0 only when every step passed.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -17,6 +19,7 @@ use clap::{Parser, Subcommand};
 use nw_content::client_build::load_client_build;
 use nw_dtls::DtlsClientConfig;
 use nw_reflect::REGISTRATION_STATUS_AUTHORIZED;
+use nw_testclient::chat::{ChatSettings, run_chat};
 use nw_testclient::config::{
     PASSWORD_ENV, SECOND_PASSWORD_ENV, SWARM_PASSWORD_ENV, TestClientConfig, load_testclient_config,
 };
@@ -32,6 +35,8 @@ use nw_world::world_file::world_file_path;
 
 /// The committed example configuration.
 const DEFAULT_CONFIG: &str = "config/nw-testclient.toml";
+/// The line of `chat` without `--line`: the GM command list.
+const DEFAULT_CHAT_LINE: &str = "!help";
 /// Bytes read from standard input at a time while waiting for its end.
 const INPUT_BUFFER_BYTES: usize = 256;
 /// The kernel's network counters (Linux).
@@ -75,6 +80,13 @@ enum Command {
         /// Bots of this step instead of `[hunt] bots`.
         #[arg(long)]
         bots: Option<usize>,
+    },
+    /// One client (the first account) says a line in area chat and waits for the server's
+    /// answer: system lines for a GM chat command of a game master, else the line itself.
+    Chat {
+        /// The line, as typed in the chat box.
+        #[arg(long, default_value = DEFAULT_CHAT_LINE)]
+        line: String,
     },
 }
 
@@ -141,6 +153,9 @@ async fn steps(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
                 config.hunt.bots = bots;
             }
             hunt(&config, &http, trusted, ledger).await
+        }
+        Command::Chat { line } => {
+            chat(&config, &http, &trusted, own(&config)?, line, &ledger).await
         }
     }
 }
@@ -341,6 +356,36 @@ async fn pair(
     .await?;
     let tolerances = (config.path_tolerance_m, config.position_tolerance_m);
     Ok(print_checks(&report.checks(tolerances.0, tolerances.1)))
+}
+
+async fn chat(
+    config: &TestClientConfig,
+    http: &reqwest::Client,
+    trusted: &DtlsClientConfig,
+    account: WalkSettings,
+    line: String,
+    ledger: &LedgerSlot,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let settings = ChatSettings {
+        account,
+        line,
+        hold: Duration::from_secs(config.hold_seconds),
+        registration_timeout: Duration::from_secs(config.registration_timeout_seconds),
+    };
+    let report = run_chat(
+        http,
+        &settings,
+        |token| RepClient::new(trusted, config.mtu, token, 0).map(|client| ledger.give(client)),
+        |line| println!("{line}"),
+    )
+    .await?;
+    for answer in &report.answers {
+        println!("answer: {answer}");
+    }
+    if report.echoed {
+        println!("the line came back as area chat");
+    }
+    Ok(print_checks(&report.checks()))
 }
 
 async fn registration(

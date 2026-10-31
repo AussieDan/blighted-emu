@@ -9,6 +9,7 @@
 //! `body` keeps the raw line only for a receiver who turned the filter off (4125 with 0), else it
 //! is empty. A client that never sends 4125 has the filter on.
 
+use crate::facet::FacetHeader;
 use crate::social::text::{read_count, read_text, write_count, write_text};
 use crate::wire::{MessageError, Reader, Writer};
 
@@ -328,6 +329,52 @@ impl ChatCall {
         };
         Some(call)
     }
+
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::Send { .. } => SEND_CHAT_MESSAGE_TYPE_INDEX,
+            Self::SetProfanityFilter { .. } => SET_PROFANITY_FILTER_TYPE_INDEX,
+            Self::SetLanguage { .. } => SET_LANGUAGE_TYPE_INDEX,
+            Self::SetMute { .. } => SET_CHAT_MUTE_TYPE_INDEX,
+            Self::ClearMute { .. } => CLEAR_CHAT_MUTE_TYPE_INDEX,
+        }
+    }
+
+    /// The body of the call to the chat facet `header`, as [`crate::social::SocialCall::decode`]
+    /// reads it (a test client's call).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when a text or the link count does not fit its prefix.
+    pub fn encode(&self, header: FacetHeader) -> Result<Vec<u8>, MessageError> {
+        let mut writer = Writer::new();
+        header.write(&mut writer);
+        match self {
+            Self::Send {
+                channel,
+                body,
+                recipient_name,
+                links,
+            } => {
+                writer.u32(*channel);
+                write_text(&mut writer, body)?;
+                write_text(&mut writer, recipient_name)?;
+                write_links(&mut writer, links)?;
+            }
+            Self::SetProfanityFilter { enabled } => {
+                writer.boolean(*enabled);
+            }
+            Self::SetLanguage { language } => {
+                writer.u32(*language);
+            }
+            Self::SetMute { character, flag } | Self::ClearMute { character, flag } => {
+                write_text(&mut writer, character)?;
+                writer.u8(*flag);
+            }
+        }
+        Ok(writer.finish())
+    }
 }
 
 /// The notice of a mute or a social block that was set or cleared (1866, 1629).
@@ -489,6 +536,39 @@ mod tests {
             platform_id: PLATFORM_ID.to_owned(),
             flag: true,
             trailer: MESSAGE_TRAILER,
+        }
+    }
+
+    #[test]
+    fn every_chat_call_reads_back_as_it_was_written() {
+        let header = FacetHeader {
+            target: 0x6314_eebf_2d14_ecee,
+            entity: 0x2715_f9bc_a18f_dece,
+        };
+        let calls = [
+            ChatCall::Send {
+                channel: ChatChannel::Area.wire(),
+                body: "!help".to_owned(),
+                recipient_name: String::new(),
+                links: vec![ItemLink([7; ITEM_LINK_LEN])],
+            },
+            ChatCall::SetProfanityFilter { enabled: false },
+            ChatCall::SetLanguage { language: 8 },
+            ChatCall::SetMute {
+                character: SENDER.to_owned(),
+                flag: 0,
+            },
+            ChatCall::ClearMute {
+                character: SENDER.to_owned(),
+                flag: 0,
+            },
+        ];
+        for call in calls {
+            let body = call.encode(header).expect("encode");
+            let read = SocialCall::decode(call.type_index(), &body)
+                .expect("a social call")
+                .expect("decode");
+            assert_eq!(read, (header, SocialCall::Chat(call)));
         }
     }
 

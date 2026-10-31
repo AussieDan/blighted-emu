@@ -210,6 +210,21 @@ impl SocialPush {
         Ok(writer.finish())
     }
 
+    /// Decodes the whole body `body` of push `type_index`, its header first; `None` for another
+    /// type.
+    pub fn decode(
+        type_index: u64,
+        body: &[u8],
+    ) -> Option<Result<(FacetHeader, Self), MessageError>> {
+        let mut reader = Reader::new(body);
+        let header = match FacetHeader::read(&mut reader) {
+            Ok(header) => header,
+            Err(error) => return Some(Err(error)),
+        };
+        let args = &body[body.len() - reader.remaining()..];
+        Self::decode_args(type_index, args).map(|push| push.map(|push| (header, push)))
+    }
+
     /// Decodes the arguments `args` of push `type_index`; `None` for another type.
     pub fn decode_args(type_index: u64, args: &[u8]) -> Option<Result<Self, MessageError>> {
         let mut reader = Reader::new(args);
@@ -302,6 +317,31 @@ mod tests {
             envelope.body,
             [0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 9]
         );
+    }
+
+    #[test]
+    fn a_whole_push_body_reads_back_with_its_header() {
+        let header = FacetHeader {
+            target: 3,
+            entity: 4,
+        };
+        let push = SocialPush::Chat(chat::ChatPush::Batch(vec![chat::ChatMessage::system(
+            chat::ChatChannel::System,
+            "Done.".to_owned(),
+        )]));
+        let bytes = push_envelope(
+            push.type_index(),
+            header,
+            &push.encode_args().expect("args"),
+        )
+        .expect("envelope");
+        let envelope = Envelope::decode(&bytes).expect("decode");
+        let read = SocialPush::decode(push.type_index(), &envelope.body)
+            .expect("a push")
+            .expect("read");
+        let type_index = push.type_index();
+        assert_eq!(read, (header, push));
+        assert!(SocialPush::decode(type_index, &[1, 2]).is_some_and(|read| read.is_err()));
     }
 
     #[test]

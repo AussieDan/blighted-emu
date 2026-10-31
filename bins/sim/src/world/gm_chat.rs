@@ -623,8 +623,8 @@ mod tests {
     use std::sync::Arc;
 
     use nw_content::progression::Progression;
+    use nw_messages::FacetHeader;
     use nw_messages::social::chat::SEND_CHAT_MESSAGE_TYPE_INDEX;
-    use nw_messages::{FacetHeader, Writer};
     use nw_reflect::Envelope;
 
     use super::*;
@@ -656,20 +656,17 @@ mod tests {
 
     /// The body of a 1291 that says `line` in area chat.
     fn say(line: &str) -> Vec<u8> {
-        let mut writer = Writer::new();
-        FacetHeader {
+        ChatCall::Send {
+            channel: ChatChannel::Area.wire(),
+            body: line.to_owned(),
+            recipient_name: String::new(),
+            links: Vec::new(),
+        }
+        .encode(FacetHeader {
             target: 0,
             entity: 0,
-        }
-        .write(&mut writer);
-        writer.u32(ChatChannel::Area.wire());
-        writer
-            .prefixed(line.len() as u64)
-            .expect("line")
-            .bytes(line.as_bytes());
-        writer.prefixed(0).expect("no receiver");
-        writer.prefixed(0).expect("no link");
-        writer.finish()
+        })
+        .expect("line")
     }
 
     fn chat(world: &mut SimWorld, number: u64, line: &str) -> Option<GmChat> {
