@@ -72,6 +72,13 @@ const INTERACTION_ACCEPTED: u8 = 1;
 const TRADING_POST_ANSWER_EXTRA: u32 = 0x5a3f_1797;
 /// Most contracts one answer holds (retail pages hold at most 100).
 const MAX_PAGE: u32 = 100;
+/// The time a player waits after a search it was answered before its next one is answered,
+/// ms. Retail (4 trading post captures, 159 searches): each of the 20 searches less than 1 s
+/// after the player's last answered one was refused with `Throttled` (7), the latest 999 ms
+/// after (`tradepost_post_sell_cancel_buyorder_sellorder` 415.5 s); every search 1.03 s or more
+/// after was answered. A refused search does not start the wait again (since the last answered
+/// search, 8 of the 20 came in the same tick as it).
+const SEARCH_INTERVAL_MS: u64 = 1_000;
 /// The `ContractType` value of a make-good contract, which this server has none of.
 const MAKE_GOOD_KIND: u32 = 2;
 /// Metric: economy calls by `call` and `result`.
@@ -508,6 +515,8 @@ struct TradeSession {
 pub(super) struct Economy {
     /// The outpost of the trading post each player opened last, by player number.
     posts: HashMap<u64, u64>,
+    /// When each player's last answered search came, Unix ms, by player number.
+    searched_ms: HashMap<u64, u64>,
     /// Work for the loop.
     jobs: Vec<EconomyJob>,
     /// The characters whose deliveries a take is running for.
@@ -520,6 +529,21 @@ pub(super) struct Economy {
     next_trade: u64,
     /// The generic invites that wait for their answer.
     pub(super) invites: super::invites::Invites,
+}
+
+impl Economy {
+    /// Whether a search of player `number` at `now_ms` is answered ([`SEARCH_INTERVAL_MS`]);
+    /// an answered one starts the wait again.
+    fn may_search(&mut self, number: u64, now_ms: u64) -> bool {
+        let waited = self
+            .searched_ms
+            .get(&number)
+            .is_none_or(|last| now_ms.saturating_sub(*last) >= SEARCH_INTERVAL_MS);
+        if waited {
+            self.searched_ms.insert(number, now_ms);
+        }
+        waited
+    }
 }
 
 fn economy(message: EconomyMessage) -> ServerMessage {
@@ -707,6 +731,14 @@ impl SimWorld {
                 let Some(caller) = self.caller(entity, header, lookup) else {
                     return;
                 };
+                let number = self
+                    .world
+                    .get::<Player>(entity)
+                    .map_or(0, |player| player.number);
+                if !self.economy.may_search(number, now_ms) {
+                    count_call("search", false);
+                    return self.reply(&caller, &[action_failed(&caller, failure::THROTTLED)]);
+                }
                 count_call("search", true);
                 self.economy.jobs.push(EconomyJob::Search {
                     caller,
@@ -1295,10 +1327,11 @@ impl SimWorld {
         }
     }
 
-    /// Player `number` left this sim: its invite and its trade end, and its trading post is
-    /// forgotten.
+    /// Player `number` left this sim: its invite and its trade end, and its trading post and
+    /// last search are forgotten.
     pub(super) fn economy_left(&mut self, number: u64) {
         self.economy.posts.remove(&number);
+        self.economy.searched_ms.remove(&number);
         self.invites_left(number);
         self.end_trade(number, trade_failure::TRADE_CANCELED);
     }
@@ -2080,6 +2113,30 @@ mod tests {
         };
         let wanted = character_orders(character, &all);
         assert!(wanted.open && wanted.closed && wanted.created && wanted.completed);
+    }
+
+    #[test]
+    fn a_search_within_a_second_of_the_last_answered_one_is_throttled() {
+        /// Retail `tradepost_post_sell_cancel_buyorder_sellorder`: answered at 414.65 s,
+        /// refused 999 ms later; answered searches 1.03 s apart.
+        const FIRST_MS: u64 = 1_781_362_637_778;
+        const REFUSED_AFTER_MS: u64 = 999;
+        const ANSWERED_AFTER_MS: u64 = 1_030;
+        let mut economy = Economy::default();
+        const PLAYER: u64 = 1;
+        const OTHER: u64 = 2;
+        assert!(economy.may_search(PLAYER, FIRST_MS));
+        assert!(!economy.may_search(PLAYER, FIRST_MS), "the same tick");
+        assert!(!economy.may_search(PLAYER, FIRST_MS + REFUSED_AFTER_MS));
+        assert!(
+            economy.may_search(OTHER, FIRST_MS),
+            "each player waits alone"
+        );
+        assert!(economy.may_search(PLAYER, FIRST_MS + ANSWERED_AFTER_MS));
+        assert!(
+            !economy.may_search(PLAYER, FIRST_MS + ANSWERED_AFTER_MS + REFUSED_AFTER_MS),
+            "an answered search starts the wait again"
+        );
     }
 
     #[test]
