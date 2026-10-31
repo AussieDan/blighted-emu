@@ -63,13 +63,16 @@ pub struct TestClientConfig {
     pub hunt: HuntConfig,
 }
 
-/// `[hunt]` (M6-B spec section 11). The accounts, sockets, speed and ground are those of
-/// `[swarm]`.
+/// `[hunt]` (M6-B spec section 11). The sockets, speed and ground are those of `[swarm]`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HuntConfig {
     /// Bots to run.
     pub bots: usize,
+    /// Account names are this and five digits; not the swarm's, whose bots stand elsewhere.
+    pub account_prefix: String,
+    /// Character names are this and three letters; letters only.
+    pub character_prefix: String,
     /// New bots per second.
     pub bots_per_second: u32,
     /// The hunt starts, east and north, in metres.
@@ -163,6 +166,8 @@ impl TestClientConfig {
         let fleet = self.fleet_settings(
             Fleet {
                 bots: swarm.bots,
+                account_prefix: &swarm.account_prefix,
+                character_prefix: &swarm.character_prefix,
                 bots_per_second: swarm.bots_per_second,
                 duration_seconds: swarm.duration_seconds,
                 metrics_urls: &swarm.metrics_urls,
@@ -193,17 +198,25 @@ impl TestClientConfig {
         })
     }
 
-    /// The hunt settings with the bot password `password`. The bot accounts, the walking speed
-    /// and the ground come from `[swarm]`.
+    /// The hunt settings with the bot password `password`. The sockets, the walking speed and
+    /// the ground come from `[swarm]`.
     ///
     /// # Errors
     ///
     /// Returns [`ScenarioConfigError`] for a `[hunt]` or `[swarm]` value that is not allowed.
     pub fn hunt_settings(&self, password: String) -> Result<HuntSettings, ScenarioConfigError> {
         let hunt = &self.hunt;
+        if hunt.account_prefix == self.swarm.account_prefix {
+            return invalid(
+                "account_prefix",
+                "the hunt needs its own accounts: swarm runs move the swarm's bots",
+            );
+        }
         let fleet = self.fleet_settings(
             Fleet {
                 bots: hunt.bots,
+                account_prefix: &hunt.account_prefix,
+                character_prefix: &hunt.character_prefix,
                 bots_per_second: hunt.bots_per_second,
                 duration_seconds: hunt.duration_seconds,
                 metrics_urls: &hunt.metrics_urls,
@@ -234,7 +247,7 @@ impl TestClientConfig {
         })
     }
 
-    /// The bots of a scenario, with the accounts and sockets of `[swarm]`.
+    /// The bots of a scenario, with the sockets of `[swarm]`.
     fn fleet_settings(
         &self,
         fleet: Fleet<'_>,
@@ -244,8 +257,8 @@ impl TestClientConfig {
         if !(1..=MAX_BOTS).contains(&fleet.bots) {
             return invalid("bots", "must be 1 to 17576");
         }
-        let name_length = swarm.character_prefix.len() + NAME_SUFFIX_LETTERS as usize;
-        let letters = swarm
+        let name_length = fleet.character_prefix.len() + NAME_SUFFIX_LETTERS as usize;
+        let letters = fleet
             .character_prefix
             .bytes()
             .all(|byte| byte.is_ascii_alphabetic());
@@ -263,8 +276,8 @@ impl TestClientConfig {
         }
         Ok(FleetSettings {
             bots: fleet.bots,
-            account_prefix: swarm.account_prefix.clone(),
-            character_prefix: swarm.character_prefix.clone(),
+            account_prefix: fleet.account_prefix.to_owned(),
+            character_prefix: fleet.character_prefix.to_owned(),
             password,
             login_url: self.login_url.clone(),
             game_url: self.game_url.clone(),
@@ -282,6 +295,8 @@ impl TestClientConfig {
 /// The values of a scenario section that make its fleet.
 struct Fleet<'a> {
     bots: usize,
+    account_prefix: &'a str,
+    character_prefix: &'a str,
     bots_per_second: u32,
     duration_seconds: u64,
     metrics_urls: &'a [String],
@@ -417,6 +432,8 @@ mod tests {
         assert!(refused(|hunt| hunt.reach_m = 0.0));
         assert!(refused(|hunt| hunt.attack_interval_ms = 0));
         assert!(refused(|hunt| hunt.respawn_wait_ms = 0));
+        assert!(refused(|hunt| hunt.character_prefix = "Hunt1".to_owned()));
+        assert!(refused(|hunt| hunt.account_prefix = "bot".to_owned()));
         assert!(
             refused(|hunt| hunt.bots = MAX_BOTS_PER_START + 1),
             "a crowd at one start sees only bots"

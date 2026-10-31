@@ -10,8 +10,9 @@ use std::collections::BTreeMap;
 
 use nw_messages::entity_ids::IdHolder;
 use nw_messages::{
-    EntitySlots, LOGIN_MESSAGE_TYPES, MemberState, MessageError, PLAYER_SLICE_ASSET, ServerMessage,
-    SlotRead, WorldPosition, entity_of_facet, number_of_seen_raw_id, release_raw_id,
+    EntitySlots, LOGIN_MESSAGE_TYPES, MemberState, MessageError, PLAYER_VITALS_ID, ServerMessage,
+    SlotRead, SlotUpdate, VitalsData, WorldPosition, entity_of_facet, number_of_seen_raw_id,
+    release_raw_id,
 };
 use thiserror::Error;
 
@@ -219,30 +220,22 @@ impl SyncView {
     }
 }
 
-/// Bundles with the own position that a mob may miss before the view drops it: each tick sends
-/// the own position once, and a mob in view in every tick.
-pub const MAX_MISSED_ROUNDS: u64 = 2;
-
-/// A mob the bot is sent.
-#[derive(Debug, Clone, Copy)]
-struct SeenMob {
-    /// `None` until its first position.
-    position: Option<WorldPosition>,
-    /// The round it was last sent in.
-    round: u64,
-}
-
-/// What a hunt bot keeps: its own position, the mobs it is sent, and counts of the combat
-/// messages for it. An entity is a mob from a spawn card of another prefab than the player's
-/// on; a mob whose slot is stopped, or that is not sent for more than [`MAX_MISSED_ROUNDS`]
-/// rounds (one round per bundle with the own position), is dead or out of view, and it comes back
-/// with a new card.
+/// What a hunt bot keeps: its own position, the mobs it is sent, the bundles it got, and counts
+/// of the combat messages for it. An entity is a mob from its spawn card ([`is_mob_card`]):
+/// players, statics, gather nodes, stations and quest objects have cards too, and a bot that took
+/// a rock for a mob swung at it all run (live hunt 2026-10-31). A mob stays in view until its slot is stopped: the server sends a mob again only
+/// when it has something new (a group with nothing to send is left out), so a mob that stands
+/// still is not in every bundle. A mob whose vitals say it died is dropped at once; a respawned
+/// mob comes with a new card.
 #[derive(Debug, Clone, Default)]
 pub struct CombatView {
     own: OwnView,
-    round: u64,
+    bundles: u64,
+    /// Mob cards read so far.
+    mob_cards: u64,
     slots: EntitySlots,
-    mobs: BTreeMap<u64, SeenMob>,
+    /// The mobs by entity number; `None` until a mob's first position.
+    mobs: BTreeMap<u64, Option<WorldPosition>>,
     hits_dealt: u64,
     hits_taken: u64,
     deaths: u64,
@@ -259,11 +252,11 @@ impl CombatView {
         let own_position = self.own.apply(&read);
         match read {
             Read::Bundle(mut bundle) => {
+                self.bundles += 1;
                 for gone in self.slots.resolve(&mut bundle) {
                     self.mobs.remove(&gone);
                     release_raw_id(self.own.holder, gone);
                 }
-                let round = self.round;
                 for update in bundle
                     .updates
                     .iter()
@@ -272,30 +265,18 @@ impl CombatView {
                     let Some(entity) = update.entity else {
                         continue;
                     };
-                    if update
-                        .card
-                        .is_some_and(|card| card.asset != Some(PLAYER_SLICE_ASSET))
+                    if is_mob_card(update) {
+                        // A card again keeps the place: a mob that stands still sends none.
+                        self.mobs.entry(entity).or_insert(None);
+                        self.mob_cards += 1;
+                    }
+                    if died(update) {
+                        self.mobs.remove(&entity);
+                    } else if let Some(mob) = self.mobs.get_mut(&entity)
+                        && update.position.is_some()
                     {
-                        self.mobs.insert(
-                            entity,
-                            SeenMob {
-                                position: None,
-                                round,
-                            },
-                        );
+                        *mob = update.position;
                     }
-                    if let Some(mob) = self.mobs.get_mut(&entity) {
-                        mob.round = round;
-                        if update.position.is_some() {
-                            mob.position = update.position;
-                        }
-                    }
-                }
-                if own_position.is_some() {
-                    self.round += 1;
-                    let now = self.round;
-                    self.mobs
-                        .retain(|_, mob| now - mob.round <= MAX_MISSED_ROUNDS);
                 }
             }
             Read::Combat { event, .. } => {
@@ -317,7 +298,17 @@ impl CombatView {
     pub fn mobs(&self) -> impl Iterator<Item = (u64, WorldPosition)> + '_ {
         self.mobs
             .iter()
-            .filter_map(|(number, mob)| Some((*number, mob.position?)))
+            .filter_map(|(number, position)| Some((*number, (*position)?)))
+    }
+
+    /// The bundles read so far.
+    pub const fn bundles(&self) -> u64 {
+        self.bundles
+    }
+
+    /// The mob cards read so far.
+    pub const fn mob_cards(&self) -> u64 {
+        self.mob_cards
     }
 
     /// 2071 messages for hits this bot made.
@@ -334,6 +325,40 @@ impl CombatView {
     pub const fn deaths(&self) -> u64 {
         self.deaths
     }
+}
+
+/// Whether `update` is the card of a mob: one with creature vitals (a mob of the prefab table: its
+/// card group carries its whole vitals), or one whose asset is its own id (a mob without a
+/// prefab: the sim names its card's asset by the mob's raw id, so the client finds no slice).
+/// The ids are random per spawn, as retail's, so the number of an entity tells nothing.
+fn is_mob_card(update: &SlotUpdate) -> bool {
+    let Some(card) = update.card else {
+        return false;
+    };
+    let creature_vitals = update.members.iter().any(|member| match &member.state {
+        MemberState::Vitals(vitals) => vitals
+            .slot_0
+            .as_ref()
+            .and_then(|slot| slot.vitals_id)
+            .is_some_and(|id| id != PLAYER_VITALS_ID),
+        _ => false,
+    });
+    let self_named = card
+        .asset
+        .zip(card.gde_ref)
+        .is_some_and(|(asset, raw_id)| asset.id == raw_id);
+    creature_vitals || self_named
+}
+
+/// Whether the vitals of `update` say its entity died: no health left, or the dead block.
+fn died(update: &SlotUpdate) -> bool {
+    update.members.iter().any(|member| match &member.state {
+        MemberState::Vitals(vitals) => vitals.slot_0.as_ref().is_some_and(|slot| {
+            slot.health_amount.is_some_and(|health| health <= 0.0)
+                || slot.vitals_data.as_ref().is_some_and(VitalsData::is_dead)
+        }),
+        _ => false,
+    })
 }
 
 /// The world as one client saw it.
@@ -452,9 +477,9 @@ mod tests {
         FIRST_OTHER_SLOT, entity_group, login_samples, melee_sample, players_bundle,
     };
     use nw_messages::{
-        AssetId, BodyCodec, BundleGroup, ClientAddEntryMsg, DYNAMIC_SLICE_SUB_ID, DamageDealtMsg,
-        DeathRecapMsg, GDE_ID_LEN, LOCAL_PLAYER_INTEREST, LOGIN_CLIENT_CONTEXT,
-        ReplicatedStateBundle,
+        AssetId, BodyCodec, BundleGroup, BundleMember, ClientAddEntryMsg, DYNAMIC_SLICE_SUB_ID,
+        DamageDealtMsg, DeathRecapMsg, GDE_ID_LEN, LOCAL_PLAYER_INTEREST, LOGIN_CLIENT_CONTEXT,
+        ReplicatedStateBundle, VitalsState,
     };
     use nw_reflect::{Envelope, TypeId};
 
@@ -569,13 +594,36 @@ mod tests {
     /// which the other tests, running at the same time, must not lose for [`MOB`].
     const STOPPED_MOB: u64 = (1 << 34) + 6;
     const HIT: f32 = 42.0;
+    /// Bundles in the still-mob test: far more than a tick or two.
+    const STILL_BUNDLES: u64 = 30;
+    /// The vitals component of a mob group (sim `MobCard`).
+    const MOB_VITALS_COMPONENT: u64 = 10;
+    const MOB_HEALTH: u32 = 370;
 
     const MOB_SLOT: u16 = FIRST_OTHER_SLOT;
     const OTHER_SLOT: u16 = FIRST_OTHER_SLOT + 1;
-    const MOB_ASSET: AssetId = AssetId {
+    const ROCK_SLOT: u16 = FIRST_OTHER_SLOT + 2;
+    /// A static's entity number (the sim's statics start at 2^40).
+    const ROCK: u64 = 1 << 40;
+    /// A level object's asset: no mob's.
+    const STATIC_ASSET: AssetId = AssetId {
         id: [0; GDE_ID_LEN],
         sub_id: DYNAMIC_SLICE_SUB_ID,
     };
+    /// The prefab of a mob of the prefab table.
+    const CREATURE_ASSET: AssetId = AssetId {
+        id: [1; GDE_ID_LEN],
+        sub_id: DYNAMIC_SLICE_SUB_ID,
+    };
+    const CREATURE_VITALS_ID: u32 = 7;
+
+    /// The card asset of a mob without a prefab: its own raw id (sim `EntityKind::mob`).
+    fn self_named_asset(mob: u64) -> AssetId {
+        AssetId {
+            id: nw_messages::raw_id_of_entity(mob),
+            sub_id: DYNAMIC_SLICE_SUB_ID,
+        }
+    }
 
     /// A bundle that stops `stops`, with the own position and then `groups`.
     fn mob_bundle(sequence: u64, stops: Vec<u16>, groups: Vec<BundleGroup>) -> Received {
@@ -588,7 +636,12 @@ mod tests {
     }
 
     fn mob_at(mob: u64, x: f32, carded: bool) -> BundleGroup {
-        entity_group(MOB_SLOT, mob, carded.then_some(MOB_ASSET), Some(at(x)))
+        entity_group(
+            MOB_SLOT,
+            mob,
+            carded.then(|| self_named_asset(mob)),
+            Some(at(x)),
+        )
     }
 
     fn combat_view() -> CombatView {
@@ -600,7 +653,7 @@ mod tests {
     }
 
     #[test]
-    fn the_view_keeps_mobs_while_they_are_sent() {
+    fn the_view_keeps_a_mob_until_its_slot_stops() {
         let mut view = combat_view();
         let other = entity_group(
             OTHER_SLOT,
@@ -608,28 +661,76 @@ mod tests {
             Some(nw_messages::PLAYER_SLICE_ASSET),
             Some(at(3.0)),
         );
-        let first = mob_bundle(0, Vec::new(), vec![mob_at(MOB, 2.0, true), other]);
+        let rock = entity_group(ROCK_SLOT, ROCK, Some(STATIC_ASSET), Some(at(1.5)));
+        let first = mob_bundle(0, Vec::new(), vec![mob_at(MOB, 2.0, true), other, rock]);
         assert_eq!(view.read(&first).expect("read"), Some(at(1.0)));
         assert_eq!(
             view.mobs().collect::<Vec<_>>(),
             vec![(MOB, at(2.0))],
-            "a player is no mob"
+            "a player and a static are no mobs"
         );
         view.read(&mob_bundle(1, Vec::new(), vec![mob_at(MOB, 4.0, false)]))
             .expect("read");
         assert_eq!(view.mobs().collect::<Vec<_>>(), vec![(MOB, at(4.0))]);
-        for sequence in 2..=2 + MAX_MISSED_ROUNDS {
+        for sequence in 2..STILL_BUNDLES {
             view.read(&mob_bundle(sequence, Vec::new(), Vec::new()))
                 .expect("read");
         }
         assert_eq!(
-            view.mobs().count(),
-            0,
-            "no longer sent: dead or out of view"
+            view.mobs().collect::<Vec<_>>(),
+            vec![(MOB, at(4.0))],
+            "a mob that stands still is not sent again, and stays"
         );
-        view.read(&mob_bundle(9, Vec::new(), vec![mob_at(MOB, 4.0, false)]))
+        assert_eq!(view.bundles(), STILL_BUNDLES);
+        let card_again = entity_group(MOB_SLOT, MOB, Some(self_named_asset(MOB)), None);
+        view.read(&mob_bundle(STILL_BUNDLES, Vec::new(), vec![card_again]))
             .expect("read");
-        assert_eq!(view.mobs().count(), 0, "a mob comes back with a new card");
+        assert_eq!(
+            view.mobs().collect::<Vec<_>>(),
+            vec![(MOB, at(4.0))],
+            "its card again keeps its place"
+        );
+        assert_eq!(view.mob_cards(), 2);
+    }
+
+    #[test]
+    fn a_creature_card_with_its_vitals_is_a_mob() {
+        let mut view = combat_view();
+        let mut creature = entity_group(MOB_SLOT, MOB, Some(CREATURE_ASSET), Some(at(2.0)));
+        creature.members.push(BundleMember {
+            component: MOB_VITALS_COMPONENT,
+            state: MemberState::Vitals(VitalsState::creature(
+                MOB_HEALTH,
+                MOB_HEALTH,
+                CREATURE_VITALS_ID,
+                1,
+                1,
+            )),
+        });
+        view.read(&mob_bundle(0, Vec::new(), vec![creature]))
+            .expect("read");
+        assert_eq!(view.mobs().collect::<Vec<_>>(), vec![(MOB, at(2.0))]);
+    }
+
+    #[test]
+    fn a_mob_that_died_is_dropped_and_comes_back_with_a_new_card() {
+        let mut view = combat_view();
+        view.read(&mob_bundle(0, Vec::new(), vec![mob_at(MOB, 2.0, true)]))
+            .expect("read");
+        let mut dead = entity_group(MOB_SLOT, MOB, None, None);
+        dead.members.push(BundleMember {
+            component: MOB_VITALS_COMPONENT,
+            state: MemberState::Vitals(VitalsState::creature(0, MOB_HEALTH, 1, 1, 1)),
+        });
+        view.read(&mob_bundle(1, Vec::new(), vec![dead]))
+            .expect("read");
+        assert_eq!(view.mobs().count(), 0, "dead");
+        view.read(&mob_bundle(2, Vec::new(), vec![mob_at(MOB, 3.0, false)]))
+            .expect("read");
+        assert_eq!(view.mobs().count(), 0, "no card yet");
+        view.read(&mob_bundle(3, Vec::new(), vec![mob_at(MOB, 3.0, true)]))
+            .expect("read");
+        assert_eq!(view.mobs().collect::<Vec<_>>(), vec![(MOB, at(3.0))]);
     }
 
     #[test]

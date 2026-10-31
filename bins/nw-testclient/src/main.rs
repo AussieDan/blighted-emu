@@ -74,8 +74,8 @@ enum Command {
         #[arg(long)]
         bots: Option<usize>,
     },
-    /// Many bots that fight mobs (`[hunt]`, with the accounts of `[swarm]`). The bot password
-    /// comes from `NW_SECRET_TESTCLIENT_SWARM_PASSWORD`.
+    /// Many bots that fight mobs (`[hunt]`, with accounts of their own and the sockets of
+    /// `[swarm]`). The bot password comes from `NW_SECRET_TESTCLIENT_SWARM_PASSWORD`.
     Hunt {
         /// Bots of this step instead of `[hunt] bots`.
         #[arg(long)]

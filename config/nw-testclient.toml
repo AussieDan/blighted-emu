@@ -64,11 +64,18 @@ content_dir = "local-data/content"
 level = "newworld_vitaeeterna"
 
 # hunt (M6-B exit test): bots walk to the nearest mob they see, stop in reach and attack it; a
-# bot that dies asks to respawn. The accounts, sockets, walking speed and ground are those of
-# [swarm]. Put the hunt starts on flat land near low-level spawns (the M6-B record lists them).
+# bot that dies asks to respawn. The sockets, walking speed and ground are those of [swarm].
+# Put the hunt starts on flat land near low-level spawns (the M6-B record lists them). New
+# characters appear at world-director's start_positions, so run the director with the hunt
+# starts (NW_DIRECTOR_START_POSITIONS='[{x = 11132.5, y = 7305.9}]') and new hunt names; a bot
+# more than 70 m from every start fails "every bot began near a hunt start". The M6-B record ran
+# the sims with a 5 s mob respawn (NW_SIM_COMBAT__MOB_RESPAWN_MS=5000), so every bot finds a mob.
 [hunt]
 # At most 30 bots per start: each player sees its 47 nearest entities, bots and mobs together.
 bots = 30
+# Not the swarm's accounts: a swarm run leaves its bots elsewhere.
+account_prefix = "hunter"
+character_prefix = "Hunter"
 bots_per_second = 10
 # Bot n waits on a ring of 8 m around start n modulo their number while it sees no mob.
 starts_m = [[11132.5, 7305.9]]
