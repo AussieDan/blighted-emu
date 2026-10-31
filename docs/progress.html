@@ -98,7 +98,7 @@
 <body>
 <main>
   <h1>Blighted New World Emulator: Progress</h1>
-  <p class="sub">Status on 2026-10-31. Client build 25810808. Last commit <code>3ae8cb6c</code>.</p>
+  <p class="sub">Status on 2026-10-31. Client build 25810808. Last commit <code>448ed2d8</code>.</p>
 
   <div class="cards" id="summary"></div>
 
@@ -121,6 +121,10 @@
 
   <h2>What to do next (in order)</h2>
   <ol class="next">
+    <li><strong>Make the beach sim fast enough for many players.</strong>
+      <div class="why">With 30 test bots at the starting beach (<code>nw-testclient hunt</code>), its sim runs about 300 ms per tick (the mob tick is 75 % of it), so it does not answer new logins in time ("the sim did not answer") and the bots get no world. The build before 2026-10-31 does the same. Notes: <code>local-data/findings/2026-10-31-night-test-run.md</code>.</div></li>
+    <li><strong>Build the weapon abilities and mana.</strong>
+      <div class="why">The ability keys (1 to 3), their cooldowns, spells and effects, and mana use are not built. Retail spends mana per spell (<code>ManaData</code>) and gives it back about 3.3 per second at Focus 250. Notes: <code>local-data/findings/2026-10-31-dodge-refusals-and-mana.md</code>.</div></li>
     <li><strong>Live check of the GM chat commands.</strong>
       <div class="why">Give your account the <code>game_master</code> rank, log in, and type <code>!help</code>, <code>!level 60</code>, <code>!coins 1000</code> and <code>!where</code> in chat. The answer comes as a System chat line that only you see. If the client does not show it, move the answer to the whisper channel. The command list is in the README under "GM chat commands".</div></li>
     <li><strong>Check the target lock pick on retail.</strong>
@@ -157,6 +161,12 @@
 
   <h2>Done list</h2>
   <ul class="done">
+    <li>✅ Player max health grows with the level and Constitution as retail: 856 + 1.75 x level squared + the Constitution health (9 retail points of two characters fit); the client gets the new max after a level up or a spend (2026-10-31).</li>
+    <li>✅ Storage and trading post: an item gets a new id on each move, the storage seen from afar and the storage notes match retail, and a trading post search less than 1 s after the last one is refused as retail (2026-10-31).</li>
+    <li>✅ Fast travel costs azoth as retail (20, or 10 within the player's territory; inn and home travel free); a mount summon is refused in combat and cancelled in the air as retail (2026-10-31).</li>
+    <li>✅ Crafting, dyes and salvage: the item notes carry the last storage search, a craft sends one note per item made, and the bag sync reasons match retail (2026-10-31).</li>
+    <li>✅ Status effects: the out-of-combat regen stops at full health, a player gets no heal number for its own heals and potions, and food heals scale with the held effects as retail (2026-10-31).</li>
+    <li>✅ Test client: <code>nw-testclient chat</code> says a line in area chat and checks the answer (a GM command's system lines, or the line itself); a test race in the view tests is fixed (2026-10-31).</li>
     <li>✅ Recipes: a salvaged schematic sets the achievement its recipe asks for; daily and weekly recipe cooldowns count crafts, refuse past the quantity, are saved and go to the client in the crafting state as retail (2026-10-30).</li>
     <li>✅ Gear perks: a worn item's perks hold their status effects (<code>PerkData.Affix</code> to <code>AffixStatData.StatusEffect</code>), potency 1 plus the scale per gear score from 100 (fits the retail bag perk 2.508 at gear score 430) (2026-10-30).</li>
     <li>✅ Factions: the faction pick (3161) joins or changes the faction, saved; the faction state change goes as retail; the join quest step ends; quests and missions check <code>RequiredFaction</code> (2026-10-30).</li>
@@ -242,9 +252,9 @@ const AREAS = [
       ["Client patch", 100, "live", "Cert bypass, Steam offline login.", "Nothing."],
       ["Login server and launcher (M2)", 90, "live", "Password or Discord login, Linux Proton start, two worlds.", "Windows start is built. A live test on Windows: Unknown."],
       ["Gateway and registration (M3)", 100, "live", "DTLS and registration with the real client.", "Nothing."],
-      ["Many sims and handoff (M5)", 90, "bots", "1,000 bots cross cell borders.", "Real clients crossing cell borders: Unknown."],
+      ["Many sims and handoff (M5)", 90, "bots", "1,000 bots cross cell borders.", "Real clients crossing cell borders: Unknown. 30 hunt bots at the beach: its sim runs about 300 ms a tick and times out logins (2026-10-31; also before)."],
       ["Database saves", 80, "tests", "Accounts, characters, items, progression, quests, notifications.", "Saves of the systems below that are not done."],
-      ["Admin tools", 85, "tests", "Live panel, studio, GM commands, drop simulator, script editor. GM chat commands in the game (<code>!help</code>).", "Pages for systems that are not done. GM chat commands: not checked live; whether the client shows our System chat line is Unknown."],
+      ["Admin tools", 85, "tests", "Live panel, studio, GM commands, drop simulator, script editor. GM chat commands in the game (<code>!help</code>). <code>nw-testclient chat</code> says a GM line and checks the answer.", "Pages for systems that are not done. GM chat commands: not checked live. In the 2026-10-30 camp test the client sent no chat line at all (cause: likely the chat probation flag, sent since c3c84794)."],
       ["Server status page", 10, "code", "The admin live panel reads the metrics of every server (admins only).", "A public page: players online per world, round trip time per player, healthy or unhealthy (over 2000 ms or a server part that does not answer). Same checks as the client's canary metrics (docs/re/2026-10-02-client-metrics-and-canary.md)."],
     ],
   },
@@ -261,13 +271,13 @@ const AREAS = [
   {
     name: "Combat",
     features: [
-      ["Melee hits", 75, "live", "Homing, lag help, retail damage messages.", "Boar hits miss sometimes. Cause: Unknown."],
+      ["Melee hits", 75, "live", "Homing, lag help, retail damage messages.", "Boar hits miss sometimes (not seen in the 3 live logs of 2026-10-30: every swing with a mob within 2 m hit). Cause: Unknown."],
       ["Target lock", 90, "live", "Lock, release and wheel cycling work live (110ccc0).", "Retail check of the nearest-in-circle pick; lock after a reconnect."],
-      ["Dodge and stamina", 90, "tests", "Match retail (review 2026-10-01).", "Live check."],
+      ["Dodge and stamina", 90, "tests", "Match retail (review 2026-10-01).", "Live check. Retail refuses a land dodge 250 to 414 ms after an attack press (4 of 4 at full stamina); the rule is in the attack animation data (IfCanDodge), not read yet."],
       ["Block", 70, "tests", "Guard break, no regen while held, 2218 only in the tutorial, cross-sim hits.", "Live check. Rise delay, facing arc. Ranged block from the data only."],
-      ["Ranged and magic", 45, "tests", "Staffs, gauntlets, bows, muskets cast along the aim.", "Abilities, mana use, full projectile rules."],
-      ["Status effects", 50, "code", "Effects from game data.", "Live check of most effects."],
-      ["Death, respawn, revive", 85, "live", "Death screen, 38 respawn points, revive at 1 health.", "Some respawn points."],
+      ["Ranged and magic", 45, "tests", "Staffs, gauntlets, bows, muskets cast along the aim.", "Weapon abilities (keys 1 to 3) and mana use: not built. Retail spends mana per spell (ManaData costs, 5 and 16 seen) and gives back about 3.3 per second (general-other-01). Full projectile rules."],
+      ["Status effects", 55, "code", "Effects from game data. Checked against retail: the out-of-combat regen ends at full health, food heals 3 times as much while it runs, no heal number (4298) for the player's own heals.", "Mob effects to the client (remote map): retail sends them, the server does not. Live check of most effects."],
+      ["Death, respawn, revive", 85, "live", "Death screen, 38 respawn points, revive at 1 health. A drunk potion sends no heal number (retail).", "Death's door: retail used it for 107 of 281 deaths in community captures (quests, catacombs); which deaths take it is Unknown. Some respawn points."],
       ["PvP", 35, "tests", "PvP hits roll like retail. Faction join and change (3161), saved, sent as retail; quests check RequiredFaction.", "Flag rules, PvP zones, rewards: not checked. Faction boards, forts."],
     ],
   },
@@ -295,8 +305,8 @@ const AREAS = [
     features: [
       ["Quest engine", 88, "tests", "Task types from task sheets, turn-in, rewards. Many quests at once, with the client's journal limit per quest type. Interact, game mode, give item, patrol, level, talk, gather, cyclic object, temporary unlock, craft, objective, use item, territory, fishing, salvage, item family, refine, song and dungeon steps. Town board missions. 772 quest trigger volumes from the level data. Done StayActive steps show as retail. Quest objects that are loot containers give their quest items; kills count by spawner category and category group.", "Live check of the new steps (Truffle Fever failed live before the fix); pin limit Unknown. Live check of the races and the faction join. Puzzle scripts, the emote step, PvP faction mission steps (TaskDie, control points), trigger areas of instance levels (20)."],
       ["Beach and wreck quests", 70, "tests", "Start beach chain and wreck quests 4 to 7.", "Full live run."],
-      ["Main story and side quests", 45, "tests", "The engine runs them from game data. Side quests with only supported steps: 508 of 528; main story: 349 of 358.", "Nobody played them live. The faction join works; the faction boards offer no missions yet."],
-      ["XP, levels, attribute points", 80, "tests", "Kill XP, level up, attribute and weapon points.", "Live check after the tutorial."],
+      ["Main story and side quests", 45, "tests", "The engine runs them from game data. Side quests with only supported steps: 526 of 528; main story: 354 of 358 (2 steps have no target in the data, 2 are puzzle scripts).", "Nobody played them live. The faction join works; the faction boards offer no missions yet."],
+      ["XP, levels, attribute points", 88, "tests", "Kill XP, level up, attribute and weapon points. Max health grows with the level and Constitution as retail (856 + 1.75 x level squared + the Constitution health: 9 retail points fit), and the client gets the new max after a level up or a spend.", "Live check after the tutorial. Attribute damage scaling and the attribute threshold effects (evidence conflicts). Gear health bonuses."],
       ["Weapon mastery", 70, "tests", "Mastery XP and saves.", "Live check."],
       ["Area charting, territory standing", 60, "tests", "Charting XP, standing rank 1.", "Higher ranks and their rewards."],
       ["Achievements", 60, "code", "Achievement and meta achievement states.", "Live check."],
@@ -308,12 +318,12 @@ const AREAS = [
       ["Inventory, gear, paperdoll", 75, "live", "Inventory, slots, gear versions.", "Gear score rules, some item calls."],
       ["Loot drops", 75, "tests", "Retail loot tables, drop chance, one bag per kill.", "Live check outside the tutorial."],
       ["Gathering and skinning", 70, "live", "Skinning, nodules, gatherables. The sickle is the harvesting tool (slot 34). Held effects add their gather speed (food, music buffs). Worn perks hold their status effects, scaled by the item's gear score (tool, armour, amulet and bag perks).", "Tool levels and node respawn, live. Gathering luck: how ROL values change a gather roll is Unknown (the roll is server only)."],
-      ["Crafting", 72, "tests", "Campfire, recipes, craft answers after the item change, and the bag reasons of a craft (2 used, 3 made) as retail. Required, hiding and one-time recipe achievements. Held effects (crafting food) raise the gear score range. A salvaged schematic teaches its recipe. Daily and weekly recipe cooldowns, saved, sent as retail.", "Live check; higher stations and refining. The reset of the 79200 s cooldown and the colour gypsum orbs: Unknown."],
+      ["Crafting", 75, "tests", "Campfire, recipes, craft answers after the item change, and the bag reasons of a craft (2 used, 3 made, 2 on a used-up slot) as retail. Required, hiding and one-time recipe achievements. Held effects (crafting food) raise the gear score range. A salvaged schematic teaches its recipe. Daily and weekly recipe cooldowns, saved, sent as retail. Checked against 6 retail crafting and refining captures: one storage note per item made, with the last storage search.", "Live check; higher stations and refining. Crafts take from storage in retail (which storage: Unknown); bonus items of another kind (their table: Unknown). The reset of the 79200 s cooldown and the colour gypsum orbs: Unknown."],
       ["Fishing", 55, "tests", "Fishing code, one live run. Fishing quest steps and quest fish.", "Result of the live run: Unknown."],
-      ["Repair, salvage, transmog, dyes", 40, "code", "Code exists.", "Not checked."],
+      ["Repair, salvage, transmog, dyes", 50, "tests", "Checked against retail salvage (4 captures) and dye captures: the salvaged slot goes out with reason 24, its items with 26 (containers) or 33 (gear); dye items and their emptied slots with 2.", "No retail repair capture. The storage note count of a salvage and a dye: Unknown. No live test."],
       ["Shops and coins", 50, "code", "Coins state, shop code.", "Not checked live."],
-      ["Storage", 40, "code", "Storage search code.", "Not checked."],
-      ["Trading post", 35, "code", "Code and database tables exist.", "No capture check, no live test."],
+      ["Storage", 50, "code", "Storage search code. Checked against the retail storage capture: new ids on a move, the view from afar, 2 storage notes per move.", "No live test. Weight limit, transfer fee and the notes after a view from afar are Unknown."],
+      ["Trading post", 40, "code", "Code and database tables exist. Search throttle (1 s, retail reason 7) from 4 captures.", "No live test. Posting fees Unknown."],
     ],
   },
   {
