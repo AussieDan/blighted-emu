@@ -49,10 +49,17 @@ const SUMMON_AUTHORIZATION_MS: u64 = 8_000;
 /// The dash starts only with this much mount stamina (`playeractions_mount.actionlist`
 /// `MountDash`: `IfMountStamina GreaterThanOrEqual 15`).
 const DASH_MIN_STAMINA: f32 = 15.0;
-/// The 5752 byte of unknown meaning, the notification and the number of unknown meaning (all 8
-/// retail cancels: 0, 1 and 0).
-const CANCEL_FLAG: u8 = 0;
+/// The 5752 byte of a refusal at the summon key and of a player's own cancel, and of a cancel of
+/// a running summon by the server (summon survey of 2026-10-31, 398 retail 5752: 0 in all 213
+/// refusals at the key and 103 player cancels; 1 in all 47 server cancels: `Combat` 13,
+/// `RestrictedArea` 21, `Midair` 13, `Interact` 2; the meaning is Unknown).
+const KEY_OR_PLAYER_CANCEL_FLAG: u8 = 0;
+const SERVER_CANCEL_FLAG: u8 = 1;
+/// The 5752 notification (1 in all 398 retail calls).
 const CANCEL_NOTIFY: bool = true;
+/// The 5752 number of a refusal on cooldown, and of every other reason (1 in all 17 retail
+/// `OnCooldown` refusals, 0 in the 381 others; the meaning is Unknown).
+const ON_COOLDOWN_DETAIL: u32 = 1;
 const CANCEL_DETAIL: u32 = 0;
 /// The 5969 result of a name taken (0 in both retail answers).
 const RENAME_TAKEN: u32 = 0;
@@ -644,6 +651,14 @@ impl SimWorld {
                     authorized: true,
                     ..
                 } if now_ms > expires_ms => Due::Cancel(SummonCancelReason::PlayerCancelled),
+                // Retail: 5752 `Midair` 3.0 s after the 5747 (13 of 13), at the summon's end.
+                Phase::Summoning {
+                    authorized: false,
+                    ready_ms,
+                    ..
+                } if now_ms >= ready_ms && !player.tracked.is_grounded() => {
+                    Due::Cancel(SummonCancelReason::Midair)
+                }
                 Phase::Summoning {
                     mount_id,
                     ready_ms,
@@ -892,10 +907,11 @@ impl SimWorld {
     }
 
     /// The summon key of player `entity` at `now_ms` (retail Mount-quest capture: 5747 40 ms
-    /// after the press, then the mount id): refused on cooldown, before any mount type is
-    /// unlocked (5752 21, the cooldown set to now), without a usable mount (22), while swimming
-    /// (25) or while the mount choice window is open (no answer: `SummonMount` needs it
-    /// closed).
+    /// after the press, then the mount id): refused on cooldown, in combat (5752 6 without a
+    /// 5747: 173 retail refusals, one in `general-other-01` at 687.5 s after a fight), before any
+    /// mount type is unlocked (5752 21, the cooldown set to now), without a usable mount (22),
+    /// while swimming (25) or while the mount choice window is open (no answer: `SummonMount`
+    /// needs it closed).
     fn summon(&mut self, entity: Entity, now_ms: u64) {
         let rules = &self.achievement_rules;
         let mounts = &self.content.mounts;
@@ -913,6 +929,8 @@ impl SimWorld {
         }
         let refusal = if now_ms < player.mount.cooldown_end_ms {
             Err(SummonCancelReason::OnCooldown)
+        } else if player.combat.in_combat() {
+            Err(SummonCancelReason::Combat)
         } else if player.tracked.is_swimming() {
             Err(SummonCancelReason::Swimming)
         } else if !mounts
@@ -959,9 +977,13 @@ impl SimWorld {
                 MountServerMsg::SummonCancelled {
                     header,
                     reason,
-                    flag: CANCEL_FLAG,
+                    flag: KEY_OR_PLAYER_CANCEL_FLAG,
                     notify: CANCEL_NOTIFY,
-                    detail: CANCEL_DETAIL,
+                    detail: if reason == SummonCancelReason::OnCooldown {
+                        ON_COOLDOWN_DETAIL
+                    } else {
+                        CANCEL_DETAIL
+                    },
                 }
             }
         };
@@ -969,9 +991,10 @@ impl SimWorld {
         push_mount_message(&mut self.combat_messages, connection, &message);
     }
 
-    /// The summon of player `entity` ends without a mount for `reason` at `now_ms`: 5752, the
-    /// authorization cleared and the summon cooldown its type's voluntary dismount cooldown
-    /// ahead (retail: 1,000 ms after each of 5 player cancels).
+    /// The summon of player `entity` ends without a mount for `reason` at `now_ms`: 5752 (its
+    /// flag 0 for the player's own cancel, 1 for the server's), the authorization cleared and
+    /// the summon cooldown its type's voluntary dismount cooldown ahead (retail: 1,000 ms after
+    /// each of 5 player cancels).
     fn cancel_summon(&mut self, entity: Entity, reason: SummonCancelReason, now_ms: u64) {
         let Some(Phase::Summoning { mount_id, .. }) = self
             .world
@@ -994,7 +1017,11 @@ impl SimWorld {
         let message = MountServerMsg::SummonCancelled {
             header: FacetHeader::of(MOUNT_FACET, player.number),
             reason,
-            flag: CANCEL_FLAG,
+            flag: if reason == SummonCancelReason::PlayerCancelled {
+                KEY_OR_PLAYER_CANCEL_FLAG
+            } else {
+                SERVER_CANCEL_FLAG
+            },
             notify: CANCEL_NOTIFY,
             detail: CANCEL_DETAIL,
         };
@@ -1663,6 +1690,95 @@ mod tests {
                 ),
                 "{refused:?}"
             );
+        }
+
+        #[test]
+        fn a_summon_in_combat_is_refused_and_a_hit_ends_a_running_one_as_retail() {
+            let mut world = world_with(vec![UNLOCK_BIT, GIFT_BIT]);
+            ticked(&mut world, NOW);
+            ticked(&mut world, NOW + TICK_MS);
+            let entity = world.player_by_number(PLAYER).expect("player");
+            world
+                .world
+                .get_mut::<Player>(entity)
+                .expect("player")
+                .combat
+                .hit(NOW, false);
+            let refused = press(&mut world, 1, NOW + 2 * TICK_MS);
+            assert!(
+                matches!(
+                    refused[..],
+                    [MountServerMsg::SummonCancelled {
+                        reason: SummonCancelReason::Combat,
+                        flag: KEY_OR_PLAYER_CANCEL_FLAG,
+                        detail: CANCEL_DETAIL,
+                        ..
+                    }]
+                ),
+                "no 5747 in combat: {refused:?}"
+            );
+            let mut world = world_with(vec![UNLOCK_BIT, GIFT_BIT]);
+            ticked(&mut world, NOW);
+            ticked(&mut world, NOW + TICK_MS);
+            let entity = world.player_by_number(PLAYER).expect("player");
+            press(&mut world, 1, NOW + 2 * TICK_MS);
+            world.mount_hit(entity, 10.0, 100.0, false, NOW + 3 * TICK_MS);
+            let ended = ticked(&mut world, NOW + 3 * TICK_MS);
+            assert!(
+                matches!(
+                    ended[..],
+                    [MountServerMsg::SummonCancelled {
+                        reason: SummonCancelReason::Combat,
+                        flag: SERVER_CANCEL_FLAG,
+                        ..
+                    }]
+                ),
+                "{ended:?}"
+            );
+            let early = press(&mut world, 2, NOW + 4 * TICK_MS);
+            assert!(
+                matches!(
+                    early[..],
+                    [MountServerMsg::SummonCancelled {
+                        reason: SummonCancelReason::OnCooldown,
+                        flag: KEY_OR_PLAYER_CANCEL_FLAG,
+                        detail: ON_COOLDOWN_DETAIL,
+                        ..
+                    }]
+                ),
+                "{early:?}"
+            );
+        }
+
+        #[test]
+        fn a_summon_that_ends_in_the_air_is_cancelled_midair() {
+            const HEIGHT_M: f32 = 20.0;
+            let mut world = world_with(vec![UNLOCK_BIT, GIFT_BIT]);
+            ticked(&mut world, NOW);
+            let start = NOW + TICK_MS;
+            press(&mut world, 1, start);
+            let entity = world.player_by_number(PLAYER).expect("player");
+            {
+                let mut player = world.world.get_mut::<Player>(entity).expect("player");
+                let at = player.tracked.position();
+                player.tracked.drop_at(nw_sim_core::Position {
+                    z: at.z + HEIGHT_M,
+                    ..at
+                });
+            }
+            let ended = ticked(&mut world, start + u64::from(SUMMON_MS));
+            assert!(
+                matches!(
+                    ended[..],
+                    [MountServerMsg::SummonCancelled {
+                        reason: SummonCancelReason::Midair,
+                        flag: SERVER_CANCEL_FLAG,
+                        ..
+                    }]
+                ),
+                "{ended:?}"
+            );
+            assert!(!mount_of(&mut world).authorization.authorized);
         }
 
         #[test]

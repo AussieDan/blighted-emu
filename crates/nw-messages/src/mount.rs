@@ -906,12 +906,13 @@ pub enum MountServerMsg {
         header: FacetHeader,
         /// Why.
         reason: SummonCancelReason,
-        /// A byte of unknown meaning (0 in all 8 retail calls).
+        /// A byte of unknown meaning (398 retail calls: 0 for a refusal at the summon key and
+        /// a player's cancel, 1 for the server's cancel of a running summon).
         flag: u8,
-        /// The client shows the reason's text (1 in all 8 retail calls; `FUN_1438f42f0`
+        /// The client shows the reason's text (1 in all 398 retail calls; `FUN_1438f42f0`
         /// returns early on 0).
         notify: bool,
-        /// A number of unknown meaning (0 in all 8 retail calls).
+        /// A number of unknown meaning (398 retail calls: 1 with `OnCooldown`, 0 otherwise).
         detail: u32,
     },
     /// 2749: the player may use mounts (1 in all 23 retail calls).
