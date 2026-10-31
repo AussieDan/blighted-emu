@@ -7,7 +7,8 @@
 //!
 //! Environment values are parsed as TOML-like values, so `123456` becomes a number and
 //! `true` becomes a bool. To give such a value to a string field, quote it inside the value:
-//! `NW_EDGE_DATABASE__PASSWORD='"123456"'`.
+//! `NW_EDGE_DATABASE__PASSWORD='"123456"'`. A list of tables is one value:
+//! `NW_DIRECTOR_START_POSITIONS='[{x = 1.0, y = 2.0}]'`.
 
 use std::path::{Path, PathBuf};
 
@@ -150,6 +151,34 @@ mod tests {
             jail.set_env("NW_TEST_DATABASE__URL", format!("\"{NUMERIC_TEXT}\""));
             let config = load(CONFIG_FILE).expect("quoted digits stay a string");
             assert_eq!(config.database.url, NUMERIC_TEXT);
+            Ok(())
+        });
+    }
+
+    #[derive(Debug, PartialEq, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct PointsConfig {
+        points: Vec<Point>,
+    }
+
+    #[derive(Debug, PartialEq, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Point {
+        x: f32,
+        y: f32,
+    }
+
+    #[test]
+    fn environment_value_replaces_a_list_of_tables() {
+        Jail::expect_with(|jail| {
+            jail.create_file(CONFIG_FILE, "points = [{ x = 1.0, y = 2.0 }]\n")?;
+            jail.set_env("NW_TEST_POINTS", "[{x = 3.5, y = 4.5}, {x = 5.0, y = 6.0}]");
+            let config: PointsConfig =
+                load_config(Path::new(CONFIG_FILE), TEST_PREFIX).expect("valid config");
+            assert_eq!(
+                config.points,
+                vec![Point { x: 3.5, y: 4.5 }, Point { x: 5.0, y: 6.0 }]
+            );
             Ok(())
         });
     }
