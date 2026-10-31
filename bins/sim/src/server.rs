@@ -547,7 +547,12 @@ impl Loop {
         let reply = match self.world.admit(&message, self.now_ms(), server_time()) {
             Ok(login) => {
                 metrics::counter!(METRIC_ADMITS, RESULT_LABEL => ADMITTED).increment(1);
-                tracing::info!(character = %message.character, resumed = !message.login, "joined");
+                tracing::info!(
+                    character = %message.character,
+                    resumed = !message.login,
+                    game_master = message.game_master,
+                    "joined"
+                );
                 self.gateways
                     .joined(&message.connection.gateway, Instant::now());
                 self.forwards.remove(&message.connection);

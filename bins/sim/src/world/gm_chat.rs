@@ -429,6 +429,15 @@ impl SimWorld {
         };
         let sender = *self.by_connection.get(connection)?;
         let player = self.world.get::<Player>(sender)?;
+        // The live check of the GM commands: a line that looks like one, and who sent it.
+        if line.trim_start().starts_with(GM_COMMAND_PREFIX) {
+            tracing::debug!(
+                entity = player.number,
+                game_master = player.game_master,
+                %line,
+                "chat line with the GM command prefix"
+            );
+        }
         if !player.game_master {
             return None;
         }
