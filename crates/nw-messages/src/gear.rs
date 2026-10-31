@@ -171,14 +171,22 @@ pub fn record(item: &GearItem, sync_reason: u8, container_slot: Option<u16>) -> 
     }
 }
 
-/// The records of `items` as container slots (one per slot, empty ones included), each sent
-/// for `sync_reason`.
-fn container_records(items: &[Option<GearItem>], sync_reason: u8) -> Vec<ItemRecord> {
+/// The records of the second container `open` (one per slot, empty ones included): each item
+/// sent for its sync reason, with its slot unless the view is seen from afar, and each empty
+/// slot as [`OpenContainer::empty_reason`] says.
+fn container_records(open: &OpenContainer) -> Vec<ItemRecord> {
     (0_u16..)
-        .zip(items)
+        .zip(&open.items)
         .map(|(container_slot, item)| match item {
-            Some(item) => record(item, sync_reason, Some(container_slot)),
-            None => ItemRecord::EMPTY_SLOT,
+            Some(item) => record(
+                item,
+                open.sync_reason,
+                open.slots_listed.then_some(container_slot),
+            ),
+            None => ItemRecord {
+                sync_reason: open.empty_reason,
+                ..ItemRecord::EMPTY_SLOT
+            },
         })
         .collect()
 }
@@ -187,15 +195,15 @@ fn container_records(items: &[Option<GearItem>], sync_reason: u8) -> Vec<ItemRec
 fn bag_records(bag: &[Option<GearItem>], reasons: &[u8]) -> Vec<ItemRecord> {
     (0_u16..)
         .zip(bag)
-        .map(|(container_slot, item)| match item {
-            Some(item) => {
-                let reason = reasons
-                    .get(usize::from(container_slot))
-                    .copied()
-                    .unwrap_or(SYNC_MOVED_IN);
-                record(item, reason, Some(container_slot))
+        .map(|(container_slot, item)| {
+            let reason = reasons.get(usize::from(container_slot)).copied();
+            match item {
+                Some(item) => record(item, reason.unwrap_or(SYNC_MOVED_IN), Some(container_slot)),
+                None => ItemRecord {
+                    sync_reason: reason.unwrap_or(SYNC_LOGIN),
+                    ..ItemRecord::EMPTY_SLOT
+                },
             }
-            None => ItemRecord::EMPTY_SLOT,
         })
         .collect()
 }
@@ -216,6 +224,14 @@ pub struct OpenContainer {
     /// `Container Was Emptied`: retail true for an opened storage without items, false for a
     /// closed one (open-world `storage_open_deposit_withdraw_transfer`, `item_actions`).
     pub was_emptied: bool,
+    /// Whether each item's record carries its container slot. Retail
+    /// `storage_open_deposit_withdraw_transfer`: yes for a storage the player stands at (19.6 s,
+    /// slot 0 after the first deposit), no for a storage seen from afar (92.5 s, after 1512).
+    pub slots_listed: bool,
+    /// The sync reason of an empty slot's record. Retail, same capture: 6 for a storage the
+    /// player stands at (28.4 s, the slot a take emptied), 47 for a storage seen from afar
+    /// (88.3 s, the two empty slots of an empty storage).
+    pub empty_reason: u8,
 }
 
 /// What the gear states show besides the worn items, the bag and the hands.
@@ -231,8 +247,9 @@ pub struct GearExtras {
     /// The container in the second container, when one was opened.
     pub open_container: Option<OpenContainer>,
     /// The sync reason of each bag slot's record: the reason of its last change (a craft's
-    /// [`crate::items::SYNC_CRAFT_USED`] or [`crate::items::SYNC_CRAFTED`]); a slot past its end
-    /// is an item moved in.
+    /// [`crate::items::SYNC_CRAFT_USED`] or [`crate::items::SYNC_CRAFTED`]), for an empty slot
+    /// the reason it was emptied with (retail: a craft's 2, a salvage's 24); a slot past its end
+    /// is an item moved in, or an empty slot of [`SYNC_LOGIN`].
     pub bag_reasons: Vec<u8>,
 }
 
@@ -451,10 +468,7 @@ impl PlayerGear {
             .collect();
         let second_container = match &extras.open_container {
             Some(open) => ContainerState {
-                items: Some(list(
-                    version,
-                    container_records(&open.items, open.sync_reason),
-                )),
+                items: Some(list(version, container_records(open))),
                 bonus_max_encumbrance: Some(0),
                 can_transfer: Some(open.can_transfer),
                 was_emptied: Some(open.was_emptied),
@@ -757,6 +771,54 @@ pub(crate) mod tests {
         let mut reader = Reader::new(&bytes);
         assert_eq!(PaperdollState::read(&mut reader), Ok(gear.paperdoll));
         assert!(reader.is_empty());
+    }
+
+    #[test]
+    fn a_storage_seen_from_afar_sends_no_slots_as_retail() {
+        /// Retail `storage_open_deposit_withdraw_transfer` sync reasons: a storage the player
+        /// stands at (6) and one seen from afar after 1512 (47).
+        const NEAR: u8 = 6;
+        const AFAR: u8 = 47;
+        const STORED_INDEX: u32 = 5102;
+        const VERSION: u64 = 1737;
+        let view = |sync_reason, slots_listed| GearExtras {
+            open_container: Some(OpenContainer {
+                items: vec![Some(item(STORED_INDEX, 0, 0)), None],
+                sync_reason,
+                can_transfer: true,
+                was_emptied: false,
+                slots_listed,
+                empty_reason: sync_reason,
+            }),
+            ..GearExtras::default()
+        };
+        let records = |extras: &GearExtras| {
+            let gear = PlayerGear::with_extras(&[], &[], VERSION, Hands::default(), extras);
+            full(gear.second_container.items.as_ref()).to_vec()
+        };
+        let near = records(&view(NEAR, true));
+        assert_eq!(
+            (near[0].container_slot, near[0].sync_reason),
+            (Some(0), NEAR)
+        );
+        assert_eq!((near[1].container_slot, near[1].sync_reason), (None, NEAR));
+        let afar = records(&view(AFAR, false));
+        assert_eq!(
+            (
+                afar[0].container_slot,
+                afar[0].sync_reason,
+                afar[0].item_index
+            ),
+            (None, AFAR, STORED_INDEX)
+        );
+        assert_eq!(
+            (
+                afar[1].container_slot,
+                afar[1].sync_reason,
+                afar[1].quantity
+            ),
+            (None, AFAR, 0)
+        );
     }
 
     #[test]

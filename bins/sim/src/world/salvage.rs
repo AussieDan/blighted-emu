@@ -9,6 +9,8 @@
 //!
 //! Retail answers with no message of its own: the bag's changes (the item gone, the items
 //! gained) and the wallet's (ledgers `Playthrough_Part_03`, `MSQ6-lv28`, `20261008-145727-200`).
+//! The salvaged stack's record, or its emptied slot's, carries [`SYNC_SALVAGED`]; the items
+//! gained carry [`SYNC_SALVAGE_GEAR`] for an item with durability, else [`SYNC_SALVAGE_OPENED`].
 //! The client sends no count with 6188; each slot's whole stack goes (Inferred: the 13 retail
 //! slots held one item each).
 
@@ -17,6 +19,7 @@ use std::sync::Arc;
 use bevy_ecs::entity::Entity;
 use nw_content::perks::rarity;
 use nw_content::salvage::SalvageSource;
+use nw_messages::items::{SYNC_SALVAGE_GEAR, SYNC_SALVAGE_OPENED, SYNC_SALVAGED};
 use nw_messages::wire::RAW_ID_LEN;
 
 use super::loot_bag::LimitsSent;
@@ -134,7 +137,7 @@ impl SimWorld {
         now_ms: u64,
     ) -> Result<(), SalvageRefusal> {
         let content = Arc::clone(&self.content);
-        let (item_id, gear_score, quantity) = {
+        let (item_id, gear_score, quantity, gained_reason) = {
             let mut player = self
                 .world
                 .get_mut::<Player>(entity)
@@ -154,13 +157,18 @@ impl SimWorld {
             }
             let quantity = target.quantity.unwrap_or(item.quantity);
             let (item_id, gear_score) = (item_id.to_owned(), item.gear_score);
+            let gained_reason = if item.max_durability > 0 {
+                SYNC_SALVAGE_GEAR
+            } else {
+                SYNC_SALVAGE_OPENED
+            };
             if content.salvage.of(&item_id).is_none() {
                 return Err(SalvageRefusal::NotSalvageable);
             }
-            if !gear.take_from_slot(target.bag_slot, quantity) {
+            if !gear.take_from_slot_as(target.bag_slot, quantity, SYNC_SALVAGED) {
                 return Err(SalvageRefusal::Quantity);
             }
-            (item_id, gear_score, quantity)
+            (item_id, gear_score, quantity, gained_reason)
         };
         let Some(rule) = content.salvage.of(&item_id) else {
             return Err(SalvageRefusal::NotSalvageable);
@@ -186,7 +194,7 @@ impl SimWorld {
         }
         self.send_loot_limits(number, LimitsSent::Changed);
         tracing::debug!(player = number, item = %item_id, quantity, ?items, "salvaged");
-        self.give_loot(number, items, now_ms);
+        self.give_loot_as(number, items, gained_reason, now_ms);
         if let Some(event) = &rule.event {
             self.grant_event(number, event, quantity);
         }
@@ -321,6 +329,20 @@ mod tests {
         world.salvage(entity, number, &[target], NOW);
         assert_eq!(count(&world, CHEST), 0, "salvaged");
         assert_eq!(count(&world, INGOT), 2, "a fifth of the recipe's 5 ingots");
+        // Retail `20261008-145727-200` 1622.944 s: the salvaged gear's slot went out empty with
+        // 24, the resources it gave with 33.
+        let reasons = {
+            let player = world.world.get::<Player>(entity).expect("player");
+            let gear = player.gear.as_ref().expect("gear");
+            let ingot = slot_of(gear, INGOT).expect("ingot slot");
+            let Some(nw_messages::list_delta::ReplicatedList::Full(bag)) = gear.states().bag.items
+            else {
+                panic!("a full bag list");
+            };
+            let reason = |slot: u32| bag.elements[usize::try_from(slot).expect("slot")].sync_reason;
+            (reason(slot), reason(ingot))
+        };
+        assert_eq!(reasons, (SYNC_SALVAGED, SYNC_SALVAGE_GEAR));
         let ingot_slot = {
             let player = world.world.get::<Player>(entity).expect("player");
             assert_eq!(player.coins, coins_before + COINS);

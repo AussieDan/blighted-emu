@@ -750,7 +750,9 @@ impl SimWorld {
     }
 
     /// Takes the stacks `taken` out of the bag of player `entity` and `fee` coins out of its
-    /// wallet; refused (nothing taken) when the bag or the wallet no longer holds them.
+    /// wallet; refused (nothing taken) when the bag or the wallet no longer holds them. The
+    /// stacks taken count for no item change: retail sends one 7048 per item a craft makes
+    /// ([`super::storage_search`]).
     fn take_stacks(
         &mut self,
         entity: Entity,
@@ -782,6 +784,9 @@ impl SimWorld {
         for (item, quantity, _) in taken {
             gear.take_as(item, *quantity, SYNC_CRAFT_USED);
         }
+        let (carried, stored) = (gear.carried(), gear.stored_stacks());
+        let used: Vec<&str> = needed.iter().map(|(item, _)| *item).collect();
+        player.item_changes.absorb(&used, &carried, &stored);
         if fee > 0 {
             player.coins -= u64::from(fee);
             player.coins_changed = true;
@@ -1484,6 +1489,92 @@ mod tests {
         };
         assert_eq!(reason_of(ORE), Some(SYNC_CRAFT_USED), "the ore left");
         assert_eq!(reason_of(INGOT), Some(SYNC_CRAFTED), "the ingot made");
+    }
+
+    #[test]
+    fn a_craft_that_uses_up_a_stack_empties_its_slot_as_used() {
+        // Retail `Refining` 98.832 s and `Craft-Gypsum-Orbs` 16.524 s: the slot of the stack a
+        // craft used up went out empty with sync reason 2.
+        use nw_messages::items::SYNC_CRAFT_USED;
+        use nw_messages::list_delta::ReplicatedList;
+        let (mut world, entity) = at_the_smelter(ORE_PER_CRAFT, COINS);
+        let ingot = world.content.kits.item(INGOT).cloned().expect("ingot");
+        let ore_slot = {
+            let mut player = world.world.get_mut::<Player>(entity).expect("player");
+            let gear = player.gear.as_mut().expect("gear");
+            // The ingot made joins this stack, as retail's outputs joined theirs.
+            assert!(gear.add(&ingot, 1));
+            let slots = u32::try_from(nw_messages::STARTER_BAG_SLOTS).expect("slots");
+            (0..slots)
+                .find(|slot| gear.bag_item(*slot).is_some_and(|(id, _)| id == ORE))
+                .expect("the ore's slot")
+        };
+        world.craft(
+            entity,
+            NUMBER,
+            lowercase_crc32(INGOT),
+            1,
+            FEE_PER_CRAFT,
+            &[],
+            &CraftChoice::default(),
+            NOW,
+        );
+        world.crafts_due(NOW + CRAFT_MS);
+        let gear = world
+            .world
+            .get::<Player>(entity)
+            .and_then(|player| player.gear.as_ref())
+            .expect("gear")
+            .states();
+        let Some(ReplicatedList::Full(bag)) = gear.bag.items else {
+            panic!("a full bag list");
+        };
+        let emptied = bag.elements[usize::try_from(ore_slot).expect("slot")];
+        assert_eq!(emptied.quantity, 0, "the ore is gone");
+        assert_eq!(emptied.sync_reason, SYNC_CRAFT_USED);
+    }
+
+    #[test]
+    fn a_craft_sends_one_item_change_per_item_made_with_the_last_search() {
+        // Retail `Refining` 14.899 s and 15.962 s: a craft that used one item and made another
+        // sent one 7048, with the search of 11.583 s and its 21 results (44 of 44 crafts of one
+        // output kind alike, module notes of `storage_search`).
+        use super::super::OWN_CARD_DELAY_MS;
+        use super::super::storage_search::SearchFor;
+        const SEARCH: [u8; RAW_ID_LEN] = [5; RAW_ID_LEN];
+        let (mut world, entity) = at_the_smelter(ORE_PER_CRAFT, COINS);
+        let card_at = NOW + OWN_CARD_DELAY_MS;
+        world.tick(card_at, card_at).expect("the first card");
+        world
+            .world
+            .get_mut::<super::super::attack::Vitals>(entity)
+            .expect("vitals")
+            .spawned = true;
+        world.take_messages();
+        world.search_storage(entity, NUMBER, SEARCH, SearchFor::Unknown, false, card_at);
+        world.craft(
+            entity,
+            NUMBER,
+            lowercase_crc32(INGOT),
+            1,
+            FEE_PER_CRAFT,
+            &[],
+            &CraftChoice::default(),
+            card_at,
+        );
+        world.take_messages();
+        let due = card_at + CRAFT_MS;
+        let sent = world.tick(due, due).expect("tick").messages;
+        let changes: Vec<_> = messages_for(&sent, &connection(NUMBER))
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerMessage::StorageSearchItems(items) => Some(items),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(changes.len(), 1, "the ingot; the ore used counts for none");
+        assert_eq!(changes[0].search, SEARCH, "the last search goes with it");
+        assert_eq!(changes[0].total, 0, "its result count");
     }
 
     #[test]

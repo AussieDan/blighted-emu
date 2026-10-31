@@ -8,7 +8,11 @@
 //! `RequestCompleteObjective`); 2 after the take-all of a loot bag (2939) and 3 after the end of
 //! a chest's use (3746). Inferred: one per item whose stacks changed. Which items the two loot
 //! cases changed is not in the decoded members, so whether their counts follow that rule is
-//! Unknown.
+//! Unknown. The storage chests count apart: retail `storage_open_deposit_withdraw_transfer`
+//! sent 2 after each of its 7 deposits (2801) and 5 takes (2942) of one stack, the item's
+//! change in the bag and in the storage. Retail also sent 1 to 3 after each of its 7 storage
+//! views from afar (1512), which move no item, and 2 at the chest's open; what those count is
+//! Unknown and this server sends none for them.
 //!
 //! **Searches (run-15 items2 study, retail MSQ16).** A new search (7044, `refresh` 0) is
 //! answered with 7046: every item of the player's storage chests that an ingredient of a
@@ -20,11 +24,23 @@
 //! 7044 at once, as retail did in the other 4). When the storages' totals of listed items change,
 //! a 7048 with the search id lists those results' indexes and new totals and the count of the
 //! results (retail 4 to 10 s after the change; this server sends it with the change).
+//!
+//! **The last search goes with every item change (retail crafting ledgers).** From a player's
+//! first search on, each item-change 7048 carries its last search id and that search's result
+//! count, also after the station closed: `Refining` 15.962 s (search of 11.583 s, 21 results),
+//! `refining_all_stations_single_batch_territorylvlup` 159.490 s (3, 33 s after the close) and
+//! 224.075 s (a salvage), `Hive_Dye` 233.387 s; before the first search, none (the same ledgers
+//! at login). A change of the search's stored totals goes in the same message, not one more:
+//! `Craft-Gypsum-Orbs` 54.233 s and `Refining` 98.805 s sent one 7048 that listed the changed
+//! result. Which of several 7048s lists them is Unknown (no retail sample); this server lists
+//! them in the first. **A craft counts the items it made** ([`ItemChanges::absorb`]): one 7048
+//! per craft in 44 of 44 retail crafts of one output kind (seven ledgers), though each changed
+//! the ingredient too; `Refining` 77.255 s sent 2 for a craft that also gave a bonus item of
+//! another kind.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bevy_ecs::component::Component;
 use bevy_ecs::entity::Entity;
 use nw_bus::{CarriedItem, ItemPlace};
 use nw_formats::objectstream::lowercase_crc32;
@@ -38,37 +54,127 @@ use nw_messages::{
 
 use super::{Player, SimWorld, send_now};
 
-/// The last byte of a 7048 (0 in every retail body).
-const SEARCH_ITEMS_LAST: u8 = 0;
 /// The station of a search that names none (the housing and dye screens).
 const NO_STATION: u32 = 0;
 
 /// The stacks of one item: each place and quantity, in order.
 type Stacks = Vec<(ItemPlace, u32)>;
+/// A stored stack: its item id, storage chest, slot there and quantity.
+pub(super) type StoredStack = (String, [u8; RAW_ID_LEN], usize, u32);
+/// The stored stacks of one item: each storage chest, slot and quantity, in order.
+type StoredStacks = Vec<([u8; RAW_ID_LEN], usize, u32)>;
 
-/// The items a player held at its last change.
+/// The items a player held at its last change, and its last storage search.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct ItemChanges {
     held: BTreeMap<String, Stacks>,
+    /// The stored stacks; `None` before the first call.
+    stored: Option<BTreeMap<String, StoredStacks>>,
+    /// The player's last storage search; `None` before its first.
+    search: Option<StorageSearch>,
+}
+
+/// How many items differ between `before` and `after`: an item counts once when it came, went
+/// or its stacks changed.
+fn changed_items<V: PartialEq>(before: &BTreeMap<String, V>, after: &BTreeMap<String, V>) -> usize {
+    after
+        .iter()
+        .filter(|(item, stacks)| before.get(*item) != Some(*stacks))
+        .count()
+        + before
+            .keys()
+            .filter(|item| !after.contains_key(*item))
+            .count()
 }
 
 impl ItemChanges {
-    /// How many items changed from the last call to `carried`: an item counts once when it
-    /// came, went, moved or changed quantity. The first call counts every item.
-    pub(super) fn changes(&mut self, carried: &[CarriedItem]) -> usize {
+    /// How many items changed from the last call to `carried` and `stored`: an item counts once
+    /// for its carried stacks and once for its stored stacks when they came, went, moved or
+    /// changed quantity. The first call counts every carried item and no stored one (Inferred:
+    /// the retail new character's 5 at its first card were its 5 worn items, with no storage).
+    pub(super) fn changes(&mut self, carried: &[CarriedItem], stored: &[StoredStack]) -> usize {
         let held = stacks_by_item(carried);
-        let changed = held
-            .iter()
-            .filter(|(item, stacks)| self.held.get(*item) != Some(*stacks))
-            .count()
+        let kept = stored_by_item(stored);
+        let changed = changed_items(&self.held, &held)
             + self
-                .held
-                .keys()
-                .filter(|item| !held.contains_key(*item))
-                .count();
+                .stored
+                .as_ref()
+                .map_or(0, |before| changed_items(before, &kept));
         self.held = held;
+        self.stored = Some(kept);
         changed
     }
+
+    /// The 7048s of a change of the items of the player of entity number `number` to `carried`
+    /// and `stored`, whose stored totals by item id are `totals`: one per changed item
+    /// ([`ItemChanges::changes`]), each with the last search's id and result count; the first
+    /// lists the search's results whose totals changed (module notes).
+    pub(super) fn messages(
+        &mut self,
+        number: u64,
+        carried: &[CarriedItem],
+        stored: &[StoredStack],
+        totals: &BTreeMap<String, u32>,
+    ) -> Vec<ServerMessage> {
+        let count = self.changes(carried, stored);
+        if count == 0 {
+            return Vec::new();
+        }
+        let blank = StorageSearchItemsMsg::item_change(number);
+        let Some(search) = self.search.as_mut() else {
+            return vec![ServerMessage::StorageSearchItems(blank); count];
+        };
+        let mut items = search.changes(totals);
+        let total = u32::try_from(search.results.len()).unwrap_or(u32::MAX);
+        (0..count)
+            .map(|_| {
+                ServerMessage::StorageSearchItems(StorageSearchItemsMsg {
+                    search: search.search,
+                    items: std::mem::take(&mut items),
+                    total,
+                    ..blank.clone()
+                })
+            })
+            .collect()
+    }
+
+    /// Takes the stacks of the items `item_ids` in `carried` and `stored` as known: a change of
+    /// them so far counts for no 7048 (a craft's used ingredients, module notes).
+    pub(super) fn absorb(
+        &mut self,
+        item_ids: &[&str],
+        carried: &[CarriedItem],
+        stored: &[StoredStack],
+    ) {
+        let mut held = stacks_by_item(carried);
+        let mut kept = stored_by_item(stored);
+        for item_id in item_ids {
+            match held.remove(*item_id) {
+                Some(stacks) => self.held.insert((*item_id).to_owned(), stacks),
+                None => self.held.remove(*item_id),
+            };
+            if let Some(known) = self.stored.as_mut() {
+                match kept.remove(*item_id) {
+                    Some(stacks) => known.insert((*item_id).to_owned(), stacks),
+                    None => known.remove(*item_id),
+                };
+            }
+        }
+    }
+}
+
+/// The stored stacks of `stored` by item id, each item's stacks in storage and slot order.
+fn stored_by_item(stored: &[StoredStack]) -> BTreeMap<String, StoredStacks> {
+    let mut kept: BTreeMap<String, StoredStacks> = BTreeMap::new();
+    for (item_id, storage, slot, quantity) in stored {
+        kept.entry(item_id.clone())
+            .or_default()
+            .push((*storage, *slot, *quantity));
+    }
+    for stacks in kept.values_mut() {
+        stacks.sort_unstable();
+    }
+    kept
 }
 
 /// The stacks of `carried` by item id, each item's stacks in place order.
@@ -120,7 +226,7 @@ impl SearchFor {
 }
 
 /// A player's last storage search: its id and the results last sent (item id and total).
-#[derive(Component, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct StorageSearch {
     search: [u8; RAW_ID_LEN],
     results: Vec<(String, u32)>,
@@ -187,16 +293,17 @@ impl SimWorld {
         now_ms: u64,
     ) {
         let content = Arc::clone(&self.content);
-        let answered = self
-            .world
-            .get::<StorageSearch>(entity)
+        let Some(mut player) = self.world.get_mut::<Player>(entity) else {
+            return;
+        };
+        let answered = player
+            .item_changes
+            .search
+            .as_ref()
             .is_some_and(|last| last.search == search && last.answered_ms == Some(now_ms));
         if refresh && answered {
             return;
         }
-        let Some(player) = self.world.get::<Player>(entity) else {
-            return;
-        };
         let connection = player.connection.clone();
         let totals = player
             .gear
@@ -224,7 +331,7 @@ impl SimWorld {
             search,
             items: state.items(),
         });
-        self.world.entity_mut(entity).insert(state);
+        player.item_changes.search = Some(state);
         send_now(&mut self.combat_messages, &connection, &[answer]);
     }
 
@@ -232,7 +339,10 @@ impl SimWorld {
     /// the ready note (7047) goes first, then the results (7046), as retail sent them in
     /// 3 of 7 searches.
     pub(super) fn replicate_search(&mut self, entity: Entity, number: u64) {
-        let Some(last) = self.world.get::<StorageSearch>(entity) else {
+        let Some(player) = self.world.get::<Player>(entity) else {
+            return;
+        };
+        let Some(last) = player.item_changes.search.as_ref() else {
             return;
         };
         let ready = ServerMessage::StorageSearchReady(StorageSearchReadyMsg {
@@ -245,38 +355,8 @@ impl SimWorld {
             search: last.search,
             items: last.items(),
         });
-        let Some(player) = self.world.get::<Player>(entity) else {
-            return;
-        };
         let connection = player.connection.clone();
         send_now(&mut self.combat_messages, &connection, &[ready, answer]);
-    }
-
-    /// After an item call of player `number` (`entity`): when its storages' totals of the
-    /// results of its last search changed, the 7048 of those results.
-    pub(super) fn search_results_changed(&mut self, entity: Entity, number: u64) {
-        let Some(player) = self.world.get::<Player>(entity) else {
-            return;
-        };
-        let connection = player.connection.clone();
-        let Some(totals) = player.gear.as_ref().map(super::gear::Gear::stored_totals) else {
-            return;
-        };
-        let Some(mut last) = self.world.get_mut::<StorageSearch>(entity) else {
-            return;
-        };
-        let items = last.changes(&totals);
-        if items.is_empty() {
-            return;
-        }
-        let message = ServerMessage::StorageSearchItems(StorageSearchItemsMsg {
-            header: global_storage_header(number),
-            search: last.search,
-            items,
-            total: u32::try_from(last.results.len()).unwrap_or(u32::MAX),
-            last: SEARCH_ITEMS_LAST,
-        });
-        send_now(&mut self.combat_messages, &connection, &[message]);
     }
 }
 
@@ -354,41 +434,158 @@ mod tests {
             item(SWORD, 1, ItemPlace::Worn(MAIN_HAND)),
             item(CHEST, 1, ItemPlace::Worn(CHEST_SLOT)),
         ];
-        assert_eq!(changes.changes(&worn), 2);
-        assert_eq!(changes.changes(&worn), 0, "nothing changed");
+        assert_eq!(changes.changes(&worn, &[]), 2);
+        assert_eq!(changes.changes(&worn, &[]), 0, "nothing changed");
     }
 
     #[test]
     fn a_move_a_gain_a_quantity_and_a_removal_count_once_each() {
         let mut changes = ItemChanges::default();
-        changes.changes(&[
-            item(SWORD, 1, ItemPlace::Bag(0)),
-            item(POTION, 1, ItemPlace::Bag(1)),
-        ]);
-        assert_eq!(
-            changes.changes(&[
-                item(SWORD, 1, ItemPlace::Worn(MAIN_HAND)),
+        changes.changes(
+            &[
+                item(SWORD, 1, ItemPlace::Bag(0)),
                 item(POTION, 1, ItemPlace::Bag(1)),
-            ]),
+            ],
+            &[],
+        );
+        assert_eq!(
+            changes.changes(
+                &[
+                    item(SWORD, 1, ItemPlace::Worn(MAIN_HAND)),
+                    item(POTION, 1, ItemPlace::Bag(1)),
+                ],
+                &[]
+            ),
             1,
             "an equip moves one item"
         );
         assert_eq!(
-            changes.changes(&[
-                item(SWORD, 1, ItemPlace::Worn(MAIN_HAND)),
-                item(POTION, 2, ItemPlace::Bag(1)),
-                item(CHEST, 1, ItemPlace::Bag(2)),
-            ]),
+            changes.changes(
+                &[
+                    item(SWORD, 1, ItemPlace::Worn(MAIN_HAND)),
+                    item(POTION, 2, ItemPlace::Bag(1)),
+                    item(CHEST, 1, ItemPlace::Bag(2)),
+                ],
+                &[]
+            ),
             2,
             "a new quantity and a new item"
         );
         assert_eq!(
-            changes.changes(&[
-                item(POTION, 2, ItemPlace::Bag(1)),
-                item(CHEST, 1, ItemPlace::Bag(2)),
-            ]),
+            changes.changes(
+                &[
+                    item(POTION, 2, ItemPlace::Bag(1)),
+                    item(CHEST, 1, ItemPlace::Bag(2)),
+                ],
+                &[]
+            ),
             1,
             "a removal"
+        );
+    }
+
+    /// The 7048s of `sent`.
+    fn search_items(sent: &[ServerMessage]) -> Vec<&StorageSearchItemsMsg> {
+        sent.iter()
+            .filter_map(|message| match message {
+                ServerMessage::StorageSearchItems(items) => Some(items),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn every_item_change_carries_the_last_search_and_the_first_its_changed_results() {
+        // Retail `refining_all_stations_single_batch_territorylvlup`: none before the first
+        // search (0.472 s), the search after its station closed (159.490 s);
+        // `Craft-Gypsum-Orbs` 54.233 s: the changed result in the change's own 7048.
+        const NUMBER: u64 = 1;
+        const INGOT: &str = "IngotT2";
+        const ORE: &str = "OreT1";
+        const SEARCH: [u8; RAW_ID_LEN] = [7; RAW_ID_LEN];
+        const STORAGE: [u8; RAW_ID_LEN] = [3; RAW_ID_LEN];
+        let mut changes = ItemChanges::default();
+        let sent = changes.messages(
+            NUMBER,
+            &[item(POTION, 1, ItemPlace::Bag(0))],
+            &[],
+            &BTreeMap::new(),
+        );
+        assert_eq!(
+            search_items(&sent),
+            [&StorageSearchItemsMsg::item_change(NUMBER)],
+            "no search yet"
+        );
+        changes.search = Some(StorageSearch {
+            search: SEARCH,
+            results: vec![(INGOT.to_owned(), 12), (ORE.to_owned(), 40)],
+            answered_ms: None,
+        });
+        let sent = changes.messages(
+            NUMBER,
+            &[item(POTION, 2, ItemPlace::Bag(0))],
+            &[(ORE.to_owned(), STORAGE, 0, 39)],
+            &BTreeMap::from([(ORE.to_owned(), 39)]),
+        );
+        let sent = search_items(&sent);
+        assert_eq!(sent.len(), 2, "the potion and the stored ore");
+        assert!(
+            sent.iter()
+                .all(|items| items.search == SEARCH && items.total == 2)
+        );
+        assert_eq!(
+            sent[0]
+                .items
+                .iter()
+                .map(|changed| (changed.index, changed.item.quantity))
+                .collect::<Vec<_>>(),
+            [(0, 0), (1, 39)]
+        );
+        assert!(sent[1].items.is_empty(), "listed once");
+    }
+
+    #[test]
+    fn an_absorbed_change_counts_for_no_item_change() {
+        let mut changes = ItemChanges::default();
+        changes.changes(&[item(POTION, 3, ItemPlace::Bag(0))], &[]);
+        let after = [
+            item(POTION, 1, ItemPlace::Bag(0)),
+            item(SWORD, 1, ItemPlace::Bag(1)),
+        ];
+        changes.absorb(&[POTION], &after, &[]);
+        assert_eq!(changes.changes(&after, &[]), 1, "the sword only");
+    }
+
+    #[test]
+    fn a_deposit_and_a_take_count_twice_as_retail() {
+        const FLINT: &str = "FlintT1";
+        const STORAGE: [u8; RAW_ID_LEN] = [3; RAW_ID_LEN];
+        const STORED: [u8; RAW_ID_LEN] = [4; RAW_ID_LEN];
+        let mut changes = ItemChanges::default();
+        let bag = [item(FLINT, 5, ItemPlace::Bag(0))];
+        assert_eq!(
+            changes.changes(&bag, &[(FLINT.to_owned(), STORED, 0, 7)]),
+            1,
+            "the first call counts no stored item"
+        );
+        assert_eq!(
+            changes.changes(
+                &[],
+                &[
+                    (FLINT.to_owned(), STORED, 0, 7),
+                    (FLINT.to_owned(), STORAGE, 0, 5)
+                ]
+            ),
+            2
+        );
+        assert_eq!(
+            changes.changes(&bag, &[(FLINT.to_owned(), STORED, 0, 7)]),
+            2
+        );
+        assert_eq!(
+            changes.changes(&bag, &[(FLINT.to_owned(), STORED, 0, 7)]),
+            0,
+            "nothing moved"
         );
     }
 }

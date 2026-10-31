@@ -340,7 +340,6 @@ impl SimWorld {
             ),
             ItemCallMsg::ReplicateSearchResults { .. } => self.replicate_search(entity, number),
         }
-        self.search_results_changed(entity, number);
     }
 
     /// Runs `act` on the gear of player `entity` (and the player); `None` without gear.
@@ -1198,14 +1197,20 @@ mod tests {
                     quantity: FLINTS,
                 }]
             );
-            let changed: Vec<&StorageSearchItemsMsg> = messages
+            let changes: Vec<&StorageSearchItemsMsg> = messages
                 .iter()
                 .filter_map(|message| match message {
-                    ServerMessage::StorageSearchItems(items) if items.search == SEARCH => {
-                        Some(items)
-                    }
+                    ServerMessage::StorageSearchItems(items) => Some(items),
                     _ => None,
                 })
+                .collect();
+            assert!(
+                changes.iter().all(|items| items.search == SEARCH),
+                "every item change carries the last search"
+            );
+            let changed: Vec<_> = changes
+                .iter()
+                .filter(|items| !items.items.is_empty())
                 .collect();
             assert_eq!(changed.len(), 1);
             assert_eq!(changed[0].total, 1);

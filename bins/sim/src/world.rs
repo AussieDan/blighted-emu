@@ -44,10 +44,9 @@ use nw_messages::{
     GatheringInterruptedMsg, Hands, HealthChange, InputRecord, InteractionEndedMsg,
     InteractionRequest, InteractionValidatedMsg, LOGIN_CLIENT_CONTEXT, LevelSpec, LookDir,
     LookupRequest, MeleeHitMsg, MemberState, MessageError, PlayerLook, PlayerSeenByAiMsg,
-    PlayerStates, ProgressionState, SelectedAsTargetMsg, ServerMessage, ShownItem,
-    StorageSearchItemsMsg, TUTORIAL_LEVEL, TargetMsg, TeleportStep, TimeSynchMsg,
-    UnselectedAsTargetMsg, VitalsData, WorldPosition, facet_entity, put_looking_through_loadout,
-    put_member,
+    PlayerStates, ProgressionState, SelectedAsTargetMsg, ServerMessage, ShownItem, TUTORIAL_LEVEL,
+    TargetMsg, TeleportStep, TimeSynchMsg, UnselectedAsTargetMsg, VitalsData, WorldPosition,
+    facet_entity, put_looking_through_loadout, put_member,
 };
 use nw_sim_core::{
     CellBounds, CellGrid, CellOwners, Dice, Footing, Ground, GroundCheck, Health, Interest,
@@ -4697,24 +4696,28 @@ impl Neighbourhood<'_> {
                         gear.take_change()
                     }
                 });
-                // Retail sends one empty storage search (7048) per changed item before the
-                // bundle of the change ([`storage_search`]).
+                // Retail sends one storage search items (7048) per changed item before the
+                // bundle of the change, with the player's last search ([`storage_search`]).
                 let item_changes = match (&gear, &player.gear) {
                     (Some(_), Some(held)) => {
                         let carried = held.carried();
-                        player.item_changes.changes(&carried)
+                        let stored = held.stored_stacks();
+                        let totals = held.stored_totals();
+                        player
+                            .item_changes
+                            .messages(own, &carried, &stored, &totals)
                     }
-                    _ => 0,
+                    _ => Vec::new(),
                 };
-                if item_changes > 0 {
-                    let change =
-                        ServerMessage::StorageSearchItems(StorageSearchItemsMsg::item_change(own))
-                            .envelope()?;
+                if !item_changes.is_empty() {
                     outgoing.push(Outgoing {
                         connection: player.connection.clone(),
                         channel: MESSAGE_CHANNEL,
                         reliable: true,
-                        envelopes: vec![change; item_changes],
+                        envelopes: item_changes
+                            .iter()
+                            .map(ServerMessage::envelope)
+                            .collect::<Result<_, _>>()?,
                     });
                 }
                 // The quest tracker: the whole quest with the first card, then its changes.

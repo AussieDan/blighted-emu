@@ -39,6 +39,18 @@ pub const SYNC_CRAFT_USED: u8 = 2;
 /// 2 light rations). With another reason the live client said "Crafting attempt failed" after
 /// each good craft and cancelled it (2026-10-29 play test).
 pub const SYNC_CRAFTED: u8 = 3;
+/// Sync reason of the bag stack a salvage took from, or of its emptied slot (retail
+/// `MSQ6-lv28` 888.480 s, `Playthrough_Part_03` 218.774 s, `20261008-145727-200` 699.612 s: 20 of
+/// 20 salvages).
+pub const SYNC_SALVAGED: u8 = 24;
+/// Sync reason of the bag stacks a salvage of an item without durability gave: a loot
+/// container's (retail `refining_all_stations_single_batch_territorylvlup` 224.081 s and
+/// 226.932 s, the reward containers crafted at 94.596 s and 99.997 s; `Playthrough_Part_03`
+/// 218.774 s, a `ConcealedVaultLVL30`; `20261008-145727-200` 1625.280 s and 1635.714 s).
+pub const SYNC_SALVAGE_OPENED: u8 = 26;
+/// Sync reason of the bag stacks a salvage of an item with durability gave (retail
+/// `20261008-145727-200` 1622.944 s: a gear item of durability 1500 and gear score 350).
+pub const SYNC_SALVAGE_GEAR: u8 = 33;
 /// Item flags bit 0: bound to the character.
 pub const ITEM_BOUND: u8 = 0x01;
 /// Item flags bit 1: locked by its owner (retail 2549 set it and cleared it: flags 1 to 3 and

@@ -26,7 +26,7 @@ use nw_db::{AccountSkins, DbError};
 use nw_messages::inventories::{
     ITEM_TYPE_INSTANCE, ITEM_TYPE_SKIN, REGIONALITY_GLOBAL, REGIONALITY_PERSONAL,
 };
-use nw_messages::items::DYE_BYTES;
+use nw_messages::items::{DYE_BYTES, SYNC_CRAFT_USED};
 use nw_messages::wire::RAW_ID_LEN;
 use nw_messages::{
     DyeEntry, FacetHeader, INVENTORIES, InventoriesMsg, InventoryKey, ItemData, ItemLook,
@@ -653,8 +653,10 @@ impl SimWorld {
         if let Some(mut player) = self.world.get_mut::<Player>(entity)
             && let Some(gear) = player.gear.as_mut()
         {
+            // Retail `Hive_Dye` 232.245 s: the dye stacks and the slots they left empty went
+            // out with a craft's sync reason.
             for (bag_slot, quantity) in takes {
-                gear.take_from_slot(bag_slot, quantity);
+                gear.take_from_slot_as(bag_slot, quantity, SYNC_CRAFT_USED);
             }
         }
         let mut messages = Vec::new();
@@ -913,6 +915,20 @@ mod tests {
                     .map(|gear| gear.bag_count(FLINT))
             };
             assert_eq!(flints(&world), Some(FLINTS - 2));
+            let states = world
+                .world
+                .get::<Player>(entity)
+                .and_then(|player| player.gear.as_ref())
+                .map(crate::world::gear::Gear::states);
+            let Some(nw_messages::list_delta::ReplicatedList::Full(bag)) =
+                states.and_then(|states| states.bag.items)
+            else {
+                panic!("a full bag list");
+            };
+            assert_eq!(
+                bag.elements[0].sync_reason, SYNC_CRAFT_USED,
+                "retail Hive_Dye 232.245 s"
+            );
             // A store color and too few dyes change nothing.
             world.transmog_call(&connection(1), dye([9, 0, 0, 0]));
             world.transmog_call(&connection(1), dye([DYE_COLOR; DYE_BYTES]));

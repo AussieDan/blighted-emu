@@ -4,6 +4,8 @@
 //! takes the sword, fills the bag and equips from it (live-tutorial note, section 5). Outside the
 //! tutorial the items are saved (admin studio S5), and a login starts from the saved items.
 
+use std::collections::BTreeMap;
+
 use nw_bus::{CarriedItem, ItemPlace};
 use nw_content::starter::{EquipSlot, KitItem, StarterKits};
 use nw_messages::items::SYNC_MOVED;
@@ -160,6 +162,12 @@ pub(super) struct Gear {
     worn: Vec<(u32, Option<Stack>)>,
     /// One entry per bag slot.
     bag: Vec<Option<Stack>>,
+    /// The sync reason of the empty record of each bag slot that a change of its own reason
+    /// emptied ([`Gear::take_as`], [`Gear::take_from_slot_as`]); a slot forgets it when a
+    /// stack fills it. Retail: a craft's emptied slot 2 (`Refining` 98.832 s,
+    /// `Craft-Gypsum-Orbs` 16.524 s), a dye's 2 (`Hive_Dye` 232.245 s), a salvage's 24
+    /// (`MSQ6-lv28` 888.480 s); other empty slots carry [`SYNC_LOGIN`].
+    emptied: BTreeMap<usize, u8>,
     /// The version of the last states sent.
     version: u64,
     /// Whether the items changed since the states were sent.
@@ -207,6 +215,7 @@ impl Gear {
             character,
             worn: Vec::new(),
             bag: vec![None; STARTER_BAG_SLOTS],
+            emptied: BTreeMap::new(),
             version: FIRST_GEAR_VERSION,
             changed: false,
             unsaved: false,
@@ -252,6 +261,7 @@ impl Gear {
             character,
             worn: Vec::new(),
             bag: vec![None; STARTER_BAG_SLOTS],
+            emptied: BTreeMap::new(),
             version: FIRST_GEAR_VERSION,
             changed: false,
             unsaved: false,
@@ -815,7 +825,7 @@ impl Gear {
         }
         let stack = self.take_off(slot_id).ok_or(EquipRefusal::NotWorn)?;
         match wanted {
-            Some(index) => self.bag[index] = Some(stack),
+            Some(index) => self.fill_bag_slot(index, stack),
             None => {
                 self.put_in_bag(stack);
             }
@@ -884,7 +894,7 @@ impl Gear {
             return false;
         }
         let mut left = quantity;
-        for entry in &mut self.bag {
+        for (index, entry) in self.bag.iter_mut().enumerate() {
             if left == 0 {
                 break;
             }
@@ -900,6 +910,7 @@ impl Gear {
             left -= taken;
             if stack.item.quantity == 0 {
                 *entry = None;
+                self.emptied.insert(index, reason);
             }
         }
         self.changed = true;
@@ -916,10 +927,22 @@ impl Gear {
     /// Takes `quantity` of the stack in bag slot `bag_slot`, emptying the slot when the stack is
     /// used up; whether the slot held that many (it changes nothing when not).
     pub(super) fn take_from_slot(&mut self, bag_slot: u32, quantity: u32) -> bool {
-        let Some(entry) = usize::try_from(bag_slot)
-            .ok()
-            .and_then(|index| self.bag.get_mut(index))
-        else {
+        self.take_from_slot_marked(bag_slot, quantity, None)
+    }
+
+    /// [`Gear::take_from_slot`] for a change of sync reason `reason` (a dye's
+    /// [`nw_messages::items::SYNC_CRAFT_USED`], a salvage's): the stack's record, or the
+    /// emptied slot's, shows it.
+    pub(super) fn take_from_slot_as(&mut self, bag_slot: u32, quantity: u32, reason: u8) -> bool {
+        self.take_from_slot_marked(bag_slot, quantity, Some(reason))
+    }
+
+    /// [`Gear::take_from_slot`], marking the stack with `reason` when there is one.
+    fn take_from_slot_marked(&mut self, bag_slot: u32, quantity: u32, reason: Option<u8>) -> bool {
+        let Some(index) = usize::try_from(bag_slot).ok() else {
+            return false;
+        };
+        let Some(entry) = self.bag.get_mut(index) else {
             return false;
         };
         let Some(stack) = entry
@@ -929,8 +952,14 @@ impl Gear {
             return false;
         };
         stack.item.quantity -= quantity;
+        if let Some(reason) = reason {
+            stack.reason = reason;
+        }
         if stack.item.quantity == 0 {
             *entry = None;
+            if let Some(reason) = reason {
+                self.emptied.insert(index, reason);
+            }
         }
         self.changed = true;
         self.unsaved = true;
@@ -1060,7 +1089,7 @@ impl Gear {
             && let Some(taken_off) = self.take_off(slot_id)
         {
             if whole {
-                self.bag[bag_index] = Some(taken_off);
+                self.fill_bag_slot(bag_index, taken_off);
             } else {
                 self.put_in_bag(taken_off);
             }

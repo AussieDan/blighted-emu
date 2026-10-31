@@ -5,9 +5,9 @@
 //!
 //! Retail open world, `storage_open_deposit_withdraw_transfer` and `item_actions`: a storage
 //! chest the player uses and a bag of dropped items it opens show in its second container
-//! (component 76); a deposit (2801) empties the bag slot and fills the next storage slot with
-//! the same instance id, a take (2942) the other way; the close leaves one empty slot and no
-//! transfer. Retail newchar 2026-09-18: a worn item keeps its owned-items key, a new one takes the
+//! (component 76); a deposit (2801) empties the bag slot and fills the first free storage slot,
+//! a take (2942) the other way, each with a new counter and, for an item without durability, a
+//! new instance id ([`Gear::stored_move`]); the close leaves one empty slot and no transfer. Retail newchar 2026-09-18: a worn item keeps its owned-items key, a new one takes the
 //! lowest free key, and a loadout names its items by those keys.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,7 +16,7 @@ use nw_bus::{ItemLookState, ItemState, PlayerInventory, SavedLoadout, StoredItem
 use nw_content::item_rolls::RolledItem;
 use nw_content::starter::{KitItem, StarterKits};
 use nw_messages::item_calls::{LOCATION_BAG, LOCATIONS_BY_KEY, loadout_status};
-use nw_messages::items::SYNC_MOVED;
+use nw_messages::items::{SYNC_LOGIN, SYNC_MOVED};
 use nw_messages::paperdoll::Loadout;
 use nw_messages::wire::RAW_ID_LEN;
 use nw_messages::{GearExtras, GearItem, ItemLook, OpenContainer};
@@ -201,7 +201,7 @@ impl Gear {
     /// from the character and the item id, or from them and the first serial no stack holds.
     pub(super) fn new_stack(&mut self, item: &KitItem, quantity: u32) -> Stack {
         let mut new = stack(self.character, item, quantity);
-        new.item.instance = self.free_instance(&item.item_id);
+        new.item.instance = self.free_instance(&item.item_id, None);
         new.item.counter = self.holdings.next_counter;
         self.holdings.next_counter = self.holdings.next_counter.saturating_add(1);
         new
@@ -246,11 +246,35 @@ impl Gear {
     pub(super) fn own_instance(&mut self, mut moved: Stack) -> Stack {
         let instance = moved.item.instance;
         if self.stacks().any(|left| left.item.instance == instance) {
-            moved.item.instance = self.free_instance(&moved.item_id);
+            moved.item.instance = self.free_instance(&moved.item_id, None);
             moved.item.counter = self.holdings.next_counter;
             moved.key = None;
             self.holdings.next_counter = self.holdings.next_counter.saturating_add(1);
         }
+        moved
+    }
+
+    /// `moved`, a stack that goes between the bag and a storage chest (2801, 2942), as it
+    /// arrives: always the next item counter, and a new instance id unless it is an item with
+    /// durability whose id no other stack holds.
+    ///
+    /// Retail `storage_open_deposit_withdraw_transfer` (12 moves): each resource deposited
+    /// (19.6, 22.9, 39.7, 98.1 s) and each stack taken (28.3, 29.8, 94.7 s) arrived with a new
+    /// instance id and a new counter; the gear deposited at 25.5 s (durability 750) kept its
+    /// instance id, lock and perks, with a new counter (bag 100027, storage 90914). Retail
+    /// counts the counters of the bag and of the storages apart (100071 and up, 90912 and up);
+    /// where each count starts is Unknown, so this server takes them from its one counter.
+    /// Inferred: a stack with durability taken out of a storage keeps its id as a deposited one
+    /// did (no retail take of gear).
+    fn stored_move(&mut self, mut moved: Stack) -> Stack {
+        let old = moved.item.instance;
+        let shared = self.stacks().any(|left| left.item.instance == old);
+        if moved.item.max_durability == 0 || shared {
+            moved.item.instance = self.free_instance(&moved.item_id, Some(&old));
+            moved.key = None;
+        }
+        moved.item.counter = self.holdings.next_counter;
+        self.holdings.next_counter = self.holdings.next_counter.saturating_add(1);
         moved
     }
 
@@ -267,10 +291,11 @@ impl Gear {
             .chain(dropped.iter().flatten())
     }
 
-    /// An instance id for a new stack of `item_id` that no stack holds.
-    fn free_instance(&self, item_id: &str) -> [u8; RAW_ID_LEN] {
+    /// An instance id for a new stack of `item_id` that no stack holds and that is not
+    /// `besides` (the id a moved stack leaves behind).
+    fn free_instance(&self, item_id: &str, besides: Option<&[u8; RAW_ID_LEN]>) -> [u8; RAW_ID_LEN] {
         let taken = |instance: &[u8; RAW_ID_LEN]| {
-            self.stacks().any(|stack| stack.item.instance == *instance)
+            besides == Some(instance) || self.stacks().any(|stack| stack.item.instance == *instance)
         };
         let first = instance_id(self.character, item_id);
         if !taken(&first) {
@@ -371,40 +396,57 @@ impl Gear {
             bag_reasons: self
                 .bag
                 .iter()
-                .map(|stack| stack.as_ref().map_or(SYNC_MOVED, |stack| stack.reason))
+                .enumerate()
+                .map(|(index, stack)| {
+                    stack.as_ref().map_or_else(
+                        || self.emptied.get(&index).copied().unwrap_or(SYNC_LOGIN),
+                        |stack| stack.reason,
+                    )
+                })
                 .collect(),
         }
     }
 
     /// The second container's view.
     fn open_container(&self) -> Option<OpenContainer> {
-        let view = |stacks: &[Option<Stack>], sync_reason| OpenContainer {
-            items: stacks
-                .iter()
-                .map(|stack| stack.as_ref().map(|stack| stack.item))
-                .collect(),
-            sync_reason,
-            can_transfer: true,
-            was_emptied: stacks.iter().all(Option::is_none),
-        };
+        let view =
+            |stacks: &[Option<Stack>], sync_reason, slots_listed, empty_reason| OpenContainer {
+                items: stacks
+                    .iter()
+                    .map(|stack| stack.as_ref().map(|stack| stack.item))
+                    .collect(),
+                sync_reason,
+                can_transfer: true,
+                was_emptied: stacks.iter().all(Option::is_none),
+                slots_listed,
+                empty_reason,
+            };
         Some(match self.holdings.opened.as_ref()? {
-            Opened::Storage { storage, near } => view(
-                self.holdings
+            Opened::Storage { storage, near } => {
+                let slots = self
+                    .holdings
                     .storages
                     .get(storage)
-                    .map_or(&[][..], Vec::as_slice),
-                if *near {
+                    .map_or(&[][..], Vec::as_slice);
+                // The view's reason goes with its empty slots too; only a storage the player
+                // stands at lists the slots ([`OpenContainer::slots_listed`]).
+                let reason = if *near {
                     SYNC_STORAGE_NEAR
                 } else {
                     SYNC_STORAGE_AFAR
-                },
-            ),
-            Opened::Dropped { items, .. } => view(items.as_slice(), SYNC_DROPPED_BAG),
+                };
+                view(slots, reason, *near, reason)
+            }
+            Opened::Dropped { items, .. } => {
+                view(items.as_slice(), SYNC_DROPPED_BAG, true, SYNC_LOGIN)
+            }
             Opened::Closed => OpenContainer {
                 items: vec![None; CLOSED_SLOTS],
                 sync_reason: SYNC_DROPPED_BAG,
                 can_transfer: false,
                 was_emptied: false,
+                slots_listed: true,
+                empty_reason: SYNC_LOGIN,
             },
         })
     }
@@ -418,7 +460,23 @@ impl Gear {
     /// [`Gear::put_in_bag`] for a change of sync reason `reason`.
     pub(super) fn put_in_bag_as(&mut self, mut stack: Stack, reason: u8) -> bool {
         stack.reason = reason;
-        put_in(&mut self.bag, stack).is_some()
+        self.fill_bag(stack)
+    }
+
+    /// Puts `stack` into the first free bag slot, a new one when none is free, and the slot
+    /// forgets the reason it was emptied with; whether the bag had room.
+    fn fill_bag(&mut self, stack: Stack) -> bool {
+        put_in(&mut self.bag, stack)
+            .inspect(|index| {
+                self.emptied.remove(index);
+            })
+            .is_some()
+    }
+
+    /// Puts `stack` into bag slot `index`, which forgets the reason it was emptied with.
+    pub(super) fn fill_bag_slot(&mut self, index: usize, stack: Stack) {
+        self.bag[index] = Some(stack);
+        self.emptied.remove(&index);
     }
 
     /// Whether the bag can take one more stack.
@@ -680,6 +738,20 @@ impl Gear {
             .collect()
     }
 
+    /// Each stored stack: its item id, its storage chest, its slot there and its quantity.
+    pub(in crate::world) fn stored_stacks(&self) -> Vec<(String, [u8; RAW_ID_LEN], usize, u32)> {
+        self.holdings
+            .storages
+            .iter()
+            .flat_map(|(storage, slots)| {
+                slots.iter().enumerate().filter_map(|(slot, stack)| {
+                    let stack = stack.as_ref()?;
+                    Some((stack.item_id.clone(), *storage, slot, stack.item.quantity))
+                })
+            })
+            .collect()
+    }
+
     /// The total quantity of each item over every storage chest of the player, by item id.
     pub(in crate::world) fn stored_totals(&self) -> BTreeMap<String, u32> {
         let mut totals = BTreeMap::new();
@@ -733,7 +805,7 @@ impl Gear {
             return Err(ItemRefusal::Full);
         }
         let moved = take_out(&mut self.bag, instance, quantity)?;
-        let moved = self.own_instance(moved);
+        let moved = self.stored_move(moved);
         put_in(self.open_slots()?, moved);
         self.touched();
         Ok(())
@@ -750,8 +822,8 @@ impl Gear {
             return Err(ItemRefusal::Full);
         }
         let moved = take_out(self.open_slots()?, instance, quantity)?;
-        let moved = self.own_instance(moved);
-        put_in(&mut self.bag, moved);
+        let moved = self.stored_move(moved);
+        self.fill_bag(moved);
         self.touched();
         Ok(())
     }
@@ -1092,6 +1164,20 @@ mod tests {
         gear
     }
 
+    /// Sets the durability (and its maximum) of the bag stack of instance `instance`; its
+    /// counter.
+    fn set_durability(gear: &mut Gear, instance: [u8; RAW_ID_LEN], durability: u32) -> u32 {
+        let stack = gear
+            .bag
+            .iter_mut()
+            .flatten()
+            .find(|stack| stack.item.instance == instance)
+            .expect("in the bag");
+        stack.item.max_durability = durability;
+        stack.item.durability = durability;
+        stack.item.counter
+    }
+
     fn bag_instance(gear: &Gear, item_id: &str) -> [u8; RAW_ID_LEN] {
         gear.bag
             .iter()
@@ -1166,6 +1252,7 @@ mod tests {
     fn a_storage_takes_and_gives_back_the_same_stack() {
         let mut gear = gear();
         let flint = bag_instance(&gear, FLINT);
+        set_durability(&mut gear, flint, 0);
         assert_eq!(gear.deposit(flint, 0), Err(ItemRefusal::NoContainer));
         gear.open_storage(STORAGE, true);
         let view = gear.extras().open_container.expect("open");
@@ -1175,27 +1262,58 @@ mod tests {
         let stored = gear.holdings.storages[&STORAGE][0].clone().expect("stored");
         assert_eq!(stored.item.quantity, 2);
         assert_ne!(stored.item.instance, flint);
-        // The rest of it keeps its id.
+        // The rest of it, an item without durability, takes a new id and counter too (retail).
         assert_eq!(gear.deposit(flint, 0), Ok(()));
         let rest = gear.holdings.storages[&STORAGE][1].clone().expect("stored");
-        assert_eq!(
-            (rest.item.instance, rest.item.quantity),
-            (flint, FLINTS - 2)
-        );
+        assert_eq!(rest.item.quantity, FLINTS - 2);
+        assert_ne!(rest.item.instance, flint);
+        assert_ne!(rest.item.counter, stored.item.counter);
         assert_eq!(gear.bag_count(FLINT), 0);
         let saved = gear.inventory();
         assert_eq!(saved.stored.len(), 2);
-        assert_eq!(gear.withdraw(flint, 0), Ok(()));
+        assert_eq!(gear.withdraw(flint, 0), Err(ItemRefusal::NoSuchItem));
+        assert_eq!(gear.withdraw(rest.item.instance, 0), Ok(()));
         assert_eq!(gear.bag_count(FLINT), FLINTS - 2);
+        assert_ne!(bag_instance(&gear, FLINT), rest.item.instance);
         assert!(gear.close_container());
         let closed = gear.extras().open_container.expect("closed");
         assert_eq!((closed.items.len(), closed.can_transfer), (1, false));
-        assert_eq!(gear.withdraw(flint, 0), Err(ItemRefusal::NoContainer));
+        assert_eq!(
+            gear.withdraw(stored.item.instance, 0),
+            Err(ItemRefusal::NoContainer)
+        );
         // Another sim takes the storage as it was saved.
         let kits = kits();
         let mut again = Gear::carried_in(&kits, CHARACTER, &gear.carried(), None, None);
         again.restore_inventory(&kits, &saved);
         assert_eq!(again.inventory(), saved);
+    }
+
+    #[test]
+    fn stored_gear_keeps_its_id_and_a_storage_seen_from_afar_lists_no_slots() {
+        const DURABILITY: u32 = 750;
+        let mut gear = gear();
+        let flint = bag_instance(&gear, FLINT);
+        let counter = set_durability(&mut gear, flint, DURABILITY);
+        gear.open_storage(STORAGE, true);
+        assert_eq!(gear.deposit(flint, 0), Ok(()));
+        let stored = gear.holdings.storages[&STORAGE][0].clone().expect("stored");
+        assert_eq!(
+            stored.item.instance, flint,
+            "an item with durability keeps its id"
+        );
+        assert_ne!(stored.item.counter, counter);
+        let near = gear.extras().open_container.expect("near");
+        assert_eq!(
+            (near.sync_reason, near.slots_listed, near.empty_reason),
+            (SYNC_STORAGE_NEAR, true, SYNC_STORAGE_NEAR)
+        );
+        gear.open_storage(STORAGE, false);
+        let afar = gear.extras().open_container.expect("afar");
+        assert_eq!(
+            (afar.sync_reason, afar.slots_listed, afar.empty_reason),
+            (SYNC_STORAGE_AFAR, false, SYNC_STORAGE_AFAR)
+        );
     }
 
     #[test]
