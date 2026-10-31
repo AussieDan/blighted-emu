@@ -199,6 +199,10 @@ pub struct Admit {
     /// Whether the account has the game master rank: the sim takes its client's GM messages.
     #[serde(default)]
     pub game_master: bool,
+    /// Whether the account is in probation: its client blocks global and trade chat
+    /// (`accountInProbation`).
+    #[serde(default)]
+    pub account_in_probation: bool,
 }
 
 /// The answer to [`Admit`].
@@ -410,6 +414,9 @@ pub struct HandoffOffer {
     /// Whether the account has the game master rank, as in [`Admit::game_master`].
     #[serde(default)]
     pub game_master: bool,
+    /// Whether the account is in probation, as in [`Admit::account_in_probation`].
+    #[serde(default)]
+    pub account_in_probation: bool,
     /// The player's quests: the active one with its run, and the finished ones.
     #[serde(default)]
     pub quests: PlayerQuests,
@@ -1370,6 +1377,7 @@ mod tests {
             quests: PlayerQuests::default(),
             progression: progression(),
             game_master: false,
+            account_in_probation: true,
         });
         round_trip(AdmitReply::Admitted);
         round_trip(AdmitReply::Refused {
@@ -1411,6 +1419,7 @@ mod tests {
             attribute_version: 9,
             fishing_sequence: 4,
             game_master: true,
+            account_in_probation: true,
             achievement_version: 25,
             items: Some(vec![CarriedItem {
                 item_id: "PotionHealthT1".to_owned(),

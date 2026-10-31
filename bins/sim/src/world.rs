@@ -615,6 +615,8 @@ struct Player {
     level_sent: Option<u32>,
     /// Whether its account has the game master rank: the sim takes its client's GM messages.
     game_master: bool,
+    /// Whether its account is in probation: its client blocks global and trade chat.
+    account_in_probation: bool,
     /// The crafting station it uses and the interaction it opened it with, until that
     /// interaction ends.
     station: Option<String>,
@@ -988,6 +990,8 @@ struct Arrival {
     fishing_sequence: u16,
     /// Whether its account has the game master rank.
     game_master: bool,
+    /// Whether its account is in probation.
+    account_in_probation: bool,
     /// Its saved or carried quests.
     quests: PlayerQuests,
 }
@@ -1173,6 +1177,7 @@ impl SimWorld {
             attribute_version: 0,
             fishing_sequence: 0,
             game_master: admit.game_master,
+            account_in_probation: admit.account_in_probation,
             quests: admit.quests.clone(),
         };
         self.check(&arrival)?;
@@ -1317,6 +1322,7 @@ impl SimWorld {
             attribute_version: offer.attribute_version,
             fishing_sequence: offer.fishing_sequence,
             game_master: offer.game_master,
+            account_in_probation: offer.account_in_probation,
             quests: offer.quests.clone(),
         };
         self.check(&arrival)?;
@@ -1448,6 +1454,11 @@ impl SimWorld {
                     nw_messages::seasons::seasons_rewards_initialized(),
                     nw_messages::seasons::seasons_tracked_stats_initialized(),
                 ]);
+                // Whether the account is in probation, which blocks global and trade chat:
+                // retail sent `accountInProbation` 1.9 to 9.4 s after every captured spawn,
+                // apart from the own card.
+                let in_probation = player.account_in_probation;
+                nw_messages::put_account_in_probation(&mut player.extra_members, in_probation);
             }
             player.own_card_bundle = None;
         }
@@ -4096,6 +4107,7 @@ impl SimWorld {
                     title_changed: arrival.progression.title.is_some(),
                     level_sent: None,
                     game_master: arrival.game_master,
+                    account_in_probation: arrival.account_in_probation,
                     station: None,
                     station_interaction: None,
                     last_interaction: None,
@@ -5107,6 +5119,7 @@ fn handoff_offer(
         attribute_version: player.attributes.version(),
         fishing_sequence: player.fishing.next_sequence(),
         game_master: player.game_master,
+        account_in_probation: player.account_in_probation,
         quests,
         progression: player.progression(),
         achievement_version: player.flow.achievement_version(),
@@ -5452,6 +5465,7 @@ mod tests {
             quests: PlayerQuests::default(),
             progression: PlayerProgression::default(),
             game_master: false,
+            account_in_probation: false,
         }
     }
 
@@ -11243,6 +11257,31 @@ mod tests {
             world.admit(&admit_at(9, 0.0, true), NOW, SERVER_TIME),
             Err(WorldError::Full)
         ));
+    }
+
+    #[test]
+    fn a_spawn_tells_the_client_whether_its_account_is_in_probation() {
+        for in_probation in [false, true] {
+            let mut world = world_with_spawns(Vec::new());
+            world.set_table(&table(&["sim-a", "sim-b"])).expect("table");
+            let admit = Admit {
+                account_in_probation: in_probation,
+                ..admit_at(1, CELL_M / 2.0, true)
+            };
+            world.admit(&admit, NOW, SERVER_TIME).expect("admit");
+            tick(&mut world, NOW + OWN_CARD_DELAY_MS);
+            world.heard_from(&connection(1));
+            let entity = world.player_by_number(1).expect("player");
+            let player = world.world.get::<Player>(entity).expect("player");
+            assert!(
+                player.extra_members.iter().any(|member| matches!(
+                    &member.state,
+                    MemberState::PlayerComponent(state)
+                        if state.account_in_probation == Some(in_probation)
+                )),
+                "{in_probation}"
+            );
+        }
     }
 
     #[test]

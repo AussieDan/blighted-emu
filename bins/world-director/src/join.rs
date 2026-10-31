@@ -3,7 +3,7 @@
 //! and the progression, read the account's admin rank, take an entity number, and ask the owner
 //! of the cell to take the player.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use nw_bus::{
     Admit, AdmitReply, Bus, CarriedItem, CarriedMount, HomeRecord, HousingItem, InstanceStay,
@@ -13,8 +13,8 @@ use nw_bus::{
 };
 use nw_db::{
     AdminRank, PgPool, SavedArena, SavedInventory, SavedItem, SavedItemRolls, SavedMounts,
-    SavedPlace, SavedPosition, SavedProgression, SavedQuests, SavedTravel, admin_rank,
-    character_by_id, character_inventory, character_items, character_position,
+    SavedPlace, SavedPosition, SavedProgression, SavedQuests, SavedTravel, account_by_id,
+    admin_rank, character_by_id, character_inventory, character_items, character_position,
     character_progression, character_quests, next_entity_number,
 };
 use nw_login::look::{saved_backstory, saved_look};
@@ -24,8 +24,13 @@ use uuid::Uuid;
 use crate::instances::InstanceTable;
 use crate::sims::Assignment;
 
-/// Longest wait for an account's admin rank; it stays far below the admit timeout.
+/// Longest wait for an account's admin rank and age; it stays far below the admit timeout.
 const RANK_READ_TIMEOUT: Duration = Duration::from_millis(300);
+/// An account younger than this is in probation: its client blocks global and trade chat
+/// (the client's `javelin.account-probation-time-hours` default 72, the text
+/// `ui_cannot_chat_global_blocked` "...until your account is older than {hoursNeeded} hours").
+const ACCOUNT_PROBATION_HOURS: i64 = 72;
+const SECONDS_PER_HOUR: i64 = 3_600;
 
 /// The handoff count and the bundle sequence of a new player.
 const NEW_PLAYER_COUNT: u64 = 0;
@@ -238,7 +243,8 @@ pub async fn route_join(
                 .unwrap_or_default(),
         ),
     };
-    let game_master = is_game_master(context.ranks.as_ref(), join.account).await;
+    let standing = account_standing(context.ranks.as_ref(), join.account).await;
+    let game_master = standing.game_master;
     let stay = progression.arena.stay.as_ref().and_then(|stay| {
         stay_route(
             stay,
@@ -291,6 +297,7 @@ pub async fn route_join(
         quests,
         progression,
         game_master,
+        account_in_probation: standing.in_probation,
     };
     let reply = context
         .bus
@@ -307,24 +314,63 @@ pub async fn route_join(
     }
 }
 
-/// Whether `account` has the game master rank (or a higher one) in `ranks`. A failed or slow
-/// read (above [`RANK_READ_TIMEOUT`]) gives no GM rights, so a database fault never refuses or
-/// holds up a join.
-async fn is_game_master(ranks: Option<&PgPool>, account: Uuid) -> bool {
+/// What an account's admin rank and age give it in the world.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Standing {
+    /// It has the game master rank (or a higher one).
+    game_master: bool,
+    /// It is in probation ([`in_probation`]).
+    in_probation: bool,
+}
+
+/// The standing of `account` from the global database `ranks`. No database, or a failed or slow
+/// read (above [`RANK_READ_TIMEOUT`]), gives no GM rights and no probation, so a database fault
+/// never refuses, holds up or mutes a join.
+async fn account_standing(ranks: Option<&PgPool>, account: Uuid) -> Standing {
     let Some(ranks) = ranks else {
-        return false;
+        return Standing::default();
     };
-    match tokio::time::timeout(RANK_READ_TIMEOUT, admin_rank(ranks, account)).await {
-        Ok(Ok(rank)) => rank.is_some_and(|rank| rank >= AdminRank::GameMaster),
+    let read = async {
+        Ok::<_, nw_db::DbError>((
+            admin_rank(ranks, account).await?,
+            account_by_id(ranks, account).await?,
+        ))
+    };
+    match tokio::time::timeout(RANK_READ_TIMEOUT, read).await {
+        Ok(Ok((rank, found))) => Standing {
+            game_master: rank.is_some_and(|rank| rank >= AdminRank::GameMaster),
+            in_probation: in_probation(rank, found.map(|found| found.created_at_unix), unix_now()),
+        },
         Ok(Err(error)) => {
-            tracing::warn!(%error, %account, "admin rank read failed; no GM rights");
-            false
+            tracing::warn!(%error, %account, "account read failed; no GM rights, no probation");
+            Standing::default()
         }
         Err(_) => {
-            tracing::warn!(%account, "admin rank read too slow; no GM rights");
-            false
+            tracing::warn!(%account, "account read too slow; no GM rights, no probation");
+            Standing::default()
         }
     }
+}
+
+/// Whether an account with the admin rank `rank`, created at `created_at_unix`, is in
+/// probation at `now_unix`: it is younger than [`ACCOUNT_PROBATION_HOURS`]. Any admin rank (a
+/// CSR, a game master, a head admin) is never in probation, and neither is an account whose age
+/// is not known. Retail's rule also waits for a character play time
+/// (`javelin.character-probation-time-minutes` 180); this server does not count play time.
+fn in_probation(rank: Option<AdminRank>, created_at_unix: Option<i64>, now_unix: i64) -> bool {
+    rank.is_none()
+        && created_at_unix.is_some_and(|created| {
+            now_unix.saturating_sub(created) < ACCOUNT_PROBATION_HOURS * SECONDS_PER_HOUR
+        })
+}
+
+/// Unix seconds now; 0 for a clock before 1970.
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
 }
 
 /// The saved quests as a sim runs them; a running quest whose run no longer reads is dropped.
@@ -543,6 +589,23 @@ fn player_inventory(saved: SavedInventory) -> PlayerInventory {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_young_account_is_in_probation_unless_it_has_an_admin_rank() {
+        const NOW: i64 = 1_800_000_000;
+        let hours_ago = |hours: i64| Some(NOW - hours * SECONDS_PER_HOUR);
+        assert!(in_probation(None, hours_ago(1), NOW));
+        assert!(in_probation(
+            None,
+            hours_ago(ACCOUNT_PROBATION_HOURS - 1),
+            NOW
+        ));
+        assert!(!in_probation(None, hours_ago(ACCOUNT_PROBATION_HOURS), NOW));
+        for rank in [AdminRank::Csr, AdminRank::GameMaster, AdminRank::HeadAdmin] {
+            assert!(!in_probation(Some(rank), hours_ago(1), NOW), "{rank:?}");
+        }
+        assert!(!in_probation(None, None, NOW), "age not known");
+    }
 
     #[test]
     fn saved_quests_read_their_run_and_drop_a_bad_one() {

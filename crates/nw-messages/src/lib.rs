@@ -224,8 +224,8 @@ pub use payload::{BundleGroup, BundleMember, BundlePayload, KnownMembers, Member
 pub use player_components::{
     EmptyState, HealthChange, PLAYER_COMPONENT_COMPONENT, PLAYER_COMPONENT_TYPE_INDEX,
     PLAYER_EMPTY_COMPONENTS, PLAYER_VITALS_COMPONENT, PlayerComponentState, PlayerStates,
-    change_members, empty_state, gear_members, player_members, put_is_in_store,
-    put_looking_through_loadout, put_member,
+    change_members, empty_state, gear_members, player_members, put_account_in_probation,
+    put_is_in_store, put_looking_through_loadout, put_member,
 };
 pub use player_data::{
     NO_GUILD, NO_PLATFORM, NO_PLATFORM_PRESENCE, PlayerDataRequest, PlayerDataResponseMsg,

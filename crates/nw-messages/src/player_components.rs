@@ -73,6 +73,14 @@ const PLAYER_COMPONENT_SLOTS: u8 = 3;
 const SLOT_1_BIT: u8 = 0b010;
 /// Children registered on slot 1 (death note, 2026-09-18).
 const SLOT_1_CHILDREN: u8 = 22;
+/// Slot 1 child 3: `accountInProbation`, one boolean byte. While it is true the client refuses
+/// to send global and trade chat and currency trades, with `ui_cannot_chat_global_blocked`
+/// ("...until your account is older than {hoursNeeded} hours...") (`FUN_14683dba0` copies it,
+/// `FUN_14684b480` reads it for the chat send; client defaults `javelin.account-probation-time-
+/// hours` 72, `javelin.social.enable-account-age-chat-restriction` 1). Retail sent `02 08 00`
+/// 1.9 to 9.4 s after the spawn in all three captured sessions (general-other-01,
+/// newchar-linux, newchar-retail).
+const CHILD_ACCOUNT_IN_PROBATION: u16 = 1 << 3;
 /// Slot 1 child 12: `onDeathRespawnCooldown`, an `f32`. A change of it to 0 or more opens the
 /// client's death screen (`FUN_14683dba0`, `Hud.LocalPlayer.OnPlayerDeath`).
 const CHILD_ON_DEATH_RESPAWN_COOLDOWN: u16 = 1 << 12;
@@ -337,6 +345,8 @@ impl EmptyState {
 /// are not encoded here.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct PlayerComponentState {
+    /// Slot 1 child 3: whether the account is in probation (chat and trade blocked), when sent.
+    pub account_in_probation: Option<bool>,
     /// Slot 1 child 12: the respawn cooldown that opens the death screen, when sent.
     pub on_death_respawn_cooldown: Option<f32>,
     /// Slot 2 child 0: the 16-byte character id, when sent.
@@ -353,6 +363,7 @@ impl PlayerComponentState {
     /// The first body of a local player: `characterId` is `id`, `playerConnected` is true.
     pub const fn connected(id: [u8; RAW_ID_LEN]) -> Self {
         Self {
+            account_in_probation: None,
             on_death_respawn_cooldown: None,
             character_id: Some(id),
             player_connected: Some(true),
@@ -365,6 +376,7 @@ impl PlayerComponentState {
     /// `09 9f3d 02 80 20 00000000`, 7 to 55 ms after the 4299).
     pub const fn died() -> Self {
         Self {
+            account_in_probation: None,
             on_death_respawn_cooldown: Some(OPEN_WORLD_RESPAWN_COOLDOWN),
             character_id: None,
             player_connected: None,
@@ -381,6 +393,7 @@ impl PlayerComponentState {
     /// 15; Inferred: its UI follows the replicated flag, `OnIsLookingThroughLoadoutChanged`).
     pub const fn looking_through_loadout(looking: bool) -> Self {
         Self {
+            account_in_probation: None,
             on_death_respawn_cooldown: None,
             character_id: None,
             player_connected: None,
@@ -393,11 +406,24 @@ impl PlayerComponentState {
     /// (`PlayerComponentServerFacet_RequestSetIsInStore`).
     pub const fn in_store(in_store: bool) -> Self {
         Self {
+            account_in_probation: None,
             on_death_respawn_cooldown: None,
             character_id: None,
             player_connected: None,
             looking_through_loadout: None,
             is_in_store: Some(in_store),
+        }
+    }
+
+    /// The change of `accountInProbation` to `in_probation` (retail `02 08 00`).
+    pub const fn account_in_probation(in_probation: bool) -> Self {
+        Self {
+            account_in_probation: Some(in_probation),
+            on_death_respawn_cooldown: None,
+            character_id: None,
+            player_connected: None,
+            looking_through_loadout: None,
+            is_in_store: None,
         }
     }
 
@@ -422,10 +448,15 @@ impl PlayerComponentState {
         };
         if slots & SLOT_1_BIT != 0 {
             read_children(reader, FIELD, SLOT_1_CHILDREN, |reader, child| {
-                if 1_u32 << child != u32::from(CHILD_ON_DEATH_RESPAWN_COOLDOWN) {
+                // Slot 1 has 22 children: a bit above 15 is no `u16` child.
+                let bit = 1_u32 << child;
+                if bit == u32::from(CHILD_ACCOUNT_IN_PROBATION) {
+                    state.account_in_probation = Some(reader.boolean()?);
+                } else if bit == u32::from(CHILD_ON_DEATH_RESPAWN_COOLDOWN) {
+                    state.on_death_respawn_cooldown = Some(reader.f32()?);
+                } else {
                     return Err(unsized_child(child));
                 }
-                state.on_death_respawn_cooldown = Some(reader.f32()?);
                 Ok(())
             })?;
         }
@@ -448,7 +479,17 @@ impl PlayerComponentState {
 
     /// Writes the state for the bundle path. A slot without a known child is not sent.
     pub fn write(&self, writer: &mut Writer) {
+        let probation = self.account_in_probation;
         let cooldown = self.on_death_respawn_cooldown;
+        let slot_1_children = if probation.is_some() {
+            CHILD_ACCOUNT_IN_PROBATION
+        } else {
+            0
+        } | if cooldown.is_some() {
+            CHILD_ON_DEATH_RESPAWN_COOLDOWN
+        } else {
+            0
+        };
         let character_id = self.character_id;
         let player_connected = self.player_connected;
         let looking = self.looking_through_loadout;
@@ -462,7 +503,7 @@ impl PlayerComponentState {
             false,
             in_store.is_some(),
         ]);
-        let slots = if cooldown.is_some() {
+        let slots = if slot_1_children != 0 {
             SLOT_1_BIT
         } else {
             NO_SLOT
@@ -472,13 +513,18 @@ impl PlayerComponentState {
             SLOT_2_BIT
         };
         writer.u8(slots);
-        if let Some(cooldown) = cooldown {
+        if slot_1_children != 0 {
             write_known_children(
                 writer,
-                CHILD_ON_DEATH_RESPAWN_COOLDOWN,
+                slot_1_children,
                 SLOT_1_CHILDREN,
-                |writer, _| {
-                    writer.f32(cooldown);
+                |writer, child| match 1 << child {
+                    CHILD_ACCOUNT_IN_PROBATION => {
+                        probation.map(|in_probation| writer.boolean(in_probation));
+                    }
+                    _ => {
+                        cooldown.map(|cooldown| writer.f32(cooldown));
+                    }
                 },
             );
         }
@@ -884,6 +930,16 @@ pub fn put_looking_through_loadout(members: &mut Vec<BundleMember>, looking: boo
         members,
         PlayerComponentState::looking_through_loadout(looking),
         |state| state.looking_through_loadout = Some(looking),
+    );
+}
+
+/// Puts the change of `accountInProbation` to `in_probation` into the own group `members`, as
+/// [`put_looking_through_loadout`] puts its change.
+pub fn put_account_in_probation(members: &mut Vec<BundleMember>, in_probation: bool) {
+    put_player_change(
+        members,
+        PlayerComponentState::account_in_probation(in_probation),
+        |state| state.account_in_probation = Some(in_probation),
     );
 }
 
@@ -1462,6 +1518,53 @@ mod tests {
         assert_eq!(read, state);
         assert_eq!(read.player_connected, Some(true));
         assert_eq!(read.character_id, Some(ID));
+    }
+
+    #[test]
+    fn the_probation_change_is_retail_s_bytes_and_merges_with_a_death() {
+        // Retail, all three captured sessions: `02 08 00` (slot 1, child 3, false).
+        const RETAIL_NOT_IN_PROBATION: [u8; 3] = [0x02, 0x08, 0x00];
+        const IN_PROBATION: [u8; 3] = [0x02, 0x08, 0x01];
+        for (in_probation, retail) in [(false, RETAIL_NOT_IN_PROBATION), (true, IN_PROBATION)] {
+            let state = PlayerComponentState::account_in_probation(in_probation);
+            let mut writer = Writer::new();
+            state.write(&mut writer);
+            let bytes = writer.finish();
+            assert_eq!(bytes, retail);
+            let mut reader = Reader::new(&bytes);
+            assert_eq!(
+                PlayerComponentState::read(&mut reader).expect("read"),
+                state
+            );
+            reader.finish().expect("to the end");
+        }
+        let mut members = vec![BundleMember {
+            component: PLAYER_COMPONENT_COMPONENT,
+            state: MemberState::PlayerComponent(PlayerComponentState::died()),
+        }];
+        put_account_in_probation(&mut members, false);
+        let MemberState::PlayerComponent(state) = &members[0].state else {
+            panic!("player component");
+        };
+        let mut writer = Writer::new();
+        state.write(&mut writer);
+        let bytes = writer.finish();
+        let mut reader = Reader::new(&bytes);
+        let read = PlayerComponentState::read(&mut reader).expect("read");
+        reader.finish().expect("to the end");
+        assert_eq!(read.account_in_probation, Some(false));
+        assert_eq!(
+            read.on_death_respawn_cooldown,
+            Some(OPEN_WORLD_RESPAWN_COOLDOWN)
+        );
+    }
+
+    #[test]
+    fn a_slot_1_child_above_bit_15_is_refused_not_a_panic() {
+        // Slot 1, child bytes for children 0 to 20 empty, then child 21 (the last of 22).
+        const CHILD_21: [u8; 5] = [0x02, 0x80, 0x80, 0x80, 0x01];
+        let mut reader = Reader::new(&CHILD_21);
+        assert!(PlayerComponentState::read(&mut reader).is_err());
     }
 
     #[test]

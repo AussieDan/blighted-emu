@@ -27,8 +27,9 @@ pub struct DirectorConfig {
     pub world_database: DatabaseConfig,
     /// The environment variable with the world database password; it starts with `NW_SECRET_`.
     pub world_database_password_env: String,
-    /// The global database, for the admin ranks: an account with the game master rank gets the
-    /// client GM flag. Without it no account gets GM rights.
+    /// The global database, for the admin ranks and the account ages: an account with the game
+    /// master rank gets the client GM flag, and a young account without a rank is in probation.
+    /// Without it no account gets GM rights and none is in probation.
     #[serde(default)]
     pub global_database: Option<GlobalDatabase>,
     /// The pinned client build file.
