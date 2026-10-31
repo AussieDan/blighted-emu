@@ -29,7 +29,7 @@ use nw_messages::{
     HealthChange, InputPosition, ItemLook, LookDir, MemberState, MessageError, PaperdollPublic,
     PaperdollState, PlayerGear, PlayerLook, PlayerStates, RemoteStep, RemoteUpper,
     SecondSlayerState, ShownItem, SlayerState, SlotChange, StepPlace, UpperSlots, VitalsData,
-    VitalsState, put_looking_through_loadout, put_member,
+    put_looking_through_loadout, put_member,
 };
 use nw_sim_core::Position;
 
@@ -247,6 +247,7 @@ const fn slot_of_ghost(slot: GhostSlotChange) -> SlotChange {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) struct ReplicaMemory {
     health: u32,
+    max_health: u32,
     blocking: bool,
     gear_version: u64,
     hands: Hands,
@@ -346,16 +347,19 @@ impl Replica {
                 } else {
                     seen.life_ms
                 };
-                let change = (seen.health != health).then_some(HealthChange {
+                let max = (seen.max_health != source.max_health).then_some(source.max_health);
+                let change = (seen.health != health || max.is_some()).then_some(HealthChange {
                     health,
                     first_damage: seen.health == source.max_health,
                     life,
+                    max,
                 });
                 (change, seen.blocking != source.blocking, life_ms)
             }
         };
         let memory = ReplicaMemory {
             health,
+            max_health: source.max_health,
             blocking: source.blocking,
             gear_version: source.gear_version,
             hands: source.hands,
@@ -481,14 +485,9 @@ impl Replica {
             })?),
         }];
         if let Some(change) = self.health_change {
-            let vitals = match change.life {
-                Some(life) => VitalsState::player_life(change.health, life),
-                None if change.first_damage => VitalsState::creature_first_damage(change.health),
-                None => VitalsState::creature_health(change.health),
-            };
             members.push(BundleMember {
                 component: VITALS_COMPONENT,
-                state: MemberState::Vitals(vitals),
+                state: MemberState::Vitals(change.vitals()),
             });
         }
         if let Some(public) = &self.paperdoll_change {

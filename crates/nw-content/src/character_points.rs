@@ -22,6 +22,8 @@ pub const ATTRIBUTE_NAMES: [&str; ATTRIBUTE_COUNT] = [
 ];
 /// How many attributes there are.
 pub const ATTRIBUTE_COUNT: usize = 5;
+/// The attribute id of Constitution.
+pub const CONSTITUTION: u32 = 0;
 /// The `IsAbility` cell of a progression point that is an ability-tree point.
 const IS_ABILITY: &str = "1";
 
@@ -69,6 +71,8 @@ pub struct CharacterPoints {
     ability_tables: Vec<u32>,
     /// Each weapon pool (CRC) and its `VersionNumber`, in table order.
     pool_versions: Vec<(u32, u32)>,
+    /// The `Health` of each Constitution `Level` row, by value.
+    constitution_health: BTreeMap<u32, u32>,
 }
 
 /// One `ProgressionPointData` row, as [`CharacterPoints::build`] takes it.
@@ -132,6 +136,16 @@ impl CharacterPoints {
             .filter(|table| table.unique_id.eq_ignore_ascii_case(LEVEL_TABLE))
             .flat_map(|table| &table.rows)
             .map(|row| (row.level_number, row.attribute_respec_cost));
+        let constitution_health = tables
+            .attribute_definition
+            .iter()
+            .filter(|table| {
+                table
+                    .unique_id
+                    .eq_ignore_ascii_case(ATTRIBUTE_NAMES[CONSTITUTION as usize])
+            })
+            .flat_map(|table| &table.rows)
+            .map(|row| (row.level, row.health));
         Self::build(
             levels,
             attribute_levels,
@@ -144,6 +158,26 @@ impl CharacterPoints {
             points,
         )
         .with_respec_costs(respec_costs)
+        .with_constitution_health(constitution_health)
+    }
+
+    /// These rules with the Constitution `rows` (`Level`, `Health`); a negative cell is 0.
+    #[must_use]
+    pub fn with_constitution_health(mut self, rows: impl IntoIterator<Item = (i64, i64)>) -> Self {
+        self.constitution_health = rows
+            .into_iter()
+            .map(|(level, health)| (clamp(level), clamp(health)))
+            .collect();
+        self
+    }
+
+    /// The max health that Constitution `value` gives: its row's `Health`, else the row below
+    /// it; 0 below the first row or without the table.
+    pub fn constitution_health(&self, value: u32) -> u32 {
+        self.constitution_health
+            .range(..=value)
+            .next_back()
+            .map_or(0, |(_, health)| *health)
     }
 
     /// These rules with the attribute refund cost `costs` of each level (level number,
@@ -233,6 +267,7 @@ impl CharacterPoints {
             ability_tables: ability_tables.into_iter().map(lowercase_crc32).collect(),
             pool_versions,
             respec_costs: BTreeMap::new(),
+            constitution_health: BTreeMap::new(),
         }
     }
 
@@ -380,6 +415,20 @@ pub(crate) mod tests {
             "a level the table does not list"
         );
         assert_eq!(rules.attribute_points_at(2), 10, "the other rules stay");
+    }
+
+    /// Retail Constitution `Health` of a few `Level` rows (content bundle 25810808).
+    const CONSTITUTION_ROWS: [(i64, i64); 4] = [(5, 0), (10, 200), (200, 6_419), (-1, 9)];
+
+    #[test]
+    fn constitution_gives_its_rows_health() {
+        let rules = rules().with_constitution_health(CONSTITUTION_ROWS);
+        assert_eq!(rules.constitution_health(5), 0);
+        assert_eq!(rules.constitution_health(10), 200);
+        assert_eq!(rules.constitution_health(200), 6_419);
+        assert_eq!(rules.constitution_health(150), 200, "the row below");
+        assert_eq!(rules.constitution_health(0), 9, "a negative level is 0");
+        assert_eq!(CharacterPoints::default().constitution_health(200), 0);
     }
 
     #[test]

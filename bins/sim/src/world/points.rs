@@ -9,13 +9,16 @@
 //! and after a spend, the points alone at a level up (retail newchar 2026-09-18).
 
 use nw_bus::ConnectionRef;
-use nw_content::character_points::{ATTRIBUTE_COUNT, CharacterPoints};
+use nw_content::character_points::{ATTRIBUTE_COUNT, CONSTITUTION, CharacterPoints};
+use nw_content::progression::Progression;
 use nw_messages::items::FIRST_VERSION;
 use nw_messages::{
     AttributeState, AttributeValue, MasteryTreeRespecResponseMsg, PersistentAttributes,
     PointsClientMsg, ServerMessage,
 };
+use nw_sim_core::player_max_health;
 
+use super::attack::Vitals;
 use super::{Player, SimWorld, send_now};
 
 /// The `m_chosenMagnifyBehavior` retail sends (5 for the new character of newchar 2026-09-18
@@ -178,6 +181,14 @@ impl Attributes {
         })
     }
 
+    /// The final value of attribute `id`: its base and its spent points; 0 for an id the rules
+    /// do not have.
+    fn value(&self, rules: &CharacterPoints, id: u32) -> u32 {
+        rules
+            .attribute(id)
+            .map_or(0, |range| range.base.saturating_add(self.spent_on(id)))
+    }
+
     fn spent_on(&self, id: u32) -> u32 {
         self.spent
             .iter()
@@ -200,14 +211,59 @@ impl Attributes {
             .rev()
             .filter_map(|index| {
                 let id = u32::try_from(index).ok()?;
-                let range = rules.attribute(id)?;
-                Some((id, range.base.saturating_add(self.spent_on(id))))
+                rules.attribute(id)?;
+                Some((id, self.value(rules, id)))
             })
             .collect()
     }
 }
 
+/// The max health of a player of `experience` with `attributes` and the base health `base`.
+fn max_health(
+    progression: &Progression,
+    base: u32,
+    experience: u32,
+    attributes: &Attributes,
+) -> u32 {
+    let level = progression.level_of(experience);
+    let constitution = attributes.value(&progression.points, CONSTITUTION);
+    player_max_health(
+        base,
+        level,
+        progression.points.constitution_health(constitution),
+    )
+}
+
 impl SimWorld {
+    /// The max health of a player of `experience` with the spent attribute points `spent`.
+    pub(super) fn player_max_health(&self, experience: u32, spent: &[AttributeValue]) -> u32 {
+        max_health(
+            &self.content.progression,
+            self.combat.data.player_base_health(),
+            experience,
+            &Attributes::of(spent, FIRST_VERSION),
+        )
+    }
+
+    /// Moves each player's max health to its level and Constitution: after a level up, a spend
+    /// and a refund (the vitals change goes with the next bundle).
+    pub(super) fn tick_max_health(&mut self) {
+        let content = std::sync::Arc::clone(&self.content);
+        let base = self.combat.data.player_base_health();
+        let mut query = self.world.query::<(&Player, &mut Vitals)>();
+        for (player, mut vitals) in query.iter_mut(&mut self.world) {
+            let max = max_health(
+                &content.progression,
+                base,
+                player.experience,
+                &player.attributes,
+            );
+            if vitals.health.max() != max {
+                vitals.health.set_max(max);
+            }
+        }
+    }
+
     /// Carries out the point call `call` of the client of `connection`.
     pub fn points_call(&mut self, connection: &ConnectionRef, call: PointsClientMsg) {
         let Some(&entity) = self.by_connection.get(connection) else {
@@ -300,8 +356,7 @@ mod tests {
     use super::*;
     use nw_content::character_points::PointRow;
 
-    /// Constitution and Strength (client enum `CharacterAttributeType`).
-    const CONSTITUTION: u32 = 0;
+    /// Strength (client enum `CharacterAttributeType`).
     const STRENGTH: u32 = 2;
     /// Retail `AttributePoints` of levels 0 to 3.
     const LEVEL_POINTS: [i64; 4] = [0, 5, 5, 5];
@@ -478,7 +533,7 @@ mod tests {
         use nw_reflect::Envelope;
 
         use super::super::*;
-        use super::{BASE, LEVEL_POINTS, MAX, PointRow, STRENGTH};
+        use super::{BASE, CONSTITUTION, LEVEL_POINTS, MAX, PointRow, STRENGTH};
         use crate::player_content::PlayerContent;
         use crate::world::REPLICATION_CHANNEL;
         use crate::world::tests::{NOW, SERVER_TIME, admit_at, connection, world_with_spawns};
@@ -492,6 +547,10 @@ mod tests {
         /// Retail `VersionNumber` of the greatsword pool.
         const SWORD_VERSION: i64 = 1;
         const MAX_LEVEL: i64 = 10;
+        /// Retail Constitution `Health` of rows 5 and 10.
+        const CONSTITUTION_ROWS: [(i64, i64); 2] = [(5, 0), (10, 200)];
+        /// The health 1.75 x level 2 squared adds.
+        const LEVEL_TWO_HEALTH: u32 = 7;
         /// Level 2 starts at 480 experience; weapon rank 1 at 10.
         const LEVEL_TWO_XP: u32 = 480;
         const RANK_ONE_XP: u32 = 10;
@@ -528,7 +587,8 @@ mod tests {
                 [COMBO],
                 [(SWORD, SWORD_VERSION)],
                 [point(COMBO, None), point(UPGRADE, Some((COMBO, 1)))],
-            );
+            )
+            .with_constitution_health(CONSTITUTION_ROWS);
             progression
         }
 
@@ -781,6 +841,80 @@ mod tests {
                 })
                 .collect();
             assert_eq!(answers, [(true, 0), (false, 9)]);
+        }
+
+        /// The max healths of the own vitals changes of `ticks` ticks from `from`.
+        fn max_changes(world: &mut SimWorld, from: u64, ticks: u64) -> Vec<f32> {
+            (0..ticks)
+                .flat_map(|tick| {
+                    world
+                        .tick(from + tick * TICK_MS, SERVER_TIME)
+                        .expect("tick")
+                        .messages
+                })
+                .filter(|out| {
+                    out.connection == connection(PLAYER) && out.channel == REPLICATION_CHANNEL
+                })
+                .flat_map(|out| out.envelopes)
+                .filter_map(|bytes| {
+                    let envelope = Envelope::decode(&bytes).expect("envelope");
+                    match ServerMessage::from_envelope(&envelope) {
+                        Some(Ok(ServerMessage::Bundle(bundle))) => Some(bundle),
+                        _ => None,
+                    }
+                })
+                .flat_map(|bundle| SlotRead::of(&bundle).expect("read").updates)
+                .filter(|update| update.interest == LOCAL_PLAYER_INTEREST)
+                .flat_map(|update| update.members)
+                .filter_map(|member| match member.state {
+                    MemberState::Vitals(vitals) => vitals.slot_0?.health_max,
+                    _ => None,
+                })
+                .collect()
+        }
+
+        fn health(world: &mut SimWorld) -> (u32, u32) {
+            let entity = world.player_by_number(PLAYER).expect("player");
+            let vitals = world
+                .world
+                .get::<crate::world::Vitals>(entity)
+                .expect("vitals");
+            (vitals.health.current(), vitals.health.max())
+        }
+
+        #[test]
+        fn the_level_and_constitution_set_the_max_health_and_a_change_is_sent() {
+            let mut world = world();
+            let base = world.combat.data.player_base_health();
+            let at_level = base + LEVEL_TWO_HEALTH;
+            assert_eq!(
+                health(&mut world),
+                (at_level, at_level),
+                "the level at login"
+            );
+            let first = max_changes(&mut world, NOW, CARD_TICKS);
+            assert_eq!(first, [at_level as f32], "the card's vitals");
+            let later = NOW + CARD_TICKS * TICK_MS;
+            world.points_call(
+                &connection(PLAYER),
+                PointsClientMsg::SpendAttributePoints {
+                    header: HEADER,
+                    attributes: vec![CONSTITUTION],
+                    points: vec![5],
+                },
+            );
+            let with_constitution = at_level + 200;
+            assert_eq!(
+                max_changes(&mut world, later, STATE_TICKS),
+                [with_constitution as f32],
+                "the new max alone"
+            );
+            assert_eq!(health(&mut world), (with_constitution, with_constitution));
+            let later = later + STATE_TICKS * TICK_MS;
+            assert!(
+                max_changes(&mut world, later, STATE_TICKS).is_empty(),
+                "no change"
+            );
         }
     }
 }

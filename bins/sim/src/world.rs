@@ -660,6 +660,8 @@ struct Player {
     fall: fall_damage::FallTrack,
     /// The health its client last got (a card or a vitals change).
     health_sent: Option<u32>,
+    /// The max health its client was last sent; `None` before the first card.
+    health_max_sent: Option<u32>,
     /// The server time of its last spawn or respawn (ms since 2000-01-01).
     life_ms: u64,
     /// Its stamina.
@@ -1178,7 +1180,9 @@ impl SimWorld {
                 .settings
                 .limits
                 .onto_ground(&*self.ground, Position::from(admit.position)),
-            health: Health::full(self.combat.data.player_max_health()),
+            health: Health::full(
+                self.player_max_health(admit.progression.experience, &admit.progression.attributes),
+            ),
             // A fresh login gets spawn protection until its client spawns; a resume was already
             // in the world.
             spawned: !admit.login,
@@ -1325,7 +1329,10 @@ impl SimWorld {
             } else {
                 position
             },
-            health: Health::at(offer.health, self.combat.data.player_max_health()),
+            health: Health::at(
+                offer.health,
+                self.player_max_health(offer.progression.experience, &offer.progression.attributes),
+            ),
             // A handed-off player was already in the world; one that enters a new level spawns
             // again once its client has loaded it.
             spawned: !enters,
@@ -2138,6 +2145,7 @@ impl SimWorld {
         self.tick_item_effects(now_ms);
         self.tick_stamina(now_ms);
         self.server_ms = server_time;
+        self.tick_max_health();
         self.tick_status_effects(now_ms);
         self.tick_falls(now_ms);
         self.tick_mounts(now_ms);
@@ -4185,6 +4193,7 @@ impl SimWorld {
                         status_effects: status_effects::StatusEffects::default(),
                         fall: fall_damage::FallTrack::default(),
                         health_sent: None,
+                        health_max_sent: None,
                         life_ms: 0,
                         stamina: Stamina::default(),
                         mount: mount::PlayerMount::of(&arrival.progression.mounts),
@@ -4797,15 +4806,27 @@ impl Neighbourhood<'_> {
                     }
                     _ => None,
                 };
+                // A new max goes as its own vitals change too (retail: `healthMax` alone after a
+                // level up or a Constitution spend).
+                let health_max = vitals.health.max();
+                let max = (own_card == OwnCard::Without
+                    && player
+                        .health_max_sent
+                        .is_some_and(|sent| sent != health_max))
+                .then_some(health_max);
                 let health_change = ((own_card == OwnCard::Without
                     && player.health_sent != Some(health))
-                    || life.is_some())
+                    || life.is_some()
+                    || max.is_some())
                 .then(|| HealthChange {
                     health,
-                    first_damage: player.health_sent == Some(vitals.health.max()),
+                    first_damage: player.health_sent.is_some()
+                        && player.health_sent == player.health_max_sent,
                     life,
+                    max,
                 });
                 player.health_sent = Some(health);
+                player.health_max_sent = Some(health_max);
                 let stamina = player.stamina.take_change();
                 player.combat.tick(self.now_ms);
                 let combat_status = player.combat.take_change(self.now_ms, self.server_time);
@@ -8493,7 +8514,7 @@ mod tests {
         let mut admit = admit_at(1, CELL_M / 2.0, true);
         admit.look = Some(SAVED_LOOK);
         world.admit(&admit, NOW, SERVER_TIME).expect("admit");
-        let max = world.combat.data.player_max_health();
+        let max = world.combat.data.player_base_health();
         let messages = tick(&mut world, NOW + OWN_CARD_DELAY_MS).messages;
         let bundle = bundle_of(&messages, &connection(1)).expect("bundle");
         let own = SlotRead::of(&bundle)

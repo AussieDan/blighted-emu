@@ -117,6 +117,16 @@ impl Health {
         self.current
     }
 
+    /// A new max: a rise adds to the health too, a fall takes it down to the max at most
+    /// (Inferred: retail shows the player full after each level up of newchar 2026-09-18).
+    pub fn set_max(&mut self, max: u32) {
+        if max > self.max && self.current > 0 {
+            self.current = self.current.saturating_add(max - self.max);
+        }
+        self.max = max;
+        self.current = self.current.min(max);
+    }
+
     /// The health now.
     pub const fn current(&self) -> u32 {
         self.current
@@ -126,6 +136,23 @@ impl Health {
     pub const fn max(&self) -> u32 {
         self.max
     }
+}
+
+/// Health each zero-based level squared adds to a player's max (module notes of
+/// [`player_max_health`]).
+const PLAYER_HEALTH_PER_LEVEL_SQUARED: f64 = 1.75;
+
+/// Max health of a player of zero-based `level`: its vitals' base health (`Player`
+/// `HealthInitial`, 856), 1.75 x level squared, and the `Health` its Constitution gives, without
+/// the fraction. Observed: the own `healthMax` of newchar-retail-2026-09-18 at levels 0 and 2 to 7
+/// (856, 863, 871.75, 884, 899.75, 919, 941.75; 200 more after 5 points in Constitution, its
+/// row 10) and of general-other-01 at level 64 with Constitution 200 (856 + 7168 + 6419 = 14443).
+pub fn player_max_health(base: u32, level: u32, constitution_health: u32) -> u32 {
+    let level = f64::from(level);
+    let health = f64::from(base)
+        + PLAYER_HEALTH_PER_LEVEL_SQUARED * level * level
+        + f64::from(constitution_health);
+    to_whole(health.floor())
 }
 
 /// Max health of a mob: the level's base health, its `HealthMod`, then its creature type's
@@ -263,6 +290,44 @@ mod tests {
         let mut health = Health::at(500, 856);
         assert_eq!(health.heal(300), 800);
         assert_eq!(health.heal(486), 856);
+    }
+
+    #[test]
+    fn player_health_fits_the_retail_levels_and_constitution() {
+        /// `Player` `HealthInitial`.
+        const BASE: u32 = 856;
+        /// Constitution `Health` of rows 10 and 200.
+        const CONSTITUTION_10: u32 = 200;
+        const CONSTITUTION_200: u32 = 6_419;
+        let retail = [
+            (0, 856),
+            (2, 863),
+            (3, 871),
+            (4, 884),
+            (5, 899),
+            (6, 919),
+            (7, 941),
+        ];
+        for (level, health) in retail {
+            assert_eq!(player_max_health(BASE, level, 0), health, "level {level}");
+        }
+        assert_eq!(player_max_health(BASE, 5, CONSTITUTION_10), 1_099);
+        assert_eq!(player_max_health(BASE, 64, CONSTITUTION_200), 14_443);
+    }
+
+    #[test]
+    fn a_new_max_moves_the_health_with_a_rise_and_caps_it_on_a_fall() {
+        let mut health = Health::full(856);
+        health.set_max(863);
+        assert_eq!((health.current(), health.max()), (863, 863));
+        let mut hurt = Health::at(500, 856);
+        hurt.set_max(1_056);
+        assert_eq!(hurt.current(), 700);
+        hurt.set_max(600);
+        assert_eq!((hurt.current(), hurt.max()), (600, 600));
+        let mut dead = Health::at(0, 856);
+        dead.set_max(900);
+        assert!(dead.is_dead(), "a rise does not raise the dead");
     }
 
     #[test]

@@ -526,7 +526,7 @@ pub struct CombatData {
     /// The slayer sequences the server starts for each weapon stance.
     player_sequences: PlayerSequences,
     vision_offsets: HashMap<String, f32>,
-    player_max_health: u32,
+    player_base_health: u32,
 }
 
 impl CombatData {
@@ -545,7 +545,7 @@ impl CombatData {
     ///
     /// Returns [`CombatDataError`] when a config row is missing.
     pub fn build(source: CombatSource, rows: &CombatRows) -> Result<Self, CombatDataError> {
-        let player_max_health = source
+        let player_base_health = source
             .player_health
             .iter()
             .find(|(id, _)| *id == rows.player_vitals_id)
@@ -691,7 +691,7 @@ impl CombatData {
             player_attacks: PlayerAttacks::default(),
             player_sequences: PlayerSequences::default(),
             vision_offsets: source.vision_offsets.into_iter().collect(),
-            player_max_health,
+            player_base_health,
         })
     }
 
@@ -797,9 +797,9 @@ impl CombatData {
             .unwrap_or(0.0)
     }
 
-    /// The player's max health.
-    pub const fn player_max_health(&self) -> u32 {
-        self.player_max_health
+    /// The player's base health: its max at level 0 without Constitution.
+    pub const fn player_base_health(&self) -> u32 {
+        self.player_base_health
     }
 }
 
@@ -1231,7 +1231,7 @@ mod tests {
 
     #[test]
     fn the_player_health_is_the_initial_of_its_row() {
-        assert_eq!(data().player_max_health(), PLAYER_HEALTH);
+        assert_eq!(data().player_base_health(), PLAYER_HEALTH);
     }
 
     #[test]

@@ -214,6 +214,16 @@ impl VitalsState {
         }
     }
 
+    /// This state with the max health `health_max` in slot 0 (`healthMax` and `maxHealth`).
+    #[must_use]
+    #[allow(clippy::cast_precision_loss, reason = "health stays far below 2^24")]
+    pub fn with_health_max(mut self, health_max: u32) -> Self {
+        let slot = self.slot_0.get_or_insert_with(VitalsSlot0::default);
+        slot.health_max = Some(health_max as f32);
+        slot.max_health = Some(u16::try_from(health_max).unwrap_or(u16::MAX));
+        self
+    }
+
     /// A change of a creature's health to `health`. A creature at 0 is dead: its `vitalsData`
     /// head is 1, which plays the death on the client.
     pub fn creature_health(health: u32) -> Self {

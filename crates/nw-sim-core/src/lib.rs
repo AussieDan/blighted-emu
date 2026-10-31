@@ -30,7 +30,7 @@ pub use cells::{
 pub use character::{Character, CharacterInput, Intent, MountPace, MountPaces, Posture};
 pub use combat::{
     Damage, Dice, Health, Hit, MIN_HIT, MobAttack, PlayerAttack, Threat, mob_hit, mob_max_health,
-    player_hit,
+    player_hit, player_max_health,
 };
 pub use equip_load::{EquipLoad, EquipLoadLimits};
 pub use footing::{Footing, WaterDepth};

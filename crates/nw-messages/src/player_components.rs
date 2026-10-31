@@ -682,6 +682,24 @@ pub struct HealthChange {
     pub first_damage: bool,
     /// The player died or lives again: its new `vitalsData`.
     pub life: Option<VitalsData>,
+    /// The new max health, when it changed (retail newchar 2026-09-18: `healthMax` and
+    /// `maxHealth` after each level up and Constitution spend).
+    pub max: Option<u32>,
+}
+
+impl HealthChange {
+    /// The vitals member of the change.
+    pub fn vitals(&self) -> VitalsState {
+        let vitals = match self.life {
+            Some(life) => VitalsState::player_life(self.health, life),
+            None if self.first_damage => VitalsState::creature_first_damage(self.health),
+            None => VitalsState::creature_health(self.health),
+        };
+        match self.max {
+            Some(max) => vitals.with_health_max(max),
+            None => vitals,
+        }
+    }
 }
 
 /// The members of every player component in [`PLAYER_EMPTY_COMPONENTS`] for `states`: a connected
@@ -730,14 +748,9 @@ pub fn change_members(states: PlayerStates<'_>) -> Vec<BundleMember> {
                 state: MemberState::PlayerComponent(PlayerComponentState::died()),
             });
         }
-        let vitals = match change.life {
-            Some(life) => VitalsState::player_life(change.health, life),
-            None if change.first_damage => VitalsState::creature_first_damage(change.health),
-            None => VitalsState::creature_health(change.health),
-        };
         members.push(BundleMember {
             component: PLAYER_VITALS_COMPONENT,
-            state: MemberState::Vitals(vitals),
+            state: MemberState::Vitals(change.vitals()),
         });
     }
     if let Some(stamina) = states.stamina {
@@ -1226,6 +1239,7 @@ mod tests {
                 health: 0,
                 first_damage: false,
                 life: Some(VitalsData::player_dead(SPAWNED_MS)),
+                max: None,
             }),
             cooldowns: None,
             stamina: None,
@@ -1244,6 +1258,7 @@ mod tests {
                 health: HEALTH.1,
                 first_damage: false,
                 life: Some(VitalsData::player_alive(SPAWNED_MS)),
+                max: None,
             }),
             ..death
         };
@@ -1280,6 +1295,7 @@ mod tests {
                 health: HEALED,
                 first_damage: false,
                 life: None,
+                max: None,
             }),
             cooldowns: None,
             stamina: Some(spend),
