@@ -7,6 +7,7 @@
 //! A query takes the line into each candidate body's own space (the inverse of its place), so a
 //! shape is stored once and placed many times; a line's parameter is the same in both spaces.
 
+use std::cell::Cell;
 use std::sync::Arc;
 
 use nw_formats::rigid::{Vec3, add, cross, dot, scale, sub};
@@ -188,6 +189,14 @@ impl Grid {
         (index(low), index(high))
     }
 
+    /// The first cell (column, row) of `bounds`: the grid holds a body in every cell from there
+    /// to the cell of its far corner.
+    fn first_cell(&self, bounds: &Bounds) -> (usize, usize) {
+        let column = self.cell_range(bounds.min[0], bounds.min[0], self.origin[0], self.columns);
+        let row = self.cell_range(bounds.min[1], bounds.min[1], self.origin[1], self.rows);
+        (column.0, row.0)
+    }
+
     fn bodies_in(&self, column: usize, row: usize) -> &[u32] {
         let cell = row * self.columns + column;
         let (start, end) = (self.starts[cell] as usize, self.starts[cell + 1] as usize);
@@ -319,7 +328,8 @@ impl CollisionIndex {
             let reach = best.map_or(length, |floor| top - floor);
             let origin = [x, y, top];
             let down = [0.0, 0.0, -1.0];
-            let hits = self.hits_in_body(placed, origin, down, reach, Faces::Entering);
+            let hits =
+                self.hits_in_body(placed, origin, down, reach, Faces::Entering, Some(min_up));
             for (t, normal) in hits {
                 if normal[UP] >= min_up && best.is_none_or(|floor| top - t > floor) {
                     best = Some(top - t);
@@ -359,20 +369,27 @@ impl CollisionIndex {
         let (first_row, last_row) =
             self.grid
                 .cell_range(low[1], high[1], self.grid.origin[1], self.grid.rows);
+        let one_cell = first_column == last_column && first_row == last_row;
         let mut best: Option<(f32, Vec3)> = None;
-        let mut seen = std::collections::HashSet::new();
         for row in first_row..=last_row {
             for column in first_column..=last_column {
                 for &index in self.grid.bodies_in(column, row) {
-                    if !seen.insert(index) {
-                        continue;
-                    }
                     let placed = &self.bodies[index as usize];
                     let reach = best.map_or(length, |(t, _)| t);
                     if placed.bounds.clip(from, unit, reach).is_none() {
                         continue;
                     }
-                    for (t, normal) in self.hits_in_body(placed, from, unit, reach, faces) {
+                    // A body of several cells is taken once, in the first of its cells that the
+                    // line's cells reach: the cell where a set of the bodies seen would first
+                    // take it.
+                    if !one_cell {
+                        let (body_column, body_row) = self.grid.first_cell(&placed.bounds);
+                        if column != body_column.max(first_column) || row != body_row.max(first_row)
+                        {
+                            continue;
+                        }
+                    }
+                    for (t, normal) in self.hits_in_body(placed, from, unit, reach, faces, None) {
                         if best.is_none_or(|(known, _)| t < known) {
                             best = Some((t, normal));
                         }
@@ -388,7 +405,9 @@ impl CollisionIndex {
     }
 
     /// The surfaces of one body on the line `origin + t * direction` (`direction` of unit
-    /// length), `t` in `[0, reach]`: each `t` with the world's outward unit normal.
+    /// length), `t` in `[0, reach]`: each `t` with the world's outward unit normal. The search of
+    /// a mesh stops past the nearest hit that faces up at least `stop_up` (any hit without one):
+    /// the callers take the nearest such hit only.
     fn hits_in_body(
         &self,
         placed: &PlacedBody,
@@ -396,6 +415,7 @@ impl CollisionIndex {
         direction: Vec3,
         reach: f32,
         faces: Faces,
+        stop_up: Option<f32>,
     ) -> Vec<(f32, Vec3)> {
         let Some(inverse) = invert(&placed.body.place) else {
             return Vec::new();
@@ -410,9 +430,14 @@ impl CollisionIndex {
             return Vec::new();
         };
         let mut hits = Vec::new();
+        let limit = Cell::new(reach);
         let mut take = |hit: LocalHit| {
-            if (0.0..=reach).contains(&hit.t) {
-                hits.push((hit.t, world_normal(&inverse, hit.normal)));
+            if (0.0..=limit.get()).contains(&hit.t) {
+                let normal = world_normal(&inverse, hit.normal);
+                hits.push((hit.t, normal));
+                if stop_up.is_none_or(|min_up| normal[UP] >= min_up) {
+                    limit.set(hit.t);
+                }
             }
         };
         match geometry {
@@ -424,7 +449,7 @@ impl CollisionIndex {
                         triangles,
                         local_origin,
                         local_direction,
-                        reach,
+                        &limit,
                         faces,
                         &mut take,
                     );
@@ -538,7 +563,7 @@ fn counts(faces: Faces, normal: Vec3, direction: Vec3) -> bool {
     faces == Faces::Both || dot(normal, direction) < 0.0
 }
 
-/// The triangles of a mesh on the line.
+/// The triangles of a mesh on the line, out to `reach`; `take` may shorten it.
 #[allow(
     clippy::too_many_arguments,
     reason = "the line, the mesh and its tree, read in one walk"
@@ -549,7 +574,7 @@ fn mesh_hits(
     triangles: &[[u16; 3]],
     origin: Vec3,
     direction: Vec3,
-    reach: f32,
+    reach: &Cell<f32>,
     faces: Faces,
     take: &mut impl FnMut(LocalHit),
 ) {
@@ -558,7 +583,7 @@ fn mesh_hits(
         let Some(node) = tree.nodes.get(index) else {
             continue;
         };
-        if node.bounds.clip(origin, direction, reach).is_none() {
+        if node.bounds.clip(origin, direction, reach.get()).is_none() {
             continue;
         }
         if node.count == 0 {
@@ -1199,6 +1224,35 @@ mod tests {
     }
 
     #[test]
+    fn a_ray_over_many_cells_meets_walls_of_many_cells_at_the_nearest() {
+        // Walls 0.25 m thick across x, 200 m long in y: each is in several cell rows, and the
+        // line starts in a row past their first.
+        let index = index(
+            vec![Geometry::Box {
+                half_extents: [0.125, 100.0, 2.0],
+            }],
+            vec![
+                Body {
+                    geometry: 0,
+                    place: moved(150.0, 0.0, 2.0),
+                },
+                Body {
+                    geometry: 0,
+                    place: moved(70.0, 0.0, 2.0),
+                },
+            ],
+        );
+        let hit = index
+            .raycast([0.0, 40.0, 1.0], [200.0, 75.0, 1.0])
+            .expect("wall");
+        assert!((hit.point[0] - 69.875).abs() < TOLERANCE, "{hit:?}");
+        let back = index
+            .raycast([200.0, -75.0, 1.0], [0.0, -40.0, 1.0])
+            .expect("from the other side");
+        assert!((back.point[0] - 150.125).abs() < TOLERANCE, "{back:?}");
+    }
+
+    #[test]
     fn an_entering_ray_meets_a_wall_from_outside_only() {
         // A box 2 m thick across x from x = 9 to x = 11.
         let index = index(
@@ -1258,5 +1312,77 @@ mod tests {
             ],
         );
         assert_eq!(index.body_count(), 0);
+    }
+
+    /// Three mob places of the open world's starting beach (the hunt starts of the tools
+    /// repository's test client config), where retail beach mobs walk.
+    const BEACH_STARTS: [[f32; 2]; 3] = [[7171.3, 3160.2], [9696.3, 2260.2], [7971.3, 4685.2]];
+    /// The half side of the square of points around each place: a mob walks there.
+    const BEACH_HALF_SIDE_M: f32 = 96.0;
+    /// The spacing of the points, m.
+    const BEACH_SPACING_M: f32 = 1.5;
+    /// A mob's walk line step (`sim::mob_ai` `FLOOR_STEP_M`).
+    const WALK_STEP_M: f32 = 0.5;
+    /// A height over the beach's floors, m.
+    const ABOVE_BEACH_M: f32 = 120.0;
+    /// The knee height of a walk step's wall ray over its floor (`sim::mob_ai` `STEP_UP_M`).
+    const KNEE_M: f32 = 0.5;
+    /// The longest mean time of one walk step (a floor and a wall ray), µs, on the 28-core
+    /// development PC (2026-10-31): 1.82 with the first-cell check on every body of a ray, 1.55
+    /// with it only on rays over several cells and a mesh search that stops at the nearest hit.
+    const MAX_WALK_STEP_US: f64 = 1.7;
+    const US_PER_S: f64 = 1e6;
+
+    /// Run with `NW_CONTENT_DIR` set:
+    /// `cargo test --release -p nw-world walk_steps_on_the_beach -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "needs the build 25810808 collision file in NW_CONTENT_DIR; a release timing"]
+    fn walk_steps_on_the_beach_are_fast() {
+        const BUILD: &str = "25810808";
+        const LEVEL: &str = "newworld_vitaeeterna";
+        let dir = std::env::var("NW_CONTENT_DIR").expect("NW_CONTENT_DIR");
+        let path = crate::collision::collision_file_path(std::path::Path::new(&dir), BUILD, LEVEL);
+        let level = LevelCollision::load(&path, BUILD).expect("collision");
+        let index = CollisionIndex::new(LevelCollision {
+            deferred: Vec::new(),
+            ..level
+        });
+        // A few hundred points a side.
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            reason = "a few hundred"
+        )]
+        let side = (2.0 * BEACH_HALF_SIDE_M / BEACH_SPACING_M) as u32;
+        let mut points = Vec::new();
+        for [x, y] in BEACH_STARTS {
+            for row in 0..side {
+                for column in 0..side {
+                    points.push([
+                        x - BEACH_HALF_SIDE_M + column as f32 * BEACH_SPACING_M,
+                        y - BEACH_HALF_SIDE_M + row as f32 * BEACH_SPACING_M,
+                    ]);
+                }
+            }
+        }
+        let started = std::time::Instant::now();
+        let (mut floors, mut walls) = (0_u32, 0_u32);
+        for [x, y] in &points {
+            let floor = index.floor_at(*x, *y, ABOVE_BEACH_M);
+            floors += u32::from(floor.is_some());
+            let knee = floor.unwrap_or(0.0) + KNEE_M;
+            walls += u32::from(
+                index
+                    .raycast([*x, *y, knee], [*x + WALK_STEP_M, *y, knee])
+                    .is_some(),
+            );
+        }
+        let step_us = started.elapsed().as_secs_f64() * US_PER_S / points.len() as f64;
+        println!(
+            "beach walk steps: {} points, {floors} on a structure, {walls} walls; {step_us:.3} us a step",
+            points.len()
+        );
+        assert!(floors > 0, "the beach has structures");
+        assert!(step_us < MAX_WALK_STEP_US, "{step_us:.3} us a step");
     }
 }

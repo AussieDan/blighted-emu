@@ -121,8 +121,8 @@
 
   <h2>What to do next (in order)</h2>
   <ol class="next">
-    <li><strong>Make the beach sim fast enough for many players.</strong>
-      <div class="why">With 30 test bots at the starting beach (<code>nw-testclient hunt</code>), its sim runs about 300 ms per tick (the mob tick is 75 % of it), so it does not answer new logins in time ("the sim did not answer") and the bots get no world. The build before 2026-10-31 does the same. Notes: <code>local-data/findings/2026-10-31-night-test-run.md</code>.</div></li>
+    <li><strong>Fix the hunt test's start points, then finish the busy sim's speed.</strong>
+      <div class="why">Done 2026-10-31: with 28 bots, the busy sim no longer misses ticks (late ticks 500+ to about 4, no tick over 100 ms), and every bot logs in and stays. Still open: the hunt bots appear at the world director's 123 load test points, far from the hunt starts, so they never reach a mob (no hits, also on the build before); 98.9 % of all ticks fit in one tick, the test wants 99 % (the rest: about 1,000 awake mobs near 28 bots). Notes: <code>local-data/findings/2026-10-31-beach-sim-speed.md</code>.</div></li>
     <li><strong>Build the weapon abilities and mana.</strong>
       <div class="why">The ability keys (1 to 3), their cooldowns, spells and effects, and mana use are not built. Retail spends mana per spell (<code>ManaData</code>) and gives it back about 3.3 per second at Focus 250. Notes: <code>local-data/findings/2026-10-31-dodge-refusals-and-mana.md</code>.</div></li>
     <li><strong>Live check of the GM chat commands.</strong>
@@ -161,6 +161,7 @@
 
   <h2>Done list</h2>
   <ul class="done">
+    <li>✅ Busy sim speed: the open map leaves out the encounter spawns of the encounters it does not run (the forts' invasion rosters, up to 2,226 mobs on one point, and the breaches' seven tier copies of each mob; 59,214 of 115,965 spawns), mob minds use all their threads from 128 awake mobs, and the collision rays lost a hash set per ray. With 28 bots: late ticks 500+ to about 4, every bot logs in and stays (2026-10-31).</li>
     <li>✅ Player max health grows with the level and Constitution as retail: 856 + 1.75 x level squared + the Constitution health (9 retail points of two characters fit); the client gets the new max after a level up or a spend (2026-10-31).</li>
     <li>✅ Storage and trading post: an item gets a new id on each move, the storage seen from afar and the storage notes match retail, and a trading post search less than 1 s after the last one is refused as retail (2026-10-31).</li>
     <li>✅ Fast travel costs azoth as retail (20, or 10 within the player's territory; inn and home travel free); a mount summon is refused in combat and cancelled in the air as retail (2026-10-31).</li>
@@ -284,7 +285,7 @@ const AREAS = [
   {
     name: "Mobs",
     features: [
-      ["Spawns and health", 90, "tests", "99.3% of creature records explained.", "A few odd records."],
+      ["Spawns and health", 90, "tests", "99.3% of creature records explained. The open map leaves out the invasion and breach encounter spawns (no encounter runner there).", "A few odd records. Breaches and invasions need an encounter runner."],
       ["Mob AI", 65, "live", "1,075 behavior trees from Server.pak. Thorpe fight fixed. Mob paths stop at walls and climb at most 0.6 m a step.", "Janszoon tree is built from held trees; he attacks, throws his anchor at 6 to 10 m (Inferred; the anchor is now a real projectile), his charge follows the slope and he leashes home (live check needed). Terrain cookies now in our ground; mobs walk around rocks and crates."],
       ["Mob animations", 85, "tests", "736 of 747 creature assets.", "11 assets."],
       ["Patrols and waypoints", 70, "tests", "12,858 spawns get waypoint paths.", "Live check."],

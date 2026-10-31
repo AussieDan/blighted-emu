@@ -43,6 +43,7 @@ use crate::mob_ai::{
     COMBAT_LEASH_KEY, MobAi, Shown, SpawnAi, Strike, Surroundings, TreeMind, floor_line,
     height_after_move,
 };
+use crate::objectives::KillTypes;
 
 /// A mob farther than this from its spawn does not fall asleep: its tree walks it home first
 /// (Observed: a retail beach corrupted sailor 29 m from where it started walked home with
@@ -53,6 +54,11 @@ const AWAY_FROM_HOME_M: f32 = 10.0;
 /// A player scans for mobs to wake again after moving this far (about 2 s of running); far less
 /// than the wake radius, so a mob wakes before the player can reach it.
 pub const WAKE_RESCAN_M: f32 = 10.0;
+/// The starts of the vitals categories of the encounters that the open map does not run
+/// ([`without_unrun_encounters`]): the invasion's mobs (`VitalsCategoryData` `Invasion_Bomber`,
+/// `Invasion_Grunt`, `Invasion_Sniper`, ...) and the corrupted breaches' (`Darkness`,
+/// `DarknessAI`).
+const UNRUN_ENCOUNTER_CATEGORIES: [&str; 2] = ["Invasion_", "Darkness"];
 
 /// The first mob's number after [`MOB_ENTITY_BASE`]. A number whose low 32 bits are all zero
 /// gives a `GdeRef` that the client takes but never shows: in every live run the first spawned
@@ -63,8 +69,10 @@ const FIRST_MOB_OFFSET: u64 = 1;
 const NO_SPAWN_CATEGORY: u32 = 0;
 
 /// Mobs per thread below which the minds run on fewer threads (our engineering limit: a thread
-/// costs about as much to start as a few hundred mind steps).
-pub const MIN_MOBS_PER_THREAD: usize = 512;
+/// costs about as much to start as a few hundred mind steps on flat ground, but on the level's
+/// floors a step that checks its walk lines costs far more; live hunt 2026-10-31: about 1,000
+/// awake mobs ran on one thread at 512, with a mob tick of 33 to 100 ms).
+pub const MIN_MOBS_PER_THREAD: usize = 128;
 
 /// How long the grid of the awake mobs for the group aggro serves before it is made again (our
 /// engineering limit), and how far a mob may have moved since (a run of 7 m/s for a second,
@@ -426,6 +434,54 @@ pub fn unscripted_spawns(spawns: Arc<[VitalsSpawn]>, scripted: bool) -> Arc<[Vit
         .filter(|spawn| !spawn.is_encounter)
         .cloned()
         .collect()
+}
+
+/// `spawns` without the encounter spawns of the encounters that the open map does not run (a
+/// vitals row in an `UNRUN_ENCOUNTER_CATEGORIES` category) when `open_map`. Observed (data,
+/// build 25810808), each an encounter spawn and named by no task:
+/// - the invasion's 29,235: the forts' siege encounters (`Siege_Fort_BrimstoneSands`, ...), up
+///   to 2,226 at one point; the open map runs no invasion (Inferred: a war game mode of its own).
+/// - the breaches' 29,664: each place of a breach (`Enc_Darkness_...`) holds its mob seven
+///   times, once for each tier of levels 25 to 70 (`corruption_swarmer_dt1` to `_dt6`, `_dt1`
+///   twice), of which one runs at a time (Inferred); the open map runs no breach.
+///
+/// With the categories that start so, 59,214 of the open map's 115,965 spawns are left out (sim
+/// log 2026-10-31). Awake, one fort's 2,226 ran the sim's mob tick to 175 ms (live hunt). Retail
+/// showed no mob of an encounter spawn either: general-other-01, 711 to 732 s, the player within
+/// 25 m of the `loot_goblin` of `Enc_WorldEvent_LootGoblin_00` and no goblin in the capture.
+pub fn without_unrun_encounters(
+    spawns: Arc<[VitalsSpawn]>,
+    open_map: bool,
+    kill_types: &KillTypes,
+) -> Arc<[VitalsSpawn]> {
+    if !open_map {
+        return spawns;
+    }
+    let unrun = |spawn: &VitalsSpawn| {
+        spawn.is_encounter
+            && kill_types
+                .of(spawn.vitals_id)
+                .is_some_and(|(_, categories)| {
+                    categories
+                        .iter()
+                        .any(|category| is_unrun_encounter(category))
+                })
+    };
+    spawns
+        .iter()
+        .filter(|spawn| !unrun(spawn))
+        .cloned()
+        .collect()
+}
+
+/// Whether vitals category `category` starts with one of `UNRUN_ENCOUNTER_CATEGORIES` (case
+/// aside).
+fn is_unrun_encounter(category: &str) -> bool {
+    UNRUN_ENCOUNTER_CATEGORIES.iter().any(|start| {
+        category
+            .get(..start.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(start))
+    })
 }
 
 fn position_of(spawn: &VitalsSpawn) -> Position {
@@ -1796,6 +1852,45 @@ mod tests {
         let spawns: Arc<[VitalsSpawn]> = Arc::from([encounter, standing.clone()]);
         assert_eq!(&*unscripted_spawns(Arc::clone(&spawns), false), &*spawns);
         assert_eq!(&*unscripted_spawns(spawns, true), &[standing][..]);
+    }
+
+    #[test]
+    fn the_open_map_leaves_out_the_encounters_it_does_not_run() {
+        const SNIPER: &str = "invasion_sniper";
+        const SWARMER: &str = "corruption_swarmer_dt1";
+        let kill_types = KillTypes::build([
+            (
+                SNIPER.to_owned(),
+                "Invasion_Sniper,Hostile,Corrupted".to_owned(),
+            ),
+            (
+                SWARMER.to_owned(),
+                "Corruption_Swarmer_DT1,Hostile,Corrupted,darkness".to_owned(),
+            ),
+            (TEST_MOB.to_owned(), "Boar,Hostile".to_owned()),
+        ]);
+        let encounter = |x: f32, id: &str| VitalsSpawn {
+            is_encounter: true,
+            ..spawn_at(x, id, TEST_LEVEL)
+        };
+        let standing_swarmer = spawn_at(2.0, SWARMER, TEST_LEVEL);
+        let quest_boar = encounter(3.0, TEST_MOB);
+        let spawns: Arc<[VitalsSpawn]> = Arc::from([
+            encounter(0.0, SNIPER),
+            encounter(1.0, SWARMER),
+            standing_swarmer.clone(),
+            quest_boar.clone(),
+        ]);
+        assert_eq!(
+            &*without_unrun_encounters(Arc::clone(&spawns), true, &kill_types),
+            &[standing_swarmer, quest_boar][..],
+            "a plain spawn and another encounter's stay; the category's case does not count"
+        );
+        assert_eq!(
+            &*without_unrun_encounters(Arc::clone(&spawns), false, &kill_types),
+            &*spawns,
+            "an instance keeps them"
+        );
     }
 
     #[test]

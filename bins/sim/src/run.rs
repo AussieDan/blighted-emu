@@ -39,7 +39,7 @@ use crate::asset_solids::AssetSolids;
 use crate::config::{SimConfig, SimConfigError, SimRole, load_sim_config};
 use crate::gameplay::{GameplayError, load_gameplay};
 use crate::mob_ai::{LookAssets, MobAi, resolve_ai};
-use crate::mobs::{spawns_of_level, unscripted_spawns};
+use crate::mobs::{spawns_of_level, unscripted_spawns, without_unrun_encounters};
 use crate::player_content::{MobLooks, PlayerContent};
 use crate::server::{
     Databases, LATENCY_BUCKETS_SECONDS, LoopSettings, METRIC_HANDOFF_SECONDS,
@@ -447,6 +447,20 @@ async fn serve_async(
         .map_err(|error| RunError::Metrics(error.to_string()))?;
     let world_file = ground.terrain();
     tracing::info!(sim = %config.sim_id, world = %config.world_id, level = %config.level, "serving");
+    let level_spawns = unscripted_spawns(
+        spawns_of_level(&config.level, &world_file.vitals),
+        config.role == SimRole::Instance && content.dungeon_scripts.has_level(&config.level),
+    );
+    let spawns = without_unrun_encounters(
+        Arc::clone(&level_spawns),
+        config.role == SimRole::OpenMap,
+        &content.kill_types,
+    );
+    tracing::info!(
+        spawns = spawns.len(),
+        left_out = level_spawns.len() - spawns.len(),
+        "mob spawns; the encounter spawns the open map does not run are left out"
+    );
     let settings = LoopSettings {
         sim_id: config.sim_id.clone(),
         world_id: config.world_id,
@@ -462,15 +476,7 @@ async fn serve_async(
         heartbeat_interval: std::time::Duration::from_millis(config.heartbeat_interval_ms),
         heartbeat_misses: config.heartbeat_misses,
         mob_ai: resolve_ai(world_file, &mob_ai),
-        combat: config.combat_settings(
-            combat,
-            unscripted_spawns(
-                spawns_of_level(&config.level, &world_file.vitals),
-                config.role == SimRole::Instance
-                    && content.dungeon_scripts.has_level(&config.level),
-            ),
-            mob_ai,
-        ),
+        combat: config.combat_settings(combat, spawns, mob_ai),
         design: Arc::new(design),
         leaderboard_calendar: config.leaderboard_calendar()?,
         content,

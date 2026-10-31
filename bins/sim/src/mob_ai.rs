@@ -643,9 +643,14 @@ fn route_of(path: &PatrolPath, ai: &MobAi) -> Route {
 /// The height of a mob that moved to `to` on `ground`: the floor's under it, unless that lies
 /// more than [`MAX_STEP_DOWN_M`] below the mob.
 pub fn height_after_move(ground: &dyn Ground, to: Position) -> f32 {
-    match ground.floor_at(to.x, to.y, to.z) {
-        Some(height) if to.z - height <= MAX_STEP_DOWN_M => height,
-        _ => to.z,
+    height_over(ground.floor_at(to.x, to.y, to.z), to.z)
+}
+
+/// [`height_after_move`] of a mob at height `z` over `floor`.
+fn height_over(floor: Option<f32>, z: f32) -> f32 {
+    match floor {
+        Some(height) if z - height <= MAX_STEP_DOWN_M => height,
+        _ => z,
     }
 }
 
@@ -694,7 +699,7 @@ pub fn floor_line(
         if on_floor && below.is_some_and(|floor| last.z - floor > MAX_STEP_DOWN_M) {
             return None;
         }
-        let z = height_after_move(ground, Position { x, y, z: last.z });
+        let z = height_over(below, last.z);
         let run = last.horizontal_distance(Position { x, y, z });
         if max_rise.is_some_and(|rise| run > 0.0 && (z - last.z).abs() / run > rise) {
             return None;
