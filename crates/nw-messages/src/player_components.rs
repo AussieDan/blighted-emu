@@ -33,6 +33,7 @@ use crate::containers::{
     ItemManagementState,
 };
 use crate::cooldowns::{COOLDOWNS_TYPE_INDEX, CooldownsState};
+use crate::faction_state::FACTION_TYPE_INDEX;
 use crate::game_events::GAME_EVENT_TYPE_INDEX;
 use crate::gathering::{GATHERING_TYPE_INDEX, GatheringState};
 use crate::gear::PlayerGear;
@@ -186,8 +187,6 @@ pub const PLAYER_EMPTY_COMPONENTS: [(u64, u64); 57] = [
 
 /// Type index of `MB::PlayerNameTagComponentReplicatedState` (component 54).
 pub const PLAYER_NAME_TAG_TYPE_INDEX: u64 = 100;
-/// Type index of `MB::FactionComponentReplicatedState` (component 49).
-const FACTION_TYPE_INDEX: u64 = 3152;
 /// Type index of `MB::ChargeComponentReplicatedState` (component 48).
 const CHARGE_TYPE_INDEX: u64 = 5257;
 /// Type index of `MB::AudioProxyComponentReplicatedState` (component 13).

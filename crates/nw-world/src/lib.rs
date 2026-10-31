@@ -12,6 +12,7 @@ pub mod interact_tags;
 pub mod level_script;
 pub mod map_tiles;
 pub mod metadata;
+pub mod quick_courses;
 pub mod records;
 pub mod roads;
 pub mod script;

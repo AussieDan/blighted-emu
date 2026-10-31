@@ -436,6 +436,29 @@ impl Gear {
             .map(|(_, stack)| stack.item_id.as_str())
     }
 
+    /// The perks of the worn items that apply, each with its item's gear score: those of every
+    /// worn item but the weapons of the main-hand and off-hand options not in the hand (an
+    /// off-hand option goes with its main-hand option: 27 with 24, 29 with 26).
+    pub(super) fn worn_perks(&self) -> Vec<(&str, u32)> {
+        let held = self.held_option();
+        let in_hand = |slot_id: u32| match slot_id {
+            slot::MAIN_HAND_OPTION_1..=slot::MAIN_HAND_OPTION_3 => held == Some(slot_id),
+            slot::OFF_HAND_OPTION_1 | slot::OFF_HAND_OPTION_3 => {
+                held.and_then(off_hand_of) == Some(slot_id)
+            }
+            _ => true,
+        };
+        self.worn_stacks()
+            .filter(|(slot_id, _)| in_hand(*slot_id))
+            .flat_map(|(_, stack)| {
+                stack
+                    .perks
+                    .iter()
+                    .map(|perk| (perk.as_str(), stack.item.gear_score))
+            })
+            .collect()
+    }
+
     /// The off-hand item worn with the weapon in the hand (a shield).
     pub(super) fn off_hand_weapon(&self) -> Option<&str> {
         self.worn_item(off_hand_of(self.held_option()?)?)
@@ -1135,6 +1158,40 @@ pub(crate) mod tests {
         )
         .expect("staff");
         gear
+    }
+
+    #[test]
+    fn the_worn_perks_are_those_of_the_armor_and_the_weapon_in_the_hand() {
+        let mut gear = gear_with_staff();
+        for (slot_id, stack) in gear.worn.iter_mut() {
+            if let Some(stack) = stack {
+                stack.perks = vec![format!("Perk_{slot_id}")];
+            }
+        }
+        let held = gear.held_option().expect("a weapon");
+        let mut listed: Vec<String> = gear
+            .worn_perks()
+            .into_iter()
+            .map(|(perk, _)| perk.to_owned())
+            .collect();
+        listed.sort();
+        let mut wanted: Vec<String> = gear
+            .worn_stacks()
+            .map(|(slot_id, _)| slot_id)
+            .filter(|slot_id| {
+                !(slot::MAIN_HAND_OPTION_1..=slot::OFF_HAND_OPTION_3).contains(slot_id)
+                    || *slot_id == held
+            })
+            .map(|slot_id| format!("Perk_{slot_id}"))
+            .collect();
+        wanted.sort();
+        assert_eq!(listed, wanted);
+        assert!(
+            listed.contains(&format!("Perk_{held}")),
+            "the weapon in the hand"
+        );
+        let weapons = gear.main_hand().count();
+        assert!(weapons >= 2, "the kit's weapon and the staff");
     }
 
     /// [`kits`] with the master rows of `extra` items too: (item id, item class).

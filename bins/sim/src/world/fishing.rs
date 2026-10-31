@@ -49,7 +49,7 @@ use super::attack::counter_is_newer;
 use super::quest_objects::grant;
 use super::tradeskill::progression_gain;
 use super::{Body, Player, SimWorld, send_now, unix_ns};
-use crate::objectives::Event;
+use crate::objectives::{Event, FishCaught, FishingStep};
 
 /// The paperdoll slot of the fishing pole (`PaperdollSlotTypes` `FISHING_SLOT`, `FUN_145cac380`).
 pub(super) const FISHING_SLOT: u32 = 37;
@@ -108,6 +108,8 @@ const MS_PER_S: f64 = 1_000.0;
 const ONCE: u32 = 1;
 /// One bait goes on the hook.
 const ONE_BAIT: u32 = 1;
+/// The roll of a quest fish's chance, in percent.
+const PERCENT: u32 = 100;
 
 /// The keys of one input record that fishing reads.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -182,6 +184,11 @@ pub(super) struct Fight {
     pub(super) tension: f64,
     /// When the hook was set.
     pub(super) hooked_ms: u64,
+    /// The fish's length and weight.
+    pub(super) length: f32,
+    pub(super) weight: f32,
+    /// It bit at a hotspot.
+    pub(super) at_hotspot: bool,
 }
 
 impl Fight {
@@ -269,6 +276,8 @@ pub(super) enum FishingAction {
     Caught(Box<Fight>),
     /// The cast is over: its bait `item` comes back unless the loss chance takes it.
     BaitBack { item: String, loss_chance: f64 },
+    /// Fishing took a step that the player's fishing tasks count.
+    QuestStep(FishingStep),
 }
 
 /// The replicated step list.
@@ -562,6 +571,7 @@ impl PlayerFishing {
         match fight {
             Some(fight) => {
                 self.enter(FishingState::HookHit);
+                actions.push(FishingAction::QuestStep(FishingStep::Hook));
                 self.phase = Phase::Hooked {
                     at_ms: now_ms.saturating_add(HOOK_HIT_MS),
                     fight: Box::new(fight),
@@ -597,6 +607,7 @@ impl PlayerFishing {
             Phase::Equipping { at_ms } if now_ms >= at_ms => {
                 self.enter(FishingState::FishingEquipped);
                 self.phase = Phase::Equipped;
+                actions.push(FishingAction::QuestStep(FishingStep::Equip));
             }
             Phase::Flying { at_ms, cast } if now_ms >= at_ms => {
                 actions.push(FishingAction::Landed {
@@ -606,6 +617,7 @@ impl PlayerFishing {
                 if cast.water.is_some() {
                     self.enter(FishingState::CastHitWater);
                     self.enter(FishingState::FishingStarted);
+                    actions.push(FishingAction::QuestStep(FishingStep::Cast));
                     self.phase = Phase::Waiting {
                         at_ms: now_ms.saturating_add(cast.nibble_ms),
                         cast,
@@ -702,11 +714,12 @@ impl PlayerFishing {
             };
         } else {
             if active != self.held {
-                self.enter(if self.held {
-                    FishingState::ReelingActive
+                if self.held {
+                    self.enter(FishingState::ReelingActive);
+                    actions.push(FishingAction::QuestStep(FishingStep::Reel));
                 } else {
-                    FishingState::ReelingRecover
-                });
+                    self.enter(FishingState::ReelingRecover);
+                }
             }
             self.phase = Phase::Reeling {
                 fight,
@@ -951,6 +964,13 @@ impl SimWorld {
                 FishingAction::BaitBack { item, loss_chance } => {
                     self.bait_back(entity, &item, loss_chance);
                 }
+                FishingAction::QuestStep(step) => {
+                    if let Some(number) =
+                        self.world.get::<Player>(entity).map(|player| player.number)
+                    {
+                        self.quest_event(number, Event::Fishing(step), now_ms);
+                    }
+                }
             }
         }
     }
@@ -1119,11 +1139,13 @@ impl SimWorld {
         self.fishing_actions(entity, actions.unwrap_or_default(), now_ms);
     }
 
-    /// Rolls what player `entity`'s hook brings in from the water of `cast`: the bait's loot
-    /// table when it names one, else the hotspot's, else [`FISHING_LOOT_TABLE`], with the roll
-    /// bonuses of the pole, the bait and the hotspot, holding the water's tag, the hotspot's
-    /// loot tag and the loot tags of the player's territories. The first catchable item rolled
-    /// is the catch; its behavior, length and weight are picked evenly from its rows.
+    /// Rolls what player `entity`'s hook brings in from the water of `cast`: a quest fish of the
+    /// player's waiting catch tasks at its chance ([`crate::objectives::ObjectiveRun::fish_drops`]),
+    /// else the bait's loot table when it names one, else the hotspot's, else
+    /// [`FISHING_LOOT_TABLE`], with the roll bonuses of the pole, the bait and the hotspot,
+    /// holding the water's tag, the hotspot's loot tag and the loot tags of the player's
+    /// territories. The first catchable item rolled is the catch; its behavior, length and
+    /// weight are picked evenly from its rows.
     fn roll_catch(&mut self, entity: Entity, cast: &Cast, now_ms: u64) -> Option<HookedCatch> {
         let content = Arc::clone(&self.content);
         let rules = &content.fishing;
@@ -1157,19 +1179,44 @@ impl SimWorld {
         tags.push(water.tag().to_owned());
         tags.extend(hotspot.map(|hotspot| hotspot.loot_tag.clone()));
         let (bonuses, wire_modifiers) = roll_bonuses(modifiers);
-        let reached = self.reached_loot_limits(number);
-        let context = nw_content::loot::LootContext {
-            tags: &tags,
-            ..self.loot_context(number, None, &reached)
+        let zones = super::player_territories(&content, &territories);
+        let quest_fish: Vec<(String, u32)> = self
+            .quests
+            .get(&number)
+            .into_iter()
+            .flatten()
+            .flat_map(|quest| quest.run.fish_drops(water.tag(), &zones))
+            .collect();
+        let bitten = quest_fish
+            .into_iter()
+            .find(|(item, percent)| {
+                rules.catchable(item).is_some() && self.dice.below(PERCENT) < *percent
+            })
+            .map(|(item, _)| item);
+        let (item, catchable) = match bitten {
+            Some(item) => {
+                let catchable = rules.catchable(&item)?;
+                (item, catchable)
+            }
+            None => {
+                let reached = self.reached_loot_limits(number);
+                let context = nw_content::loot::LootContext {
+                    tags: &tags,
+                    ..self.loot_context(number, None, &reached)
+                };
+                let dice = &mut self.dice;
+                let rolled =
+                    content
+                        .loot
+                        .roll_with_bonuses(&table, context, &bonuses, &mut |below| {
+                            dice.below(below)
+                        });
+                let items = self.limit_loot(number, rolled);
+                items
+                    .iter()
+                    .find_map(|(item, _)| Some((item.clone(), rules.catchable(item)?)))?
+            }
         };
-        let dice = &mut self.dice;
-        let rolled = content
-            .loot
-            .roll_with_bonuses(&table, context, &bonuses, &mut |below| dice.below(below));
-        let items = self.limit_loot(number, rolled);
-        let (item, catchable) = items
-            .iter()
-            .find_map(|(item, _)| Some((item.clone(), rules.catchable(item)?)))?;
         let behaviors: Vec<&Behavior> = catchable
             .behaviors
             .iter()
@@ -1203,6 +1250,9 @@ impl SimWorld {
                 left_m: reel_m,
                 tension: 0.0,
                 hooked_ms: now_ms,
+                length,
+                weight,
+                at_hotspot: hotspot.is_some(),
             },
         })
     }
@@ -1229,6 +1279,16 @@ impl SimWorld {
         }
         tracing::debug!(player = number, item = %fight.item, "fish caught");
         self.give_loot(number, vec![(fight.item.clone(), ONCE)], now_ms);
+        self.quest_event(
+            number,
+            Event::FishCaught(FishCaught {
+                item: &fight.item,
+                length: fight.length,
+                weight: fight.weight,
+                hotspot: fight.at_hotspot,
+            }),
+            now_ms,
+        );
         self.fishing_event(number, FISHING_DATA.catch_event, now_ms);
         if let Some(event) = &fight.reward_event {
             self.fishing_event(number, event, now_ms);
@@ -1306,6 +1366,9 @@ mod tests {
             left_m: 20.0,
             tension: 0.0,
             hooked_ms: NOW,
+            length: 12.0,
+            weight: 3.0,
+            at_hotspot: false,
         }
     }
 
@@ -1342,7 +1405,10 @@ mod tests {
             fishing.keys(1, keys, true, NOW),
             [FishingAction::PutWeaponAway]
         );
-        fishing.tick(NOW + EQUIP_MS);
+        assert_eq!(
+            fishing.tick(NOW + EQUIP_MS),
+            [FishingAction::QuestStep(FishingStep::Equip)]
+        );
         assert_eq!(
             states(&fishing),
             [
@@ -1414,10 +1480,13 @@ mod tests {
         let landed = fishing.tick(NOW + 3_500);
         assert_eq!(
             landed,
-            [FishingAction::Landed {
-                bobber: [10.0, 20.0, 40.0],
-                hotspot: 0
-            }]
+            [
+                FishingAction::Landed {
+                    bobber: [10.0, 20.0, 40.0],
+                    hotspot: 0
+                },
+                FishingAction::QuestStep(FishingStep::Cast)
+            ]
         );
         fishing.tick(NOW + 13_500);
         fishing.tick(NOW + 14_700);
@@ -1430,10 +1499,19 @@ mod tests {
             tension_multiplier: 0.8,
             ..fight(0)
         };
-        assert!(fishing.hook(Some(small), NOW + 15_000).is_empty());
+        assert_eq!(
+            fishing.hook(Some(small), NOW + 15_000),
+            [FishingAction::QuestStep(FishingStep::Hook)]
+        );
         fishing.tick(NOW + 15_000 + HOOK_HIT_MS);
         key(&mut fishing, held, NOW + 15_700);
         let mut at = NOW + 15_700;
+        at += 33;
+        assert_eq!(
+            fishing.tick(at),
+            [FishingAction::QuestStep(FishingStep::Reel)],
+            "the reel starts"
+        );
         let mut caught = Vec::new();
         while caught.is_empty() && at < NOW + 60_000 {
             at += 33;

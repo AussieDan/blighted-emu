@@ -17,6 +17,7 @@ pub mod creature_animations;
 pub mod datatable_overrides;
 pub mod drop_rolls;
 pub mod equip_load;
+pub mod factions;
 pub mod fill;
 /// Typed row structs and `Tables`, written by `content-tool codegen`. Do not edit by hand.
 // The generator writes prettyplease output, which rustfmt would format differently.
@@ -42,11 +43,14 @@ pub mod mounts;
 pub mod music;
 pub mod mutations;
 pub mod objective_limits;
+pub mod perk_effects;
 pub mod perks;
 pub mod player_attacks;
 pub mod player_sequences;
 pub mod poi_tags;
 pub mod progression;
+pub mod quick_courses;
+pub mod recipe_cooldowns;
 pub mod respawn_points;
 pub mod rewards;
 pub mod salvage;

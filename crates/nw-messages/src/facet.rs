@@ -169,6 +169,8 @@ pub const ENTERED_TERRITORY_FALLBACK_TYPE_INDEX: u64 = 6733;
 pub const EXITED_TERRITORY_FALLBACK_TYPE_INDEX: u64 = 6734;
 /// Type index of `FactionComponentServerFacet_RequestTogglePvpFlag`.
 pub const TOGGLE_PVP_FLAG_TYPE_INDEX: u64 = 2525;
+/// Type index of `FactionComponentServerFacet_RequestSetFaction`.
+pub const SET_FACTION_TYPE_INDEX: u64 = 3161;
 /// Type index of `WhisperPlayerComponentClientFacet_RequestStartWhisper`.
 pub const START_WHISPER_TYPE_INDEX: u64 = 5070;
 /// Type index of `GameModeParticipantComponentClientFacet_OnGameModeSchedulerRefreshed`.
@@ -574,6 +576,15 @@ pub enum ClientFacetMsg {
         /// The header (the player's `FactionComponent`).
         header: FacetHeader,
     },
+    /// 3161: the player picks a faction at a faction representative (`Faction_Selection`).
+    /// Retail `Hive_join_yellow_faction_quest`, `Marauders_Advancement` and `Change-Faction`:
+    /// the component header and one byte, the faction (`nw_content::factions`).
+    SetFaction {
+        /// The header (the player's `FactionComponent`).
+        header: FacetHeader,
+        /// The faction.
+        faction: u8,
+    },
     /// 6416: the player left a territory area (retail sends no answer).
     TerritoryExited {
         /// The header (the player's `TerritoryDetectorComponent`).
@@ -832,6 +843,12 @@ impl ClientFacetMsg {
             TOGGLE_PVP_FLAG_TYPE_INDEX => {
                 read(|header, _reader| Ok(Self::TogglePvpFlag { header }))
             }
+            SET_FACTION_TYPE_INDEX => read(|header, reader| {
+                Ok(Self::SetFaction {
+                    header,
+                    faction: reader.u8()?,
+                })
+            }),
             TERRITORY_EXITED_TYPE_INDEX => read(|header, reader| {
                 Ok(Self::TerritoryExited {
                     header,
@@ -1630,6 +1647,20 @@ mod tests {
                 header,
                 looking: false
             }))
+        );
+    }
+
+    #[test]
+    fn a_faction_pick_is_the_header_and_the_faction() {
+        // Retail `Hive_join_yellow_faction_quest` at 1782054439.467: the Covenant.
+        const BODY: &str = "bb5f9a725dc645ade31988a05074e0b003";
+        let header = FacetHeader {
+            target: 0xbb5f_9a72_5dc6_45ad,
+            entity: 0xe319_88a0_5074_e0b0,
+        };
+        assert_eq!(
+            ClientFacetMsg::decode(SET_FACTION_TYPE_INDEX, &hex(BODY)),
+            Some(Ok(ClientFacetMsg::SetFaction { header, faction: 3 }))
         );
     }
 

@@ -66,6 +66,9 @@ pub enum ToolError {
     /// The camp slice file cannot be written.
     #[error(transparent)]
     CampSlices(#[from] nw_world::camps::CampSlicesError),
+    /// The quick course path file cannot be written.
+    #[error(transparent)]
+    QuickCourses(#[from] nw_world::quick_courses::QuickCoursesError),
     /// The reloaded bundle does not hold what was written.
     #[error("bundle check failed: {what} is {found} after reload, expected {expected}")]
     CountMismatch {

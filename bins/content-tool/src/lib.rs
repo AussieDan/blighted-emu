@@ -25,6 +25,7 @@ pub mod mob_prefabs;
 #[cfg(all(test, feature = "own-replay"))]
 mod own_replay;
 pub mod player_attacks;
+pub mod quick_courses;
 pub mod roads;
 pub mod source;
 pub mod stand_in_trees;

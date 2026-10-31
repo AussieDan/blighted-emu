@@ -510,6 +510,25 @@ pub struct PlayerProgression {
     /// `NotificationID`, times shown), ascending (world migration 0022).
     #[serde(default)]
     pub notifications: Vec<(u32, u32)>,
+    /// Its recipe cooldown counts, ended ones too, by recipe (world migration 0024).
+    #[serde(default)]
+    pub recipe_cooldowns: Vec<RecipeCooldownCount>,
+    /// Its faction (world migration 0025).
+    #[serde(default)]
+    pub faction: PlayerFaction,
+}
+
+/// A player's faction (world migration 0025), as a join, a handoff and a save carry it: the
+/// `FactionComponentReplicatedState` `faction`, `factionChangeCount` and
+/// `lastFactionChangeTimepoint`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerFaction {
+    /// The faction: 0 none, 1 Syndicate, 2 Marauders, 3 Covenant (`FactionData`).
+    pub faction: u8,
+    /// How often it changed from one faction to another.
+    pub changes: u16,
+    /// Unix nanoseconds of the last change; 0 for none.
+    pub changed_ns: u64,
 }
 
 /// A player's musical performance lockout (world migration 0018), as a join, a handoff and a save
@@ -675,6 +694,17 @@ pub struct LootLimitCount {
     pub count: u64,
     /// Unix nanoseconds of its last count.
     pub counted_ns: u64,
+    /// Unix nanoseconds when it goes back to 0.
+    pub ends_ns: u64,
+}
+
+/// One recipe cooldown count of a player (`nw_content::recipe_cooldowns`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecipeCooldownCount {
+    /// The lowercase `RecipeID`.
+    pub recipe_id: String,
+    /// The crafts made.
+    pub count: u32,
     /// Unix nanoseconds when it goes back to 0.
     pub ends_ns: u64,
 }
@@ -1242,6 +1272,16 @@ mod tests {
                 next_performance_ms: Some(u64::MAX),
             },
             notifications: vec![(u32::MAX, u32::MAX)],
+            recipe_cooldowns: vec![RecipeCooldownCount {
+                recipe_id: "leathert51".to_owned(),
+                count: u32::MAX,
+                ends_ns: u64::MAX,
+            }],
+            faction: PlayerFaction {
+                faction: u8::MAX,
+                changes: u16::MAX,
+                changed_ns: u64::MAX,
+            },
         }
     }
 

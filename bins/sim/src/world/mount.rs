@@ -217,7 +217,7 @@ impl PlayerMount {
     }
 
     /// The mount it rides.
-    const fn riding(&self) -> Option<u32> {
+    pub(super) const fn riding(&self) -> Option<u32> {
         match self.phase {
             Phase::Mounted { mount_id } => Some(mount_id),
             Phase::Idle | Phase::Summoning { .. } => None,
@@ -1184,7 +1184,7 @@ impl SimWorld {
 }
 
 /// Queues the reliable mount message `message` to `connection` in `outgoing`.
-fn push_mount_message(
+pub(super) fn push_mount_message(
     outgoing: &mut Vec<Outgoing>,
     connection: ConnectionRef,
     message: &MountServerMsg,

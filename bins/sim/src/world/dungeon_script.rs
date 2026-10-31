@@ -28,6 +28,7 @@ use uuid::Uuid;
 
 use super::loot_bag::LimitsSent;
 use super::{Body, Player, SimWorld, Vitals};
+use crate::objectives::Event;
 
 /// Milliseconds in a second.
 const MS_PER_S: u64 = 1_000;
@@ -848,10 +849,33 @@ impl SimWorld {
                 ScriptOutcome::Completed => {
                     tracing::info!(instance = %run.instance, "every encounter done");
                     self.complete_mutated_instance(now_ms);
+                    self.game_mode_completed(now_ms);
                 }
             }
         }
         self.dungeon_run = Some(run);
+    }
+
+    /// Every player of the instance finished its game mode (`TaskCompleteDungeon`).
+    fn game_mode_completed(&mut self, now_ms: u64) {
+        let Some(mode) = self
+            .instance_run
+            .as_ref()
+            .map(|run| run.game_mode().to_owned())
+        else {
+            return;
+        };
+        let numbers: Vec<u64> = {
+            let mut query = self.world.query::<&Player>();
+            query
+                .iter(&self.world)
+                .map(|player| player.number)
+                .collect()
+        };
+        for number in numbers {
+            self.quest_event(number, Event::GameModeCompleted(&mode), now_ms);
+            self.update_quest_tracker(number);
+        }
     }
 
     /// Every player of the instance gets the loot of loot table `table` (each its own roll, as

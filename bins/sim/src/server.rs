@@ -1961,6 +1961,20 @@ fn saved_progression(progression: &PlayerProgression) -> SavedProgression {
         notifications: nw_db::SavedNotifications {
             shown: progression.notifications.clone(),
         },
+        recipe_cooldowns: progression
+            .recipe_cooldowns
+            .iter()
+            .map(|cooldown| nw_db::SavedRecipeCooldown {
+                recipe_id: cooldown.recipe_id.clone(),
+                count: cooldown.count,
+                ends_ns: cooldown.ends_ns,
+            })
+            .collect(),
+        faction: nw_db::SavedFaction {
+            faction: progression.faction.faction,
+            changes: progression.faction.changes,
+            changed_ns: progression.faction.changed_ns,
+        },
     }
 }
 

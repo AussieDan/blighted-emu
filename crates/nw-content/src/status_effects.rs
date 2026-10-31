@@ -56,6 +56,17 @@ const DAMAGE_TYPE_COLUMNS: [&str; DAMAGE_TYPE_COUNT] = [
     "Thrust",
 ];
 
+/// The gathering tradeskill of each `EFF_*` column, in column order.
+const GATHER_EFFICIENCY_COLUMNS: [&str; 4] = ["Harvesting", "Logging", "Mining", "Skinning"];
+/// The crafting tradeskill of each `MGS_*` and `MaxGS_*` column pair, in column order.
+const CRAFT_GEAR_SCORE_COLUMNS: [&str; 5] = [
+    "Arcana",
+    "Armoring",
+    "Engineering",
+    "Jewelcrafting",
+    "Weaponsmithing",
+];
+
 /// The rules of one status effect.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatusEffectRule {
@@ -122,6 +133,11 @@ pub struct StatusEffectRule {
     pub absorption: Vec<(u8, f64)>,
     /// The `Dmg*` columns: (damage type `IntID`, share added to the holder's hits).
     pub damage_mods: Vec<(u8, f64)>,
+    /// The `EFF_*` columns: (gathering tradeskill, gathering efficiency added).
+    pub gather_efficiency: Vec<(String, f64)>,
+    /// The `MGS_*` and `MaxGS_*` columns: (crafting tradeskill, gear score added to the least
+    /// and to the most gear score of its crafts).
+    pub craft_gear_score: Vec<(String, i64, i64)>,
 }
 
 impl StatusEffectRule {
@@ -202,6 +218,10 @@ pub struct EffectSourceRow {
     pub absorption: Vec<(String, f64)>,
     /// The `Dmg*` columns: (damage type `TypeID`, value).
     pub damage_mods: Vec<(String, f64)>,
+    /// The `EFF_*` columns: (gathering tradeskill, value).
+    pub gather_efficiency: Vec<(String, f64)>,
+    /// The `MGS_*` and `MaxGS_*` columns: (crafting tradeskill, least, most).
+    pub craft_gear_score: Vec<(String, i64, i64)>,
 }
 
 impl EffectSourceRow {
@@ -279,6 +299,38 @@ impl EffectSourceRow {
             duration_mods: row.effect_duration_mods.clone(),
             absorption: by_type(absorption),
             damage_mods: by_type(damage),
+            gather_efficiency: GATHER_EFFICIENCY_COLUMNS
+                .iter()
+                .zip([
+                    row.eff_harvesting,
+                    row.eff_logging,
+                    row.eff_mining,
+                    row.eff_skinning,
+                ])
+                .filter_map(|(skill, value)| {
+                    value
+                        .filter(|value| *value != 0.0)
+                        .map(|value| ((*skill).to_owned(), value))
+                })
+                .collect(),
+            craft_gear_score: CRAFT_GEAR_SCORE_COLUMNS
+                .iter()
+                .zip([
+                    (row.mgs_arcana, row.max_gs_arcana),
+                    (row.mgs_armoring, row.max_gs_armoring),
+                    (row.mgs_engineering, row.max_gs_engineering),
+                    (row.mgs_jewelcrafting, row.max_gs_jewelcrafting),
+                    (row.mgs_weaponsmithing, row.max_gs_weaponsmithing),
+                ])
+                .filter(|(_, (least, most))| least.is_some() || most.is_some())
+                .map(|(skill, (least, most))| {
+                    (
+                        (*skill).to_owned(),
+                        least.unwrap_or_default(),
+                        most.unwrap_or_default(),
+                    )
+                })
+                .collect(),
         }
     }
 }
@@ -500,6 +552,8 @@ fn rule(
         duration_mods: mods(row.duration_mods.as_deref()),
         absorption: typed(&row.absorption),
         damage_mods: typed(&row.damage_mods),
+        gather_efficiency: row.gather_efficiency.clone(),
+        craft_gear_score: row.craft_gear_score.clone(),
     }
 }
 

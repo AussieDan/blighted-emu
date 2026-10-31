@@ -4,6 +4,9 @@
 //! `SalvageItemsInInventory` (6188) name bag items, and the server takes each and grants:
 //!
 //! - its `SalvageGameEventID`'s reward (`SalvageCoinGrantT2`: 25 coins);
+//! - its `SalvageAchievement`: a schematic (`Schematic_ShatterslashT4`) sets the achievement
+//!   (`ShatterslashT4`) that its recipe's `RequiredAchievementID` asks for, so the salvage
+//!   teaches the recipe;
 //! - when `SalvageResources` is 1, the items of its `RepairRecipe`: a `[LTID]X` cell rolls loot
 //!   table `X` with the item's tier, rarity and gear score as levels
 //!   ([`crate::loot::LootTables::roll_salvage`]); a plain cell names a "Salvage Values" recipe
@@ -52,6 +55,8 @@ pub struct SalvageRule {
     pub source: Option<SalvageSource>,
     /// `SalvageGameEventID`.
     pub event: Option<String>,
+    /// `SalvageAchievement`.
+    pub achievement: Option<String>,
 }
 
 impl SalvageRule {
@@ -90,6 +95,8 @@ pub struct SalvageRow {
     pub repair_recipe: Option<String>,
     /// `SalvageGameEventID`.
     pub event: Option<String>,
+    /// `SalvageAchievement`.
+    pub achievement: Option<String>,
     /// `Tier`.
     pub tier: Option<i64>,
     /// `ForceRarity`.
@@ -148,6 +155,7 @@ impl Salvage {
                 resources: row.salvage_resources,
                 repair_recipe: row.repair_recipe.clone(),
                 event: row.salvage_game_event_id.clone(),
+                achievement: row.salvage_achievement.clone(),
                 tier: row.tier,
                 rarity: row.force_rarity,
             });
@@ -185,6 +193,9 @@ impl Salvage {
                     rarity: count(row.rarity),
                     source,
                     event: row.event.filter(|event| !event.is_empty()),
+                    achievement: row
+                        .achievement
+                        .filter(|achievement| !achievement.is_empty()),
                 });
         }
         Self { by_item }
@@ -202,7 +213,7 @@ mod tests {
 
     /// Master rows of build 25810808: a drop armour piece with a loot table, a quest chest piece
     /// with a "Salvage Values" recipe, a starter shield without resources, a loot container,
-    /// and a resource that cannot be salvaged.
+    /// a resource that cannot be salvaged, and a weapon schematic.
     fn salvage() -> Salvage {
         let row =
             |item: &str, resources: Option<i64>, recipe: &str, event: &str, tier: i64| SalvageRow {
@@ -211,6 +222,7 @@ mod tests {
                 resources,
                 repair_recipe: Some(recipe.to_owned()),
                 event: Some(event.to_owned()),
+                achievement: None,
                 tier: Some(tier),
                 rarity: None,
             };
@@ -250,6 +262,10 @@ mod tests {
                 SalvageRow {
                     salvageable: false,
                     ..row("IngotT2", None, "", "", 2)
+                },
+                SalvageRow {
+                    achievement: Some("ShatterslashT4".to_owned()),
+                    ..row("Schematic_ShatterslashT4", None, "", "", 4)
                 },
             ],
             [
@@ -313,5 +329,15 @@ mod tests {
             [("ClothT2".to_owned(), 2)],
             "less than five gives none back"
         );
+    }
+
+    #[test]
+    fn a_schematic_salvage_teaches_the_achievement_of_its_recipe() {
+        let salvage = salvage();
+        let schematic = salvage.of("schematic_shatterslasht4").expect("schematic");
+        assert_eq!(schematic.achievement.as_deref(), Some("ShatterslashT4"));
+        assert_eq!(schematic.source, None, "a schematic gives no items");
+        let chest = salvage.of("SoldierArchetypeChest_Upgrade").expect("chest");
+        assert_eq!(chest.achievement, None);
     }
 }

@@ -568,8 +568,110 @@ enum TaskKind {
         count: u32,
         taken: bool,
     },
+    /// Done after `count` of this step of fishing (`TaskFishingEquip`, `TaskFishingCast`,
+    /// `TaskFishingHook`, `TaskFishingReel`: the steps the fishing tutorial quests teach).
+    Fishing { step: FishingStep, count: u32 },
+    /// Done after `count` catches that [`FishCatchRule`] takes (`TaskFishingCatchFish`,
+    /// `TaskFishingCatchAnyFish`, `TaskFishingCatchLength`, `TaskFishingCatchWeight`,
+    /// `TaskFishingHotspotAny`).
+    CatchFish { rule: FishCatchRule, count: u32 },
+    /// Done after the player salvaged `count` of the item (`TaskSalvageItem`).
+    Salvage { item: String, count: u32 },
+    /// Done after `count` crafts of an item of this family (`TaskCraftWeaponFamily`: its
+    /// `CraftingRecipeID` names the weapon mastery, `SwordAbilityTable`, of any sword).
+    CraftFamily { family: String, count: u32 },
+    /// Done while the player holds `count` items of this family (`TaskHaveItemsWithWeaponFamily`:
+    /// a weapon mastery; `TaskHaveItemsWithItemFamily`: an `ItemClass` tag, `FishingTreasure`).
+    HaveFamily { family: String, count: u32 },
+    /// Done after `count` finished performances of this song (`TaskPerformSong`: its
+    /// `ItemName` is the `SongId`, `WaltzEasy`), near its `OverrideLocation` when it has one
+    /// (`13_Summer_09_PlayWithBand_playLocation1`).
+    PerformSong {
+        song: String,
+        near: Option<TriggerArea>,
+        count: u32,
+    },
+    /// Done when the player finishes an instance of this game mode (`TaskCompleteDungeon`:
+    /// `DungeonGreatCleave00`): every encounter of its script done.
+    CompleteGameMode(String),
+    /// Done when the player finishes this quick course (`TaskQuickCourse`: its `ItemName` is the
+    /// `QuickCourseId`, `EF_Tour_0`; retail `ef_tour_0-Hermit-s-Rally` ended the course with
+    /// 6065 at the finish node).
+    QuickCourse(String),
+    /// Done when the player passes section `section` of this quick course
+    /// (`TASKQUICKCOURSECHECKPOINT`: hidden, its `MinGearScore` the section, Inferred: 8 and 7
+    /// on `17ZQ_QuickCourse_Silkfoot_Aster` of 9 sections, 9 on `MarAmar_Werewolf` of 10).
+    QuickCourseSection { course: String, section: u32 },
+    /// Done while the player owns `count` houses (`TaskHouseScore`: `1225_0201_d_01_PurchaseHouse`,
+    /// "purchase a house", target 1; a new house's score is 0, retail 3692, so the target counts
+    /// houses: Inferred, no captured character had the quest).
+    OwnHouses(u32),
+    /// Done when the player picks a faction (`TaskChooseFaction`: its `ItemName` is the faction
+    /// representative, `9814_Beyza`, whose `Faction_Selection` service sends the pick; retail
+    /// `Hive_join_yellow_faction_quest` completed the objective in the bundle after the 3161).
+    ChooseFaction,
     /// A task type this server does not run: done at once, so the tree goes on.
     Unsupported,
+}
+
+/// A step of fishing that a fishing task counts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FishingStep {
+    /// The pole came out (`FishingEquipped`).
+    Equip,
+    /// The bobber landed in water (`CastHitWater`).
+    Cast,
+    /// The hook was set on a fish (`HookHit`).
+    Hook,
+    /// The player reeled a hooked fish in (`ReelingActive`).
+    Reel,
+}
+
+/// Which catches a fishing catch task counts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FishCatchRule {
+    /// The item caught; `None`: any fish.
+    item: Option<String>,
+    /// The least length and weight (`TargetThreshold`).
+    min_length: Option<f32>,
+    min_weight: Option<f32>,
+    /// Only catches at a hotspot count.
+    hotspot: bool,
+    /// The quest fish the task's item is: it bites while the task waits.
+    drop: Option<FishDrop>,
+}
+
+impl FishCatchRule {
+    /// Any fish anywhere.
+    const ANY: Self = Self {
+        item: None,
+        min_length: None,
+        min_weight: None,
+        hotspot: false,
+        drop: None,
+    };
+
+    /// Whether it takes `catch`.
+    fn takes(&self, catch: &FishCaught<'_>) -> bool {
+        self.item
+            .as_deref()
+            .is_none_or(|item| item.eq_ignore_ascii_case(catch.item))
+            && self.min_length.is_none_or(|least| catch.length >= least)
+            && self.min_weight.is_none_or(|least| catch.weight >= least)
+            && (!self.hotspot || catch.hotspot)
+    }
+}
+
+/// The quest fish of a catch task: a bite in its water and territory is the task's item at its
+/// chance (`ItemDropProbability`). Quest fish (`0223_0101_HookedSquid`, `16_Side_11_TastyFish`)
+/// have `FishingCatchables` rows and no loot table row: only the task makes them bite.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FishDrop {
+    percent: u32,
+    /// The water tag (`LootTag`); `None`: any water.
+    water: Option<String>,
+    /// The territory (`TerritoryID`); `None`: any.
+    territory: Option<u32>,
 }
 
 /// The item a mission task adds when the player opens a container (a loot crate) in its place
@@ -666,6 +768,12 @@ pub struct TaskRow {
     pub stay_active: bool,
     /// `TerritoryID`: the territory of a go-to-territory task (`0` names none).
     pub territory_id: Option<u32>,
+    /// `LootTag`: the water (`Fresh` or `Salt`) a fishing task's quest fish bites in.
+    pub loot_tag: Option<String>,
+    /// `TargetThreshold`: the least length or weight of a fish a fishing task counts.
+    pub target_threshold: Option<f64>,
+    /// `MinGearScore`: of a quick course checkpoint task, the section it waits for.
+    pub min_gear_score: Option<i64>,
 }
 
 /// Every task row with an index by lowercase task id, made once for the trees of many
@@ -768,6 +876,9 @@ pub fn task_rows(tables: &Tables) -> Vec<TaskRow> {
                 .stay_active
                 .as_deref()
                 .is_some_and(|cell| STAY_ACTIVE_CELLS.contains(&cell.to_lowercase().as_str())),
+            loot_tag: row.loot_tag.clone(),
+            target_threshold: row.target_threshold,
+            min_gear_score: row.min_gear_score,
         })
         .collect()
 }
@@ -891,6 +1002,10 @@ fn kind_of(row: &TaskRow) -> TaskKind {
         drop: drop(),
         returned,
     };
+    let fishing = |step| TaskKind::Fishing { step, count };
+    let catch = |rule| TaskKind::CatchFish { rule, count };
+    // Lengths and weights are a few tens: the cast loses nothing.
+    let threshold = || row.target_threshold.map(|threshold| threshold as f32);
     match row.kind.to_ascii_lowercase().as_str() {
         "consecutivetaskcontainer" => TaskKind::Consecutive,
         "partialtaskcontainer" => TaskKind::Partial,
@@ -971,7 +1086,19 @@ fn kind_of(row: &TaskRow) -> TaskKind {
         "tasktriggergameevent" => {
             filled(&row.kill_enemy_type).map_or(TaskKind::Unsupported, TaskKind::TriggerGameEvent)
         }
-        "taskgotopoitag" => filled(&row.poi_tag).map_or(TaskKind::Unsupported, TaskKind::GoToPoi),
+        // A go-to with only a location (`03_SQ_04_WulfstanGlyphs_GoToKazu`) is done near it.
+        "taskgotopoitag" => match (
+            filled(&row.poi_tag),
+            row.override_location.as_deref().and_then(location_of),
+        ) {
+            (Some(poi), _) => TaskKind::GoToPoi(poi),
+            (None, Some(location)) => TaskKind::TriggerArea {
+                area: Some(TriggerArea::Around(location)),
+                leave: false,
+                place: None,
+            },
+            (None, None) => TaskKind::Unsupported,
+        },
         "taskexitpoitag" => filled(&row.poi_tag).map_or(TaskKind::Unsupported, TaskKind::ExitPoi),
         "taskequipitem" => TaskKind::EquipItem(item()),
         "taskgamemode" => {
@@ -1035,13 +1162,17 @@ fn kind_of(row: &TaskRow) -> TaskKind {
                 duration_ms: (row.duration.unwrap_or_default().max(0.0) * MS_PER_SECOND) as u64,
             }
         }),
-        "taskgiveitem" => {
-            filled(&row.item_name).map_or(TaskKind::Unsupported, |item| TaskKind::GiveItem {
+        // A give with an interact tag and no item (`12A_MSQ_24_DefeatGawain_CollectCrownItem`)
+        // is done by the interact with its object.
+        "taskgiveitem" => match (filled(&row.item_name), filled(&row.interact_tag)) {
+            (Some(item), _) => TaskKind::GiveItem {
                 item,
                 count,
                 taken: false,
-            })
-        }
+            },
+            (None, Some(tag)) => TaskKind::Interact { tag, count },
+            (None, None) => TaskKind::Unsupported,
+        },
         // A carried item that a container or a mob drops is waited for as an item task; one
         // without a drop is given at the start. Both go back when the quest ends.
         "taskgiveandtakeitem" => match filled(&row.item_name) {
@@ -1068,6 +1199,80 @@ fn kind_of(row: &TaskRow) -> TaskKind {
         }
         "taskopenuiscreen" => {
             TaskKind::OpenUiScreen(lowercase_crc32(row.ui_screen_tag.as_deref().unwrap_or("")))
+        }
+        "taskfishingequip" => fishing(FishingStep::Equip),
+        "taskfishingcast" => fishing(FishingStep::Cast),
+        "taskfishinghook" => fishing(FishingStep::Hook),
+        "taskfishingreel" => fishing(FishingStep::Reel),
+        "taskfishingcatchfish" => catch(FishCatchRule {
+            item: filled(&row.item_name),
+            drop: filled(&row.item_name)
+                .and(row.item_drop_probability)
+                .and_then(|percent| u32::try_from(percent).ok())
+                .filter(|percent| *percent > 0)
+                .map(|percent| FishDrop {
+                    percent,
+                    water: filled(&row.loot_tag),
+                    territory: row.territory_id,
+                }),
+            ..FishCatchRule::ANY
+        }),
+        "taskfishingcatchanyfish" => catch(FishCatchRule::ANY),
+        "taskfishingcatchlength" => catch(FishCatchRule {
+            min_length: threshold(),
+            ..FishCatchRule::ANY
+        }),
+        "taskfishingcatchweight" => catch(FishCatchRule {
+            min_weight: threshold(),
+            ..FishCatchRule::ANY
+        }),
+        "taskfishinghotspotany" => catch(FishCatchRule {
+            hotspot: true,
+            ..FishCatchRule::ANY
+        }),
+        "tasksalvageitem" => filled(&row.item_name).map_or(TaskKind::Unsupported, |item| {
+            TaskKind::Salvage { item, count }
+        }),
+        "taskcraftweaponfamily" => {
+            filled(&row.crafting_recipe_id).map_or(TaskKind::Unsupported, |family| {
+                TaskKind::CraftFamily { family, count }
+            })
+        }
+        "taskhaveitemswithweaponfamily" | "taskhaveitemswithitemfamily" => filled(&row.item_name)
+            .map_or(TaskKind::Unsupported, |family| TaskKind::HaveFamily {
+                family,
+                count,
+            }),
+        "taskchoosefaction" => TaskKind::ChooseFaction,
+        "taskquickcourse" => {
+            filled(&row.item_name).map_or(TaskKind::Unsupported, TaskKind::QuickCourse)
+        }
+        "taskquickcoursecheckpoint" => match (
+            filled(&row.item_name),
+            row.min_gear_score
+                .and_then(|section| u32::try_from(section).ok()),
+        ) {
+            (Some(course), Some(section)) => TaskKind::QuickCourseSection { course, section },
+            _ => TaskKind::Unsupported,
+        },
+        "taskhousescore" => TaskKind::OwnHouses(count),
+        "taskcompletedungeon" => {
+            filled(&row.game_mode_id).map_or(TaskKind::Unsupported, TaskKind::CompleteGameMode)
+        }
+        "taskperformsong" => {
+            filled(&row.item_name).map_or(TaskKind::Unsupported, |song| TaskKind::PerformSong {
+                song,
+                near: row
+                    .override_location
+                    .as_deref()
+                    .and_then(location_of)
+                    .map(TriggerArea::Around),
+                count,
+            })
+        }
+        // A refining recipe is a crafting recipe of a refining station (`GypsumOrb` at the kiln).
+        "taskrefinerecipe" => {
+            filled(&row.crafting_recipe_id).map_or(TaskKind::Unsupported, TaskKind::CraftRecipe)
         }
         _ => TaskKind::Unsupported,
     }
@@ -1246,7 +1451,56 @@ pub enum Event<'a> {
         /// Its state at the gather, from 0.
         state: u32,
     },
+    /// The player's fishing took this step.
+    Fishing(FishingStep),
+    /// The player caught a fish.
+    FishCaught(FishCaught<'a>),
+    /// The player salvaged this many of this item.
+    Salvaged {
+        /// The item id.
+        item: &'a str,
+        /// How many.
+        quantity: u32,
+    },
+    /// The player crafted an item of these families (its `ItemClass` tags and weapon mastery).
+    CraftedFamilies(&'a [String]),
+    /// The player finished an instance of the game mode of this id.
+    GameModeCompleted(&'a str),
+    /// The player joined or changed to this faction (`nw_content::factions`).
+    FactionChosen(u8),
+    /// The player passed section `section` (its index) of this quick course.
+    QuickCourseSection {
+        /// The `QuickCourseId`.
+        course: &'a str,
+        /// The section's index.
+        section: u32,
+    },
+    /// The player finished this quick course.
+    QuickCourseFinished(&'a str),
+    /// The player finished a performance of this song here.
+    SongPerformed {
+        /// The `SongId`.
+        song: &'a str,
+        /// Where the player stood.
+        at: Position,
+    },
 }
+
+/// A fish the player caught.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FishCaught<'a> {
+    /// Its item id.
+    pub item: &'a str,
+    /// Its length, as its `FishingCatchables` range.
+    pub length: f32,
+    /// Its weight, as its `FishingCatchables` range.
+    pub weight: f32,
+    /// It bit at a hotspot.
+    pub hotspot: bool,
+}
+
+/// Whether an item (its id) is of a family (an `ItemClass` tag or a weapon mastery).
+pub type OfFamily<'a> = dyn Fn(&str, &str) -> bool + 'a;
 
 /// The player's level of a progression id (`None`: the character), as its rank or its points.
 pub type LevelOf<'a> = dyn Fn(Option<&str>, bool) -> Option<u32> + 'a;
@@ -1266,6 +1520,12 @@ pub struct Facts<'a> {
     pub level: Option<&'a LevelOf<'a>>,
     /// The territories (zones) it is in; `None` when the server does not know them.
     pub territories: Option<&'a [u32]>,
+    /// Whether an item (its id) is of a family (an `ItemClass` tag or a weapon mastery); `None`
+    /// when the server does not know, so no family task is judged.
+    pub of_family: Option<&'a OfFamily<'a>>,
+    /// How many houses it owns; `None` when the server does not know, so no house task is
+    /// judged.
+    pub houses: Option<u32>,
 }
 
 /// Where a task the quest tracker shows stands.
@@ -1641,6 +1901,8 @@ impl ObjectiveRun {
                 achieved: None,
                 level: None,
                 territories: None,
+                of_family: None,
+                houses: None,
             },
             now_ms,
         )
@@ -1711,6 +1973,7 @@ impl ObjectiveRun {
                 TaskKind::HasAchievement(achievement) => {
                     facts.achieved.is_some_and(|achieved| achieved(achievement))
                 }
+                TaskKind::OwnHouses(count) => facts.houses.is_some_and(|houses| houses >= *count),
                 TaskKind::HaveLevel {
                     progression,
                     target,
@@ -1719,6 +1982,24 @@ impl ObjectiveRun {
                     .level
                     .and_then(|level| level(progression.as_deref(), *points))
                     .is_some_and(|level| level >= *target),
+                TaskKind::HaveFamily { family, count } => {
+                    facts.of_family.is_some_and(|of_family| {
+                        let holding: u32 = facts
+                            .held
+                            .iter()
+                            .filter(|(id, _, _)| of_family(id, family))
+                            .map(|(_, quantity, _)| *quantity)
+                            .sum();
+                        if holding < *count && holding != progress {
+                            self.states[index] = TaskState::Active {
+                                progress: holding,
+                                due_ms,
+                            };
+                            self.list(index);
+                        }
+                        holding >= *count
+                    })
+                }
                 _ => false,
             };
             if met {
@@ -1759,6 +2040,44 @@ impl ObjectiveRun {
                     drop: Some(drop),
                     ..
                 } if drops(drop) => Some((item.clone(), drop.percent)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The quick courses the waiting course tasks ask the player to ride.
+    pub fn courses(&self) -> Vec<&str> {
+        self.waiting()
+            .filter_map(|kind| match kind {
+                TaskKind::QuickCourse(course) => Some(course.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The quest fish the waiting catch tasks make bite in water `water` (its tag) for a player
+    /// in `territories`: each item and its chance in percent.
+    pub fn fish_drops(&self, water: &str, territories: &[u32]) -> Vec<(String, u32)> {
+        self.waiting()
+            .filter_map(|kind| match kind {
+                TaskKind::CatchFish {
+                    rule:
+                        FishCatchRule {
+                            item: Some(item),
+                            drop: Some(drop),
+                            ..
+                        },
+                    ..
+                } if drop
+                    .water
+                    .as_deref()
+                    .is_none_or(|wanted| wanted.eq_ignore_ascii_case(water))
+                    && drop
+                        .territory
+                        .is_none_or(|territory| territories.contains(&territory)) =>
+                {
+                    Some((item.clone(), drop.percent))
+                }
                 _ => None,
             })
             .collect()
@@ -1933,11 +2252,56 @@ impl ObjectiveRun {
                     1,
                     *count,
                 ),
+                (TaskKind::Fishing { step, count }, Event::Fishing(seen)) => {
+                    (*step == seen, 1, *count)
+                }
+                (TaskKind::CatchFish { rule, count }, Event::FishCaught(caught)) => {
+                    (rule.takes(&caught), 1, *count)
+                }
+                (
+                    TaskKind::Salvage {
+                        item: wanted,
+                        count,
+                    },
+                    Event::Salvaged { item, quantity },
+                ) => (wanted.eq_ignore_ascii_case(item), quantity, *count),
+                (TaskKind::CraftFamily { family, count }, Event::CraftedFamilies(families)) => (
+                    families
+                        .iter()
+                        .any(|seen| seen.eq_ignore_ascii_case(family)),
+                    1,
+                    *count,
+                ),
+                (
+                    TaskKind::PerformSong { song, near, count },
+                    Event::SongPerformed { song: seen, at },
+                ) => (
+                    song.eq_ignore_ascii_case(seen)
+                        && near.as_ref().is_none_or(|area| area.contains(at)),
+                    1,
+                    *count,
+                ),
                 (TaskKind::GameMode(mode), Event::GameModeEntered(seen))
                 | (TaskKind::ConversationState(mode), Event::Talked(seen))
-                | (TaskKind::Objective(mode), Event::ObjectiveDone(seen)) => {
+                | (TaskKind::Objective(mode), Event::ObjectiveDone(seen))
+                | (TaskKind::CompleteGameMode(mode), Event::GameModeCompleted(seen)) => {
                     (mode.eq_ignore_ascii_case(seen), 1, 1)
                 }
+                (TaskKind::ChooseFaction, Event::FactionChosen(_)) => (true, 1, 1),
+                (TaskKind::QuickCourse(course), Event::QuickCourseFinished(seen)) => {
+                    (course.eq_ignore_ascii_case(seen), 1, 1)
+                }
+                (
+                    TaskKind::QuickCourseSection { course, section },
+                    Event::QuickCourseSection {
+                        course: seen,
+                        section: passed,
+                    },
+                ) => (
+                    course.eq_ignore_ascii_case(seen) && passed >= *section,
+                    1,
+                    1,
+                ),
                 _ => (false, 1, 1),
             };
             if !matches {
@@ -2237,6 +2601,8 @@ pub(crate) mod tests {
             achieved: None,
             level: None,
             territories: None,
+            of_family: None,
+            houses: None,
         };
         run.sync(&facts(&inside), 0);
         run.sync(&facts(&outside), STAY_MS / 2);
@@ -2271,6 +2637,8 @@ pub(crate) mod tests {
             achieved: None,
             level: None,
             territories: None,
+            of_family: None,
+            houses: None,
         };
         run.sync(&facts(&["12a_leavelochnir"]), 0);
         assert!(!run.is_done("Enter"), "not in the causeway volume");
@@ -2312,6 +2680,8 @@ pub(crate) mod tests {
             achieved: None,
             level: Some(&low),
             territories: None,
+            of_family: None,
+            houses: None,
         };
         run.sync(&facts, 0);
         assert!(!run.is_done("Level") && run.is_done("Fishing"));
@@ -2319,6 +2689,8 @@ pub(crate) mod tests {
         let facts = Facts {
             level: Some(&high),
             territories: None,
+            of_family: None,
+            houses: None,
             ..facts
         };
         run.sync(&facts, 0);
@@ -2430,6 +2802,8 @@ pub(crate) mod tests {
                     achieved: None,
                     level: None,
                     territories: Some(territories),
+                    of_family: None,
+                    houses: None,
                 },
                 0,
             );
@@ -2454,6 +2828,311 @@ pub(crate) mod tests {
         assert!(!run.finished(), "food is another item");
         run.event(Event::ItemUsed("09a_s0_sporeelixir"), 0);
         assert!(run.finished(), "two uses");
+    }
+
+    #[test]
+    fn fishing_step_tasks_count_their_own_step() {
+        // Client rows `C91_FQ_02_01` to `C91_FQ_02_04`: equip once, then 3 casts, hooks and reels.
+        let rows = vec![
+            container("Root", "ConsecutiveTaskContainer", &["Equip", "Cast"]),
+            row("Equip", "TaskFishingEquip"),
+            TaskRow {
+                target_qty: Some(3),
+                ..row("Cast", "TaskFishingCast")
+            },
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        let (mut run, _) = ObjectiveRun::start(tree, 0);
+        run.event(Event::Fishing(FishingStep::Cast), 0);
+        assert!(run.is_active("Equip"), "a cast before the pole is out");
+        run.event(Event::Fishing(FishingStep::Equip), 0);
+        assert!(run.is_done("Equip"));
+        for _ in 0..2 {
+            run.event(Event::Fishing(FishingStep::Cast), 0);
+        }
+        run.event(Event::Fishing(FishingStep::Hook), 0);
+        assert!(!run.finished(), "two casts and a hook");
+        run.event(Event::Fishing(FishingStep::Cast), 0);
+        assert!(run.finished(), "three casts");
+    }
+
+    #[test]
+    fn catch_tasks_count_the_fish_their_rule_takes() {
+        // Client rows `C91_FQ_06_02` (8 fish of length 20 or more), `C91_FQ_08_02` (5 of weight
+        // 30 or more), `C91_FQ_04_02` (3 at hotspots) and `C91_FQ_05_01` (15 of any).
+        let rows = vec![
+            container(
+                "Root",
+                "SimpleTaskContainer",
+                &["Long", "Heavy", "Spot", "Any"],
+            ),
+            TaskRow {
+                target_threshold: Some(20.0),
+                ..row("Long", "TaskFishingCatchLength")
+            },
+            TaskRow {
+                target_threshold: Some(30.0),
+                ..row("Heavy", "TaskFishingCatchWeight")
+            },
+            row("Spot", "TaskFishingHotspotAny"),
+            TaskRow {
+                target_qty: Some(2),
+                ..row("Any", "TaskFishingCatchAnyFish")
+            },
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        let (mut run, _) = ObjectiveRun::start(tree, 0);
+        let fish = |length, weight, hotspot| {
+            Event::FishCaught(FishCaught {
+                item: "FishingSalmonMediumT1",
+                length,
+                weight,
+                hotspot,
+            })
+        };
+        run.event(fish(19.5, 29.0, false), 0);
+        assert!(run.is_active("Long") && run.is_active("Heavy") && run.is_active("Spot"));
+        assert!(run.is_active("Any"), "one of two");
+        run.event(fish(20.0, 31.0, true), 0);
+        assert!(
+            run.finished(),
+            "long, heavy, at a hotspot and the second fish"
+        );
+    }
+
+    #[test]
+    fn a_quest_fish_bites_in_its_water_and_territory_while_its_task_waits() {
+        // Client row `1323_0101_d_01_TaskFishingCatchFish`: 3 slimy boots at 50% in territory 13;
+        // `C91_FQ_03_01`: a snail at 25% in fresh water.
+        const BOOT: &str = "1323_0101_SlimyBoot";
+        const SNAIL: &str = "FishingSnailSmallT2";
+        let rows = vec![
+            container(
+                "Root",
+                "SimpleTaskContainer",
+                &["Boot", "Snail", "Sturgeon"],
+            ),
+            TaskRow {
+                item_drop_probability: Some(50),
+                territory_id: Some(13),
+                target_qty: Some(3),
+                ..with_item("Boot", "TaskFishingCatchFish", BOOT)
+            },
+            TaskRow {
+                item_drop_probability: Some(25),
+                loot_tag: Some("Fresh".to_owned()),
+                ..with_item("Snail", "TaskFishingCatchFish", SNAIL)
+            },
+            with_item(
+                "Sturgeon",
+                "TaskFishingCatchFish",
+                "FishingSummerMedleySturgeonSmallT3",
+            ),
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        let (mut run, _) = ObjectiveRun::start(tree, 0);
+        assert_eq!(run.fish_drops("Salt", &[13]), [(BOOT.to_owned(), 50)]);
+        assert_eq!(
+            run.fish_drops("Fresh", &[12]),
+            [(SNAIL.to_owned(), 25)],
+            "a sturgeon without a chance is no quest fish"
+        );
+        run.event(
+            Event::FishCaught(FishCaught {
+                item: SNAIL,
+                length: 1.0,
+                weight: 1.0,
+                hotspot: false,
+            }),
+            0,
+        );
+        assert!(run.is_done("Snail"));
+        assert!(
+            run.fish_drops("Fresh", &[12]).is_empty(),
+            "its task is done"
+        );
+    }
+
+    #[test]
+    fn salvage_and_family_tasks_count_their_item_and_family() {
+        // Client rows `C91_FQ_03_02_TaskSalvageSnail`, `06A_TS_02_ForgeSword_craftRecipe` and
+        // `06A_TS_02_ForgeSword_have_1hSwordT2`.
+        const SWORD: &str = "SwordAbilityTable";
+        let rows = vec![
+            container(
+                "Root",
+                "ConsecutiveTaskContainer",
+                &["Salvage", "Forge", "Have"],
+            ),
+            with_item("Salvage", "TaskSalvageItem", "FishingSnailSmallT2"),
+            TaskRow {
+                crafting_recipe_id: Some(SWORD.to_owned()),
+                ..with_item("Forge", "TaskCraftWeaponFamily", "1hSwordT2")
+            },
+            with_item("Have", "TaskHaveItemsWithWeaponFamily", SWORD),
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        let (mut run, _) = ObjectiveRun::start(tree, 0);
+        run.event(
+            Event::Salvaged {
+                item: "fishingsnailsmallt2",
+                quantity: 1,
+            },
+            0,
+        );
+        assert!(run.is_done("Salvage"));
+        run.event(Event::CraftedFamilies(&["Weapon".to_owned()]), 0);
+        assert!(run.is_active("Forge"), "not a sword");
+        run.event(
+            Event::CraftedFamilies(&["Weapon".to_owned(), SWORD.to_owned()]),
+            0,
+        );
+        assert!(run.is_done("Forge"));
+        let of_family = |item: &str, family: &str| item == "1hSword_T2" && family == SWORD;
+        const HELD: [(&str, u32, bool); 1] = [("1hSword_T2", 1, false)];
+        let facts = |held: &'static [(&'static str, u32, bool)]| Facts {
+            held,
+            places: None,
+            achieved: None,
+            level: None,
+            territories: None,
+            of_family: Some(&of_family),
+            houses: None,
+        };
+        run.sync(&facts(&[("IronIngotT2", 4, false)]), 0);
+        assert!(run.is_active("Have"), "no sword held");
+        run.sync(&facts(&HELD), 0);
+        assert!(run.finished());
+    }
+
+    #[test]
+    fn a_house_task_waits_for_an_owned_house_and_a_faction_task_for_a_pick() {
+        // Client rows `1225_0201_d_01_PurchaseHouse` and
+        // `FactionIntro_Covenant_Recruitment_JoinFaction`.
+        let rows = vec![
+            container("Root", "SimpleTaskContainer", &["House", "Join"]),
+            TaskRow {
+                target_qty: Some(1),
+                ..row("House", "TaskHouseScore")
+            },
+            with_item("Join", "TaskChooseFaction", "9814_Beyza"),
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        let (mut run, _) = ObjectiveRun::start(tree, 0);
+        let facts = |houses| Facts {
+            held: &[],
+            places: None,
+            achieved: None,
+            level: None,
+            territories: None,
+            of_family: None,
+            houses,
+        };
+        run.sync(&facts(None), 0);
+        run.sync(&facts(Some(0)), 0);
+        assert!(run.is_active("House"), "no house yet");
+        run.sync(&facts(Some(1)), 0);
+        assert!(!run.is_active("House"), "a house bought");
+        assert!(run.is_active("Join"));
+        run.event(Event::FactionChosen(3), 0);
+        assert!(run.finished());
+    }
+
+    #[test]
+    fn a_song_task_counts_its_song_near_its_place_and_a_dungeon_task_its_end() {
+        // Client rows `13_Summer_09_PlayWithBand_playLocation1` and
+        // `S04_GT_EXPD_RPT_04_KillIceBoss`.
+        const STAGE: Position = Position {
+            x: 9308.0,
+            y: 2827.0,
+            z: 76.0,
+        };
+        let rows = vec![
+            container("Root", "SimpleTaskContainer", &["Play", "Boss"]),
+            TaskRow {
+                override_location: Some("9308 2827 76".to_owned()),
+                ..with_item("Play", "TaskPerformSong", "FlourishEasy")
+            },
+            TaskRow {
+                game_mode_id: Some("DungeonGreatCleave00".to_owned()),
+                ..row("Boss", "TaskCompleteDungeon")
+            },
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        let (mut run, _) = ObjectiveRun::start(tree, 0);
+        let far = Position {
+            x: STAGE.x + TRIGGER_RADIUS_M + 1.0,
+            ..STAGE
+        };
+        run.event(
+            Event::SongPerformed {
+                song: "FlourishEasy",
+                at: far,
+            },
+            0,
+        );
+        run.event(
+            Event::SongPerformed {
+                song: "WaltzEasy",
+                at: STAGE,
+            },
+            0,
+        );
+        assert!(
+            run.is_active("Play"),
+            "away from the stage, or another song"
+        );
+        run.event(
+            Event::SongPerformed {
+                song: "flourisheasy",
+                at: STAGE,
+            },
+            0,
+        );
+        assert!(run.is_done("Play"));
+        run.event(Event::GameModeEntered("DungeonGreatCleave00"), 0);
+        assert!(run.is_active("Boss"), "entered, not finished");
+        run.event(Event::GameModeCompleted("DungeonGreatCleave00"), 0);
+        assert!(run.finished());
+    }
+
+    #[test]
+    fn a_go_to_with_only_a_location_and_a_give_with_only_an_interact_wait_for_them() {
+        // Client rows `03_SQ_04_WulfstanGlyphs_GoToKazu` and
+        // `12A_MSQ_24_DefeatGawain_CollectCrownItem`; a refine task is a craft of its recipe.
+        const KAZU: Position = Position {
+            x: 10193.93,
+            y: 7940.685,
+            z: 471.42,
+        };
+        let rows = vec![
+            container("Root", "SimpleTaskContainer", &["Kazu", "Crown", "Kiln"]),
+            TaskRow {
+                override_location: Some("10193.929688 7940.685059 471.424255".to_owned()),
+                ..row("Kazu", "TaskGoToPOITag")
+            },
+            TaskRow {
+                interact_tag: Some("IO_MB_MSQ2_DefeatGawain_Crown".to_owned()),
+                ..row("Crown", "TaskGiveItem")
+            },
+            TaskRow {
+                crafting_recipe_id: Some("GypsumOrb".to_owned()),
+                ..row("Kiln", "TaskRefineRecipe")
+            },
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        let (mut run, effects) = ObjectiveRun::start(tree, 0);
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::GiveItem(..))),
+            "the crown task gives nothing: {effects:?}"
+        );
+        assert!(run.is_active("Kazu") && run.is_active("Crown") && run.is_active("Kiln"));
+        run.event(Event::Moved(KAZU), 0);
+        run.event(Event::Interacted("io_mb_msq2_defeatgawain_crown"), 0);
+        run.event(Event::Crafted("GypsumOrb"), 0);
+        assert!(run.finished());
     }
 
     #[test]
@@ -2548,6 +3227,8 @@ pub(crate) mod tests {
             achieved: None,
             level: None,
             territories: None,
+            of_family: None,
+            houses: None,
         };
         run.sync(&facts(&outside), 0);
         run.event(wolf, 0);
@@ -3088,6 +3769,8 @@ pub(crate) mod tests {
             achieved: None,
             level: None,
             territories: None,
+            of_family: None,
+            houses: None,
         };
         run.sync(&facts(&["drowned_cavern_30122"]), NOW);
         assert!(!run.is_done("Area"), "elsewhere");
@@ -3116,6 +3799,8 @@ pub(crate) mod tests {
                 achieved: None,
                 level: None,
                 territories: None,
+                of_family: None,
+                houses: None,
             },
             NOW,
         );
@@ -3467,6 +4152,8 @@ pub(crate) mod tests {
                         achieved: Some(&achieved),
                         level: None,
                         territories: None,
+                        of_family: None,
+                        houses: None,
                     },
                     now,
                 ));
@@ -3874,6 +4561,8 @@ pub(crate) mod tests {
                     achieved: Some(&achieved),
                     level: None,
                     territories: None,
+                    of_family: None,
+                    houses: None,
                 },
                 NOW,
             )

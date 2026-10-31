@@ -17,6 +17,7 @@
 
 use bevy_ecs::entity::Entity;
 use nw_content::item_rules::Consumable;
+use nw_content::perk_effects::PerkEffects;
 use nw_content::status_effects::{RowKey, StatusEffectRule, StatusEffectRules};
 use nw_messages::{
     BundleMember, DamageDealtMsg, DamageItem, EffectMap, HIT_TAG, LocalEffect, MemberState,
@@ -156,6 +157,8 @@ pub(super) struct StatusEffects {
     dead: bool,
     /// The equip load whose effects it holds.
     equip_load: Option<EquipLoad>,
+    /// The effects its worn perks hold (effect, potency), by effect.
+    perk_effects: Vec<(u32, f64)>,
     /// The newest state, and whether its client has not got it yet.
     state: Option<StatusEffectsState>,
     state_due: bool,
@@ -435,6 +438,47 @@ impl StatusEffects {
         (1.0 + self.sum_by_type(rules, tag, |rule| &rule.damage_mods)).max(0.0)
     }
 
+    /// The gathering efficiency the held effects add to gathers of tradeskill `tradeskill`
+    /// (`EFF_*`: food and the music buffs, `MusicBuff_GatheringSpeed_*` 0.75).
+    pub(super) fn gather_efficiency(&self, rules: &StatusEffectRules, tradeskill: &str) -> f64 {
+        self.sum_of(rules, |rule| {
+            rule.gather_efficiency
+                .iter()
+                .filter(|(skill, _)| skill.eq_ignore_ascii_case(tradeskill))
+                .map(|(_, value)| *value)
+                .sum()
+        })
+    }
+
+    /// The gear score the held effects add to the least and the most gear score of crafts of
+    /// tradeskill `tradeskill` (`MGS_*`, `MaxGS_*`: the `FoodArmorer*` meals 5 to 15).
+    pub(super) fn craft_gear_score(
+        &self,
+        rules: &StatusEffectRules,
+        tradeskill: &str,
+    ) -> (f64, f64) {
+        let column = |most: bool| {
+            self.sum_of(rules, |rule| {
+                rule.craft_gear_score
+                    .iter()
+                    .filter(|(skill, _, _)| skill.eq_ignore_ascii_case(tradeskill))
+                    // Gear scores of a few tens.
+                    .map(|(_, least, top)| (if most { *top } else { *least }) as f64)
+                    .sum()
+            })
+        };
+        (column(false), column(true))
+    }
+
+    /// The sum over the held effects of `value`, each times its potency.
+    fn sum_of(&self, rules: &StatusEffectRules, value: impl Fn(&StatusEffectRule) -> f64) -> f64 {
+        self.held
+            .iter()
+            .filter_map(|held| Some((held, rules.get(held.crc)?)))
+            .map(|(held, rule)| value(rule) * self.potency(rules, held, rule))
+            .sum()
+    }
+
     /// The sum over the held effects of their `values` for damage type `tag`, each times its
     /// potency.
     fn sum_by_type(
@@ -478,6 +522,38 @@ impl StatusEffects {
         for crc in equip_load_effects(rules, load) {
             self.add(rules, crc, Application::plain(holder), now_ms);
         }
+    }
+
+    /// Keeps the held perk effects those of `wanted` (effect, potency, by effect), added by
+    /// `holder` at server time `now_ms`: an effect whose potency changed goes and comes back,
+    /// and one that something else ended (a death) comes back.
+    pub(super) fn set_perk_effects(
+        &mut self,
+        rules: &StatusEffectRules,
+        wanted: Vec<(u32, f64)>,
+        holder: u64,
+        now_ms: u64,
+    ) {
+        if self.perk_effects == wanted && wanted.iter().all(|(crc, _)| self.holds(*crc)) {
+            return;
+        }
+        let old = std::mem::take(&mut self.perk_effects);
+        for held in old.iter().filter(|held| !wanted.contains(held)) {
+            self.remove(held.0);
+        }
+        let missing: Vec<(u32, f64)> = wanted
+            .iter()
+            .filter(|effect| !old.contains(effect) || !self.holds(effect.0))
+            .copied()
+            .collect();
+        for (crc, potency) in missing {
+            let application = Application {
+                potency,
+                ..Application::plain(holder)
+            };
+            self.add(rules, crc, application, now_ms);
+        }
+        self.perk_effects = wanted;
     }
 
     /// The owner's state of the held effects at own clock `clock`, with `version`: the local and the lightweight maps by key, a map that is empty only when it
@@ -779,6 +855,13 @@ impl SimWorld {
                     .status_effects
                     .set_equip_load(rules, load, number, server_ms);
             }
+            let perks = player.gear.as_ref().map_or_else(Vec::new, |gear| {
+                perk_effects(&content.perk_effects, rules, &gear.worn_perks())
+            });
+            let number = player.number;
+            player
+                .status_effects
+                .set_perk_effects(rules, perks, number, server_ms);
             let max_health = f64::from(vitals.health.max());
             let ticks = player.status_effects.tick(rules, server_ms, max_health);
             if !ticks.is_empty() {
@@ -932,6 +1015,32 @@ impl SimWorld {
     }
 }
 
+/// The effects of the worn `perks` (perk id, its item's gear score) under `perk_effects`, by
+/// effect: one entry per effect, its potency the sum over the perks that hold it (Inferred: two
+/// worn items with one perk hold it once, twice as strong).
+fn perk_effects(
+    perk_effects: &PerkEffects,
+    rules: &StatusEffectRules,
+    perks: &[(&str, u32)],
+) -> Vec<(u32, f64)> {
+    let mut held: Vec<(u32, f64)> = Vec::new();
+    for (perk, gear_score) in perks {
+        let Some(effect) = perk_effects.of(perk) else {
+            continue;
+        };
+        let Some(rule) = rules.by_id(&effect.status_effect) else {
+            continue;
+        };
+        let potency = effect.potency(*gear_score);
+        match held.iter_mut().find(|(crc, _)| *crc == rule.crc) {
+            Some((_, sum)) => *sum += potency,
+            None => held.push((rule.crc, potency)),
+        }
+    }
+    held.sort_by_key(|(crc, _)| *crc);
+    held
+}
+
 #[cfg(test)]
 mod tests {
     use nw_content::status_effects::{EffectSourceRow, StatusEffectSource};
@@ -1042,6 +1151,86 @@ mod tests {
             hit_amount: HIT,
             ..Application::plain(source)
         }
+    }
+
+    #[test]
+    fn held_tradeskill_effects_add_gather_speed_and_craft_gear_score() {
+        // Retail rows `MusicBuff_GatheringSpeed_T4_Amazing` (`EFF_Mining` 0.75, also Logging,
+        // Harvesting, Skinning) and `FoodArmorerT5` (`MGS_Armoring` and `MaxGS_Armoring` 15).
+        const SPEED: &str = "MusicBuff_GatheringSpeed_T4_Amazing";
+        const MEAL: &str = "FoodArmorerT5";
+        let rules = StatusEffectRules::build(StatusEffectSource {
+            effects: vec![
+                EffectSourceRow {
+                    base_duration_s: Some(5400.0),
+                    gather_efficiency: vec![("Mining".to_owned(), 0.75)],
+                    ..row(SPEED)
+                },
+                EffectSourceRow {
+                    base_duration_s: Some(2400.0),
+                    craft_gear_score: vec![("Armoring".to_owned(), 15, 15)],
+                    ..row(MEAL)
+                },
+            ],
+            ..StatusEffectSource::default()
+        });
+        let mut effects = StatusEffects::default();
+        assert_eq!(effects.gather_efficiency(&rules, "Mining"), 0.0);
+        effects.add(
+            &rules,
+            crc(&rules, SPEED),
+            Application::plain(PLAYER),
+            START_MS,
+        );
+        effects.add(
+            &rules,
+            crc(&rules, MEAL),
+            Application::plain(PLAYER),
+            START_MS,
+        );
+        assert!((effects.gather_efficiency(&rules, "mining") - 0.75).abs() < f64::EPSILON);
+        assert_eq!(effects.gather_efficiency(&rules, "Logging"), 0.0);
+        assert_eq!(effects.craft_gear_score(&rules, "Armoring"), (15.0, 15.0));
+        assert_eq!(effects.craft_gear_score(&rules, "Arcana"), (0.0, 0.0));
+    }
+
+    #[test]
+    fn worn_perks_hold_their_effects_scaled_by_gear_score_and_keep_them_over_a_death() {
+        use nw_content::perk_effects::{PerkEffect, PerkEffects};
+        // Build 25810808: `PerkID_Tools_Efficiency_Mining` holds
+        // `Status_Perk_Tools_Efficiency_Mining` (an `EFF_Mining`), scale 7.27E-3 per gear score.
+        const PERK: &str = "PerkID_Tools_Efficiency_Mining";
+        const EFFECT: &str = "Status_Perk_Tools_Efficiency_Mining";
+        const EFFICIENCY: f64 = 0.1;
+        const SCALE: &str = "7.2727272727272727E-3";
+        const GEAR_SCORE: u32 = 210;
+        let rules = StatusEffectRules::build(StatusEffectSource {
+            effects: vec![EffectSourceRow {
+                gather_efficiency: vec![("Mining".to_owned(), EFFICIENCY)],
+                remove_on_death: true,
+                ..row(EFFECT)
+            }],
+            ..StatusEffectSource::default()
+        });
+        let perks = PerkEffects::build([(PERK.to_owned(), PerkEffect::new(EFFECT, Some(SCALE)))]);
+        let scale: f64 = SCALE.parse().expect("scale");
+        let potency = 1.0 + scale * f64::from(GEAR_SCORE - 100);
+        let wanted = perk_effects(&perks, &rules, &[(PERK, GEAR_SCORE), ("PerkID_Other", 600)]);
+        assert_eq!(wanted.len(), 1, "a perk without an effect holds none");
+        assert!((wanted[0].1 - potency).abs() < 1e-9);
+        let mut effects = StatusEffects::default();
+        effects.set_perk_effects(&rules, wanted.clone(), PLAYER, START_MS);
+        let gathers = |effects: &StatusEffects| effects.gather_efficiency(&rules, "Mining");
+        assert!((gathers(&effects) - EFFICIENCY * potency).abs() < 1e-9);
+        effects.set_dead(&rules, true);
+        effects.set_dead(&rules, false);
+        effects.set_perk_effects(&rules, wanted, PLAYER, START_MS);
+        assert!(
+            (gathers(&effects) - EFFICIENCY * potency).abs() < 1e-9,
+            "back after the death"
+        );
+        effects.set_perk_effects(&rules, Vec::new(), PLAYER, START_MS);
+        assert_eq!(gathers(&effects), 0.0, "the tool came off");
     }
 
     #[test]

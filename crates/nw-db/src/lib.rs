@@ -15,6 +15,7 @@ mod character;
 mod connect;
 mod entity;
 mod error;
+mod faction;
 mod items;
 mod meta_achievements;
 mod migrate;
@@ -24,6 +25,7 @@ mod notifications;
 mod position;
 mod progression;
 mod quests;
+mod recipe_cooldowns;
 mod session;
 mod social;
 mod social_graph;
@@ -50,6 +52,7 @@ pub use character::{
 pub use connect::{DatabaseConfig, connect, connect_lazy, connect_options};
 pub use entity::{MAX_ENTITY_NUMBER, next_entity_number};
 pub use error::DbError;
+pub use faction::SavedFaction;
 pub use items::{
     AccountSkins, SavedInventory, SavedItem, SavedItemRolls, SavedLoadout, SavedPlace,
     SavedStoredItem, character_inventory, character_items, collect_account_skins,
@@ -65,6 +68,7 @@ pub use progression::{
     SavedLootLimit, SavedProgression, character_progression, save_character_progression,
 };
 pub use quests::{SavedQuests, character_quests, save_character_quests};
+pub use recipe_cooldowns::SavedRecipeCooldown;
 pub use session::{create_launcher_session, delete_launcher_session, launcher_session_account};
 pub use social::{
     AccountTitle, StoredPlayer, clear_new_account_titles, earn_account_titles, stored_players,

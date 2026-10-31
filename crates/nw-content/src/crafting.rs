@@ -15,6 +15,7 @@ use std::collections::HashMap;
 use nw_formats::objectstream::lowercase_crc32;
 
 use crate::Tables;
+use crate::recipe_cooldowns::RecipeCooldown;
 
 /// The ingredient type of a category.
 const CATEGORY_ONLY: &str = "Category_Only";
@@ -73,6 +74,14 @@ impl Recipe {
     }
 }
 
+/// A cell with text, trimmed; `None` for an empty one.
+fn filled(cell: &Option<String>) -> Option<String> {
+    cell.as_deref()
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
 /// A station type's name and its tier: `blacksmith2` is `blacksmith` tier 2; a type that does
 /// not end in digits (`camp1_standing`) has no tier.
 fn name_and_tier(station: &str) -> (&str, Option<u32>) {
@@ -112,6 +121,38 @@ pub struct RecipeDetails {
     /// `MaxPerkItemsAllowed`: the most perk items one craft takes; `None`: as many as the item
     /// has perk slots.
     pub max_perk_items: Option<u32>,
+    /// `RequiredAchievementID`: the achievement the player must have to craft it (511 rows of
+    /// build 25810808: season and expedition recipes).
+    pub required_achievement: Option<String>,
+    /// `HiddenByAchievementID`: once the player has it, the recipe is gone (141 rows).
+    pub hidden_by: Option<String>,
+    /// `UnlockedAchievementID`: a craft sets it (73 rows), and with
+    /// `UnlockedAchievementBlocksRecrafting` no craft follows once it is set (5 rows).
+    pub unlocks: Option<String>,
+    /// `UnlockedAchievementBlocksRecrafting`.
+    pub unlock_blocks_recraft: bool,
+    /// `FirstCraftAchievementId`: the first craft sets it (5,116 rows).
+    pub first_craft_achievement: Option<String>,
+    /// `CooldownSeconds` and `CooldownQuantity` ([`crate::recipe_cooldowns`]).
+    pub cooldown: Option<RecipeCooldown>,
+}
+
+impl RecipeDetails {
+    /// Whether a player who has the achievements `has` may craft it: it has the required one,
+    /// not the hiding one, and not the one a craft unlocks when that blocks a recraft.
+    pub fn open_to(&self, has: impl Fn(&str) -> bool) -> bool {
+        self.required_achievement.as_deref().is_none_or(&has)
+            && !self.hidden_by.as_deref().is_some_and(&has)
+            && !(self.unlock_blocks_recraft && self.unlocks.as_deref().is_some_and(&has))
+    }
+
+    /// The achievements a craft sets: the one it unlocks and the first craft's.
+    pub fn craft_achievements(&self) -> impl Iterator<Item = &str> {
+        self.unlocks
+            .as_deref()
+            .into_iter()
+            .chain(self.first_craft_achievement.as_deref())
+    }
 }
 
 /// What one picked ingredient adds to a craft's gear score range.
@@ -301,6 +342,17 @@ impl Recipes {
                         max_perk_items: row
                             .max_perk_items_allowed
                             .and_then(|value| u32::try_from(value).ok()),
+                        required_achievement: filled(&row.required_achievement_id),
+                        hidden_by: filled(&row.hidden_by_achievement_id),
+                        unlocks: filled(&row.unlocked_achievement_id),
+                        unlock_blocks_recraft: row
+                            .unlocked_achievement_blocks_recrafting
+                            .unwrap_or_default(),
+                        first_craft_achievement: filled(&row.first_craft_achievement_id),
+                        cooldown: RecipeCooldown::from_cells(
+                            row.cooldown_seconds,
+                            row.cooldown_quantity,
+                        ),
                     },
                 )
             });
@@ -449,6 +501,37 @@ impl StructureCosts {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_recipe_asks_for_its_achievements_and_a_blocking_unlock_ends_its_recrafts() {
+        use super::RecipeDetails;
+        // Rows of build 25810808: a season recipe with `RequiredAchievementID`, a one-time
+        // recipe whose `UnlockedAchievementID` blocks a recraft, and one its achievement hides.
+        let required = RecipeDetails {
+            required_achievement: Some("Season_Unlock".to_owned()),
+            first_craft_achievement: Some("FirstCraft_X".to_owned()),
+            ..RecipeDetails::default()
+        };
+        assert!(!required.open_to(|_| false));
+        assert!(required.open_to(|id| id == "Season_Unlock"));
+        assert_eq!(
+            required.craft_achievements().collect::<Vec<_>>(),
+            ["FirstCraft_X"]
+        );
+        let once = RecipeDetails {
+            unlocks: Some("House_Made".to_owned()),
+            unlock_blocks_recraft: true,
+            ..RecipeDetails::default()
+        };
+        assert!(once.open_to(|_| false));
+        assert!(!once.open_to(|id| id == "House_Made"), "made once");
+        let hidden = RecipeDetails {
+            hidden_by: Some("Upgrade_Done".to_owned()),
+            ..RecipeDetails::default()
+        };
+        assert!(!hidden.open_to(|id| id == "Upgrade_Done"));
+        assert!(RecipeDetails::default().open_to(|_| false));
+    }
+
     use super::*;
 
     /// A T4 armor recipe of base gear score 400 and base tier 4.

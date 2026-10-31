@@ -27,6 +27,7 @@ use nw_bus::{
     PlayerQuests, Point, QuestRun, ScriptLogLine, SimSlot, SnapMob, SnapPlayer,
 };
 use nw_content::mutations::MutationCatalog;
+use nw_content::recipe_cooldowns::{CooldownCount, RecipeCooldownCounts};
 use nw_messages::client_input::{
     CRAFTING_STATION_KIND, GATHER_KIND, LOOT_KIND, LORE_KIND, REVIVE_PLAYER_KIND, TALK_KIND,
     TOWN_BOARD_KIND, TRIGGER_KIND, WATER_GATHER_KIND,
@@ -69,6 +70,7 @@ mod dungeon_script;
 pub mod economy;
 mod encounter;
 mod events;
+mod faction;
 mod fall_damage;
 mod fishing;
 mod game_mode;
@@ -99,6 +101,7 @@ mod progression;
 mod projectile;
 mod quest_objects;
 mod quest_tracker;
+mod quick_course;
 mod repair;
 mod replica;
 mod revive;
@@ -622,6 +625,12 @@ struct Player {
     station: Option<String>,
     /// The interaction that opened [`Player::station`].
     station_interaction: Option<u64>,
+    /// Its recipe cooldown counts ([`nw_content::recipe_cooldowns`]).
+    recipe_cooldowns: RecipeCooldownCounts,
+    /// Its faction ([`faction`]).
+    faction: nw_bus::PlayerFaction,
+    /// The quick course it rides ([`quick_course`]).
+    course: quick_course::PlayerCourse,
     /// The last open-world interaction its client asked for: the client repeats the request in
     /// each input until it ends the interaction, and retail answers each one once (retail
     /// 2026-09-18: one 3743 for a talk the client held 20 s; ours answered all 667 inputs).
@@ -734,6 +743,17 @@ impl Player {
             arena: self.arena.carried(),
             music: self.music.carried(),
             notifications: self.notifications.carried(),
+            recipe_cooldowns: self
+                .recipe_cooldowns
+                .counts()
+                .into_iter()
+                .map(|count| nw_bus::RecipeCooldownCount {
+                    recipe_id: count.recipe,
+                    count: count.count,
+                    ends_ns: count.ends_ns,
+                })
+                .collect(),
+            faction: self.faction,
         }
     }
 
@@ -944,6 +964,9 @@ pub enum QuestRefusal {
     /// The player finished it and it is not repeatable.
     #[error("the player finished this quest")]
     Done,
+    /// The player is not of its `RequiredFaction`, or is of the faction it excludes.
+    #[error("the player's faction may not take this quest")]
+    Faction,
 }
 
 /// A new player before it is in the world.
@@ -1231,8 +1254,10 @@ impl SimWorld {
         self.arena_arrived(admit.entity);
         self.transmog_arrived(admit.entity, admit.login);
         if admit.login {
-            // Retail's login state lists the loot limit counts.
+            // Retail's login state lists the loot limit counts and the recipe cooldowns.
             self.send_loot_limits(admit.entity, loot_bag::LimitsSent::Spawn);
+            self.send_recipe_cooldowns(admit.entity, loot_bag::LimitsSent::Spawn);
+            self.send_faction(admit.entity);
         }
         if admit.login && self.is_tutorial() {
             self.start_tutorial(admit.entity, now_ms);
@@ -1377,6 +1402,8 @@ impl SimWorld {
         if enters {
             // A new level's spawn state lists them as a login's does (Inferred).
             self.send_loot_limits(offer.entity, loot_bag::LimitsSent::Spawn);
+            self.send_recipe_cooldowns(offer.entity, loot_bag::LimitsSent::Spawn);
+            self.send_faction(offer.entity);
         }
         // From the tutorial only: an instance move keeps the quests (its offer has a stay).
         if enters
@@ -2114,6 +2141,7 @@ impl SimWorld {
         self.tick_status_effects(now_ms);
         self.tick_falls(now_ms);
         self.tick_mounts(now_ms);
+        self.tick_quick_courses(now_ms);
         self.tick_hands(now_ms, server_time);
         self.tick_pushes(now_ms);
         self.gathers_due(now_ms);
@@ -2308,6 +2336,16 @@ impl SimWorld {
             .quests
             .quest(objective)
             .ok_or(QuestRefusal::NoQuest)?;
+        let faction = self
+            .player_by_number(number)
+            .and_then(|entity| self.world.get::<Player>(entity))
+            .map_or(nw_content::factions::NO_FACTION, |player| {
+                player.faction.faction
+            });
+        if !nw_content::factions::faction_requirement_met(def.required_faction.as_deref(), faction)
+        {
+            return Err(QuestRefusal::Faction);
+        }
         if let Some(group) = def.limit_group {
             let limit = self.content.gameplay.objective_limits.limit(group);
             let running = self
@@ -2531,6 +2569,18 @@ impl SimWorld {
         self.quest_event_where(number, |_| true, event, now_ms);
     }
 
+    /// Sets achievement `achievement` of player `number` and feeds it to the player's quests.
+    fn earn_achievement(&mut self, number: u64, achievement: &str, now_ms: u64) {
+        if let Some(entity) = self.player_by_number(number)
+            && let Some(mut player) = self.world.get_mut::<Player>(entity)
+        {
+            player
+                .flow
+                .set_achievement(&self.achievement_rules, achievement);
+        }
+        self.quest_event(number, Event::AchievementSet(achievement), now_ms);
+    }
+
     /// Feeds game event `event` to quest `objective` of player `number` only.
     fn quest_event_for(&mut self, number: u64, objective: &str, event: Event<'_>, now_ms: u64) {
         self.quest_event_where(
@@ -2679,20 +2729,16 @@ impl SimWorld {
                         })
                     }
                 };
-                // The territory of each area or point of interest the client named.
-                let mut territories: Vec<u32> = player
-                    .territories
-                    .iter()
-                    .filter_map(|id| content.charting.territory_of(u32::from(*id)))
-                    .collect();
-                territories.sort_unstable();
-                territories.dedup();
+                let territories = player_territories(content, &player.territories);
+                let of_family = |item: &str, family: &str| item_of_family(content, item, family);
                 let facts = Facts {
                     held: &held,
                     places: Some(&places),
                     achieved: Some(&achieved),
                     level: Some(&level),
                     territories: Some(&territories),
+                    of_family: Some(&of_family),
+                    houses: Some(player.travel.houses()),
                 };
                 for quest in quests.iter_mut() {
                     effects.extend(quest.run.sync(&facts, now_ms));
@@ -3324,6 +3370,10 @@ impl SimWorld {
                 if let Some(mut player) = self.world.get_mut::<Player>(entity) {
                     player.pvp_flagged = !player.pvp_flagged;
                 }
+                return Ok(());
+            }
+            ClientFacetMsg::SetFaction { faction, .. } => {
+                self.set_faction(entity, number, *faction, now_ms);
                 return Ok(());
             }
             // A cutscene and the load of a new level put the weapon away; the flow answers them.
@@ -3997,164 +4047,175 @@ impl SimWorld {
             arrival.backstory.as_deref(),
             &self.content,
         );
-        let entity = self
-            .world
-            .spawn((
-                Player {
-                    connection: arrival.connection.clone(),
-                    character: arrival.character,
-                    name: arrival.name,
-                    look: arrival.look,
-                    gear: match &arrival.items {
-                        Some(items) => {
-                            let mut gear = Gear::carried_in(
+        let entity =
+            self.world
+                .spawn((
+                    Player {
+                        connection: arrival.connection.clone(),
+                        character: arrival.character,
+                        name: arrival.name,
+                        look: arrival.look,
+                        gear: match &arrival.items {
+                            Some(items) => {
+                                let mut gear = Gear::carried_in(
+                                    &self.content.kits,
+                                    arrival.character,
+                                    items,
+                                    arrival.drawn_weapon,
+                                    arrival.active_weapon,
+                                );
+                                gear.restore_inventory(&self.content.kits, &arrival.inventory);
+                                Some(gear)
+                            }
+                            None => Gear::starter(
                                 &self.content.kits,
                                 arrival.character,
-                                items,
-                                arrival.drawn_weapon,
-                                arrival.active_weapon,
-                            );
-                            gear.restore_inventory(&self.content.kits, &arrival.inventory);
-                            Some(gear)
-                        }
-                        None => Gear::starter(
-                            &self.content.kits,
-                            arrival.character,
-                            arrival.backstory.as_deref(),
+                                arrival.backstory.as_deref(),
+                            ),
+                        },
+                        item_changes: storage_search::ItemChanges::default(),
+                        backstory: arrival.backstory,
+                        number: arrival.number,
+                        bundles_sent: replication.bundles_sent,
+                        last_time_synch_ms,
+                        interest: Interest::new(
+                            self.settings.interest_radius_m,
+                            self.settings.max_visible_players,
                         ),
+                        slots: replication.slots,
+                        own_card_sent: false,
+                        own_card_due_ms: arrival.own_card_due_ms,
+                        own_card_bundle: None,
+                        login: arrival.login,
+                        own_card_sent_ms: 0,
+                        others_due_ms: if arrival.spawned { Some(0) } else { None },
+                        client_context: arrival.client_context,
+                        flow: arrival.flow,
+                        leave_at_ms: None,
+                        phasing_left_ms: None,
+                        moved: false,
+                        move_facing: None,
+                        push: None,
+                        tracked: TrackedBody::new(motion.position()),
+                        input_counter: None,
+                        state_number: None,
+                        view: None,
+                        view_sent: None,
+                        slayer: slayer::SlayerTrack::default(),
+                        remote_plan: replica::RemotePlan::default(),
+                        throttle_cleared: false,
+                        defer_throttle_clear: false,
+                        auto_pin: true,
+                        pvp_flagged: false,
+                        own_places: OwnPlaces::default(),
+                        footing: Footing::SPAWN,
+                        footing_sent: Footing::SPAWN,
+                        teleport_step: None,
+                        refused_since_ms: None,
+                        last_grounded: Some(motion.position()),
+                        camera_held_until_ms: None,
+                        looking_through_loadout: false,
+                        loadout_change_due: false,
+                        own_spawned_ms: None,
+                        teleports: 0,
+                        quest: None,
+                        done_quests: arrival.quests.done.clone(),
+                        quests_unsaved: false,
+                        tracker_floor: arrival.quests.tracker_version,
+                        experience: arrival.progression.experience,
+                        experience_changed: false,
+                        coins: arrival.progression.coins,
+                        coins_changed: false,
+                        loot: loot_bag::PlayerLoot::with_limits(&arrival.progression.loot_limits),
+                        progression_saved: arrival
+                            .progression_saved
+                            .then(|| arrival.progression.clone()),
+                        arrived_achievements: arrival.progression.achievements,
+                        masteries: progression::Masteries::of(
+                            &arrival_masteries,
+                            &self.content.progression,
+                            arrival.mastery_versions,
+                        )
+                        .with_points(
+                            &arrival.progression.weapon_points,
+                            &self.content.progression,
+                        )
+                        .with_territory_points(&arrival.progression.territory_points)
+                        .with_slots(
+                            &arrival.progression.ability_slots,
+                            &self.content.progression,
+                        ),
+                        attributes: points::Attributes::of(
+                            &arrival.progression.attributes,
+                            arrival.attribute_version,
+                        ),
+                        meta: meta_achievements::MetaState::of(
+                            &arrival.progression.meta_counters,
+                            &arrival.progression.meta_completed,
+                        ),
+                        title: arrival.progression.title,
+                        title_changed: arrival.progression.title.is_some(),
+                        level_sent: None,
+                        game_master: arrival.game_master,
+                        account_in_probation: arrival.account_in_probation,
+                        station: None,
+                        station_interaction: None,
+                        faction: arrival.progression.faction,
+                        course: quick_course::PlayerCourse::default(),
+                        recipe_cooldowns: RecipeCooldownCounts::from_counts(
+                            arrival.progression.recipe_cooldowns.iter().map(|count| {
+                                CooldownCount {
+                                    recipe: count.recipe_id.clone(),
+                                    count: count.count,
+                                    ends_ns: count.ends_ns,
+                                }
+                            }),
+                        ),
+                        last_interaction: None,
+                        open_interaction: None,
+                        open_board: None,
+                        board_version: 0,
+                        interacting: false,
+                        territories: Vec::new(),
+                        travel: travel::TravelState::of(arrival.progression.travel.clone()),
+                        strikes: quest_objects::Strikes::default(),
+                        cooldowns: Vec::new(),
+                        cooldowns_changed: false,
+                        item_effects: item_calls::ItemEffects::default(),
+                        status_effects: status_effects::StatusEffects::default(),
+                        fall: fall_damage::FallTrack::default(),
+                        health_sent: None,
+                        life_ms: 0,
+                        stamina: Stamina::default(),
+                        mount: mount::PlayerMount::of(&arrival.progression.mounts),
+                        fishing: fishing::PlayerFishing::continuing(arrival.fishing_sequence),
+                        music: music::PlayerMusicState::of(&arrival.progression.music),
+                        notifications: notifications::ShownNotifications::of(
+                            &arrival.progression.notifications,
+                        ),
+                        combat: CombatTimer::default(),
+                        list_version: FIRST_VERSION,
+                        extra_members: Vec::new(),
+                        social: social_states::PlayerSocial::default(),
+                        gathers: 0,
+                        cyclic_turns: HashMap::new(),
+                        node_versions: HashMap::new(),
+                        bag_versions: HashMap::new(),
+                        ended_gather: None,
+                        statics: StaticViews::default(),
+                        assets: AssetViews::default(),
+                        solids: None,
+                        arena: instances::ArenaPlayer::of(arrival.progression.arena.clone()),
+                        game_mode: game_mode::GameModePlayer::default(),
+                        mutation_view: mutations::ScheduleView::default(),
+                        frozen: false,
+                        handoffs,
+                        no_handoff_before_ms,
                     },
-                    item_changes: storage_search::ItemChanges::default(),
-                    backstory: arrival.backstory,
-                    number: arrival.number,
-                    bundles_sent: replication.bundles_sent,
-                    last_time_synch_ms,
-                    interest: Interest::new(
-                        self.settings.interest_radius_m,
-                        self.settings.max_visible_players,
-                    ),
-                    slots: replication.slots,
-                    own_card_sent: false,
-                    own_card_due_ms: arrival.own_card_due_ms,
-                    own_card_bundle: None,
-                    login: arrival.login,
-                    own_card_sent_ms: 0,
-                    others_due_ms: if arrival.spawned { Some(0) } else { None },
-                    client_context: arrival.client_context,
-                    flow: arrival.flow,
-                    leave_at_ms: None,
-                    phasing_left_ms: None,
-                    moved: false,
-                    move_facing: None,
-                    push: None,
-                    tracked: TrackedBody::new(motion.position()),
-                    input_counter: None,
-                    state_number: None,
-                    view: None,
-                    view_sent: None,
-                    slayer: slayer::SlayerTrack::default(),
-                    remote_plan: replica::RemotePlan::default(),
-                    throttle_cleared: false,
-                    defer_throttle_clear: false,
-                    auto_pin: true,
-                    pvp_flagged: false,
-                    own_places: OwnPlaces::default(),
-                    footing: Footing::SPAWN,
-                    footing_sent: Footing::SPAWN,
-                    teleport_step: None,
-                    refused_since_ms: None,
-                    last_grounded: Some(motion.position()),
-                    camera_held_until_ms: None,
-                    looking_through_loadout: false,
-                    loadout_change_due: false,
-                    own_spawned_ms: None,
-                    teleports: 0,
-                    quest: None,
-                    done_quests: arrival.quests.done.clone(),
-                    quests_unsaved: false,
-                    tracker_floor: arrival.quests.tracker_version,
-                    experience: arrival.progression.experience,
-                    experience_changed: false,
-                    coins: arrival.progression.coins,
-                    coins_changed: false,
-                    loot: loot_bag::PlayerLoot::with_limits(&arrival.progression.loot_limits),
-                    progression_saved: arrival
-                        .progression_saved
-                        .then(|| arrival.progression.clone()),
-                    arrived_achievements: arrival.progression.achievements,
-                    masteries: progression::Masteries::of(
-                        &arrival_masteries,
-                        &self.content.progression,
-                        arrival.mastery_versions,
-                    )
-                    .with_points(
-                        &arrival.progression.weapon_points,
-                        &self.content.progression,
-                    )
-                    .with_territory_points(&arrival.progression.territory_points)
-                    .with_slots(
-                        &arrival.progression.ability_slots,
-                        &self.content.progression,
-                    ),
-                    attributes: points::Attributes::of(
-                        &arrival.progression.attributes,
-                        arrival.attribute_version,
-                    ),
-                    meta: meta_achievements::MetaState::of(
-                        &arrival.progression.meta_counters,
-                        &arrival.progression.meta_completed,
-                    ),
-                    title: arrival.progression.title,
-                    title_changed: arrival.progression.title.is_some(),
-                    level_sent: None,
-                    game_master: arrival.game_master,
-                    account_in_probation: arrival.account_in_probation,
-                    station: None,
-                    station_interaction: None,
-                    last_interaction: None,
-                    open_interaction: None,
-                    open_board: None,
-                    board_version: 0,
-                    interacting: false,
-                    territories: Vec::new(),
-                    travel: travel::TravelState::of(arrival.progression.travel.clone()),
-                    strikes: quest_objects::Strikes::default(),
-                    cooldowns: Vec::new(),
-                    cooldowns_changed: false,
-                    item_effects: item_calls::ItemEffects::default(),
-                    status_effects: status_effects::StatusEffects::default(),
-                    fall: fall_damage::FallTrack::default(),
-                    health_sent: None,
-                    life_ms: 0,
-                    stamina: Stamina::default(),
-                    mount: mount::PlayerMount::of(&arrival.progression.mounts),
-                    fishing: fishing::PlayerFishing::continuing(arrival.fishing_sequence),
-                    music: music::PlayerMusicState::of(&arrival.progression.music),
-                    notifications: notifications::ShownNotifications::of(
-                        &arrival.progression.notifications,
-                    ),
-                    combat: CombatTimer::default(),
-                    list_version: FIRST_VERSION,
-                    extra_members: Vec::new(),
-                    social: social_states::PlayerSocial::default(),
-                    gathers: 0,
-                    cyclic_turns: HashMap::new(),
-                    node_versions: HashMap::new(),
-                    bag_versions: HashMap::new(),
-                    ended_gather: None,
-                    statics: StaticViews::default(),
-                    assets: AssetViews::default(),
-                    solids: None,
-                    arena: instances::ArenaPlayer::of(arrival.progression.arena.clone()),
-                    game_mode: game_mode::GameModePlayer::default(),
-                    mutation_view: mutations::ScheduleView::default(),
-                    frozen: false,
-                    handoffs,
-                    no_handoff_before_ms,
-                },
-                Body { motion },
-                Vitals::new(arrival.health, arrival.spawned),
-            ))
-            .id();
+                    Body { motion },
+                    Vitals::new(arrival.health, arrival.spawned),
+                ))
+                .id();
         self.by_connection.insert(arrival.connection, entity);
         self.camp_arrived(entity);
     }
@@ -5127,6 +5188,42 @@ fn handoff_offer(
 }
 
 /// The items of `carried` as item tasks read them: item id, quantity and whether it is worn.
+/// The territories (zones) of each area or point of interest the client named (`areas`).
+fn player_territories(content: &PlayerContent, areas: &[u16]) -> Vec<u32> {
+    let mut territories: Vec<u32> = areas
+        .iter()
+        .filter_map(|id| content.charting.territory_of(u32::from(*id)))
+        .collect();
+    territories.sort_unstable();
+    territories.dedup();
+    territories
+}
+
+/// The families of item `item_id`: its `ItemClass` tags and its weapon mastery
+/// (`SwordAbilityTable`), for the family tasks of quests.
+fn item_families(content: &PlayerContent, item_id: &str) -> Vec<String> {
+    content
+        .item_rolls
+        .item(item_id)
+        .map(|row| row.classes.clone())
+        .unwrap_or_default()
+        .into_iter()
+        .chain(
+            content
+                .kill_rewards
+                .weapon_mastery(item_id)
+                .map(str::to_owned),
+        )
+        .collect()
+}
+
+/// Whether item `item_id` is of family `family` ([`item_families`]).
+fn item_of_family(content: &PlayerContent, item_id: &str, family: &str) -> bool {
+    item_families(content, item_id)
+        .iter()
+        .any(|seen| seen.eq_ignore_ascii_case(family))
+}
+
 fn held_items(carried: &[CarriedItem]) -> Vec<(&str, u32, bool)> {
     carried
         .iter()
@@ -11164,6 +11261,31 @@ mod tests {
     }
 
     #[test]
+    fn a_spawn_tells_the_client_whether_its_account_is_in_probation() {
+        for in_probation in [false, true] {
+            let mut world = world_with_spawns(Vec::new());
+            world.set_table(&table(&["sim-a", "sim-b"])).expect("table");
+            let admit = Admit {
+                account_in_probation: in_probation,
+                ..admit_at(1, CELL_M / 2.0, true)
+            };
+            world.admit(&admit, NOW, SERVER_TIME).expect("admit");
+            tick(&mut world, NOW + OWN_CARD_DELAY_MS);
+            world.heard_from(&connection(1));
+            let entity = world.player_by_number(1).expect("player");
+            let player = world.world.get::<Player>(entity).expect("player");
+            assert!(
+                player.extra_members.iter().any(|member| matches!(
+                    &member.state,
+                    MemberState::PlayerComponent(state)
+                        if state.account_in_probation == Some(in_probation)
+                )),
+                "{in_probation}"
+            );
+        }
+    }
+
+    #[test]
     fn a_login_saved_in_the_air_arrives_on_the_ground() {
         const GROUND_M: f32 = 20.0;
         let mut world = SimWorld::new(
@@ -11257,31 +11379,6 @@ mod tests {
             world.admit(&admit_at(9, 0.0, true), NOW, SERVER_TIME),
             Err(WorldError::Full)
         ));
-    }
-
-    #[test]
-    fn a_spawn_tells_the_client_whether_its_account_is_in_probation() {
-        for in_probation in [false, true] {
-            let mut world = world_with_spawns(Vec::new());
-            world.set_table(&table(&["sim-a", "sim-b"])).expect("table");
-            let admit = Admit {
-                account_in_probation: in_probation,
-                ..admit_at(1, CELL_M / 2.0, true)
-            };
-            world.admit(&admit, NOW, SERVER_TIME).expect("admit");
-            tick(&mut world, NOW + OWN_CARD_DELAY_MS);
-            world.heard_from(&connection(1));
-            let entity = world.player_by_number(1).expect("player");
-            let player = world.world.get::<Player>(entity).expect("player");
-            assert!(
-                player.extra_members.iter().any(|member| matches!(
-                    &member.state,
-                    MemberState::PlayerComponent(state)
-                        if state.account_in_probation == Some(in_probation)
-                )),
-                "{in_probation}"
-            );
-        }
     }
 
     #[test]

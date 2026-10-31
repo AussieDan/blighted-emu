@@ -21,6 +21,7 @@ use nw_messages::wire::RAW_ID_LEN;
 
 use super::loot_bag::LimitsSent;
 use super::{Player, SimWorld};
+use crate::objectives::Event;
 
 /// One bag item a salvage call names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,7 +124,8 @@ impl SimWorld {
     }
 
     /// Salvages the bag item of `target`: it leaves the bag, its items go into the bag (less
-    /// what the loot limits hold back) and its game event's coins into the wallet.
+    /// what the loot limits hold back), its game event's coins into the wallet, and its achievement
+    /// (a schematic's recipe unlock) is set.
     fn salvage_one(
         &mut self,
         entity: Entity,
@@ -188,6 +190,17 @@ impl SimWorld {
         if let Some(event) = &rule.event {
             self.grant_event(number, event, quantity);
         }
+        if let Some(achievement) = &rule.achievement {
+            self.earn_achievement(number, achievement, now_ms);
+        }
+        self.quest_event(
+            number,
+            Event::Salvaged {
+                item: &item_id,
+                quantity,
+            },
+            now_ms,
+        );
         Ok(())
     }
 }
@@ -197,12 +210,14 @@ mod tests {
 
     use std::sync::Arc;
 
+    use nw_content::achievements::AchievementIndexes;
     use nw_content::rewards::{EventGrant, EventGrants};
     use nw_content::salvage::{Salvage, SalvageRow};
 
     use super::*;
     use crate::player_content::PlayerContent;
     use crate::world::gear;
+    use crate::world::level_flow::AchievementRules;
     use crate::world::tests::{NOW, SERVER_TIME, admit_at, connection, world_with_spawns};
 
     /// The player's number.
@@ -229,6 +244,7 @@ mod tests {
                     resources: Some(1),
                     repair_recipe: Some(RECIPE.to_owned()),
                     event: Some(COIN_EVENT.to_owned()),
+                    achievement: None,
                     tier: Some(1),
                     rarity: None,
                 }],
@@ -319,6 +335,56 @@ mod tests {
         };
         world.salvage(entity, number, &[by_slot], NOW);
         assert_eq!(count(&world, INGOT), 2, "an ingot is not salvageable");
+    }
+
+    #[test]
+    fn a_schematic_salvage_sets_the_achievement_its_recipe_asks_for() {
+        /// A weapon schematic of build 25810808 and the achievement its recipe asks for.
+        const SCHEMATIC: &str = "Schematic_ShatterslashT4";
+        const UNLOCK: &str = "ShatterslashT4";
+        const UNLOCK_BIT: u32 = 3;
+        let mut content = content();
+        content.kits = gear::tests::kits_with(&[(SCHEMATIC, "Resource+WeaponSchematic")]);
+        content.salvage = Salvage::build(
+            [SalvageRow {
+                item: SCHEMATIC.to_owned(),
+                salvageable: true,
+                achievement: Some(UNLOCK.to_owned()),
+                ..SalvageRow::default()
+            }],
+            [],
+        );
+        let mut world = world_with_spawns(Vec::new());
+        world.content = Arc::new(content);
+        world.achievement_rules = AchievementRules::of(
+            &AchievementIndexes::build([(UNLOCK.to_owned(), UNLOCK_BIT)]),
+            &[],
+        );
+        let mut admit = admit_at(PLAYER, 0.0, true);
+        admit.backstory = Some(gear::tests::BACKSTORY.to_owned());
+        world.admit(&admit, NOW, SERVER_TIME).expect("admit");
+        let entity = world.by_connection[&connection(PLAYER)];
+        let schematic = world.content.kits.item(SCHEMATIC).cloned().expect("item");
+        let slot = {
+            let mut player = world.world.get_mut::<Player>(entity).expect("player");
+            let gear = player.gear.as_mut().expect("gear");
+            assert!(gear.add(&schematic, 1));
+            slot_of(gear, SCHEMATIC).expect("slot")
+        };
+        let rules = world.achievement_rules.clone();
+        let player = world.world.get::<Player>(entity).expect("player");
+        assert!(!player.flow.has_achievement(&rules, UNLOCK));
+        let target = SalvageTarget {
+            bag_slot: slot,
+            instance: None,
+            quantity: None,
+        };
+        world.salvage(entity, PLAYER, &[target], NOW);
+        let player = world.world.get::<Player>(entity).expect("player");
+        assert!(
+            player.flow.has_achievement(&rules, UNLOCK),
+            "the recipe is learned"
+        );
     }
 
     #[test]

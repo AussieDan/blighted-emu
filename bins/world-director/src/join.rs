@@ -426,6 +426,20 @@ fn player_progression(saved: SavedProgression) -> PlayerProgression {
             next_performance_ms: saved.music.next_performance_ms,
         },
         notifications: saved.notifications.shown,
+        recipe_cooldowns: saved
+            .recipe_cooldowns
+            .into_iter()
+            .map(|cooldown| nw_bus::RecipeCooldownCount {
+                recipe_id: cooldown.recipe_id,
+                count: cooldown.count,
+                ends_ns: cooldown.ends_ns,
+            })
+            .collect(),
+        faction: nw_bus::PlayerFaction {
+            faction: saved.faction.faction,
+            changes: saved.faction.changes,
+            changed_ns: saved.faction.changed_ns,
+        },
     }
 }
 
@@ -682,6 +696,16 @@ mod tests {
             notifications: nw_db::SavedNotifications {
                 shown: vec![(0x1e06_e356, 12)],
             },
+            recipe_cooldowns: vec![nw_db::SavedRecipeCooldown {
+                recipe_id: "leathert51".to_owned(),
+                count: 10,
+                ends_ns: 0x18b8_d351_b144_f000,
+            }],
+            faction: nw_db::SavedFaction {
+                faction: 1,
+                changes: 1,
+                changed_ns: 0x18e1_bb69_e04f_ba64,
+            },
         };
         assert_eq!(
             player_progression(saved),
@@ -735,6 +759,16 @@ mod tests {
                     next_performance_ms: Some(846_118_000_000),
                 },
                 notifications: vec![(0x1e06_e356, 12)],
+                recipe_cooldowns: vec![nw_bus::RecipeCooldownCount {
+                    recipe_id: "leathert51".to_owned(),
+                    count: 10,
+                    ends_ns: 0x18b8_d351_b144_f000,
+                }],
+                faction: nw_bus::PlayerFaction {
+                    faction: 1,
+                    changes: 1,
+                    changed_ns: 0x18e1_bb69_e04f_ba64,
+                },
             }
         );
     }

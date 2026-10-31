@@ -1024,6 +1024,13 @@ impl SimWorld {
         for event in events {
             self.quest_event(number, Event::GameEvent(&event), now_ms);
         }
+        if let Some(at) = self
+            .player_by_number(number)
+            .and_then(|entity| self.world.get::<Body>(entity))
+            .map(|body| body.motion.position())
+        {
+            self.quest_event(number, Event::SongPerformed { song: &song.id, at }, now_ms);
+        }
     }
 
     /// Every player within a performance's zone watches it; the performances count them (a

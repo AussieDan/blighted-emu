@@ -15,7 +15,6 @@ use nw_messages::social::{SocialFacet, icon_bytes, push_envelope};
 use uuid::Uuid;
 
 use super::{Body, MESSAGE_CHANNEL, Outgoing, Player, SimWorld};
-use crate::social::NO_FACTION;
 
 /// The component of a bus facet kind.
 const fn facet_of(kind: SocialFacetKind) -> SocialFacet {
@@ -45,7 +44,7 @@ impl SimWorld {
             sim: sim.clone(),
             level_name: self.settings.level.folder.to_owned(),
             territories: player.territories.clone(),
-            faction: NO_FACTION,
+            faction: player.faction.faction,
             position: [at.x, at.y],
         })
     }

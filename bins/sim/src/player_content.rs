@@ -29,8 +29,10 @@ use nw_content::mounts::MountRules;
 use nw_content::music::MusicRules;
 use nw_content::mutations::MutationCatalog;
 use nw_content::objective_limits::ObjectiveLimitGroup;
+use nw_content::perk_effects::PerkEffects;
 use nw_content::poi_tags::PoiTags;
 use nw_content::progression::Progression;
+use nw_content::quick_courses::QuickCourseRules;
 use nw_content::rewards::{EventGrants, KillExperience, Rewards};
 use nw_content::salvage::Salvage;
 use nw_content::skins::{DyeCatalog, SkinCatalog};
@@ -44,6 +46,7 @@ use nw_world::camps::CampSlices;
 use nw_world::collision::QuestVolume;
 use nw_world::dungeon_scripts::DungeonScripts;
 use nw_world::interact_tags::TagOwner;
+use nw_world::quick_courses::QuickCoursePaths;
 use nw_world::records::{Capital, GatherablePoint, WorldFile};
 use nw_world::stations::CraftingStation;
 use std::collections::{HashMap, HashSet};
@@ -93,6 +96,9 @@ pub struct QuestDef {
     pub repeatable: bool,
     /// `RequiredAchievementID`: the achievement expression an NPC offers it on.
     pub requirement: Option<String>,
+    /// `RequiredFaction`: the faction its player must be of, or not be of
+    /// ([`nw_content::factions::faction_requirement_met`]).
+    pub required_faction: Option<String>,
     /// `AchievementId`: set at completion; the next quest of the chain requires it.
     pub achievement: Option<String>,
     /// `NPCDestinationId`: the NPC the player turns it in at; without one it is done when its
@@ -123,6 +129,8 @@ pub struct ObjectiveRow {
     pub repeatable: bool,
     /// `RequiredAchievementID`.
     pub requirement: Option<String>,
+    /// `RequiredFaction`.
+    pub required_faction: Option<String>,
     /// `AchievementId`.
     pub achievement: Option<String>,
     /// `NPCDestinationId`.
@@ -147,6 +155,8 @@ pub struct MissionRow {
     pub territory: u16,
     /// `SuccessGameEventIdOverride`.
     pub success_event: Option<String>,
+    /// `RequiredFaction`: the faction board's faction (`Covenant`, `Marauder`, `Syndicate`).
+    pub required_faction: Option<String>,
     /// `TaskHaveAndReturnItemsOverride`.
     pub items: Option<String>,
     /// `TaskHaveAndReturnItemsQtyOverride`.
@@ -166,14 +176,26 @@ pub struct MissionRow {
     pub chest_percent: Option<i64>,
     /// `TaskGiveAndTakeItemOverride`: the item its give task gives (a work order).
     pub given_item: Option<String>,
+    /// `TerritoryIDOverride`: the territory of its go-to-territory tasks.
+    pub territory_override: Option<u32>,
+    /// `OverrideLocation`: the location of its go-to tasks.
+    pub location: Option<String>,
+    /// `PatrolPOI1`: the place of its patrol task.
+    pub patrol_place: Option<String>,
+    /// `PatrolDuration` (seconds): the stay of its patrol task.
+    pub patrol_duration: Option<i64>,
+    /// `TaskTimerOverride` (seconds): the duration of its timer task.
+    pub timer: Option<i64>,
 }
 
 impl MissionRow {
     /// The mission's value of template task `row`; `None` when the mission changes nothing in
     /// it. Item tasks take its items, count, drops and container chance; kill tasks its enemy
-    /// and count; give tasks its work order item; a task that enforces its location takes the
-    /// mission's place.
+    /// and count; give tasks its work order item; go-to tasks its place, territory and
+    /// location; a patrol its first patrol place and stay; a timer its duration; a task that
+    /// enforces its location takes the mission's place.
     fn override_of(&self, row: &TaskRow) -> Option<TaskRow> {
+        let original = row;
         let placed = TaskRow {
             poi_tag: if row.enforce_location {
                 self.place.clone().or(row.poi_tag.clone())
@@ -196,8 +218,33 @@ impl MissionRow {
                     ..row.clone()
                 })
             }
-            "taskgiveitem" => Some(TaskRow {
+            "taskgiveitem" | "taskgiveandtakeitem" => Some(TaskRow {
                 item_name: Some(self.given_item.clone()?),
+                ..row.clone()
+            }),
+            // A go-to template names no place: it goes to the mission's.
+            "taskgotopoitag"
+            | "taskexitpoitag"
+            | "taskgototerritory"
+            | "taskgotopoitagonterritory" => {
+                let goes = TaskRow {
+                    poi_tag: self.place.clone().or(row.poi_tag.clone()),
+                    territory_id: self.territory_override.or(row.territory_id),
+                    override_location: self.location.clone().or(row.override_location.clone()),
+                    ..row.clone()
+                };
+                (goes != *original).then_some(goes)
+            }
+            "patroltask" => Some(TaskRow {
+                poi_tag: Some(self.patrol_place.clone()?),
+                duration: self
+                    .patrol_duration
+                    .map(|seconds| seconds as f64)
+                    .or(row.duration),
+                ..row.clone()
+            }),
+            "tasktimer" => Some(TaskRow {
+                duration: Some(self.timer? as f64),
                 ..row.clone()
             }),
             "taskkillcontribution" => Some(TaskRow {
@@ -228,6 +275,7 @@ fn mission_rows(tables: &Tables) -> Vec<MissionRow> {
                 .unwrap_or_default(),
             success_event: Some(row.success_game_event_id_override.clone())
                 .filter(|event| !event.is_empty()),
+            required_faction: cell(row.required_faction.as_ref()),
             items: cell(row.task_have_and_return_items_override.as_ref()),
             items_count: row.task_have_and_return_items_qty_override,
             items_drop_enemy: cell(
@@ -240,6 +288,14 @@ fn mission_rows(tables: &Tables) -> Vec<MissionRow> {
             place: cell(row.poi_tag_override.as_ref()),
             chest_percent: row.task_have_and_return_chest_drop_probability_override,
             given_item: cell(row.task_give_and_take_item_override.as_ref()),
+            territory_override: row
+                .territory_id_override
+                .and_then(|territory| u32::try_from(territory).ok())
+                .filter(|territory| *territory != 0),
+            location: cell(row.override_location.as_ref()),
+            patrol_place: cell(row.patrol_poi1.as_ref()),
+            patrol_duration: row.patrol_duration,
+            timer: row.task_timer_override,
         })
         .collect()
 }
@@ -278,6 +334,7 @@ impl QuestBook {
                     reward_quantity: row.item_reward_qty,
                     repeatable: row.repeatable.unwrap_or_default(),
                     requirement: cell(row.required_achievement_id.as_ref()),
+                    required_faction: cell(row.required_faction.as_ref()),
                     achievement: cell(row.achievement_id.as_ref()),
                     turn_in: cell(row.npc_destination_id.as_ref()),
                     success_event: cell(row.success_game_event_id.as_ref()),
@@ -351,6 +408,10 @@ impl QuestBook {
                     .clone()
                     .or_else(|| template.success_event.clone()),
                 mission: Some(lowercase_crc32(&lower)),
+                required_faction: mission
+                    .required_faction
+                    .clone()
+                    .or_else(|| template.required_faction.clone()),
                 // A board offers a mission again after its refresh (Inferred: retail boards
                 // offer new missions every half hour).
                 repeatable: true,
@@ -381,6 +442,7 @@ impl QuestBook {
             reward,
             repeatable: row.repeatable,
             requirement: row.requirement.clone(),
+            required_faction: row.required_faction.clone(),
             achievement: row.achievement.clone(),
             turn_in: row.turn_in.clone(),
             success_event: row.success_event.clone(),
@@ -646,6 +708,10 @@ pub struct PlayerContent {
     /// The camp slices, for a placed camp's spawn group; empty until the sim loads the camp
     /// slice file.
     pub camp_slices: CampSlices,
+    /// The quick course rules.
+    pub quick_courses: QuickCourseRules,
+    /// The quick course paths; empty until the sim loads the quick course file.
+    pub quick_course_paths: QuickCoursePaths,
     /// The loot value of a player's level by its experience.
     pub player_loot_levels: PlayerLootLevels,
     /// The point-of-interest tags of each territory, for go-to and exit tasks.
@@ -680,6 +746,8 @@ pub struct PlayerContent {
     pub music: MusicRules,
     /// The item weights and the player's equip load limits.
     pub equip_loads: EquipLoads,
+    /// The status effects worn perks hold ([`nw_content::perk_effects`]).
+    pub perk_effects: PerkEffects,
     /// The mounts, their types, movement rows and dyes.
     pub mounts: MountRules,
     /// The landmarks, discoverable territories, spawn points and timings of travel.
@@ -1011,6 +1079,8 @@ impl PlayerContent {
             structure_costs: StructureCosts::from_tables(tables),
             camps: CampRules::from_tables(tables),
             camp_slices: CampSlices::default(),
+            quick_courses: QuickCourseRules::from_tables(tables),
+            quick_course_paths: QuickCoursePaths::default(),
             player_loot_levels: PlayerLootLevels::from_tables(tables),
             poi_tags: PoiTags::from_tables(tables),
             quest_objects,
@@ -1034,6 +1104,7 @@ impl PlayerContent {
             progression: Progression::of_tables(tables),
             titles: TitleRules::from_tables(tables),
             equip_loads: EquipLoads::from_tables(tables),
+            perk_effects: PerkEffects::from_tables(tables),
             mounts: MountRules::from_tables(tables),
             item_rules: ItemRules::from_tables(tables),
             status_effects: StatusEffectRules::from_tables(tables),
@@ -1121,6 +1192,48 @@ fn disabled_items<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_mission_fills_its_go_to_patrol_timer_and_transport_templates() {
+        // Template rows `M_task_goto_POITag`, `M_task_goto_territoryID`, `PVP_task_patrol`,
+        // `M_task_give_transport_item` and a timer.
+        let mission = MissionRow {
+            place: Some("Windsward_Settlement_01".to_owned()),
+            territory_override: Some(12),
+            patrol_place: Some("Fort_A".to_owned()),
+            patrol_duration: Some(60),
+            timer: Some(90),
+            given_item: Some("WorkOrder_T1".to_owned()),
+            ..MissionRow::default()
+        };
+        let row = |kind: &str| TaskRow {
+            task_id: kind.to_owned(),
+            kind: kind.to_owned(),
+            ..TaskRow::default()
+        };
+        let goes = mission.override_of(&row("TaskGoToPOITag")).expect("go-to");
+        assert_eq!(goes.poi_tag.as_deref(), Some("Windsward_Settlement_01"));
+        let territory = mission
+            .override_of(&row("TaskGoToTerritory"))
+            .expect("territory");
+        assert_eq!(territory.territory_id, Some(12));
+        let patrol = mission.override_of(&row("PatrolTask")).expect("patrol");
+        assert_eq!(
+            (patrol.poi_tag.as_deref(), patrol.duration),
+            (Some("Fort_A"), Some(60.0))
+        );
+        let timer = mission.override_of(&row("TaskTimer")).expect("timer");
+        assert_eq!(timer.duration, Some(90.0));
+        let carried = mission
+            .override_of(&row("TaskGiveAndTakeItem"))
+            .expect("transport");
+        assert_eq!(carried.item_name.as_deref(), Some("WorkOrder_T1"));
+        assert_eq!(
+            MissionRow::default().override_of(&row("TaskGoToPOITag")),
+            None,
+            "a mission without a place changes nothing"
+        );
+    }
 
     #[test]
     fn a_quest_object_takes_the_id_of_a_placed_capital_not_of_a_spawn_master() {

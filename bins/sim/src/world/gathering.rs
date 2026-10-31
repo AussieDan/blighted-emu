@@ -71,9 +71,16 @@ const ONE_GATHERER: u8 = 1;
 /// Milliseconds per second.
 const MS_PER_SECOND: f32 = 1_000.0;
 /// The paperdoll slot of each tradeskill's tool (beach-quests note: retail equips of the
-/// skinning knife, the pick and the hatchet). A gatherable that needs its tool is gathered only
-/// with an item in that slot.
-const TOOL_SLOTS: [(&str, u32); 3] = [("Skinning", 35), ("Mining", 36), ("Logging", 33)];
+/// skinning knife, the pick and the hatchet; the client's `PaperdollSlotTypes` order puts
+/// `CHOPPING_SLOT` at 33, `CUTTING_SLOT`, the sickle's, at 34, `DRESSING_SLOT` at 35 and
+/// `MINING_SLOT` at 36, before `FISHING_SLOT` 37). A gatherable that needs its tool is gathered
+/// only with an item in that slot.
+const TOOL_SLOTS: [(&str, u32); 4] = [
+    ("Skinning", 35),
+    ("Mining", 36),
+    ("Logging", 33),
+    ("Harvesting", 34),
+];
 /// The paperdoll slot of the tool of `gatherable`'s tradeskill; `None` for a tradeskill
 /// without a tool slot.
 pub(super) fn tool_slot(gatherable: &Gatherable) -> Option<u32> {
@@ -358,7 +365,7 @@ impl SimWorld {
 
     /// The gather efficiency of player `entity` with a tool on `gatherable`: its tradeskill's
     /// tool at its gear score (else [`HAND_EFFICIENCY`]), plus the gathering efficiency of the
-    /// tradeskill's rank.
+    /// tradeskill's rank and of the player's held status effects (`EFF_*`).
     fn gather_efficiency(&self, entity: Entity, gatherable: &Gatherable) -> f32 {
         let tool = self.worn_tool(entity, gatherable).and_then(|item| {
             let efficiency = self.content.tools.of(item)?;
@@ -366,9 +373,15 @@ impl SimWorld {
             Some(efficiency.at(gear_score))
         });
         let rank = gatherable.tradeskill.as_deref().map_or(0.0, |tradeskill| {
+            let effects = self.world.get::<Player>(entity).map_or(0.0, |player| {
+                player
+                    .status_effects
+                    .gather_efficiency(&self.content.status_effects, tradeskill)
+            });
             self.tradeskill_perks(entity, tradeskill)
                 .1
                 .gathering_efficiency
+                + effects
         });
         #[allow(
             clippy::cast_possible_truncation,
@@ -1207,6 +1220,27 @@ mod tests {
             64,
             "Gather_MiningT1 under a neutral multiplier"
         );
+    }
+
+    #[test]
+    fn a_harvest_takes_the_sickle_slot_and_each_tool_its_own() {
+        let of = |tradeskill: &str| {
+            tool_slot(&Gatherable {
+                tradeskill: Some(tradeskill.to_owned()),
+                ..gatherable(VEIN, false)
+            })
+        };
+        assert_eq!(
+            [
+                of("Logging"),
+                of("Harvesting"),
+                of("Skinning"),
+                of("Mining")
+            ],
+            [Some(33), Some(34), Some(35), Some(36)],
+            "CHOPPING, CUTTING, DRESSING and MINING_SLOT"
+        );
+        assert_eq!(of("Fishing"), None, "the pole has its own path");
     }
 
     #[test]

@@ -1149,6 +1149,7 @@ impl Tutorial {
             | ClientFacetMsg::EnteredTerritoryFallback { .. }
             | ClientFacetMsg::ExitedTerritoryFallback { .. }
             | ClientFacetMsg::TogglePvpFlag { .. }
+            | ClientFacetMsg::SetFaction { .. }
             | ClientFacetMsg::UpdateTrackedObjectives { .. }
             | ClientFacetMsg::SetInputsThrottled { .. }
             | ClientFacetMsg::SetObjectiveAutoPin { .. } => {

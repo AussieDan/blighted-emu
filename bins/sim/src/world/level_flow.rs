@@ -428,6 +428,7 @@ impl LevelFlow {
             | ClientFacetMsg::EnteredTerritoryFallback { .. }
             | ClientFacetMsg::ExitedTerritoryFallback { .. }
             | ClientFacetMsg::TogglePvpFlag { .. }
+            | ClientFacetMsg::SetFaction { .. }
             | ClientFacetMsg::SetInputsThrottled { .. }
             | ClientFacetMsg::WhisperStarted { .. }
             | ClientFacetMsg::SetObjectiveAutoPin { .. } => Vec::new(),

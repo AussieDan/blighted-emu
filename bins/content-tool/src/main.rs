@@ -37,6 +37,7 @@ use content_tool::mob_prefabs::{
     find_ledger_sources, run_workers, scan_ledger, vitals_names, worker_process, write_entries,
 };
 use content_tool::player_attacks::{BundleRows, PlayerAttacksReport, build_stances, read_sources};
+use content_tool::quick_courses::build_quick_courses;
 use content_tool::roads::{RoadsError, RoadsReport, build_level_roads};
 use content_tool::source::GameSource;
 use content_tool::water::{WaterError, build_level_water};
@@ -295,6 +296,13 @@ enum Command {
     /// every camp slice, from the game paks.
     CampSlices {
         /// Output folder for `camp-slices-<build>.json`.
+        #[arg(long, default_value = DEFAULT_CONTENT_DIR)]
+        out_dir: PathBuf,
+    },
+    /// Writes the quick course path file: the nodes of every mount race, rally, tour and time
+    /// trial, from the game paks.
+    QuickCourses {
+        /// Output folder for `quick-courses-<build>.json`.
         #[arg(long, default_value = DEFAULT_CONTENT_DIR)]
         out_dir: PathBuf,
     },
@@ -642,6 +650,16 @@ fn run(cli: Cli) -> Result<(), ToolError> {
                 report.path.display(),
                 report.camps,
                 report.pvp_camps,
+                report.slices
+            );
+        }
+        Command::QuickCourses { out_dir } => {
+            let source = GameSource::open(game_dir(cli.game_dir.as_deref())?)?;
+            let report = build_quick_courses(&source, &client_build, &out_dir)?;
+            println!(
+                "{}: {} courses of {} course folder slices",
+                report.path.display(),
+                report.courses,
                 report.slices
             );
         }

@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The progression of a character besides its items and quests (world migrations 0006 to
-//! 0008, 0010 for its travel state, 0012 for its mounts and 0013 for its ability slots and meta
-//! achievements): its experience, coins, achievement bits, loot limit counts, weapon masteries,
-//! spent points, travel state, mounts, mapped ability slots and meta achievements. `sim` saves
+//! 0008, 0010 for its travel state, 0012 for its mounts, 0013 for its ability slots and meta
+//! achievements, 0024 for its recipe cooldowns and 0025 for its faction): its experience, coins,
+//! achievement bits, loot limit counts, weapon masteries, spent points, travel state, mounts,
+//! mapped ability slots, meta achievements, recipe cooldown counts and faction. `sim` saves
 //! it; the director loads it at a join.
 //!
 //! Each save carries the time its state was taken; an older state never overwrites a newer one.
@@ -14,6 +15,7 @@ use uuid::Uuid;
 
 use crate::arena::{SavedArena, character_arena, save_character_arena};
 use crate::error::DbError;
+use crate::faction::{SavedFaction, character_faction, save_character_faction};
 use crate::meta_achievements::{SavedMeta, SavedSlot, character_meta, save_character_meta};
 use crate::mounts::{SavedMounts, character_mounts, save_character_mounts};
 use crate::music::{SavedMusic, character_music, save_character_music};
@@ -21,6 +23,9 @@ use crate::notifications::{
     SavedNotifications, character_notifications, save_character_notifications,
 };
 use crate::position::SaveOutcome;
+use crate::recipe_cooldowns::{
+    SavedRecipeCooldown, character_recipe_cooldowns, save_character_recipe_cooldowns,
+};
 use crate::travel::{SavedTravel, character_travel, save_character_travel};
 
 /// Milliseconds per second, for the stored time.
@@ -83,6 +88,10 @@ pub struct SavedProgression {
     pub music: SavedMusic,
     /// How often each event notification was shown (world migration 0022).
     pub notifications: SavedNotifications,
+    /// The recipe cooldown counts, by recipe (world migration 0024).
+    pub recipe_cooldowns: Vec<SavedRecipeCooldown>,
+    /// The faction (world migration 0025).
+    pub faction: SavedFaction,
 }
 
 type ProgressionRow = (bool, i64, i64, Vec<i32>);
@@ -168,6 +177,8 @@ pub async fn character_progression(
     let arena = character_arena(world, character_id).await?;
     let music = character_music(world, character_id).await?;
     let notifications = character_notifications(world, character_id).await?;
+    let recipe_cooldowns = character_recipe_cooldowns(world, character_id).await?;
+    let faction = character_faction(world, character_id).await?;
     Ok(Some(SavedProgression {
         experience: from_column(experience, "experience")?,
         coins: from_column(coins, "coins")?,
@@ -222,6 +233,8 @@ pub async fn character_progression(
         arena,
         music,
         notifications,
+        recipe_cooldowns,
+        faction,
     }))
 }
 
@@ -384,6 +397,13 @@ pub async fn save_character_progression(
     save_character_music(&mut transaction, character_id, &progression.music).await?;
     save_character_notifications(&mut transaction, character_id, &progression.notifications)
         .await?;
+    save_character_recipe_cooldowns(
+        &mut transaction,
+        character_id,
+        &progression.recipe_cooldowns,
+    )
+    .await?;
+    save_character_faction(&mut transaction, character_id, &progression.faction).await?;
     transaction.commit().await?;
     Ok(SaveOutcome::Saved)
 }
@@ -475,6 +495,18 @@ mod infra_tests {
             },
             notifications: SavedNotifications {
                 shown: vec![(0x1e06_e356, 12)],
+            },
+            // The retail refining ledger's `LeatherT51` entry.
+            recipe_cooldowns: vec![crate::SavedRecipeCooldown {
+                recipe_id: "leathert51".to_owned(),
+                count: 10,
+                ends_ns: 0x18b8_d351_b144_f000,
+            }],
+            // The retail `Change-Faction` ledger's change to the Syndicate.
+            faction: SavedFaction {
+                faction: 1,
+                changes: 1,
+                changed_ns: 0x18e1_bb69_e04f_ba64,
             },
         }
     }

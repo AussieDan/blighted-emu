@@ -29,6 +29,7 @@ use nw_world::camps::{CampSlices, camp_slices_path};
 use nw_world::collision::{LevelCollision, collision_file_path};
 use nw_world::collision_index::CollisionIndex;
 use nw_world::dungeon_scripts::{DungeonScripts, dungeon_scripts_path};
+use nw_world::quick_courses::{QuickCoursePaths, quick_courses_path};
 use nw_world::roads::{RoadMap, road_file_path};
 use nw_world::script::{DesignData, LevelDesign, design_data_path};
 use nw_world::water::{WaterMap, water_file_path};
@@ -284,6 +285,17 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
             CampSlices::default()
         }
     };
+    content.quick_course_paths =
+        match QuickCoursePaths::load(&quick_courses_path(&config.content_dir, &build)) {
+            Ok(paths) => {
+                tracing::info!(courses = paths.len(), "quick course paths");
+                paths
+            }
+            Err(error) => {
+                tracing::warn!(%error, "no quick course paths: no course can be ridden");
+                QuickCoursePaths::default()
+            }
+        };
     tracing::info!(
         tradable_items = content.trading.len(),
         trading_tax = content.trading_post.trading_tax,

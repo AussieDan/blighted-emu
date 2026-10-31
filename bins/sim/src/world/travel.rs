@@ -282,6 +282,11 @@ impl TravelState {
         self.saved.clone()
     }
 
+    /// How many houses the player owns.
+    pub(super) fn houses(&self) -> u32 {
+        u32::try_from(self.saved.homes.len()).unwrap_or(u32::MAX)
+    }
+
     fn home(&self, plot: &[u8; RAW_ID_LEN]) -> Option<&OwnedHome> {
         self.saved.homes.iter().find(|home| &home.plot == plot)
     }

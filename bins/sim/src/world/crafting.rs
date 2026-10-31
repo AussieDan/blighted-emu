@@ -26,8 +26,10 @@ use nw_content::crafting::{
     IngredientGearScore, IngredientKind, Recipe, RecipeDetails, StructureCosts,
 };
 use nw_content::perks::PERK_SLOTS;
+use nw_content::recipe_cooldowns::RecipeCooldown;
 use nw_content::tradeskill_xp::bonus_crafts;
 use nw_formats::objectstream::lowercase_crc32;
+use nw_messages::crafting_state::{CraftingCooldown, CraftingState};
 use nw_messages::facet::component;
 use nw_messages::items::{FIRST_VERSION, SYNC_CRAFT_USED, SYNC_CRAFTED};
 use nw_messages::wire::RAW_ID_LEN;
@@ -41,6 +43,8 @@ use nw_messages::{
 use nw_sim_core::Position;
 use nw_world::stations::CraftingStation;
 
+use super::gear::unix_ns;
+use super::loot_bag::LimitsSent;
 use super::slots::Slot;
 use super::statics::interactor_target;
 use super::tradeskill::EventScale;
@@ -64,11 +68,12 @@ const CRAFT_MS: u64 = 1_057;
 /// The crafts one request makes when it asks for none.
 const ONE_CRAFT: u32 = 1;
 /// How far above the range this server computes a craft's gear score may be: the crafting
-/// status effects the client counts and this server does not track (best guess, the largest
-/// bonuses that can be active together in `StatusEffectData`: tradeskill food T5 15, three
+/// status effects the client counts and this server does not hold (best guess, the largest
+/// bonuses of `StatusEffectData` from sources this server does not run: three
 /// `HousingMinGearBonus_AllCraftingT3` trophies 3 x 5, an earring perk 5 and a tradeskill
-/// mastery 5).
-const CRAFT_STATUS_GS_ALLOWANCE: u32 = 40;
+/// mastery 5). The held effects, tradeskill food among them, add their own `MGS_*` and
+/// `MaxGS_*` ([`super::status_effects::StatusEffects::craft_gear_score`]).
+const CRAFT_STATUS_GS_ALLOWANCE: u32 = 25;
 /// The values of a built station that no data sets, as the retail campfire and town station
 /// groups have them: no foundation events, a territory whose references are set, a ruin timer
 /// that is not armed, and no guild, owner, raid or faction.
@@ -343,6 +348,10 @@ pub(super) struct PendingCraft {
     due_ms: u64,
     /// What each item it makes rolls with; `None`: an item without rolls of its own.
     roll: Option<CraftRoll>,
+    /// The achievements it sets at its end (`UnlockedAchievementID`, `FirstCraftAchievementId`).
+    achievements: Vec<String>,
+    /// The recipe's cooldown, which its crafts count on at its end.
+    cooldown: Option<RecipeCooldown>,
     /// The header the answers go to.
     header: FacetHeader,
 }
@@ -381,6 +390,11 @@ enum CraftRefusal {
     Fee,
     /// The bag lacks an ingredient.
     Ingredient,
+    /// The player lacks the recipe's required achievement, has its hiding one, or has the one
+    /// it unlocks and that blocks a recraft.
+    Locked,
+    /// The crafts would pass the recipe's `CooldownQuantity` before its cooldown resets.
+    Cooldown,
 }
 
 impl SimWorld {
@@ -456,9 +470,24 @@ impl SimWorld {
         let level_reached = details.tradeskill.as_deref().is_none_or(|tradeskill| {
             self.tradeskill_perks(entity, tradeskill).1.recipe_level >= details.recipe_level
         });
+        let open = self.world.get::<Player>(entity).is_some_and(|player| {
+            details.open_to(|id| player.flow.has_achievement(&self.achievement_rules, id))
+        });
+        let now_ns = unix_ns(self.server_ms);
+        let cooled = details.cooldown.is_none_or(|cooldown| {
+            self.world.get::<Player>(entity).is_some_and(|player| {
+                player
+                    .recipe_cooldowns
+                    .allows(&recipe.id, cooldown, crafts, now_ns)
+            })
+        });
         let charged = fee.min(details.fee.saturating_mul(crafts));
         let perk_items = self.perk_items_of(entity, &recipe.item, choice, details.max_perk_items);
-        let taken = if level_reached {
+        let taken = if !open {
+            Err(CraftRefusal::Locked)
+        } else if !cooled {
+            Err(CraftRefusal::Cooldown)
+        } else if level_reached {
             self.ingredients_of(entity, &recipe, crafts, picked, &perk_items, charged)
         } else {
             Err(CraftRefusal::RecipeLevel)
@@ -474,6 +503,7 @@ impl SimWorld {
         let roll = self.craft_roll(entity, &recipe, &details, &taken, &perk_items, choice);
         let bonus = self.bonus_crafts(entity, recipe_crc, details.tradeskill.as_deref(), crafts);
         tracing::debug!(player = number, recipe = %recipe.id, crafts, bonus, charged, "craft");
+        let achievements = details.craft_achievements().map(str::to_owned).collect();
         let ingredients = recipe.ingredients.iter().fold(0_u32, |sum, ingredient| {
             sum.saturating_add(ingredient.quantity)
         });
@@ -490,7 +520,43 @@ impl SimWorld {
             event: details.game_event,
             due_ms: now_ms.saturating_add(CRAFT_MS),
             roll,
+            achievements,
+            cooldown: details.cooldown,
         });
+    }
+
+    /// Counts `crafts` crafts of `recipe` with `cooldown` for player `entity` at the server's
+    /// time, on the reset clock of the loot limits (`nw_content::recipe_cooldowns`), and its
+    /// client gets the changed counts.
+    fn count_recipe_cooldown(
+        &mut self,
+        entity: Entity,
+        recipe: &str,
+        cooldown: RecipeCooldown,
+        crafts: u32,
+    ) {
+        let Some(clock) = self.content.loot_limits.as_ref().map(|rules| rules.clock) else {
+            return;
+        };
+        let now_ns = unix_ns(self.server_ms);
+        let Some(mut player) = self.world.get_mut::<Player>(entity) else {
+            return;
+        };
+        player
+            .recipe_cooldowns
+            .add(clock, recipe, cooldown, crafts, now_ns);
+        send_recipe_cooldowns(&mut player, LimitsSent::Changed);
+    }
+
+    /// Player `number`'s client gets its recipe cooldown counts as `sent` calls for (see
+    /// [`LimitsSent`]): the crafting state goes with its next bundle.
+    pub(super) fn send_recipe_cooldowns(&mut self, number: u64, sent: LimitsSent) {
+        if let Some(mut player) = self
+            .player_by_number(number)
+            .and_then(|entity| self.world.get_mut::<Player>(entity))
+        {
+            send_recipe_cooldowns(&mut player, sent);
+        }
     }
 
     /// The perk items of `choice` that player `entity` carries and that may go on `item`: the
@@ -542,7 +608,8 @@ impl SimWorld {
 
     /// The rolls of the gear item `recipe` makes for player `entity` from the `taken` stacks
     /// and `perk_items`: the gear score `choice` asks for (its range's lowest for none), held
-    /// between the lowest of the craft's range and its highest plus
+    /// between the lowest of the craft's range and its highest (both raised by the player's
+    /// held crafting effects) plus
     /// [`CRAFT_STATUS_GS_ALLOWANCE`] and under the item's `MaxCraftGS`, and the perk each perk
     /// item's bucket gives the item. `None` for an item without rolls of its own.
     fn craft_roll(
@@ -574,7 +641,20 @@ impl SimWorld {
                 })
             })
             .collect();
-        let range = details.gear_score_range(base, rank_bonus, &ingredients);
+        let mut range = details.gear_score_range(base, rank_bonus, &ingredients);
+        if let Some(tradeskill) = details.tradeskill.as_deref()
+            && let Some(player) = self.world.get::<Player>(entity)
+        {
+            let (least, most) = player
+                .status_effects
+                .craft_gear_score(&content.status_effects, tradeskill);
+            // Gear score bonuses of a few tens.
+            range.min = range.min.saturating_add(least.max(0.0) as u32);
+            range.max = range
+                .max
+                .saturating_add(most.max(0.0) as u32)
+                .max(range.min);
+        }
         let wanted = if choice.gear_score == 0 {
             range.min
         } else {
@@ -768,6 +848,14 @@ impl SimWorld {
                 self.grant_scaled_event(craft.number, event, craft.crafts, scale);
             }
             self.quest_event(craft.number, Event::Crafted(&craft.recipe), now_ms);
+            let families = super::item_families(&self.content, &craft.item);
+            self.quest_event(craft.number, Event::CraftedFamilies(&families), now_ms);
+            for achievement in &craft.achievements {
+                self.earn_achievement(craft.number, achievement, now_ms);
+            }
+            if let Some(cooldown) = craft.cooldown {
+                self.count_recipe_cooldown(entity, &craft.recipe, cooldown, craft.crafts);
+            }
         }
     }
 
@@ -821,6 +909,43 @@ impl SimWorld {
             let idle = ServerMessage::CraftProgress(CraftProgressMsg::idle(header));
             send_now(&mut self.combat_messages, &player.connection, &[idle]);
         }
+    }
+}
+
+/// Queues the crafting state of `player` with its recipe cooldown counts when `sent` calls for
+/// it: after a change, or at a spawn with counts (retail's login state lists them; with none it
+/// sends no `m_cooldowns`).
+fn send_recipe_cooldowns(player: &mut Player, sent: LimitsSent) {
+    let changed = player.recipe_cooldowns.take_changed();
+    let shown = player.recipe_cooldowns.shown();
+    let due = match sent {
+        LimitsSent::Changed => changed,
+        LimitsSent::Spawn => !shown.is_empty(),
+    };
+    if !due {
+        return;
+    }
+    let version = player.list_version + 1;
+    let state = CraftingState {
+        cooldowns: FullList {
+            version: Some(version),
+            elements: shown
+                .into_iter()
+                .map(|cooldown| CraftingCooldown {
+                    key: cooldown.key,
+                    // `CooldownQuantity` is at most 10 in build 25810808; the wire count is a u8.
+                    count: u8::try_from(cooldown.count).unwrap_or(u8::MAX),
+                    ends_ns: cooldown.ends_ns,
+                })
+                .collect(),
+        },
+    };
+    match state.member() {
+        Ok(member) => {
+            player.list_version = version;
+            player.extra_members.push(member);
+        }
+        Err(error) => tracing::warn!(%error, "crafting state not encoded"),
     }
 }
 
@@ -1116,6 +1241,68 @@ mod tests {
             experience,
             Some(80),
             "10 per ingredient (4 ore) per craft under a neutral multiplier"
+        );
+    }
+
+    #[test]
+    fn a_recipe_cooldown_counts_its_crafts_and_refuses_past_its_quantity() {
+        use nw_content::loot_limits::{LootLimitRules, ResetClock, Weekday};
+        use nw_content::recipe_cooldowns::RecipeCooldown;
+        use nw_messages::crafting_state::{CRAFTING_STATE_COMPONENT, CRAFTING_STATE_TYPE_INDEX};
+        /// A daily cooldown of 2 crafts (`LeatherT51` has 10).
+        const QUANTITY: u32 = 2;
+        let (mut world, entity) = at_the_smelter(ORE_PER_CRAFT * (QUANTITY + 1), COINS);
+        let content = Arc::make_mut(&mut world.content);
+        content.loot_limits = Some(LootLimitRules {
+            limits: Default::default(),
+            clock: ResetClock {
+                hour_utc: 3,
+                weekly_day: Weekday::Tuesday,
+            },
+        });
+        let cooldown = RecipeCooldown::from_cells(Some(86_400), Some(i64::from(QUANTITY)));
+        let crc = lowercase_crc32(INGOT);
+        let mut details = content.recipes.details(crc);
+        details.cooldown = cooldown;
+        content.recipes = Recipes::build([content.recipes.get(crc).cloned().expect("recipe")], [])
+            .with_details([(INGOT.to_owned(), details)]);
+        let craft = |world: &mut SimWorld, crafts| {
+            world.craft(
+                entity,
+                NUMBER,
+                crc,
+                crafts,
+                FEE_PER_CRAFT * crafts,
+                &[],
+                &CraftChoice::default(),
+                NOW,
+            );
+        };
+        craft(&mut world, QUANTITY);
+        world.crafts_due(NOW + CRAFT_MS);
+        assert_eq!(bag_count(&world, entity, INGOT), QUANTITY);
+        {
+            let mut player = world.world.get_mut::<Player>(entity).expect("player");
+            let state = player
+                .extra_members
+                .iter()
+                .find(|member| member.state.type_index() == CRAFTING_STATE_TYPE_INDEX)
+                .expect("the crafting state goes to the client");
+            assert_eq!(state.component, CRAFTING_STATE_COMPONENT);
+            player.extra_members.clear();
+            let saved = player.progression().recipe_cooldowns;
+            assert_eq!(saved.len(), 1);
+            assert_eq!(
+                (saved[0].recipe_id.as_str(), saved[0].count),
+                ("ingott2", QUANTITY)
+            );
+        }
+        craft(&mut world, 1);
+        assert!(world.crafts.is_empty(), "past the quantity: refused");
+        assert_eq!(
+            bag_count(&world, entity, ORE),
+            ORE_PER_CRAFT,
+            "nothing taken"
         );
     }
 
