@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use nw_content::container::{
     ContainerError, ContainerSpec, decode_value, encode_value, read_file, write_file,
 };
+use nw_content::player_attacks::Flight;
 use serde::{Deserialize, Serialize};
 
 use crate::node::{Node, NodeId, SelectPositionParams};
@@ -22,7 +23,7 @@ pub const AI_DATA_SPEC: ContainerSpec = ContainerSpec {
     schema_hash: SCHEMA_VERSION,
 };
 /// Raised when the body layout changes.
-const SCHEMA_VERSION: u32 = 3;
+const SCHEMA_VERSION: u32 = 4;
 const FILE_PREFIX: &str = "ai-data-";
 const FILE_SUFFIX: &str = ".bin";
 
@@ -281,7 +282,7 @@ pub struct FragmentVariant {
     pub frag_tags: Vec<NameId>,
     /// How long it plays.
     pub length: FragmentLength,
-    /// Its `CAGE-Damage` and `Homing` clips.
+    /// Its procedural clips (`CAGE-Damage`, `CAGE-RangedAttack`, `Homing`, ...).
     pub windows: Vec<ProcWindow>,
 }
 
@@ -403,6 +404,33 @@ impl Grid {
     }
 }
 
+/// One attack of the ranged attack database (`rangedattackdatabase.radb`): a `CAGE-RangedAttack`
+/// clip's `RangedAttackName` in the ranged profile of the mob's main-hand weapon
+/// (`RangedAttackProfile`; Observed: `Corrupted_First_Mate_2hAnchor` is `AI_Undead`, whose
+/// `Officer_Anchor` Janszoon's toss names).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct RangedAttack {
+    /// The profile.
+    pub profile: NameId,
+    /// The attack name.
+    pub attack: NameId,
+    /// `m_maxRange`.
+    pub range_m: f32,
+    /// `m_projectileRadius`.
+    pub radius_m: f32,
+    /// `m_isHitScan`.
+    pub hit_scan: bool,
+}
+
+/// How the projectile of a slice a mob's `CAGE-RangedAttack` clip names (`SliceOverride`) flies.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct ProjectileSlice {
+    /// The slice (lower-case pak path).
+    pub slice: NameId,
+    /// Its projectile component.
+    pub flight: Flight,
+}
+
 /// A creature slice asset and its archetype.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Creature {
@@ -433,6 +461,10 @@ pub struct AiData {
     pub cage_actions: Vec<CageAction>,
     /// Creature slice assets, sorted by asset.
     pub creatures: Vec<Creature>,
+    /// Every attack of the ranged attack database.
+    pub ranged_attacks: Vec<RangedAttack>,
+    /// The projectiles of the slices the creatures' ranged clips name.
+    pub projectile_slices: Vec<ProjectileSlice>,
 }
 
 impl AiData {
@@ -506,6 +538,21 @@ impl AiData {
     pub fn cage_action(&self, archetype: &Archetype, task: NameId) -> Option<&CageAction> {
         let grid = self.grids.get(archetype.grid? as usize)?;
         self.cage_actions.get(grid.action(task)? as usize)
+    }
+
+    /// The attack `attack` of the ranged profile `profile`.
+    pub fn ranged_attack(&self, profile: &str, attack: &str) -> Option<&RangedAttack> {
+        self.ranged_attacks
+            .iter()
+            .find(|known| self.name(known.profile) == profile && self.name(known.attack) == attack)
+    }
+
+    /// How the projectile of the slice `slice` (lower-case pak path) flies.
+    pub fn projectile_flight(&self, slice: &str) -> Option<Flight> {
+        self.projectile_slices
+            .iter()
+            .find(|known| self.name(known.slice) == slice)
+            .map(|known| known.flight)
     }
 
     /// Reads the file of `client_build` from `dir`.

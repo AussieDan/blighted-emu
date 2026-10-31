@@ -59,7 +59,7 @@ const ADB_SUFFIX: &str = ".adb";
 const PLAYER_ACTIONS_PREFIX: &str = "sharedassets/springboardentitites/playerdata/cage/";
 const ACTION_LIST_SUFFIX: &str = ".actionlist";
 /// The ranged attack database.
-const RANGED_ATTACK_DATABASE: &str = "sharedassets/genericassets/rangedattackdatabase.radb";
+pub const RANGED_ATTACK_DATABASE: &str = "sharedassets/genericassets/rangedattackdatabase.radb";
 /// A prefab path's slice in the paks.
 const SLICE_PREFIX: &str = "slices/";
 const SLICE_SUFFIX: &str = ".dynamicslice";
@@ -87,7 +87,8 @@ const AIM_TAG: &str = "Aim";
 const TRANSITION_INSTANT: &str = "CAGE-TransitionInstant";
 const TRANSITION_BUFFERED: &str = "CAGE-TransitionBuffered";
 const DAMAGE_CLIP: &str = "CAGE-Damage";
-const RANGED_CLIP: &str = "CAGE-RangedAttack";
+/// The clip of a ranged attack (a player's or a mob's).
+pub const RANGED_CLIP: &str = "CAGE-RangedAttack";
 const CAST_CLIP: &str = "CAGE-CastSpell";
 const NAMED_CLIP: &str = "CAGE-Named";
 const NAMED_CLIP_NAME: &str = "Name";

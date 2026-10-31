@@ -24,7 +24,8 @@ use std::path::Path;
 
 use nw_ai::data::{
     AiData, Archetype, CageAction, CageCondition, Completion, Creature, FacingMode, FragmentLength,
-    FragmentVariant, Grid, NavConfig, ProcWindow, TagActivity, TagEffect, TreeRef, Vision,
+    FragmentVariant, Grid, NavConfig, ProcWindow, ProjectileSlice, RangedAttack, TagActivity,
+    TagEffect, TreeRef, Vision,
 };
 use nw_ai::decode::{DecodeError, ServerPakError, TreeDecoder, decode_entries, server_pak_entries};
 use nw_ai::node::NodeId;
@@ -42,11 +43,14 @@ use nw_oodle::KrakenDecompressor;
 
 use crate::creature_animations::{main_hand_item, read_entries, text_of};
 use crate::error::ToolError;
+use crate::player_attacks::{RANGED_ATTACK_DATABASE, RANGED_CLIP, ranged_attacks, slice_flight};
 use crate::source::GameSource;
 use crate::stand_in_trees::{StandInError, stand_in_trees};
 
 /// Where the user keeps the retrieved Server.pak (server-pak note).
 pub const DEFAULT_SERVER_PAK: &str = "local-data/server-pak/Server.pak";
+/// The `CAGE-RangedAttack` parameter that names the projectile slice.
+const SLICE_OVERRIDE_PARAM: &str = "SliceOverride";
 
 /// Slice fields (Observed names).
 const TREE_ASSETS: &str = "m_behaviorTreeAssets";
@@ -225,6 +229,10 @@ pub struct AiDataReport {
     pub unknown_clips: BTreeMap<String, String>,
     /// Fragment entries whose length is Unknown, by animation database.
     pub unknown_fragments: BTreeMap<String, usize>,
+    /// Attacks of the ranged attack database.
+    pub ranged_attacks: usize,
+    /// Projectile slices the ranged clips name, with a flight.
+    pub projectile_slices: usize,
     /// Files that could not be used, with the reason.
     pub skipped: BTreeMap<String, String>,
 }
@@ -1363,6 +1371,8 @@ pub fn build_ai_data(
         );
         archetypes.push(archetype);
     }
+    let (ranged_attacks, projectile_slices) =
+        ranged_shots(source, &mut decoder, &builder.actions, &mut report)?;
     let trees = decoder.finish();
     let tree_of: HashMap<NameId, u32> = trees
         .trees
@@ -1446,8 +1456,95 @@ pub fn build_ai_data(
         grids,
         cage_actions: builder.actions,
         creatures: creature_list,
+        ranged_attacks,
+        projectile_slices,
     };
     Ok((data, report))
+}
+
+/// Every attack of the ranged attack database, and the flight of each projectile slice that a
+/// `CAGE-RangedAttack` clip of `actions` names (`SliceOverride`). A slice that is missing or has
+/// no projectile component goes to the report's skipped files.
+fn ranged_shots(
+    source: &GameSource,
+    decoder: &mut TreeDecoder,
+    actions: &[CageAction],
+    report: &mut AiDataReport,
+) -> Result<(Vec<RangedAttack>, Vec<ProjectileSlice>), ToolError> {
+    let ranged_clip = decoder.intern(RANGED_CLIP);
+    let slice_param = decoder.intern(SLICE_OVERRIDE_PARAM);
+    let slice_paths: BTreeSet<String> = actions
+        .iter()
+        .flat_map(|action| action.variants.iter().chain(&action.weapon_variants))
+        .flat_map(|variant| &variant.windows)
+        .filter(|window| window.kind == ranged_clip)
+        .filter_map(|window| {
+            window
+                .params
+                .iter()
+                .find(|(name, _)| *name == slice_param)
+                .map(|(_, slice)| decoder.name(*slice).to_lowercase())
+        })
+        .filter(|slice| !slice.is_empty())
+        .collect();
+    let wanted: HashSet<String> = slice_paths
+        .iter()
+        .cloned()
+        .chain([RANGED_ATTACK_DATABASE.to_owned()])
+        .collect();
+    let bytes = read_entries(source, &wanted)?;
+    let mut ranged = Vec::new();
+    match bytes
+        .get(RANGED_ATTACK_DATABASE)
+        .map(|bytes| slice_root(bytes))
+    {
+        Some(Ok(root)) => {
+            let mut attacks: Vec<_> = ranged_attacks(&root).into_iter().collect();
+            attacks.sort_by(|left, right| left.0.cmp(&right.0));
+            for ((profile, attack), (range_m, radius_m, hit_scan)) in attacks {
+                ranged.push(RangedAttack {
+                    profile: decoder.intern(&profile),
+                    attack: decoder.intern(&attack),
+                    range_m,
+                    radius_m,
+                    hit_scan,
+                });
+            }
+        }
+        Some(Err(reason)) => {
+            report
+                .skipped
+                .insert(RANGED_ATTACK_DATABASE.to_owned(), reason);
+        }
+        None => {
+            report.skipped.insert(
+                RANGED_ATTACK_DATABASE.to_owned(),
+                "not in the paks".to_owned(),
+            );
+        }
+    }
+    let mut projectiles = Vec::new();
+    for path in &slice_paths {
+        let flight = bytes
+            .get(path)
+            .ok_or_else(|| "not in the paks".to_owned())
+            .and_then(|bytes| slice_root(bytes))
+            .and_then(|root| {
+                slice_flight(&root).ok_or_else(|| "no projectile component".to_owned())
+            });
+        match flight {
+            Ok(flight) => projectiles.push(ProjectileSlice {
+                slice: decoder.intern(path),
+                flight,
+            }),
+            Err(reason) => {
+                report.skipped.insert(path.clone(), reason);
+            }
+        }
+    }
+    report.ranged_attacks = ranged.len();
+    report.projectile_slices = projectiles.len();
+    Ok((ranged, projectiles))
 }
 
 /// The parsed animation database at `path` among `adbs`, with its path.

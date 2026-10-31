@@ -27,7 +27,7 @@ use bevy_ecs::entity::Entity;
 use nw_bus::{BusId, ConnectionRef, Hit};
 use std::sync::Arc;
 
-use nw_content::combat::{AffixDamage, AttackRow, WeaponRow};
+use nw_content::combat::{AffixDamage, AttackRow, RangedBlock, WeaponRow};
 use nw_content::player_attacks::{AttackHit, AttackKind, BasicAttack, Homing, MeleeShape, Stance};
 use nw_content::respawn_points::{nearest_respawn_point, respawn_point};
 use nw_content::status_effects::RowKey;
@@ -369,7 +369,7 @@ const EIGHT_PELLET_CONFIG: u64 = 231;
 
 /// How a mob's hit on a player lands ([`SimWorld::mob_hit_style`]).
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct MobHitStyle {
+pub(super) struct MobHitStyle {
     /// The 3601 item tag: its row's damage type.
     tag: u8,
     /// Its row's affix: the share of the hit of another type.
@@ -380,6 +380,18 @@ struct MobHitStyle {
     block_stamina: f32,
     /// Its row, for the status effects it puts on the player ([`SimWorld::mob_hit_effects`]).
     row: Option<RowKey>,
+    /// A projectile's hit ([`SimWorld::defend`]).
+    ranged: bool,
+}
+
+impl MobHitStyle {
+    /// The style of the same hit by a projectile.
+    pub(super) const fn fired(self) -> Self {
+        Self {
+            ranged: true,
+            ..self
+        }
+    }
 }
 
 /// A mob swing that has not hit yet.
@@ -646,6 +658,7 @@ impl SimWorld {
             damage_scale: PLAIN_DAMAGE_FACTOR,
             block_stamina: 0.0,
             row: Some(RowKey::of(&row.table, &row.damage_id)),
+            ranged: false,
         };
         let outcome = self
             .apply_hit_with(target, number, hit.amount, 0, now_ms, Some(&style))
@@ -1638,6 +1651,17 @@ impl SimWorld {
     }
 
     /// The weapon in the hand of the player `entity` with its gear score, when its row is known.
+    /// How the player `entity` blocks a projectile: with the shield worn with its weapon in the
+    /// hand when that has `CanBlockRanged`, else with that weapon (Inferred: a shield's block is
+    /// the shield's); `None` when neither blocks one.
+    fn ranged_block_of(&self, entity: Entity) -> Option<RangedBlock> {
+        let gear = self.world.get::<Player>(entity)?.gear.as_ref()?;
+        let block = |item: &str| self.combat.data.weapon_of_item(item)?.ranged_block;
+        gear.off_hand_weapon()
+            .and_then(block)
+            .or_else(|| gear.main_weapon().and_then(|(item, _)| block(item)))
+    }
+
     fn held_weapon(&self, entity: Entity) -> Option<(WeaponRow, u32)> {
         let (item, gear_score) = self
             .world
@@ -1884,7 +1908,7 @@ impl SimWorld {
     }
 
     /// A hit for `owner`, the sim of `target`; a mob's hit on a player carries the stamina its
-    /// block takes.
+    /// block takes and whether it is a projectile's.
     fn remote_hit(
         &self,
         owner: BusId,
@@ -1892,7 +1916,7 @@ impl SimWorld {
         attacker: u64,
         amount: u32,
         threat: u64,
-        block_stamina: Option<f32>,
+        mob_blow: Option<(f32, bool)>,
     ) -> RemoteHit {
         RemoteHit {
             owner,
@@ -1902,7 +1926,8 @@ impl SimWorld {
                 attacker_sim: self.me.id.clone(),
                 amount,
                 threat,
-                block_stamina_milli: block_stamina.map(Hit::milli_of),
+                block_stamina_milli: mob_blow.map(|(stamina, _)| Hit::milli_of(stamina)),
+                ranged: mob_blow.is_some_and(|(_, ranged)| ranged),
             },
         }
     }
@@ -2213,6 +2238,7 @@ impl SimWorld {
             damage_scale: 1.0,
             block_stamina: DEFAULT_BLOCK_STAMINA,
             row: None,
+            ranged: false,
         };
         let stability = defender
             .and_then(|defender| self.held_weapon(defender))
@@ -2238,6 +2264,7 @@ impl SimWorld {
                 damage_scale: row.coefficient,
                 block_stamina,
                 row: Some(RowKey::of(&row.table, &row.damage_id)),
+                ranged: false,
             };
         }
         let mob = intent.mob;
@@ -2265,6 +2292,7 @@ impl SimWorld {
             // A few dozen stamina points.
             block_stamina: row.block_stamina(weapon, stability) as f32,
             row: Some(RowKey::of(&row.table, &row.damage_id)),
+            ranged: false,
         }
     }
 
@@ -2283,13 +2311,17 @@ impl SimWorld {
     ///   0 at 422423 while the key stayed held).
     /// - In the tutorial every other hit comes with 2218 `blocked` 0; retail sent no 2218 in the
     ///   open world (0 of 34 hits in general-other-01, none in newchar-retail after 764894).
+    /// - A projectile's hit (`blow`'s flag) is blocked only by a weapon with `CanBlockRanged`
+    ///   ([`SimWorld::ranged_block_of`]): its block takes the block stamina times
+    ///   `RangedBlockStaminaDamageScaling`, and `RangedBlockHealthDamageScaling` of the health
+    ///   passes it (Inferred from the data: no retail ranged block was captured).
     fn defend(
         &mut self,
         entity: Entity,
         target: u64,
         mob: u64,
         amount: u32,
-        block_stamina: f32,
+        (block_stamina, ranged): (f32, bool),
         now_ms: u64,
     ) -> Option<u32> {
         let vitals = *self.world.get::<Vitals>(entity)?;
@@ -2304,8 +2336,19 @@ impl SimWorld {
             return None;
         }
         let tutorial = self.is_tutorial();
+        let ranged_block = ranged.then(|| self.ranged_block_of(entity));
+        let (can_block, block_stamina, passes) = match ranged_block {
+            None => (true, block_stamina, 0.0),
+            Some(None) => (false, block_stamina, 1.0),
+            Some(Some(block)) => (
+                true,
+                // A few dozen stamina points.
+                block_stamina * block.stamina_scale as f32,
+                block.health_scale,
+            ),
+        };
         let mut player = self.world.get_mut::<Player>(entity)?;
-        let guard = (vitals.blocking() && player.stamina.current() > 0.0)
+        let guard = (can_block && vitals.blocking() && player.stamina.current() > 0.0)
             .then(|| player.stamina.blocked_hit(block_stamina));
         let stamina = player.stamina.current();
         let connection = player.connection.clone();
@@ -2326,7 +2369,10 @@ impl SimWorld {
             );
         }
         match guard {
-            Some(Guard::Held) => None,
+            // A hit of a few hundred points.
+            Some(Guard::Held) => {
+                Some((f64::from(amount) * passes).round() as u32).filter(|passed| *passed > 0)
+            }
             Some(Guard::Broken) => {
                 self.world.get_mut::<Vitals>(entity)?.guard_broken = true;
                 Some(amount / BROKEN_GUARD_DAMAGE_DIVISOR)
@@ -2335,19 +2381,20 @@ impl SimWorld {
         }
     }
 
-    /// A mob hit from another sim on player `target` of this one: it takes its block and dodge
-    /// here, where the player's state is, then lands. Returns `None` when it takes no health
+    /// A mob hit from another sim on player `target` of this one, with `blow` (its block stamina
+    /// and whether it is a projectile's): it takes its block and dodge here, where the player's
+    /// state is, then lands. Returns `None` when it takes no health
     /// (see [`SimWorld::defend`]) or the player is not here.
     pub fn remote_mob_hit(
         &mut self,
         target: u64,
         attacker: u64,
         amount: u32,
-        block_stamina: f32,
+        blow: (f32, bool),
         now_ms: u64,
     ) -> Option<AttackOutcome> {
         let entity = self.player_by_number(target)?;
-        let amount = self.defend(entity, target, attacker, amount, block_stamina, now_ms)?;
+        let amount = self.defend(entity, target, attacker, amount, blow, now_ms)?;
         self.apply_hit(target, attacker, amount, 0, now_ms)
     }
 
@@ -2382,6 +2429,14 @@ impl SimWorld {
                     amount = hit.amount,
                     "mob attack"
                 );
+                if let Some(clip) = intent
+                    .strike
+                    .as_ref()
+                    .and_then(|strike| strike.ranged.as_ref())
+                {
+                    self.fire_mob_shot(&intent, clip, hit.amount, style, at, now_ms);
+                    return None;
+                }
                 if let Some(entity) = defender {
                     // A swing at a player who moved away misses: retail sends no hit message.
                     let body = self.world.get::<Body>(entity)?.motion.position();
@@ -2394,41 +2449,50 @@ impl SimWorld {
                         );
                         return None;
                     }
-                    let amount = self.defend(
-                        entity,
-                        intent.target,
-                        intent.mob,
-                        hit.amount,
-                        style.block_stamina,
-                        now_ms,
-                    )?;
-                    let outcome = self.apply_hit_with(
-                        intent.target,
-                        intent.mob,
-                        amount,
-                        0,
-                        now_ms,
-                        Some(&style),
-                    );
-                    if outcome.is_some() {
-                        self.mob_hit_effects(entity, intent.mob, style.row, amount);
-                    }
-                    return outcome;
                 }
-                let (owner, ghost) = self.ghost(intent.target)?;
-                let owner = owner.clone();
-                ghost.mob.is_none().then(|| {
-                    AttackOutcome::Remote(self.remote_hit(
-                        owner,
-                        intent.target,
-                        intent.mob,
-                        hit.amount,
-                        0,
-                        Some(style.block_stamina),
-                    ))
-                })
+                self.land_mob_hit(intent.target, intent.mob, hit.amount, style, now_ms)
             })
             .collect()
+    }
+
+    /// Lands a mob's hit of `amount` in `style` on the player `target`: on a player of this sim
+    /// it takes the block and dodge ([`SimWorld::defend`]) and its row's status effects; a hit
+    /// on a player ghost goes to its sim.
+    pub(super) fn land_mob_hit(
+        &mut self,
+        target: u64,
+        mob: u64,
+        amount: u32,
+        style: MobHitStyle,
+        now_ms: u64,
+    ) -> Option<AttackOutcome> {
+        if let Some(entity) = self.player_by_number(target) {
+            let amount = self.defend(
+                entity,
+                target,
+                mob,
+                amount,
+                (style.block_stamina, style.ranged),
+                now_ms,
+            )?;
+            let outcome = self.apply_hit_with(target, mob, amount, 0, now_ms, Some(&style));
+            if outcome.is_some() {
+                self.mob_hit_effects(entity, mob, style.row, amount);
+            }
+            return outcome;
+        }
+        let (owner, ghost) = self.ghost(target)?;
+        let owner = owner.clone();
+        ghost.mob.is_none().then(|| {
+            AttackOutcome::Remote(self.remote_hit(
+                owner,
+                target,
+                mob,
+                amount,
+                0,
+                Some((style.block_stamina, style.ranged)),
+            ))
+        })
     }
 }
 
@@ -3920,6 +3984,53 @@ mod tests {
     }
 
     #[test]
+    fn a_projectile_passes_a_block_without_can_block_ranged_and_a_sword_halves_it() {
+        const BLOCK_STAMINA: f32 = 16.5;
+        const AMOUNT: u32 = 40;
+        // Build 25810808 swords: `RangedBlockHealthDamageScaling` and
+        // `RangedBlockStaminaDamageScaling` 0.5.
+        const SWORD_SCALE: f64 = 0.5;
+        let blocked = |world: &mut SimWorld, ranged: bool| {
+            let entity = world.player_by_number(1).expect("player");
+            world.defend(entity, 1, mob(), AMOUNT, (BLOCK_STAMINA, ranged), NOW)
+        };
+        let mut world = fight();
+        world.attack_input(&connection(1), &[block_held()], NOW);
+        assert_eq!(blocked(&mut world, false), None, "a swing is blocked");
+        let stamina = player_stamina(&mut world, 1);
+        assert_eq!(
+            blocked(&mut world, true),
+            Some(AMOUNT),
+            "the test sword cannot block a projectile"
+        );
+        assert!((player_stamina(&mut world, 1) - stamina).abs() < f32::EPSILON);
+        let held = {
+            let entity = world.player_by_number(1).expect("player");
+            let mut player = world.world.get_mut::<Player>(entity).expect("player");
+            let gear = player.gear.insert(gear::tests::gear_with_staff());
+            gear.main_weapon().expect("a weapon").0.to_owned()
+        };
+        let mut source = crate::combat::test_support::test_source();
+        let (sword_id, sword) = source.weapons[0].clone();
+        source.item_stats.push((held, sword_id));
+        source.weapons[0].1 = WeaponRow {
+            ranged_block: Some(RangedBlock {
+                health_scale: SWORD_SCALE,
+                stamina_scale: SWORD_SCALE,
+            }),
+            ..sword
+        };
+        world.combat = committed().combat_settings(
+            Arc::new(test_data_of(source)),
+            Arc::from([]),
+            crate::combat::tests::test_mob_ai(),
+        );
+        assert_eq!(blocked(&mut world, true), Some(AMOUNT / 2), "half passes");
+        let taken = stamina - player_stamina(&mut world, 1);
+        assert!((taken - BLOCK_STAMINA * SWORD_SCALE as f32).abs() < 0.01);
+    }
+
+    #[test]
     fn a_mob_hit_from_another_sim_takes_the_block_here() {
         const BLOCK_STAMINA: f32 = 16.5;
         const AMOUNT: u32 = 40;
@@ -3927,7 +4038,7 @@ mod tests {
         world.attack_input(&connection(1), &[block_held()], NOW);
         assert!(
             world
-                .remote_mob_hit(1, mob(), AMOUNT, BLOCK_STAMINA, NOW)
+                .remote_mob_hit(1, mob(), AMOUNT, (BLOCK_STAMINA, false), NOW)
                 .is_none(),
             "a blocked hit takes no health"
         );
@@ -3936,7 +4047,7 @@ mod tests {
         world.attack_input(&connection(1), &[InputRecord::default()], NOW + TICK_MS);
         assert!(
             world
-                .remote_mob_hit(1, mob(), AMOUNT, BLOCK_STAMINA, NOW + TICK_MS)
+                .remote_mob_hit(1, mob(), AMOUNT, (BLOCK_STAMINA, false), NOW + TICK_MS)
                 .is_some(),
             "an open player takes it"
         );
@@ -4074,6 +4185,7 @@ mod tests {
                 lunge_turn_rad: std::f32::consts::PI,
                 reach_m: SHAPE_REACH_M,
             },
+            ranged: None,
         }
     }
 

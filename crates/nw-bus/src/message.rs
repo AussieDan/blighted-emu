@@ -941,6 +941,9 @@ pub struct Hit {
     /// runs the block and the dodge); `None` for a player's hit.
     #[serde(default)]
     pub block_stamina_milli: Option<u32>,
+    /// A mob's hit by a projectile (only a weapon with `CanBlockRanged` blocks it).
+    #[serde(default)]
+    pub ranged: bool,
 }
 
 /// Thousandths per unit of [`Hit::block_stamina_milli`].
@@ -1635,6 +1638,7 @@ mod tests {
             amount: 42,
             threat: 43,
             block_stamina_milli: None,
+            ranged: false,
         });
         round_trip(Hit {
             target: CONNECTION,
@@ -1643,6 +1647,7 @@ mod tests {
             amount: 42,
             threat: 0,
             block_stamina_milli: Some(16_500),
+            ranged: true,
         });
     }
 

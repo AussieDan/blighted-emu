@@ -254,6 +254,7 @@ mod tests {
                     stance: 0,
                     block_stamina_damage: 0.0,
                     block_stability: 0.0,
+                    ranged_block: None,
                 },
             )],
             player_health: vec![(rows.player_vitals_id.clone(), 1)],

@@ -87,6 +87,7 @@ mod loot_bag;
 mod members;
 mod meta_achievements;
 mod missions;
+mod mob_shot;
 mod mob_timeline;
 mod mob_trail;
 mod mount;
@@ -890,6 +891,8 @@ pub struct SimWorld {
     player_swings: Vec<PlayerSwing>,
     /// The projectiles of ranged and magic attacks on their way to their mob.
     projectile_flights: Vec<projectile::ProjectileFlight>,
+    /// The projectiles mobs fired, on their way to where they aimed.
+    mob_shots: Vec<mob_shot::MobShot>,
     /// Swings that a tutorial script started, for the next tick.
     scripted_swings: Vec<MobAttackIntent>,
     /// What the players did that leaderboard stats count, since the last
@@ -1045,6 +1048,7 @@ impl SimWorld {
             swings: Vec::new(),
             player_swings: Vec::new(),
             projectile_flights: Vec::new(),
+            mob_shots: Vec::new(),
             scripted_swings: Vec::new(),
             stat_events: Vec::new(),
             economy: economy::Economy::default(),
@@ -2080,7 +2084,8 @@ impl SimWorld {
         self.end_mob_ids();
         swings.append(&mut self.scripted_swings);
         let intents = self.swings_landing(swings, now_ms, server_time);
-        let mob_hits = self.mob_hits(intents, now_ms);
+        let mut mob_hits = self.mob_hits(intents, now_ms);
+        mob_hits.extend(self.mob_shots_due(now_ms));
         let mob_seconds = mobs_started.elapsed().as_secs_f64();
         let places: Vec<(u64, Position)> =
             self.mob_states().map(|(mob, at, _)| (mob, at)).collect();

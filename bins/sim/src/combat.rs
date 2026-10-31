@@ -189,6 +189,10 @@ pub mod test_support {
     pub const TEST_SWORD_DAMAGE: f64 = 64.0;
     /// The test sword's stance (its retail `MannequinTag`).
     pub const TEST_SWORD_STANCE: &str = "1H_Melee,Sword";
+    /// A mob weapon item with the test ranged profile (`mob_ai::test_support`).
+    pub const TEST_RANGED_ITEM: &str = "Test_Mob_Crossbow";
+    /// The weapon row of [`TEST_RANGED_ITEM`].
+    const TEST_RANGED_WEAPON: &str = "Test_Mob_CrossbowT1";
     /// The player attack table of the retail paks (`content-tool player-attacks`, build
     /// 25810808).
     pub const TEST_PLAYER_ATTACKS: &str =
@@ -242,6 +246,7 @@ pub mod test_support {
                     stance: stance_key(TEST_SWORD_STANCE),
                     block_stamina_damage: 0.0,
                     block_stability: 0.0,
+                    ranged_block: None,
                 },
             )],
             attacks: test_attack_rows(&rows.damage_table)
@@ -250,6 +255,11 @@ pub mod test_support {
                 .collect(),
 
             player_health: vec![(rows.player_vitals_id.clone(), TEST_PLAYER_HEALTH)],
+            item_stats: vec![(TEST_RANGED_ITEM.to_owned(), TEST_RANGED_WEAPON.to_owned())],
+            ranged_profiles: vec![(
+                TEST_RANGED_WEAPON.to_owned(),
+                crate::mob_ai::test_support::TEST_RANGED_PROFILE.to_owned(),
+            )],
             ..CombatSource::default()
         }
     }

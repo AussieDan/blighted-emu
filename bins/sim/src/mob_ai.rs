@@ -123,6 +123,15 @@ const SHAPE_RADIUS_PARAM: &str = "MeleeAttackShapeRadius";
 const SHAPE_HALF_HEIGHT_PARAM: &str = "MeleeAttackCapsuleHalfHeight";
 const HOMING_RADIUS_PARAM: &str = "Radius";
 const HOMING_ANGLE_PARAM: &str = "MaxAngle";
+/// A ranged attack clip and its parameters (Observed: Janszoon's `Officer_AnchorToss` in
+/// `npc_damned_anims.adb`).
+const RANGED_CLIP: &str = "CAGE-RangedAttack";
+const RANGED_ATTACK_PARAM: &str = "RangedAttackName";
+const SLICE_OVERRIDE_PARAM: &str = "SliceOverride";
+const LEAD_TARGET_PARAM: &str = "AILeadTarget";
+const LEAD_MAX_ANGLE_PARAM: &str = "AILeadTargetMaxAngle";
+/// The value of a true clip parameter.
+const PARAM_TRUE: &str = "true";
 /// The navigation config of a run (Observed: the boar's `Run` nodes name `RunToTarget`; retail
 /// boar runs reached 6.96 m/s, its maximum 7.0).
 const RUN_CONFIG: &str = "RunToTarget";
@@ -225,6 +234,11 @@ struct Names {
     shape_half_height: Option<NameId>,
     homing_radius: Option<NameId>,
     homing_angle: Option<NameId>,
+    ranged_clip: Option<NameId>,
+    ranged_attack: Option<NameId>,
+    slice_override: Option<NameId>,
+    lead_target: Option<NameId>,
+    lead_max_angle: Option<NameId>,
     run_config: Option<NameId>,
     reset: Option<NameId>,
     reset_no_heal: Option<NameId>,
@@ -266,6 +280,11 @@ impl MobAi {
             shape_half_height: name(SHAPE_HALF_HEIGHT_PARAM),
             homing_radius: name(HOMING_RADIUS_PARAM),
             homing_angle: name(HOMING_ANGLE_PARAM),
+            ranged_clip: name(RANGED_CLIP),
+            ranged_attack: name(RANGED_ATTACK_PARAM),
+            slice_override: name(SLICE_OVERRIDE_PARAM),
+            lead_target: name(LEAD_TARGET_PARAM),
+            lead_max_angle: name(LEAD_MAX_ANGLE_PARAM),
             run_config: name(RUN_CONFIG),
             reset: name(RESET_EFFECT),
             reset_no_heal: name(RESET_NO_HEAL_EFFECT),
@@ -787,12 +806,37 @@ pub struct Shown {
     pub serial: u32,
 }
 
-/// A damage window of the action a mob plays (`CAGE-Damage` of its fragment entry).
+/// A damage window of the action a mob plays (`CAGE-Damage` of its fragment entry), or the
+/// moment its `CAGE-RangedAttack` clip fires.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Window {
     at_ms: u64,
     row: NameId,
     reach: MobReach,
+    ranged: Option<RangedWindow>,
+}
+
+/// The parameters of a `CAGE-RangedAttack` clip.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct RangedWindow {
+    attack: NameId,
+    slice: Option<NameId>,
+    lead: bool,
+    lead_max_rad: f32,
+}
+
+/// The projectile of a `CAGE-RangedAttack` clip, which the mob fires at its target.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RangedClip {
+    /// `RangedAttackName`: the attack of the main-hand weapon's ranged profile.
+    pub attack: String,
+    /// `SliceOverride`: the projectile slice (lower-case pak path); `None` when the clip names
+    /// none.
+    pub slice: Option<String>,
+    /// `AILeadTarget`: it aims where the target will be when it gets there.
+    pub lead: bool,
+    /// `AILeadTargetMaxAngle`: how far from the target the lead may turn the aim (radians).
+    pub lead_max_rad: f32,
 }
 
 /// The hit of a damage window: its damage table row and how far it reaches.
@@ -804,8 +848,10 @@ pub struct Strike {
     pub row: String,
     /// The item of the creature's main hand, whose weapon row a block's stamina comes from.
     pub weapon: Option<String>,
-    /// How the swing reaches its target.
+    /// How the swing reaches its target (a ranged strike lands by its projectile instead).
     pub reach: MobReach,
+    /// The projectile of a ranged clip; `None` for a damage window.
+    pub ranged: Option<RangedClip>,
 }
 
 /// A hit of a damage window on the mob's target.
@@ -1078,6 +1124,12 @@ impl MindState {
                     row: ai.name(window.row).to_owned(),
                     weapon: arch.main_hand_item.map(|item| ai.name(item).to_owned()),
                     reach: window.reach,
+                    ranged: window.ranged.map(|ranged| RangedClip {
+                        attack: ai.name(ranged.attack).to_owned(),
+                        slice: ranged.slice.map(|slice| ai.name(slice).to_lowercase()),
+                        lead: ranged.lead,
+                        lead_max_rad: ranged.lead_max_rad,
+                    }),
                 },
             });
         }
@@ -1166,6 +1218,45 @@ impl MindState {
                 at_ms,
                 row,
                 reach: window_reach(ai, window, homing),
+                ranged: None,
+            });
+        }
+        // A ranged clip written in both databases is one shot, as a damage clip.
+        let is_ranged = |window: &&ProcWindow| Some(window.kind) == ai.names.ranged_clip;
+        let ranged_windows = if body.iter().any(|window| is_ranged(&window)) {
+            body
+        } else {
+            weapon
+        };
+        for window in ranged_windows.iter().filter(is_ranged) {
+            let (Some(row), Some(attack)) = (
+                param_of(window, ai.names.damage_row),
+                param_of(window, ai.names.ranged_attack),
+            ) else {
+                continue;
+            };
+            let text = |name| param_of(window, name).map(|value| ai.name(value).trim());
+            // Seconds of a fragment.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "seconds of a fragment"
+            )]
+            let at_ms = now_ms + (window.start_s * MS_PER_S).round() as u64;
+            self.windows.push(Window {
+                at_ms,
+                row,
+                reach: window_reach(ai, window, homing),
+                ranged: Some(RangedWindow {
+                    attack,
+                    slice: param_of(window, ai.names.slice_override)
+                        .filter(|slice| !ai.name(*slice).trim().is_empty()),
+                    lead: text(ai.names.lead_target) == Some(PARAM_TRUE),
+                    lead_max_rad: text(ai.names.lead_max_angle)
+                        .and_then(|degrees| degrees.parse::<f32>().ok())
+                        .unwrap_or(0.0)
+                        .to_radians(),
+                }),
             });
         }
     }
@@ -2143,9 +2234,12 @@ impl World for View<'_> {
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support {
     use nw_ai::build::{Build, run_config};
-    use nw_ai::data::{AiData, Creature, FragmentLength, ProcWindow, Vision};
+    use nw_ai::data::{
+        AiData, Creature, FragmentLength, ProcWindow, ProjectileSlice, RangedAttack, Vision,
+    };
     use nw_ai::node::PositionType;
     use nw_ai::value::{CompareOp, Value};
+    use nw_content::player_attacks::Flight;
     use nw_formats::objectstream::lowercase_crc32;
 
     use super::{
@@ -2196,6 +2290,19 @@ pub mod test_support {
     const TEST_REACTION_S: f32 = 0.8;
     const TEST_DEATH_S: f32 = 2.0;
     const TRUE: f32 = 1.0;
+    /// A ranged attack of the data: its profile, its name and its projectile slice.
+    pub const TEST_RANGED_PROFILE: &str = "AI_Test";
+    /// The name of the test ranged attack.
+    pub const TEST_RANGED_ATTACK: &str = "Test_Shot";
+    /// The projectile slice of the test ranged attack.
+    pub const TEST_SHOT_SLICE: &str = "slices/characters/spellslices/test_shot.dynamicslice";
+    /// The test ranged attack's range and radius.
+    pub const TEST_SHOT_RANGE_M: f32 = 10.0;
+    /// The radius of the test projectile.
+    pub const TEST_SHOT_RADIUS_M: f32 = 0.5;
+    /// The test projectile flies straight at this speed.
+    pub const TEST_SHOT_SPEED_MPS: f32 = 20.0;
+    const TEST_SHOT_LIFETIME_S: f32 = 5.0;
 
     /// The data of the test archetype.
     pub fn test_ai_data() -> AiData {
@@ -2294,7 +2401,26 @@ pub mod test_support {
         }
 
         let table = build.name(TEST_MOB_TABLE);
+        let ranged_attacks = vec![RangedAttack {
+            profile: build.name(TEST_RANGED_PROFILE),
+            attack: build.name(TEST_RANGED_ATTACK),
+            range_m: TEST_SHOT_RANGE_M,
+            radius_m: TEST_SHOT_RADIUS_M,
+            hit_scan: false,
+        }];
+        let projectile_slices = vec![ProjectileSlice {
+            slice: build.name(TEST_SHOT_SLICE),
+            flight: Flight {
+                base_speed_mps: TEST_SHOT_SPEED_MPS,
+                extra_speed_mps: 0.0,
+                time_for_max_speed_s: 0.0,
+                gravity_mps2: 0.0,
+                lifetime_s: TEST_SHOT_LIFETIME_S,
+            },
+        }];
         let mut data = build.finish(root);
+        data.ranged_attacks = ranged_attacks;
+        data.projectile_slices = projectile_slices;
         let reaction = data.name_id(REACTION_ALIAS).expect("reaction");
         let death = data.name_id(DEATH_ALIAS).expect("death");
         let mut aliases = vec![(reaction, reaction), (death, death)];

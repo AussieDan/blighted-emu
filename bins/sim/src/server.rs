@@ -1255,7 +1255,7 @@ impl Loop {
                 hit.target,
                 hit.attacker,
                 hit.amount,
-                block_stamina,
+                (block_stamina, hit.ranged),
                 now_ms,
             ),
             None => self

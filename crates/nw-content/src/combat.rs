@@ -129,7 +129,27 @@ pub struct WeaponRow {
     pub block_stamina_damage: f64,
     /// `BlockStability`: the share (percent) of a blocked hit's stamina it takes off.
     pub block_stability: f64,
+    /// How it blocks a projectile; `None` without `CanBlockRanged`: a projectile passes its
+    /// block.
+    pub ranged_block: Option<RangedBlock>,
 }
+
+/// How a weapon with `CanBlockRanged` blocks a projectile (build 25810808: shields 0 and 1,
+/// swords 0.5 and 0.5, great axes 0.3 and 0.7).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RangedBlock {
+    /// `RangedBlockHealthDamageScaling`: the share of the hit's health that passes the block
+    /// (Inferred: 0 without the cell, as on the shields that have one).
+    pub health_scale: f64,
+    /// `RangedBlockStaminaDamageScaling`: the share of the block's stamina the hit takes
+    /// (Inferred: 1 without the cell).
+    pub stamina_scale: f64,
+}
+
+/// The health share of a ranged block without `RangedBlockHealthDamageScaling`.
+const RANGED_BLOCK_HEALTH: f64 = 0.0;
+/// The stamina share of a ranged block without `RangedBlockStaminaDamageScaling`.
+const RANGED_BLOCK_STAMINA: f64 = 1.0;
 
 /// A consumable that heals: a potion.
 #[derive(Debug, Clone, PartialEq)]
@@ -215,6 +235,8 @@ pub struct CombatSource {
     pub levels: Vec<(u32, LevelRow)>,
     /// `WeaponItemDefinitions` by id.
     pub weapons: Vec<(String, WeaponRow)>,
+    /// `WeaponItemDefinitions`: (id, `RangedAttackProfile`) of the weapons that have a profile.
+    pub ranged_profiles: Vec<(String, String)>,
     /// `MasterItemDefinitions`: (item id, `ItemStatsRef`) of the items that have stats.
     pub item_stats: Vec<(String, String)>,
     /// `ConsumableItemDefinitions`: the consumables with a cooldown.
@@ -330,9 +352,25 @@ impl CombatSource {
                             block_stability: row
                                 .block_stability
                                 .map_or(0.0, |stability| stability as f64),
+                            ranged_block: row.can_block_ranged.unwrap_or_default().then(|| {
+                                RangedBlock {
+                                    health_scale: row
+                                        .ranged_block_health_damage_scaling
+                                        .unwrap_or(RANGED_BLOCK_HEALTH),
+                                    stamina_scale: row
+                                        .ranged_block_stamina_damage_scaling
+                                        .unwrap_or(RANGED_BLOCK_STAMINA),
+                                }
+                            }),
                         },
                     )
                 })
+                .collect(),
+            ranged_profiles: tables
+                .weapon_item_definitions
+                .iter()
+                .flat_map(|table| &table.rows)
+                .filter_map(|row| Some((row.weapon_id.clone(), row.ranged_attack_profile.clone()?)))
                 .collect(),
             consumables: tables
                 .consumable_item_definitions
@@ -472,6 +510,8 @@ pub struct CombatData {
     weapon: WeaponRow,
     /// The weapon row of each item that is a weapon, by lower-case item id.
     item_weapons: HashMap<String, WeaponRow>,
+    /// The ranged attack profile of each weapon item that has one, by lower-case item id.
+    item_ranged_profiles: HashMap<String, String>,
     /// The healing consumable of each item that is one, by lower-case item id.
     item_heals: HashMap<String, HealingConsumable>,
     /// The open-world PvP damage factor of each weapon item whose class the balance table
@@ -555,6 +595,21 @@ impl CombatData {
                 Some((item.to_lowercase(), *weapons.get(&stats.to_lowercase())?))
             })
             .collect();
+        let profiles: HashMap<String, &String> = source
+            .ranged_profiles
+            .iter()
+            .map(|(id, profile)| (id.to_lowercase(), profile))
+            .collect();
+        let item_ranged_profiles = source
+            .item_stats
+            .iter()
+            .filter_map(|(item, stats)| {
+                Some((
+                    item.to_lowercase(),
+                    (*profiles.get(&stats.to_lowercase())?).clone(),
+                ))
+            })
+            .collect();
         let heals: HashMap<String, (f64, f64)> = source
             .heals
             .iter()
@@ -628,6 +683,7 @@ impl CombatData {
             levels: source.levels.into_iter().collect(),
             weapon,
             item_weapons,
+            item_ranged_profiles,
             item_heals,
             item_pvp_damage,
             table_attacks,
@@ -648,6 +704,14 @@ impl CombatData {
     /// weapon. Case does not matter.
     pub fn weapon_of_item(&self, item_id: &str) -> Option<&WeaponRow> {
         self.item_weapons.get(&item_id.to_lowercase())
+    }
+
+    /// The ranged attack profile (`RangedAttackProfile`) of weapon item `item_id`; `None` for an
+    /// item that has none. Case does not matter.
+    pub fn ranged_profile_of_item(&self, item_id: &str) -> Option<&str> {
+        self.item_ranged_profiles
+            .get(&item_id.to_lowercase())
+            .map(String::as_str)
     }
 
     /// The open-world PvP damage factor of weapon item `item_id`: 1 plus its class's
@@ -919,6 +983,8 @@ mod tests {
     const ICE_GAUNTLET_ITEM: &str = "OccultistArchetype_1hGauntletIce";
     const ICE_GAUNTLET_STATS: &str = "1hElementalGauntlet_IceT2";
     const ICE_GAUNTLET_TAGS: &str = "MagicGauntlet,Ice";
+    /// The ice gauntlet's `RangedAttackProfile`.
+    const ICE_PROFILE: &str = "IceMagic";
 
     fn sword_row() -> WeaponRow {
         WeaponRow {
@@ -931,6 +997,7 @@ mod tests {
             stance: stance_key("1H_Melee,Sword"),
             block_stamina_damage: 0.0,
             block_stability: 0.0,
+            ranged_block: None,
         }
     }
 
@@ -957,6 +1024,7 @@ mod tests {
                     },
                 ),
             ],
+            ranged_profiles: vec![(ICE_GAUNTLET_STATS.to_owned(), ICE_PROFILE.to_owned())],
             consumables: vec![ConsumableRow {
                 id: "PotionHealthT1".to_owned(),
                 cooldown_s: POTION_COOLDOWN_S,
@@ -1188,5 +1256,16 @@ mod tests {
         assert!((data.pvp_damage_factor("1HSWORDT1") - (1.0 + SWORD_PVP_ADJUSTMENT)).abs() < 1e-9);
         assert!((data.pvp_damage_factor(ICE_GAUNTLET_ITEM) - 1.0).abs() < 1e-9);
         assert!((data.pvp_damage_factor("NoSuchItem") - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_weapon_item_has_the_ranged_profile_of_its_stats_row() {
+        let data = CombatData::build(source(), &rows()).expect("data");
+        assert_eq!(
+            data.ranged_profile_of_item(&ICE_GAUNTLET_ITEM.to_uppercase()),
+            Some(ICE_PROFILE)
+        );
+        assert_eq!(data.ranged_profile_of_item("1hSwordT1"), None, "no profile");
+        assert_eq!(data.ranged_profile_of_item("NoSuchItem"), None);
     }
 }

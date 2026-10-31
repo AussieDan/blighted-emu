@@ -3097,25 +3097,25 @@ mod retail_tests {
     }
 
     /// Ticks Janszoon from `from_ms` to `to_ms` with `player` (none when `None`), recording
-    /// the fragments he plays; the damage rows (table, row) of his hits.
+    /// the fragments he plays; the strikes of his hits.
     fn run_janszoon(
         mobs: &mut Mobs,
         ground: &RealGround,
         player: impl Fn(&Mobs) -> Option<Seen>,
         (from_ms, to_ms): (u64, u64),
         trace: &mut (Option<u32>, Vec<String>),
-    ) -> Vec<(String, String)> {
-        let mut rows = Vec::new();
+    ) -> Vec<crate::mob_ai::Strike> {
+        let mut strikes = Vec::new();
         for now in (from_ms..to_ms).step_by(TICK_MS as usize) {
             let seen: Vec<Seen> = player(mobs).into_iter().collect();
-            rows.extend(
+            strikes.extend(
                 mobs.tick(&seen, now, ground, 1)
                     .into_iter()
-                    .filter_map(|hit| hit.strike.map(|strike| (strike.table, strike.row))),
+                    .filter_map(|hit| hit.strike),
             );
             played(mobs, mob_entity(0), &mut trace.0, &mut trace.1);
         }
-        rows
+        strikes
     }
 
     /// The ambient vision of his slice: a 120 degree cone of 5 m.
@@ -3164,18 +3164,30 @@ mod retail_tests {
         assert_eq!(mobs.target(mob_entity(0)), Some(PLAYER), "{:?}", trace.1);
         let away = in_front_of_janszoon(&mobs, &ground, RETAIL_TOSS_M);
         let window = (JANSZOON_AGGRO_MS, JANSZOON_AGGRO_MS + THROW_WITHIN_MS);
-        let rows = run_janszoon(&mut mobs, &ground, |_| Some(away), window, &mut trace);
+        let strikes = run_janszoon(&mut mobs, &ground, |_| Some(away), window, &mut trace);
         assert!(
             trace.1.iter().any(|fragment| fragment == TOSS),
             "{:?}",
             trace.1
         );
-        // His own damage table holds the toss's row.
-        assert!(
-            rows.iter()
-                .any(|(table, row)| table == "DamnedFirstMateDamageTable"
-                    && row == "Anchor_Toss_Windup"),
-            "{rows:?}"
+        // His own damage table holds the toss's rows: the windup's damage window, and the
+        // anchor his weapon's ranged profile throws (retail: the 40 of `Anchor_Toss`).
+        let row_of = |row: &str| {
+            strikes
+                .iter()
+                .find(|strike| strike.table == "DamnedFirstMateDamageTable" && strike.row == row)
+        };
+        assert!(row_of("Anchor_Toss_Windup").is_some(), "{strikes:?}");
+        let thrown = row_of("Anchor_Toss").and_then(|strike| strike.ranged.as_ref());
+        assert_eq!(
+            thrown.map(|clip| (clip.attack.as_str(), clip.slice.as_deref())),
+            Some((
+                "Officer_Anchor",
+                Some(
+                    "slices/characters/spellslices/corrupted_firstmate_anchor_projectile.dynamicslice"
+                )
+            )),
+            "{strikes:?}"
         );
     }
 

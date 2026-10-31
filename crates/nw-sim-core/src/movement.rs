@@ -337,6 +337,8 @@ pub struct Motion {
     position: Position,
     time_ms: u64,
     budget_m: f32,
+    /// The ground-plane velocity of the last good move, m/s.
+    velocity: [f32; 2],
 }
 
 impl Motion {
@@ -346,6 +348,7 @@ impl Motion {
             position,
             time_ms: received_ms,
             budget_m: limits.max_budget_m(),
+            velocity: [0.0; 2],
         }
     }
 
@@ -357,6 +360,12 @@ impl Motion {
     /// Server time of the last good move (or of the start).
     pub const fn moved_ms(&self) -> u64 {
         self.time_ms
+    }
+
+    /// The ground-plane velocity of the last good move (m/s); still at the start and after an
+    /// import.
+    pub const fn velocity(&self) -> [f32; 2] {
+        self.velocity
     }
 
     /// The state at server time `now_ms`, for another `sim`.
@@ -380,6 +389,7 @@ impl Motion {
             position: state.position,
             time_ms: now_ms.saturating_sub(state.move_age_ms),
             budget_m,
+            velocity: [0.0; 2],
         }
     }
 
@@ -424,10 +434,20 @@ impl Motion {
             }
             None => GroundCheck::NoGround,
         };
+        let velocity = if elapsed_ms == 0 {
+            self.velocity
+        } else {
+            let seconds = elapsed_ms as f32 / MILLIS_PER_SECOND;
+            [
+                (next.x - self.position.x) / seconds,
+                (next.y - self.position.y) / seconds,
+            ]
+        };
         *self = Self {
             position: next,
             time_ms: received_ms,
             budget_m: budget - cost,
+            velocity,
         };
         Ok(check)
     }
@@ -548,6 +568,40 @@ mod tests {
             Ok(GroundCheck::Checked)
         );
         assert_eq!(motion.position(), next);
+    }
+
+    #[test]
+    fn a_good_move_sets_the_velocity_and_a_refused_one_keeps_it() {
+        let mut motion = start();
+        assert_eq!(motion.velocity(), [0.0; 2], "still at the start");
+        motion
+            .try_move(
+                &limits(),
+                &Flat,
+                &bounds(),
+                at(16.0, GROUND_HEIGHT),
+                START_MS + STEP_MS,
+            )
+            .expect("run");
+        // 6 m east in one second.
+        assert_eq!(motion.velocity(), [RUN_SPEED, 0.0]);
+        let too_far = at(100.0, GROUND_HEIGHT);
+        assert!(
+            motion
+                .try_move(&limits(), &Flat, &bounds(), too_far, START_MS + 2 * STEP_MS)
+                .is_err()
+        );
+        assert_eq!(motion.velocity(), [RUN_SPEED, 0.0]);
+        motion
+            .try_move(
+                &limits(),
+                &Flat,
+                &bounds(),
+                at(16.0, GROUND_HEIGHT),
+                START_MS + 3 * STEP_MS,
+            )
+            .expect("stand");
+        assert_eq!(motion.velocity(), [0.0; 2], "standing still");
     }
 
     #[test]

@@ -436,6 +436,11 @@ impl Gear {
             .map(|(_, stack)| stack.item_id.as_str())
     }
 
+    /// The off-hand item worn with the weapon in the hand (a shield).
+    pub(super) fn off_hand_weapon(&self) -> Option<&str> {
+        self.worn_item(off_hand_of(self.held_option()?)?)
+    }
+
     /// The weapon in the hand, with its gear score: the item of the drawn option slot, else the
     /// worn main-hand item of the lowest option slot (Inferred: retail's first island hits are
     /// the slot 24 weapon's).
@@ -1041,6 +1046,16 @@ impl Gear {
         self.changed = true;
         self.unsaved = true;
         Ok(item_id)
+    }
+}
+
+/// The off-hand option slot that goes with main-hand option slot `option`: 27 with 24, 29
+/// with 26.
+const fn off_hand_of(option: u32) -> Option<u32> {
+    match option {
+        slot::MAIN_HAND_OPTION_1 => Some(slot::OFF_HAND_OPTION_1),
+        slot::MAIN_HAND_OPTION_3 => Some(slot::OFF_HAND_OPTION_3),
+        _ => None,
     }
 }
 
