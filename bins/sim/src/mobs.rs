@@ -423,22 +423,45 @@ pub fn spawns_of_level(level: &str, spawns: &[VitalsSpawn]) -> Arc<[VitalsSpawn]
     spawns.iter().cloned().collect()
 }
 
-/// `spawns` without the encounter spawns (`IsEncounter`) when `scripted`: an instance sim whose
-/// level has a dungeon script spawns its encounters' mobs as their stages run.
-pub fn unscripted_spawns(spawns: Arc<[VitalsSpawn]>, scripted: bool) -> Arc<[VitalsSpawn]> {
-    if !scripted {
-        return spawns;
-    }
-    spawns
-        .iter()
-        .filter(|spawn| !spawn.is_encounter)
-        .cloned()
-        .collect()
+/// Which spawns a sim leaves to others.
+#[derive(Debug, Clone, Copy)]
+pub struct SpawnFilter<'a> {
+    /// An instance sim whose level has a dungeon script: the script spawns its encounters' mobs
+    /// as their stages run, so the encounter spawns (`IsEncounter`) are left out.
+    pub scripted: bool,
+    /// The open map: the encounter spawns of the encounters it does not run are left out
+    /// (see [`is_unrun`]).
+    pub open_map: bool,
+    /// The vitals categories, for the open map's rule.
+    pub kill_types: &'a KillTypes,
 }
 
-/// `spawns` without the encounter spawns of the encounters that the open map does not run (a
-/// vitals row in an `UNRUN_ENCOUNTER_CATEGORIES` category) when `open_map`. Observed (data,
-/// build 25810808), each an encounter spawn and named by no task:
+/// The spawns of `spawns` that `filter` keeps, with their design overrides. `ai` holds the
+/// overrides of `spawns` in spawn order ([`crate::mob_ai::resolve_ai`]) and a mob finds its own
+/// by its spawn index ([`Mobs::set_ai`]), so a spawn left out takes its overrides with it: else
+/// every later mob runs the profile and patrol path of another spawn (live hunt 2026-10-31: mobs
+/// at their spawn reset their fight on every think, their path 3.7 to 4.6 km away).
+pub fn sim_spawns(
+    spawns: &[VitalsSpawn],
+    ai: &[Option<SpawnAi>],
+    filter: SpawnFilter<'_>,
+) -> (Arc<[VitalsSpawn]>, Arc<[Option<SpawnAi>]>) {
+    let (kept, overrides): (Vec<VitalsSpawn>, Vec<Option<SpawnAi>>) = spawns
+        .iter()
+        .enumerate()
+        .filter(|(_, spawn)| {
+            let scripted = filter.scripted && spawn.is_encounter;
+            let unrun = filter.open_map && is_unrun(spawn, filter.kill_types);
+            !(scripted || unrun)
+        })
+        .map(|(index, spawn)| (spawn.clone(), ai.get(index).cloned().flatten()))
+        .unzip();
+    (kept.into(), overrides.into())
+}
+
+/// Whether `spawn` is an encounter spawn of an encounter that the open map does not run (a
+/// vitals row in an `UNRUN_ENCOUNTER_CATEGORIES` category). Observed (data, build 25810808),
+/// each an encounter spawn and named by no task:
 /// - the invasion's 29,235: the forts' siege encounters (`Siege_Fort_BrimstoneSands`, ...), up
 ///   to 2,226 at one point; the open map runs no invasion (Inferred: a war game mode of its own).
 /// - the breaches' 29,664: each place of a breach (`Enc_Darkness_...`) holds its mob seven
@@ -449,29 +472,15 @@ pub fn unscripted_spawns(spawns: Arc<[VitalsSpawn]>, scripted: bool) -> Arc<[Vit
 /// log 2026-10-31). Awake, one fort's 2,226 ran the sim's mob tick to 175 ms (live hunt). Retail
 /// showed no mob of an encounter spawn either: general-other-01, 711 to 732 s, the player within
 /// 25 m of the `loot_goblin` of `Enc_WorldEvent_LootGoblin_00` and no goblin in the capture.
-pub fn without_unrun_encounters(
-    spawns: Arc<[VitalsSpawn]>,
-    open_map: bool,
-    kill_types: &KillTypes,
-) -> Arc<[VitalsSpawn]> {
-    if !open_map {
-        return spawns;
-    }
-    let unrun = |spawn: &VitalsSpawn| {
-        spawn.is_encounter
-            && kill_types
-                .of(spawn.vitals_id)
-                .is_some_and(|(_, categories)| {
-                    categories
-                        .iter()
-                        .any(|category| is_unrun_encounter(category))
-                })
-    };
-    spawns
-        .iter()
-        .filter(|spawn| !unrun(spawn))
-        .cloned()
-        .collect()
+fn is_unrun(spawn: &VitalsSpawn, kill_types: &KillTypes) -> bool {
+    spawn.is_encounter
+        && kill_types
+            .of(spawn.vitals_id)
+            .is_some_and(|(_, categories)| {
+                categories
+                    .iter()
+                    .any(|category| is_unrun_encounter(category))
+            })
 }
 
 /// Whether vitals category `category` starts with one of `UNRUN_ENCOUNTER_CATEGORIES` (case
@@ -1842,6 +1851,15 @@ mod tests {
         );
     }
 
+    /// The overrides of spawn `marker`: its sight is the marker, so a test can tell whose they
+    /// are.
+    fn marked_ai(marker: f32) -> Option<crate::mob_ai::SpawnAi> {
+        Some(crate::mob_ai::SpawnAi {
+            sight_m: Some(marker),
+            ..crate::mob_ai::SpawnAi::default()
+        })
+    }
+
     #[test]
     fn a_scripted_instance_leaves_its_encounter_spawns_to_the_script() {
         let encounter = VitalsSpawn {
@@ -1849,9 +1867,23 @@ mod tests {
             ..spawn_at(0.0, TEST_MOB, TEST_LEVEL)
         };
         let standing = spawn_at(1.0, TEST_MOB, TEST_LEVEL);
-        let spawns: Arc<[VitalsSpawn]> = Arc::from([encounter, standing.clone()]);
-        assert_eq!(&*unscripted_spawns(Arc::clone(&spawns), false), &*spawns);
-        assert_eq!(&*unscripted_spawns(spawns, true), &[standing][..]);
+        let spawns = [encounter, standing.clone()];
+        let ai = [marked_ai(0.0), marked_ai(1.0)];
+        let kill_types = KillTypes::default();
+        let filter = |scripted| SpawnFilter {
+            scripted,
+            open_map: false,
+            kill_types: &kill_types,
+        };
+        let (all, all_ai) = sim_spawns(&spawns, &ai, filter(false));
+        assert_eq!((&*all, &*all_ai), (&spawns[..], &ai[..]));
+        let (kept, kept_ai) = sim_spawns(&spawns, &ai, filter(true));
+        assert_eq!(&*kept, &[standing][..]);
+        assert_eq!(
+            &*kept_ai,
+            &[marked_ai(1.0)][..],
+            "the kept spawn keeps its own AI"
+        );
     }
 
     #[test]
@@ -1875,22 +1907,53 @@ mod tests {
         };
         let standing_swarmer = spawn_at(2.0, SWARMER, TEST_LEVEL);
         let quest_boar = encounter(3.0, TEST_MOB);
-        let spawns: Arc<[VitalsSpawn]> = Arc::from([
+        let spawns = [
             encounter(0.0, SNIPER),
             encounter(1.0, SWARMER),
             standing_swarmer.clone(),
             quest_boar.clone(),
-        ]);
+        ];
+        let ai = [
+            marked_ai(0.0),
+            marked_ai(1.0),
+            marked_ai(2.0),
+            marked_ai(3.0),
+        ];
+        let filter = |open_map| SpawnFilter {
+            scripted: false,
+            open_map,
+            kill_types: &kill_types,
+        };
+        let (kept, kept_ai) = sim_spawns(&spawns, &ai, filter(true));
         assert_eq!(
-            &*without_unrun_encounters(Arc::clone(&spawns), true, &kill_types),
+            &*kept,
             &[standing_swarmer, quest_boar][..],
             "a plain spawn and another encounter's stay; the category's case does not count"
         );
         assert_eq!(
-            &*without_unrun_encounters(Arc::clone(&spawns), false, &kill_types),
-            &*spawns,
+            &*kept_ai,
+            &[marked_ai(2.0), marked_ai(3.0)][..],
+            "each kept spawn keeps its own profile and path, not the next one's"
+        );
+        let (all, all_ai) = sim_spawns(&spawns, &ai, filter(false));
+        assert_eq!(
+            (&*all, &*all_ai),
+            (&spawns[..], &ai[..]),
             "an instance keeps them"
         );
+    }
+
+    #[test]
+    fn spawns_without_overrides_get_none() {
+        let spawns = [spawn_at(0.0, TEST_MOB, TEST_LEVEL)];
+        let kill_types = KillTypes::default();
+        let filter = SpawnFilter {
+            scripted: false,
+            open_map: true,
+            kill_types: &kill_types,
+        };
+        let (_, ai) = sim_spawns(&spawns, &[], filter);
+        assert_eq!(&*ai, &[None][..], "a level whose spawns have no design AI");
     }
 
     #[test]
