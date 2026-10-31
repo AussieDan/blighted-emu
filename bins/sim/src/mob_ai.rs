@@ -1360,7 +1360,17 @@ impl MindState {
                 outcome
             }
             // It cannot go on: no floor ahead within its slope.
-            None => Some(MotionOutcome::Failed),
+            None => {
+                tracing::debug!(
+                    x = at.x,
+                    y = at.y,
+                    z = at.z,
+                    step_x = mover.position.x,
+                    step_y = mover.position.y,
+                    "mob move failed: no floor ahead"
+                );
+                Some(MotionOutcome::Failed)
+            }
         };
         self.yaw = mover.yaw;
         self.turned = true;
@@ -1804,7 +1814,19 @@ impl TreeMind {
                         self.steering(ai, node, config, &view)
                     };
                     let kind = match destination {
-                        Destination::Point(point) => MotionKind::To(position_of(point)),
+                        Destination::Point(point) => {
+                            let goal = position_of(point);
+                            tracing::debug!(
+                                archetype = self.state.archetype,
+                                node,
+                                from_x = at.x,
+                                from_y = at.y,
+                                to_x = goal.x,
+                                to_y = goal.y,
+                                "mob move to a point"
+                            );
+                            MotionKind::To(goal)
+                        }
                         Destination::Target => MotionKind::Follow {
                             goal: None,
                             config: config_index,
