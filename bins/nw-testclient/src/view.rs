@@ -565,6 +565,9 @@ mod tests {
     }
 
     const MOB: u64 = (1 << 34) + 5;
+    /// The mob of the slot stop test: the stop releases its raw id from the process registry,
+    /// which the other tests, running at the same time, must not lose for [`MOB`].
+    const STOPPED_MOB: u64 = (1 << 34) + 6;
     const HIT: f32 = 42.0;
 
     const MOB_SLOT: u16 = FIRST_OTHER_SLOT;
@@ -584,8 +587,8 @@ mod tests {
         received(BUNDLE_CHANNEL, &ServerMessage::Bundle(bundle))
     }
 
-    fn mob_at(x: f32, carded: bool) -> BundleGroup {
-        entity_group(MOB_SLOT, MOB, carded.then_some(MOB_ASSET), Some(at(x)))
+    fn mob_at(mob: u64, x: f32, carded: bool) -> BundleGroup {
+        entity_group(MOB_SLOT, mob, carded.then_some(MOB_ASSET), Some(at(x)))
     }
 
     fn combat_view() -> CombatView {
@@ -605,14 +608,14 @@ mod tests {
             Some(nw_messages::PLAYER_SLICE_ASSET),
             Some(at(3.0)),
         );
-        let first = mob_bundle(0, Vec::new(), vec![mob_at(2.0, true), other]);
+        let first = mob_bundle(0, Vec::new(), vec![mob_at(MOB, 2.0, true), other]);
         assert_eq!(view.read(&first).expect("read"), Some(at(1.0)));
         assert_eq!(
             view.mobs().collect::<Vec<_>>(),
             vec![(MOB, at(2.0))],
             "a player is no mob"
         );
-        view.read(&mob_bundle(1, Vec::new(), vec![mob_at(4.0, false)]))
+        view.read(&mob_bundle(1, Vec::new(), vec![mob_at(MOB, 4.0, false)]))
             .expect("read");
         assert_eq!(view.mobs().collect::<Vec<_>>(), vec![(MOB, at(4.0))]);
         for sequence in 2..=2 + MAX_MISSED_ROUNDS {
@@ -624,7 +627,7 @@ mod tests {
             0,
             "no longer sent: dead or out of view"
         );
-        view.read(&mob_bundle(9, Vec::new(), vec![mob_at(4.0, false)]))
+        view.read(&mob_bundle(9, Vec::new(), vec![mob_at(MOB, 4.0, false)]))
             .expect("read");
         assert_eq!(view.mobs().count(), 0, "a mob comes back with a new card");
     }
@@ -632,8 +635,12 @@ mod tests {
     #[test]
     fn a_stopped_slot_drops_its_mob_at_once() {
         let mut view = combat_view();
-        view.read(&mob_bundle(0, Vec::new(), vec![mob_at(2.0, true)]))
-            .expect("read");
+        view.read(&mob_bundle(
+            0,
+            Vec::new(),
+            vec![mob_at(STOPPED_MOB, 2.0, true)],
+        ))
+        .expect("read");
         assert_eq!(view.mobs().count(), 1);
         view.read(&mob_bundle(1, vec![MOB_SLOT], Vec::new()))
             .expect("read");
