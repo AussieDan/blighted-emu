@@ -1048,8 +1048,11 @@ impl SimWorld {
     /// drunk unless the slot is empty, holds a disabled item (`javelin.disabled-item-classes`),
     /// or the item's cooldown runs (xp-potion-exit note, section 2.5): one less in the slot, the
     /// cooldown, the heal (`health` + `health share` x max, at most to the max) and the heal's
-    /// visual script. Another consumable (food: live 2026-10-29, the light ration gave no buff
-    /// from the quick slot) is used as from the bag ([`SimWorld::consume`]).
+    /// visual script, without a heal number (retail `newchar-linux-2026-09-12`: the 608 at
+    /// 517.215 s and the health 548.35 to 865.59 at 517.231 s, no 4298 in the whole ledger; a
+    /// 4298 tells a healer of another player). Another consumable (food: live 2026-10-29, the
+    /// light ration gave no buff from the quick slot) is used as from the bag
+    /// ([`SimWorld::consume`]).
     fn drink(&mut self, number: u64, now_ms: u64, server_ms: u64) {
         let Some(entity) = self.player_by_number(number) else {
             return;
@@ -1111,19 +1114,9 @@ impl SimWorld {
         let healed = vitals.health.heal(amount);
         tracing::debug!(player = number, item, amount, healed, "drink");
         self.send_reliable(
-            connection.clone(),
+            connection,
             &ServerMessage::AdjustFxScripts(AdjustFxScriptsMsg::on(number, HEAL_SCRIPT)),
         );
-        if healed > 0 {
-            self.send_reliable(
-                connection,
-                &ServerMessage::OnHealed(nw_messages::OnHealedMsg::of(
-                    number,
-                    number,
-                    healed as f32,
-                )),
-            );
-        }
     }
 
     /// The dead player of `connection` lives again with full health, when `min_respawn_ms` have
@@ -5596,43 +5589,51 @@ mod tests {
         assert_eq!(rations, RATIONS - 1, "one ration eaten");
     }
 
+    /// The test potions in quick slot 1 of player 1.
+    const POTIONS: u32 = 2;
+
+    /// A fight whose player 1 has [`POTIONS`] healing potions in quick slot 1, their class
+    /// `disabled` or not.
+    fn potion_world(disabled: bool) -> (SimWorld, Entity) {
+        const HEAL_EFFECT: &str = "TestHeal";
+        let mut source = crate::combat::test_support::test_source();
+        source.consumables.push(nw_content::combat::ConsumableRow {
+            id: gear::tests::POTION.to_owned(),
+            cooldown_s: 1,
+            cooldown_id: gear::tests::POTION.to_owned(),
+            status_effects: HEAL_EFFECT.to_owned(),
+            use_tag: String::new(),
+        });
+        source.heals.push((HEAL_EFFECT.to_owned(), 1.0, 0.0));
+        let mut world = fight_at(MOB_X);
+        world.combat = committed().combat_settings(
+            Arc::new(test_data_of(source)),
+            Arc::from([]),
+            crate::combat::tests::test_mob_ai(),
+        );
+        if disabled {
+            Arc::make_mut(&mut world.content)
+                .disabled_items
+                .insert(gear::tests::POTION.to_lowercase());
+        }
+        let kits = gear::tests::kits();
+        let mut gear = Gear::starter(&kits, gear::tests::CHARACTER, Some(gear::tests::BACKSTORY))
+            .expect("gear");
+        gear.renew(
+            kits.item(gear::tests::POTION).expect("potion"),
+            POTIONS,
+            slot::QUICK_SLOT_1,
+            0,
+        );
+        let entity = world.by_connection[&connection(1)];
+        world.world.get_mut::<Player>(entity).expect("player").gear = Some(gear);
+        (world, entity)
+    }
+
     #[test]
     fn a_potion_of_a_disabled_class_is_not_drunk() {
-        const HEAL_EFFECT: &str = "TestHeal";
-        const POTIONS: u32 = 2;
         for (disabled, left) in [(false, POTIONS - 1), (true, POTIONS)] {
-            let mut source = crate::combat::test_support::test_source();
-            source.consumables.push(nw_content::combat::ConsumableRow {
-                id: gear::tests::POTION.to_owned(),
-                cooldown_s: 1,
-                cooldown_id: gear::tests::POTION.to_owned(),
-                status_effects: HEAL_EFFECT.to_owned(),
-                use_tag: String::new(),
-            });
-            source.heals.push((HEAL_EFFECT.to_owned(), 1.0, 0.0));
-            let mut world = fight_at(MOB_X);
-            world.combat = committed().combat_settings(
-                Arc::new(test_data_of(source)),
-                Arc::from([]),
-                crate::combat::tests::test_mob_ai(),
-            );
-            if disabled {
-                Arc::make_mut(&mut world.content)
-                    .disabled_items
-                    .insert(gear::tests::POTION.to_lowercase());
-            }
-            let kits = gear::tests::kits();
-            let mut gear =
-                Gear::starter(&kits, gear::tests::CHARACTER, Some(gear::tests::BACKSTORY))
-                    .expect("gear");
-            gear.renew(
-                kits.item(gear::tests::POTION).expect("potion"),
-                POTIONS,
-                slot::QUICK_SLOT_1,
-                0,
-            );
-            let entity = world.by_connection[&connection(1)];
-            world.world.get_mut::<Player>(entity).expect("player").gear = Some(gear);
+            let (mut world, entity) = potion_world(disabled);
             world.drink(1, NOW, SERVER_TIME);
             let potions: u32 = world
                 .world
@@ -5646,5 +5647,43 @@ mod tests {
                 .sum();
             assert_eq!(potions, left, "disabled: {disabled}");
         }
+    }
+
+    /// Retail `newchar-linux-2026-09-12`: the potion's 608 at 517.215 s, the health 548.35 to
+    /// 865.59 at 517.231 s, and no 4298 in the whole ledger.
+    #[test]
+    fn a_drunk_potion_heals_with_its_visual_script_and_no_heal_number() {
+        const HURT: u32 = 500;
+        let (mut world, entity) = potion_world(false);
+        let health = |world: &SimWorld| {
+            world
+                .world
+                .get::<Vitals>(entity)
+                .expect("vitals")
+                .health
+                .current()
+        };
+        let max = health(&world);
+        world
+            .world
+            .get_mut::<Vitals>(entity)
+            .expect("vitals")
+            .health
+            .take(HURT);
+        let _ = world.take_messages();
+        world.drink(1, NOW, SERVER_TIME);
+        assert!(health(&world) > max - HURT, "healed");
+        let messages = messages_to(&world.take_messages(), 1);
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, ServerMessage::AdjustFxScripts(_)))
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| matches!(message, ServerMessage::OnHealed(_))),
+            "no heal number"
+        );
     }
 }

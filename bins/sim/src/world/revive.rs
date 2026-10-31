@@ -8,8 +8,11 @@
 //! dead player comes back where it lies, at 1 health (4 of 4 revived vitals: `hp` 1.0 with the
 //! alive `vitalsData` head), and its health regenerates from there.
 //!
-//! Retail players do not enter death's door: 2,659 dead `vitalsData` heads against 6 death's door
-//! heads in the expedition run, none of the 682 deaths of a war and two free-for-all runs. A dead
+//! Death's door is not built: the expedition run had 2,659 dead `vitalsData` heads against 6
+//! death's door heads, and none of the 682 deaths of a war and two free-for-all runs went
+//! through it, but 107 of 281 own-player deaths of 75 community ledgers (older builds) did (head
+//! 2 before head 1; open-world quests and catacombs, never an outpost rush, a capture-the-flag, a
+//! 3v3 or an invasion; status effects study 2026-10-31). Which deaths take it is Unknown. A dead
 //! player stays dead until a revive or its respawn request.
 
 use bevy_ecs::entity::Entity;

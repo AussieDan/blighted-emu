@@ -21,8 +21,7 @@ use nw_content::perk_effects::PerkEffects;
 use nw_content::status_effects::{RowKey, StatusEffectRule, StatusEffectRules};
 use nw_messages::{
     BundleMember, DamageDealtMsg, DamageItem, EffectMap, HIT_TAG, LocalEffect, MemberState,
-    NEUTRAL_SCALE, OnDamageMsg, OnHealedMsg, STATUS_EFFECTS_COMPONENT, ServerMessage,
-    StatusEffectsState,
+    NEUTRAL_SCALE, OnDamageMsg, STATUS_EFFECTS_COMPONENT, ServerMessage, StatusEffectsState,
 };
 use nw_sim_core::EquipLoad;
 
@@ -32,9 +31,12 @@ use super::{EQUIP_LOAD_SLOTS, Player, SimWorld, send_now};
 use crate::combat::AttackOutcome;
 
 /// The effect of a hurt player out of combat (`BaseDuration` 180, `Health` 40 a second; retail
-/// removed it at the first hit taken). When it starts is a best guess from the retail captures:
-/// out of combat and below the max health (the newchar tutorial had none in its first 12
-/// minutes, open-world sessions had it after their fights).
+/// removed it at the first hit taken). It starts out of combat below the max health (retail
+/// `newchar-retail-2026-09-18`: 32 to 66 ms after the combat flag went to 0 at 766.472 s,
+/// 791.036 s and 806.387 s) and ends at the max health: retail removed it with or after the heal
+/// that filled the health, 0 to 68 ms later (`newchar-retail-2026-09-18` 767.570 s, 792.120 s,
+/// 808.469 s; `general-other-01` 148.707 s, 227.769 s, 504.178 s, 694.308 s, 746.453 s,
+/// 1216.654 s, 1244.685 s).
 const OUT_OF_COMBAT_REGEN: &str = "Status_OutOfCombat_PassiveRegen";
 /// The equip-load effects: the prefix of each, then the load's suffix (retail newchar spawn:
 /// `EquipLoad_CCDurReduction_Heavy` and `EquipLoad_CritDmgReduction_Heavy` on a slow load; an
@@ -200,20 +202,35 @@ impl StatusEffects {
     }
 
     /// The potency of `held` (of `rule`): one stack's times the stacks, at most `PotencyMax`,
-    /// times one plus the `EffectPotencyMods` of the other held effects for its categories.
+    /// times its [`Self::potency_factor`].
     fn potency(&self, rules: &StatusEffectRules, held: &Held, rule: &StatusEffectRule) -> f64 {
         let stacked = held.potency * f64::from(held.stacks);
         let stacked = rule.potency_max.map_or(stacked, |max| stacked.min(max));
-        let factor: f64 = self
-            .held
+        stacked * self.potency_factor(rules, rule)
+    }
+
+    /// One plus the `EffectPotencyMods` of the held effects other than `rule`'s for its
+    /// categories, multiplied.
+    fn potency_factor(&self, rules: &StatusEffectRules, rule: &StatusEffectRule) -> f64 {
+        self.held
             .iter()
-            .filter(|other| other.crc != held.crc)
+            .filter(|other| other.crc != rule.crc)
             .filter_map(|other| rules.get(other.crc))
             .flat_map(|other| &other.potency_mods)
             .filter(|(category, _)| rule.has_category(category))
             .map(|(_, value)| 1.0 + value)
-            .product();
-        stacked * factor
+            .product()
+    }
+
+    /// The multiple the held effects give the vitals changes of the effect named `id` (a
+    /// `StatusID`): its [`Self::potency_factor`], 1 for an id the data does not have. Retail
+    /// `general-other-01`: a `FoodRecoveryT2` heal was 187.03 at 502.111 s and 561.10 (3 times)
+    /// at 1212.654 s and 1214.685 s, while `Status_OutOfCombat_PassiveRegen` (`PassiveFoodRegen=2`)
+    /// ran.
+    pub(super) fn potency_scale(&self, rules: &StatusEffectRules, id: &str) -> f64 {
+        rules
+            .by_id(id)
+            .map_or(PLAIN_POTENCY, |rule| self.potency_factor(rules, rule))
     }
 
     /// Adds effect `crc` by `application` at server time `now_ms`: a new effect, or one more
@@ -838,7 +855,7 @@ impl SimWorld {
                     player
                         .status_effects
                         .add(rules, regen, Application::plain(number), server_ms);
-                } else if in_combat && holds {
+                } else if holds && (in_combat || !hurt) {
                     player.status_effects.remove(regen);
                 }
             }
@@ -883,8 +900,11 @@ impl SimWorld {
     }
 
     /// Applies the change `tick` of an effect of player `number` (`entity`) at `now_ms`: a heal
-    /// and a stamina gain at once; damage as an over-time 3601 (retail flags `08 00`), or as a
-    /// hit when it kills, which runs the death.
+    /// and a stamina gain at once, without a heal number (retail sends its 4298 to a healer of
+    /// another player only: none of 8,991 retail 4298 in 14 ledgers names the player it goes to,
+    /// and `newchar-retail-2026-09-18` got none for the out-of-combat heal at 807.435 s or the
+    /// food heal at 1015.028 s); damage as an over-time 3601 (retail flags `08 00`), or as a hit
+    /// when it kills, which runs the death.
     fn player_vitals_tick(&mut self, entity: Entity, number: u64, tick: VitalsTick, now_ms: u64) {
         let source_at = self.mobs.get(tick.source).map_or([0.0; 3], |mob| {
             [mob.position.x, mob.position.y, mob.position.z]
@@ -907,28 +927,13 @@ impl SimWorld {
                 return;
             }
             if tick.health > 0.0 {
-                Err(vitals.health.heal(amount))
-            } else {
-                Ok((amount < vitals.health.current()).then(|| {
-                    vitals.health.take(amount);
-                    vitals.health.max()
-                }))
+                vitals.health.heal(amount);
+                return;
             }
-        };
-        let Ok(survived) = survived else {
-            let healed = survived.unwrap_err();
-            if healed > 0 {
-                send_now(
-                    &mut self.combat_messages,
-                    &connection,
-                    &[ServerMessage::OnHealed(OnHealedMsg::of(
-                        number,
-                        number,
-                        healed as f32,
-                    ))],
-                );
-            }
-            return;
+            (amount < vitals.health.current()).then(|| {
+                vitals.health.take(amount);
+                vitals.health.max()
+            })
         };
         let Some(max_health) = survived else {
             self.apply_hit(number, tick.source, amount, 0, now_ms);
@@ -1434,5 +1439,67 @@ mod tests {
         assert!(effects.add_by_id(&rules, BLEED, MUTATION_POTENCY, SOURCE, 0));
         assert!(effects.holds(crc(&rules, BLEED)));
         assert!(!effects.add_by_id(&rules, "NotAnEffect", MUTATION_POTENCY, SOURCE, 0));
+    }
+
+    /// Retail `newchar-retail-2026-09-18`: `Status_OutOfCombat_PassiveRegen` came at 806.419 s,
+    /// healed 40 at 807.435 s and filled the health at 808.436 s, and was gone at 808.469 s; no
+    /// 4298 came for its heals.
+    #[test]
+    fn the_out_of_combat_regen_ends_at_the_max_health_and_sends_no_heal_number() {
+        use std::sync::Arc;
+
+        use crate::world::tests::{NOW, join, messages_to};
+
+        /// Its heal (`Health` 40).
+        const REGEN_HEAL: u32 = 40;
+        /// Less than two of its heals.
+        const HURT: u32 = 50;
+        /// The tick after the heal that fills the health.
+        const NEXT_TICK_MS: u64 = 33;
+        let mut world = crate::world::tests::world();
+        Arc::make_mut(&mut world.content).status_effects = rules();
+        join(&mut world, PLAYER, 0.0);
+        let entity = world.player_by_number(PLAYER).expect("player");
+        let regen = crc(&world.content.status_effects, REGEN);
+        let max = {
+            let mut vitals = world.world.get_mut::<Vitals>(entity).expect("vitals");
+            vitals.health.take(HURT);
+            vitals.health.max()
+        };
+        let state = |world: &mut SimWorld, at_ms: u64| {
+            world.server_ms = at_ms;
+            world.tick_status_effects(NOW);
+            let health = world.world.get::<Vitals>(entity).expect("vitals").health;
+            let holds = world
+                .world
+                .get::<Player>(entity)
+                .expect("player")
+                .status_effects
+                .holds(regen);
+            (health.current(), holds)
+        };
+        let _ = world.take_messages();
+        assert_eq!(state(&mut world, START_MS), (max - HURT, true), "hurt");
+        assert_eq!(
+            state(&mut world, START_MS + MS_PER_SECOND),
+            (max - HURT + REGEN_HEAL, true),
+            "its first heal a second later"
+        );
+        assert_eq!(
+            state(&mut world, START_MS + 2 * MS_PER_SECOND),
+            (max, true),
+            "the heal that fills the health"
+        );
+        assert_eq!(
+            state(&mut world, START_MS + 2 * MS_PER_SECOND + NEXT_TICK_MS),
+            (max, false),
+            "gone in the next tick"
+        );
+        assert!(
+            !messages_to(&world.take_messages(), PLAYER)
+                .iter()
+                .any(|message| matches!(message, ServerMessage::OnHealed(_))),
+            "no heal number"
+        );
     }
 }

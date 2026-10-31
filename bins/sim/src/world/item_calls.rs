@@ -114,16 +114,19 @@ impl ItemEffects {
     }
 }
 
-/// Changes `vitals` and `stamina` by `effect`, at most to their maximum: the health it gave.
-fn apply(effect: &VitalsEffect, vitals: &mut Vitals, stamina: &mut Stamina) -> u32 {
+/// Changes `vitals` and `stamina` by `effect` times `scale` (the multiple the user's held
+/// effects give it, [`super::status_effects`]), at most to their maximum: the health it gave.
+fn apply(effect: &VitalsEffect, scale: f64, vitals: &mut Vitals, stamina: &mut Stamina) -> u32 {
     if vitals.health.is_dead() {
         return 0;
     }
     let max = f64::from(vitals.health.max());
-    // The heal is below the max health plus a flat amount of a few thousand.
-    let amount = (effect.health + effect.health_share * max).max(0.0).round() as u32;
+    // The heal is a few times the max health plus a flat amount of a few thousand.
+    let amount = ((effect.health + effect.health_share * max) * scale)
+        .max(0.0)
+        .round() as u32;
     // Stamina values of a few dozen.
-    stamina.gain(effect.stamina as f32);
+    stamina.gain((effect.stamina * scale) as f32);
     vitals.health.heal(amount)
 }
 
@@ -478,16 +481,23 @@ impl SimWorld {
         if effects.is_empty() {
             return;
         }
-        let Some(mut stamina) = self
-            .world
-            .get::<Player>(entity)
-            .map(|player| player.stamina)
-        else {
+        let rules = &self.content.status_effects;
+        let Some((mut stamina, scales)) = self.world.get::<Player>(entity).map(|player| {
+            let scales: Vec<f64> = effects
+                .iter()
+                .map(|effect| {
+                    player
+                        .status_effects
+                        .potency_scale(rules, &effect.status_id)
+                })
+                .collect();
+            (player.stamina, scales)
+        }) else {
             return;
         };
         if let Some(mut vitals) = self.world.get_mut::<Vitals>(entity) {
-            for effect in effects {
-                apply(effect, &mut vitals, &mut stamina);
+            for (effect, scale) in effects.iter().zip(scales) {
+                apply(effect, scale, &mut vitals, &mut stamina);
             }
         }
         if let Some(mut player) = self.world.get_mut::<Player>(entity) {
@@ -495,13 +505,18 @@ impl SimWorld {
         }
     }
 
-    /// The repeating vitals changes of used consumables due at `now_ms`, for every player.
+    /// The repeating vitals changes of used consumables due at `now_ms`, for every player, each
+    /// times the multiple the player's held effects give it.
     pub(super) fn tick_item_effects(&mut self, now_ms: u64) {
+        let rules = &self.content.status_effects;
         let mut query = self.world.query::<(&mut Player, &mut Vitals)>();
         for (mut player, mut vitals) in query.iter_mut(&mut self.world) {
             let player = &mut *player;
             for effect in player.item_effects.due(now_ms, vitals.health.is_dead()) {
-                apply(&effect, &mut vitals, &mut player.stamina);
+                let scale = player
+                    .status_effects
+                    .potency_scale(rules, &effect.status_id);
+                apply(&effect, scale, &mut vitals, &mut player.stamina);
             }
         }
     }
@@ -923,6 +938,97 @@ mod tests {
                 target: 0,
                 entity: 0,
             }
+        }
+
+        /// Retail `general-other-01`: a `FoodRecoveryT2` heal was 187.03 at 502.111 s and 561.10
+        /// at 1212.654 s, while `Status_OutOfCombat_PassiveRegen` (`PassiveFoodRegen=2`) ran.
+        #[test]
+        fn a_food_heal_is_three_times_as_large_while_the_out_of_combat_regen_runs() {
+            use nw_content::item_rules::{Ticks, VitalsEffect};
+            use nw_content::status_effects::{
+                EffectSourceRow, StatusEffectRules, StatusEffectSource,
+            };
+
+            const FOOD: &str = "FoodRecoveryT2";
+            const REGEN: &str = "Status_OutOfCombat_PassiveRegen";
+            const FOOD_SHARE: f64 = 0.011;
+            const FOOD_EVERY_MS: u64 = 2_000;
+            const FOOD_DURATION_MS: u64 = 1_800_000;
+            /// The food's potency while the regen runs: 1 + `PassiveFoodRegen=2`.
+            const WITH_REGEN: f64 = 3.0;
+            const REGEN_POTENCY: f64 = 1.0;
+            let status_effects = StatusEffectRules::build(StatusEffectSource {
+                effects: vec![
+                    EffectSourceRow {
+                        status_id: FOOD.to_owned(),
+                        categories: Some("Recovery+PassiveFoodRegen+FoodUtility+Food".to_owned()),
+                        ..EffectSourceRow::default()
+                    },
+                    EffectSourceRow {
+                        status_id: REGEN.to_owned(),
+                        potency_mods: Some("PassiveFoodRegen=2".to_owned()),
+                        ..EffectSourceRow::default()
+                    },
+                ],
+                ..StatusEffectSource::default()
+            });
+            let mut world = world_of(PlayerContent {
+                status_effects,
+                ..PlayerContent::default()
+            });
+            let entity = world.by_connection[&connection(1)];
+            let food = VitalsEffect {
+                status_id: FOOD.to_owned(),
+                health: 0.0,
+                health_share: FOOD_SHARE,
+                stamina: 0.0,
+                ticks: Some(Ticks {
+                    first_ms: 0,
+                    every_ms: FOOD_EVERY_MS,
+                    duration_ms: FOOD_DURATION_MS,
+                }),
+                remove_on_death: false,
+                has_fx: false,
+            };
+            let max = {
+                let mut vitals = world.world.get_mut::<Vitals>(entity).expect("vitals");
+                vitals.health.take(HURT);
+                vitals.health.max()
+            };
+            world
+                .world
+                .get_mut::<Player>(entity)
+                .expect("player")
+                .item_effects
+                .start(&food, NOW);
+            let health = |world: &SimWorld| {
+                world
+                    .world
+                    .get::<Vitals>(entity)
+                    .expect("vitals")
+                    .health
+                    .current()
+            };
+            let before = health(&world);
+            world.tick_item_effects(NOW);
+            let alone = health(&world) - before;
+            let rules = Arc::clone(&world.content);
+            assert!(
+                world
+                    .world
+                    .get_mut::<Player>(entity)
+                    .expect("player")
+                    .status_effects
+                    .add_by_id(&rules.status_effects, REGEN, REGEN_POTENCY, 1, NOW)
+            );
+            let before = health(&world);
+            world.tick_item_effects(NOW + FOOD_EVERY_MS);
+            let with_regen = health(&world) - before;
+            let share = FOOD_SHARE * f64::from(max);
+            assert_eq!(
+                (f64::from(alone), f64::from(with_regen)),
+                (share.round(), (share * WITH_REGEN).round())
+            );
         }
 
         #[test]
