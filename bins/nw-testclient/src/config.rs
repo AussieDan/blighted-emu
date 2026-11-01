@@ -3,16 +3,20 @@
 //! section 9, M5 spec section 11).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use nw_common::config::{ConfigError, load_config};
+use nw_login::look::bot_creation_params;
 use nw_login::names::CHARACTER_NAME_MAX_LEN;
 use serde::Deserialize;
 
 use crate::fleet::{FleetSettings, MAX_BOTS, NAME_SUFFIX_LETTERS};
+use crate::gather::{GatherNode, GatherSettings};
 use crate::hunt::{HuntSettings, MAX_BOTS_PER_START};
 use crate::route::{Route, RouteError};
 use crate::swarm::SwarmSettings;
+use crate::walk::CHARACTER_CREATION_PARAMS;
 
 /// Environment prefix of overrides.
 pub const TESTCLIENT_ENV_PREFIX: &str = "NW_TESTCLIENT_";
@@ -61,6 +65,41 @@ pub struct TestClientConfig {
     pub swarm: SwarmConfig,
     /// `[hunt]`: the bots of the M6-B exit test.
     pub hunt: HuntConfig,
+    /// `[gather]`: the bots that gather the level's nodes.
+    pub gather: GatherConfig,
+}
+
+/// `[gather]`. The sockets, speed and ground are those of `[swarm]`; the bots appear at the
+/// director's `start_positions` and gather the nodes near them.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GatherConfig {
+    /// Bots to run.
+    pub bots: usize,
+    /// Account names are this and five digits; not the swarm's or the hunt's.
+    pub account_prefix: String,
+    /// Character names are this and three letters; letters only.
+    pub character_prefix: String,
+    /// New bots per second.
+    pub bots_per_second: u32,
+    /// The archetype pick of a new bot character (`Archetype_Mystic`): its starter kit.
+    pub backstory: String,
+    /// The tradeskills whose nodes the bots gather with their tools (the sim's `start_tools`).
+    pub tradeskills: Vec<String>,
+    /// A bot gathers the nodes within this distance of where it appeared, in metres.
+    pub search_m: f32,
+    /// A bot gathers a node within this distance, in metres.
+    pub reach_m: f32,
+    /// Longest wait for the server's answer to a gather, in milliseconds.
+    pub answer_wait_ms: u64,
+    /// Longest wait for the end of a taken gather, in milliseconds.
+    pub gather_wait_ms: u64,
+    /// Seconds in the world per bot.
+    pub duration_seconds: u64,
+    /// Longest gap between two own bundles, in milliseconds.
+    pub max_bundle_gap_ms: u64,
+    /// The metrics URL of every sim.
+    pub metrics_urls: Vec<String>,
 }
 
 /// `[hunt]` (M6-B spec section 11). The sockets, speed and ground are those of `[swarm]`.
@@ -171,6 +210,7 @@ impl TestClientConfig {
                 bots_per_second: swarm.bots_per_second,
                 duration_seconds: swarm.duration_seconds,
                 metrics_urls: &swarm.metrics_urls,
+                creation_params: CHARACTER_CREATION_PARAMS.to_owned(),
             },
             password,
         )?;
@@ -220,6 +260,7 @@ impl TestClientConfig {
                 bots_per_second: hunt.bots_per_second,
                 duration_seconds: hunt.duration_seconds,
                 metrics_urls: &hunt.metrics_urls,
+                creation_params: CHARACTER_CREATION_PARAMS.to_owned(),
             },
             password,
         )?;
@@ -244,6 +285,64 @@ impl TestClientConfig {
             attack_interval: Duration::from_millis(hunt.attack_interval_ms),
             respawn_wait: Duration::from_millis(hunt.respawn_wait_ms),
             max_bundle_gap: Duration::from_millis(hunt.max_bundle_gap_ms),
+        })
+    }
+
+    /// The gather settings with the bot password `password` and the level's gather nodes
+    /// `nodes`. The sockets and the walking speed come from `[swarm]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ScenarioConfigError`] for a `[gather]` value that is not allowed.
+    pub fn gather_settings(
+        &self,
+        password: String,
+        nodes: Arc<[GatherNode]>,
+    ) -> Result<GatherSettings, ScenarioConfigError> {
+        let gather = &self.gather;
+        if [&self.swarm.account_prefix, &self.hunt.account_prefix].contains(&&gather.account_prefix)
+        {
+            return invalid(
+                "account_prefix",
+                "the gather needs its own accounts: their characters pick an archetype",
+            );
+        }
+        let Some(creation_params) = bot_creation_params(&gather.backstory) else {
+            return invalid("backstory", "the creation settings do not write");
+        };
+        let fleet = self.fleet_settings(
+            Fleet {
+                bots: gather.bots,
+                account_prefix: &gather.account_prefix,
+                character_prefix: &gather.character_prefix,
+                bots_per_second: gather.bots_per_second,
+                duration_seconds: gather.duration_seconds,
+                metrics_urls: &gather.metrics_urls,
+                creation_params,
+            },
+            password,
+        )?;
+        if !(positive(gather.search_m) && positive(gather.reach_m)) {
+            return invalid(
+                "search_m",
+                "search and reach must be finite numbers above 0",
+            );
+        }
+        if gather.answer_wait_ms == 0 || gather.gather_wait_ms == 0 {
+            return invalid(
+                "answer_wait_ms",
+                "the answer and gather waits must be above 0",
+            );
+        }
+        Ok(GatherSettings {
+            fleet,
+            nodes,
+            search_m: gather.search_m,
+            speed_mps: self.swarm.speed_mps,
+            reach_m: gather.reach_m,
+            answer_wait: Duration::from_millis(gather.answer_wait_ms),
+            gather_wait: Duration::from_millis(gather.gather_wait_ms),
+            max_bundle_gap: Duration::from_millis(gather.max_bundle_gap_ms),
         })
     }
 
@@ -278,6 +377,7 @@ impl TestClientConfig {
             bots: fleet.bots,
             account_prefix: fleet.account_prefix.to_owned(),
             character_prefix: fleet.character_prefix.to_owned(),
+            creation_params: fleet.creation_params,
             password,
             login_url: self.login_url.clone(),
             game_url: self.game_url.clone(),
@@ -300,6 +400,7 @@ struct Fleet<'a> {
     bots_per_second: u32,
     duration_seconds: u64,
     metrics_urls: &'a [String],
+    creation_params: String,
 }
 
 fn invalid<T>(key: &'static str, reason: &'static str) -> Result<T, ScenarioConfigError> {
@@ -415,6 +516,32 @@ mod tests {
         config.swarm.duration_seconds = 0;
         config.swarm.bots_per_second = 0;
         assert!(config.swarm_settings(String::new()).is_err());
+    }
+
+    #[test]
+    fn gather_bots_pick_an_archetype_and_bad_values_are_refused() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(COMMITTED_CONFIG);
+        let config = load_testclient_config(&path).expect("config");
+        let nodes: Arc<[GatherNode]> = Arc::from([]);
+        let gather = config
+            .gather_settings(String::new(), Arc::clone(&nodes))
+            .expect("gather");
+        assert_ne!(
+            gather.fleet.creation_params, CHARACTER_CREATION_PARAMS,
+            "a gather bot picks an archetype"
+        );
+        let refused = |change: fn(&mut TestClientConfig)| {
+            let mut bad = config.clone();
+            change(&mut bad);
+            bad.gather_settings(String::new(), Arc::clone(&nodes))
+                .is_err()
+        };
+        assert!(refused(
+            |bad| bad.gather.account_prefix = bad.hunt.account_prefix.clone()
+        ));
+        assert!(refused(|bad| bad.gather.search_m = 0.0));
+        assert!(refused(|bad| bad.gather.answer_wait_ms = 0));
+        assert!(refused(|bad| bad.gather.bots = 0));
     }
 
     #[test]

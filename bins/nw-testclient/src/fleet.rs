@@ -62,6 +62,8 @@ pub struct FleetSettings {
     pub account_prefix: String,
     /// Character names are this and three letters.
     pub character_prefix: String,
+    /// The creation settings of a new bot character.
+    pub creation_params: String,
     /// The password of every bot account.
     pub password: String,
     /// `https://login.<domain>`.
@@ -368,6 +370,7 @@ async fn run_bot<B: FleetBot>(
         account,
         password: fleet.password.clone(),
         character_name,
+        creation_params: fleet.creation_params.clone(),
     };
     let admission = match walk(http, &walk_settings, |_| {}).await {
         Ok(admission) => admission,
@@ -447,6 +450,7 @@ pub(crate) mod test_support {
             bots: 2,
             account_prefix: "bot".to_owned(),
             character_prefix: "Swarm".to_owned(),
+            creation_params: crate::walk::CHARACTER_CREATION_PARAMS.to_owned(),
             password: "password-ok".to_owned(),
             login_url: String::new(),
             game_url: String::new(),

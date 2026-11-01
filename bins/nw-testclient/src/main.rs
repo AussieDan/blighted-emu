@@ -16,7 +16,9 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
 use clap::{Parser, Subcommand};
+use nw_content::bundle::{ContentBundle, bundle_path};
 use nw_content::client_build::load_client_build;
+use nw_content::gathering::{GatherRules, Gatherables};
 use nw_dtls::DtlsClientConfig;
 use nw_reflect::REGISTRATION_STATUS_AUTHORIZED;
 use nw_testclient::chat::{ChatSettings, run_chat};
@@ -24,12 +26,13 @@ use nw_testclient::config::{
     PASSWORD_ENV, SECOND_PASSWORD_ENV, SWARM_PASSWORD_ENV, TestClientConfig, load_testclient_config,
 };
 use nw_testclient::fleet::{NewClient, udp_receive_errors};
+use nw_testclient::gather::{GatherNode, run_gather};
 use nw_testclient::hunt::run_hunt;
 use nw_testclient::pair::{Check, PairSettings, run_pair};
 use nw_testclient::rep::{LedgerSlot, RepClient};
 use nw_testclient::swarm::run_swarm;
 use nw_testclient::udp::{Hold, run_rep};
-use nw_testclient::walk::{WalkSettings, login_token, walk};
+use nw_testclient::walk::{CHARACTER_CREATION_PARAMS, WalkSettings, login_token, walk};
 use nw_world::WorldFile;
 use nw_world::world_file::world_file_path;
 
@@ -78,6 +81,14 @@ enum Command {
     /// `[swarm]`). The bot password comes from `NW_SECRET_TESTCLIENT_SWARM_PASSWORD`.
     Hunt {
         /// Bots of this step instead of `[hunt] bots`.
+        #[arg(long)]
+        bots: Option<usize>,
+    },
+    /// Many bots that gather the level's nodes near where they appear (`[gather]`, with
+    /// accounts of their own and the sockets of `[swarm]`). The bot password comes from
+    /// `NW_SECRET_TESTCLIENT_SWARM_PASSWORD`.
+    Gather {
+        /// Bots of this step instead of `[gather] bots`.
         #[arg(long)]
         bots: Option<usize>,
     },
@@ -154,6 +165,13 @@ async fn steps(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             }
             hunt(&config, &http, trusted, ledger).await
         }
+        Command::Gather { bots } => {
+            let mut config = config;
+            if let Some(bots) = bots {
+                config.gather.bots = bots;
+            }
+            gather(&config, &http, trusted, ledger).await
+        }
         Command::Chat { line } => {
             chat(&config, &http, &trusted, own(&config)?, line, &ledger).await
         }
@@ -227,6 +245,104 @@ async fn hunt(
         errors_before,
         &report.checks(&settings),
     ))
+}
+
+async fn gather(
+    config: &TestClientConfig,
+    http: &reqwest::Client,
+    trusted: DtlsClientConfig,
+    ledger: Arc<LedgerSlot>,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let (ground, new_client) = fleet_parts(config, trusted, ledger)?;
+    let (nodes, gatherables) = gather_nodes(config, &ground)?;
+    println!("gather nodes in the level: {}", nodes.len());
+    let mut by_tradeskill = std::collections::BTreeMap::new();
+    for node in nodes.iter() {
+        let tradeskill = gatherables
+            .get(node.gatherable)
+            .and_then(|row| row.tradeskill.clone())
+            .unwrap_or_default();
+        *by_tradeskill.entry(tradeskill).or_insert(0_usize) += 1;
+    }
+    println!("gather nodes by tradeskill: {by_tradeskill:?}");
+    let settings = Arc::new(config.gather_settings(secret(SWARM_PASSWORD_ENV)?, nodes)?);
+    let errors_before = receive_errors();
+    let stop = stop_signal(settings.fleet.duration.is_none());
+    let report = run_gather(
+        http,
+        Arc::clone(&settings),
+        ground,
+        new_client,
+        stop,
+        |line| {
+            println!("{line}");
+        },
+    )
+    .await;
+    println!("{}", report.summary());
+    let name = |gatherable: u32| {
+        gatherables.get(gatherable).map_or(("unknown", "?"), |row| {
+            (row.id.as_str(), row.tradeskill.as_deref().unwrap_or("none"))
+        })
+    };
+    for (gatherable, count) in report.kinds() {
+        let (id, tradeskill) = name(gatherable);
+        println!("gathered {count} x {id} ({tradeskill})");
+    }
+    for (gatherable, count) in report.refused_kinds() {
+        let (id, tradeskill) = name(gatherable);
+        println!("refused {count} x {id} ({tradeskill})");
+    }
+    Ok(print_end(
+        report.error_kinds(),
+        errors_before,
+        &report.checks(&settings),
+    ))
+}
+
+/// The gather nodes of a level and the gatherables that name their kinds.
+type LevelNodes = (Arc<[GatherNode]>, Gatherables);
+
+/// The gather nodes of the `[swarm]` level that a new character with the tools of the
+/// `[gather] tradeskills` may gather: the gatherables of the content bundle of one of those
+/// tradeskills that are no loot container and ask for no tradeskill rank or item (the level's
+/// other gatherables are corpses, doors and quest objects); with the gatherables, which name
+/// each node's kind in the report.
+fn gather_nodes(
+    config: &TestClientConfig,
+    level: &WorldFile,
+) -> Result<LevelNodes, Box<dyn std::error::Error>> {
+    let swarm = &config.swarm;
+    let build = load_client_build(&swarm.client_build_config)?;
+    let tables = ContentBundle::load(&bundle_path(&swarm.content_dir, &build), &build)?.tables;
+    let gatherables = Gatherables::from_tables(&tables);
+    let rules = GatherRules::from_tables(&tables);
+    let tradeskills = &config.gather.tradeskills;
+    let workable = |crc: u32| {
+        let Some(gatherable) = gatherables.get(crc) else {
+            return false;
+        };
+        let rule = rules.of(crc);
+        let tool = gatherable.tradeskill.as_ref().is_some_and(|tradeskill| {
+            tradeskills
+                .iter()
+                .any(|own| own.eq_ignore_ascii_case(tradeskill))
+        });
+        !gatherable.loot_container
+            && rule.required_rank == 0
+            && rule.required_item.is_none()
+            && tool
+    };
+    let nodes = level
+        .gatherables
+        .iter()
+        .filter(|point| workable(point.gatherable_id))
+        .map(|point| GatherNode {
+            gatherable: point.gatherable_id,
+            at: point.position,
+        })
+        .collect();
+    Ok((nodes, gatherables))
 }
 
 /// The stop of a run without a duration: it turns `true` on Ctrl-C or when standard input
@@ -323,6 +439,7 @@ fn walk_settings(
         account: account.to_owned(),
         password,
         character_name: character_name.to_owned(),
+        creation_params: CHARACTER_CREATION_PARAMS.to_owned(),
     }
 }
 

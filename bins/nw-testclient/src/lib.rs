@@ -5,6 +5,7 @@
 pub mod chat;
 pub mod config;
 pub mod fleet;
+pub mod gather;
 pub mod hunt;
 pub mod pair;
 pub mod rep;

@@ -42,6 +42,20 @@ enum CombatEvent {
     Died { player: Option<u64> },
 }
 
+/// The server's answer to an interaction of the bot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InteractionAnswer {
+    /// 3743: the interaction `interaction` was taken (`status` 1) or refused (another status).
+    Validated {
+        /// The interaction id the bot sent.
+        interaction: u64,
+        /// The result.
+        status: u8,
+    },
+    /// 3746: the interaction is over (the gather time ran out).
+    Ended,
+}
+
 /// One world message, read.
 enum Read {
     /// Not a world message.
@@ -52,6 +66,11 @@ enum Read {
     Combat { type_index: u64, event: CombatEvent },
     /// `ClientAddEntryMsg`, with the client's own entity number.
     Entry { type_index: u64, own: Option<u64> },
+    /// An answer to an interaction (3743, 3746).
+    Interaction {
+        type_index: u64,
+        answer: InteractionAnswer,
+    },
     /// Another world message.
     Other { type_index: u64 },
 }
@@ -109,6 +128,17 @@ fn decode(received: &Received, holder: IdHolder, cards: Cards) -> Result<Read, V
                 player: entity_of_facet(death.head_b),
             },
         },
+        ServerMessage::InteractionValidated(answer) => Read::Interaction {
+            type_index,
+            answer: InteractionAnswer::Validated {
+                interaction: answer.interaction,
+                status: answer.status,
+            },
+        },
+        ServerMessage::InteractionEnded(_) => Read::Interaction {
+            type_index,
+            answer: InteractionAnswer::Ended,
+        },
         ServerMessage::ClientAddEntry(entry) => Read::Entry {
             type_index,
             own: Some(number_of_seen_raw_id(holder, &entry.entry_id)),
@@ -144,7 +174,9 @@ impl OwnView {
                 self.own = *own;
                 None
             }
-            Read::Skipped | Read::Combat { .. } | Read::Other { .. } => None,
+            Read::Skipped | Read::Combat { .. } | Read::Interaction { .. } | Read::Other { .. } => {
+                None
+            }
         }
     }
 
@@ -239,6 +271,8 @@ pub struct CombatView {
     hits_dealt: u64,
     hits_taken: u64,
     deaths: u64,
+    /// The answers to the bot's interactions since the last [`CombatView::take_interactions`].
+    interactions: Vec<InteractionAnswer>,
 }
 
 impl CombatView {
@@ -289,9 +323,15 @@ impl CombatView {
                     *counter += 1;
                 }
             }
+            Read::Interaction { answer, .. } => self.interactions.push(answer),
             Read::Skipped | Read::Entry { .. } | Read::Other { .. } => {}
         }
         Ok(own_position)
+    }
+
+    /// The answers to the bot's interactions since the last call, oldest first.
+    pub fn take_interactions(&mut self) -> Vec<InteractionAnswer> {
+        std::mem::take(&mut self.interactions)
     }
 
     /// The mobs with a position, by entity number.
@@ -426,7 +466,9 @@ impl WorldView {
                 self.own = own;
                 self.login.push(type_index);
             }
-            Read::Combat { type_index, .. } | Read::Other { type_index } => {
+            Read::Combat { type_index, .. }
+            | Read::Interaction { type_index, .. }
+            | Read::Other { type_index } => {
                 self.login.push(type_index);
             }
         }

@@ -167,6 +167,7 @@ impl Edge {
             account: format!("{ACCOUNT_PREFIX}{}", &random[..ACCOUNT_RANDOM_DIGITS]),
             password: PASSWORD.to_owned(),
             character_name: character_name.to_owned(),
+            creation_params: nw_testclient::walk::CHARACTER_CREATION_PARAMS.to_owned(),
         }
     }
 }

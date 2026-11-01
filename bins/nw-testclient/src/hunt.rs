@@ -329,22 +329,11 @@ impl Hunter {
         since: Duration,
         ground: &(dyn Ground + Send + Sync),
     ) -> Option<HuntAction> {
-        let (east, north) = (goal[0] - from[0], goal[1] - from[1]);
-        let distance = east.hypot(north);
         let elapsed = self
             .last_sent
             .map_or(SEND_INTERVAL, |sent| since.saturating_sub(sent));
-        let length = (self.settings.speed_mps * elapsed.as_secs_f32()).min(distance - stop_m);
-        if length <= 0.0 {
-            return None;
-        }
-        let (x, y) = (
-            from[0] + east / distance * length,
-            from[1] + north / distance * length,
-        );
-        let z = ground.height_at(x, y).unwrap_or(from[2]);
-        let next = InputPosition::from_metres(x, y, z)?;
-        self.here = Some([x, y, z]);
+        let (next, here) = walk_step(from, goal, stop_m, self.settings.speed_mps, elapsed, ground)?;
+        self.here = Some(here);
         self.last_sent = Some(since);
         Some(HuntAction::Move(next))
     }
@@ -378,12 +367,37 @@ impl Hunter {
     }
 }
 
+/// One walk step of `elapsed` at `speed_mps` from `from` toward `goal`, stopping `stop_m` short
+/// of it, on the ground: the input position and the place in metres; `None` when the bot is
+/// there.
+pub(crate) fn walk_step(
+    from: [f32; 3],
+    goal: [f32; 2],
+    stop_m: f32,
+    speed_mps: f32,
+    elapsed: Duration,
+    ground: &(dyn Ground + Send + Sync),
+) -> Option<(InputPosition, [f32; 3])> {
+    let (east, north) = (goal[0] - from[0], goal[1] - from[1]);
+    let distance = east.hypot(north);
+    let length = (speed_mps * elapsed.as_secs_f32()).min(distance - stop_m);
+    if length <= 0.0 {
+        return None;
+    }
+    let (x, y) = (
+        from[0] + east / distance * length,
+        from[1] + north / distance * length,
+    );
+    let z = ground.height_at(x, y).unwrap_or(from[2]);
+    Some((InputPosition::from_metres(x, y, z)?, [x, y, z]))
+}
+
 fn horizontal(own: WorldPosition, to: [f32; 2]) -> f32 {
     planar([own.x, own.y, own.z()], to)
 }
 
 /// The horizontal distance from `from` to `to`.
-fn planar(from: [f32; 3], to: [f32; 2]) -> f32 {
+pub(crate) fn planar(from: [f32; 3], to: [f32; 2]) -> f32 {
     (from[0] - to[0]).hypot(from[1] - to[1])
 }
 
@@ -628,7 +642,7 @@ impl FleetBot for HuntBot {
 }
 
 /// Sends `input` as the swarm does: unreliable, on the input channel.
-fn send_input(client: &mut RepClient, input: &ClientInputMsg) -> Result<(), RepError> {
+pub(crate) fn send_input(client: &mut RepClient, input: &ClientInputMsg) -> Result<(), RepError> {
     client.send_message(
         INPUT_CHANNEL,
         false,

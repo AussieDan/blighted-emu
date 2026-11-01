@@ -40,6 +40,8 @@ pub struct WalkSettings {
     pub password: String,
     /// Name of the character the walk creates when the account has none.
     pub character_name: String,
+    /// The creation settings of that character ([`CHARACTER_CREATION_PARAMS`]: none).
+    pub creation_params: String,
 }
 
 /// A failed HTTPS step.
@@ -145,7 +147,7 @@ pub async fn walk(
             let body = CreateCharacterRequestBody {
                 create_character_request: Some(CreateCharacterRequest {
                     name: Some(settings.character_name.clone()),
-                    character_creation_params: Some(CHARACTER_CREATION_PARAMS.to_owned()),
+                    character_creation_params: Some(settings.creation_params.clone()),
                     ..CreateCharacterRequest::default()
                 }),
             };

@@ -87,3 +87,31 @@ respawn_wait_ms = 2500
 duration_seconds = 120
 max_bundle_gap_ms = 250
 metrics_urls = ["http://127.0.0.1:9102/metrics"]
+
+# gather: bots pick an archetype (its starter kit), walk to the gather nodes of the level near
+# where they appear (the world file's gatherable points of the gatherables of the tradeskills
+# below that a new character may gather: no loot container, no rank or item asked) and gather
+# each until it ends.
+# Run the sims of a test world with the lowest tools worn by new characters (the data has no T1
+# logging axe; `2hAxeT2` is the lowest):
+# NW_SIM_START_TOOLS='[{item = "2hAxeT2", slot = 33}, {item = "1hSickleT1", slot = 34},
+# {item = "2hPickT1", slot = 36}]'. The sockets, walking speed and ground are those of [swarm].
+[gather]
+bots = 30
+# New accounts of their own: their characters pick an archetype.
+account_prefix = "gatherer"
+character_prefix = "Gatherer"
+bots_per_second = 10
+backstory = "Archetype_Soldier"
+# The tradeskills of the start tools (TOOL_SLOTS of the sim: 33 logging, 34 harvesting, 36
+# mining); only their nodes are gathered.
+tradeskills = ["Logging", "Harvesting", "Mining"]
+search_m = 300.0
+reach_m = 2.0
+# A 3743 comes in the tick after the request.
+answer_wait_ms = 5000
+# The longest T1 gathers with a T1 tool and no rank take about 10 s.
+gather_wait_ms = 30000
+duration_seconds = 180
+max_bundle_gap_ms = 250
+metrics_urls = ["http://127.0.0.1:9102/metrics"]

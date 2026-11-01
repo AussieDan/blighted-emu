@@ -223,6 +223,52 @@ pub struct InteractionRequest {
 }
 
 impl Bit8 {
+    /// The body of a gather of the object `target` (facet entity `target_entity`) of gatherable
+    /// `gatherable` (CRC-32 of its lowercase `GatherableID`), interaction `interaction`, laid
+    /// out as the retail flint request starts (gather note, newchar 739603: the object, its
+    /// facet entity, the interaction id, the kind twice, the facet entity again and the
+    /// gatherable), with the rest of the long body empty: no name, no strings, no vectors, zero
+    /// counters.
+    pub fn gather(
+        target: [u8; RAW_ID_LEN],
+        target_entity: u64,
+        interaction: u64,
+        gatherable: u32,
+    ) -> Result<Self, MessageError> {
+        const EMPTY: u64 = 0;
+        let mut writer = Writer::new();
+        writer
+            .bytes(&target)
+            .u64(target_entity)
+            .u64(interaction)
+            .u8(GATHER_KIND)
+            .u8(GATHER_KIND)
+            .u64(target_entity)
+            .u32(gatherable)
+            .prefixed(EMPTY)?
+            .bytes(&[0; LONG_AFTER_NAME_LEN])
+            .boolean(false);
+        for _ in 0..LONG_STRINGS_11_TO_14 {
+            writer.prefixed(EMPTY)?;
+        }
+        writer
+            .f32(0.0)
+            .boolean(false)
+            .boolean(false)
+            .bytes(&[0; LONG_COUNTERS_LEN])
+            .prefixed(EMPTY)?
+            .u32(0)
+            .prefixed(EMPTY)?
+            .prefixed(EMPTY)?
+            .bytes(&[0; LONG_STEPS_30_31_LEN])
+            .boolean(false)
+            .u32(0)
+            .prefixed(EMPTY)?
+            .bytes(&[0; LONG_TAIL_LEN])
+            .boolean(false);
+        Ok(Self::Body(writer.finish()))
+    }
+
     /// The interaction of a body; `None` for an empty one or a body too short.
     pub fn interaction(&self) -> Option<InteractionRequest> {
         let Self::Body(body) = self else {
@@ -753,6 +799,17 @@ impl ClientInputMsg {
             ],
             ..Self::default()
         }
+    }
+
+    /// The same input with the interaction `interaction` (bit 8) in its first record: the
+    /// client sends its interaction in every input until the interaction ends.
+    #[must_use]
+    pub fn interacting(mut self, interaction: Bit8) -> Self {
+        if let Some(record) = self.records.first_mut() {
+            record.mask |= 1 << BIT_8;
+            record.bit_8 = Some(interaction);
+        }
+        self
     }
 
     /// The same input with the view `view` (yaw and pitch, bit 6) in every record: the client
@@ -1983,6 +2040,29 @@ mod tests {
             .interaction()
             .expect("a request");
         assert_eq!(cut.gatherable, None, "too short for the gatherable");
+    }
+
+    #[test]
+    fn a_built_gather_reads_back_as_the_request_it_names() {
+        const TARGET: [u8; RAW_ID_LEN] = [7; RAW_ID_LEN];
+        const ENTITY: u64 = 0x5489_ec38_c63e_125b;
+        const INTERACTION: u64 = 0x053c_aadb_ccbb_f4e5;
+        const SINGLE_STONE: u32 = 0xa417_137f;
+        let body = Bit8::gather(TARGET, ENTITY, INTERACTION, SINGLE_STONE).expect("body");
+        let input =
+            ClientInputMsg::position(InputPosition::from_metres(10.0, 20.0, 30.0).expect("finite"))
+                .interacting(body);
+        let read = ClientInputMsg::decode(&input.encode().expect("encode")).expect("decode");
+        assert_eq!(
+            read.interaction(),
+            Some(InteractionRequest {
+                target: TARGET,
+                target_entity: ENTITY,
+                interaction: INTERACTION,
+                kind: GATHER_KIND,
+                gatherable: Some(SINGLE_STONE),
+            })
+        );
     }
 
     #[test]

@@ -17,7 +17,9 @@ use data_encoding::BASE64;
 use flate2::Compression;
 use flate2::read::ZlibDecoder;
 use flate2::write::ZlibEncoder;
-use nw_formats::objectstream::{Element, lowercase_crc32, parse_object_stream};
+use nw_formats::objectstream::{
+    Element, lowercase_crc32, parse_object_stream, write_object_stream,
+};
 use nw_messages::{LOOK_CHOICES, PlayerLook};
 
 /// The key of the creation settings in a stored character's appearance.
@@ -208,67 +210,82 @@ fn visuals(params: &str) -> Option<Element> {
     parse_object_stream(&blob).ok()
 }
 
+/// The saved names of the live test character, in [`PlayerLook`] child order: the look of the
+/// characters the test client creates with an archetype pick ([`bot_creation_params`]).
+const MALE_NAMES: [&str; LOOK_CHOICES] = [
+    "Male",
+    "face05",
+    "skin01",
+    "hairstyle65m",
+    "facialhair44m",
+    "haircolor5",
+    "haircolor5",
+    "eyecolor12",
+    "none",
+    "scar6",
+    "tattoo26",
+    "tattoocolor15",
+];
+/// Bytes below this one go in the JSON string as `\u` escapes, as the client writes them.
+const ESCAPE_BELOW: u8 = 0x20;
+
+/// The children of the look `names`, in [`PlayerLook`] child order.
+fn names(names: &[&str]) -> Vec<(&'static str, Vec<u8>)> {
+    [GENDER_NAME, RACE_NAME]
+        .into_iter()
+        .chain(CHOICE_LISTS.iter().map(|list| list.name))
+        .zip(names)
+        .map(|(child, name)| (child, name.as_bytes().to_vec()))
+        .collect()
+}
+
+/// Creation settings as the client writes them, with the ObjectStream children `children`: the
+/// ObjectStream bytes as one JSON string, byte by byte, in zlib and base64. `None` when the
+/// stream does not write.
+pub fn creation_params(children: &[(&str, Vec<u8>)]) -> Option<String> {
+    let root = Element {
+        children: children
+            .iter()
+            .map(|(name, value)| Element::with_value(lowercase_crc32(name), value.clone()))
+            .collect(),
+        ..Element::default()
+    };
+    let blob = write_object_stream(&root).ok()?;
+    let mut json = br#"{"currency":0,"visualsBlob":""#.to_vec();
+    for byte in blob {
+        if byte < ESCAPE_BELOW || byte == b'"' || byte == b'\\' {
+            json.extend(format!("\\u{byte:04x}").bytes());
+        } else {
+            json.push(byte);
+        }
+    }
+    json.extend(br#"","position":{"x":0.0,"y":0.0,"z":0.0},"currentLevel":0}"#);
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&json).ok()?;
+    Some(BASE64.encode(&encoder.finish().ok()?))
+}
+
+/// The creation settings of a test character: the live test character's look and the
+/// archetype pick `backstory` (`Archetype_Mystic`), so that it starts with that archetype's
+/// starter kit as a player does.
+pub fn bot_creation_params(backstory: &str) -> Option<String> {
+    let mut children = names(&MALE_NAMES);
+    children.push((BACKSTORY_NAME, backstory.as_bytes().to_vec()));
+    creation_params(&children)
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
-    use nw_formats::objectstream::write_object_stream;
-
     use super::*;
 
-    /// The saved names of the live test character, in [`PlayerLook`] child order.
-    const MALE_NAMES: [&str; LOOK_CHOICES] = [
-        "Male",
-        "face05",
-        "skin01",
-        "hairstyle65m",
-        "facialhair44m",
-        "haircolor5",
-        "haircolor5",
-        "eyecolor12",
-        "none",
-        "scar6",
-        "tattoo26",
-        "tattoocolor15",
-    ];
     /// Their list positions (player-appearance note, section 2).
     const MALE_LOOK: [u8; LOOK_CHOICES] = [0, 5, 0, 65, 44, 4, 4, 11, 0, 6, 26, 14];
     /// A value with bytes that are not UTF-8 and need JSON escapes, like the saved item ids.
     const RAW_VALUE: [u8; 4] = [0x88, 0x00, b'"', 0xff];
     /// A child that is not a look choice.
     const OTHER_CHILD: &str = "equipment";
-    const ESCAPE_BELOW: u8 = 0x20;
-
-    fn names(names: &[&str]) -> Vec<(&'static str, Vec<u8>)> {
-        [GENDER_NAME, RACE_NAME]
-            .into_iter()
-            .chain(CHOICE_LISTS.iter().map(|list| list.name))
-            .zip(names)
-            .map(|(child, name)| (child, name.as_bytes().to_vec()))
-            .collect()
-    }
-
-    /// Creation settings as the client writes them: the ObjectStream bytes as one JSON string,
-    /// byte by byte, in zlib and base64.
     fn params(children: &[(&str, Vec<u8>)]) -> String {
-        let root = Element {
-            children: children
-                .iter()
-                .map(|(name, value)| Element::with_value(lowercase_crc32(name), value.clone()))
-                .collect(),
-            ..Element::default()
-        };
-        let blob = write_object_stream(&root).expect("stream");
-        let mut json = br#"{"currency":0,"visualsBlob":""#.to_vec();
-        for byte in blob {
-            if byte < ESCAPE_BELOW || byte == b'"' || byte == b'\\' {
-                json.extend(format!("\\u{byte:04x}").bytes());
-            } else {
-                json.push(byte);
-            }
-        }
-        json.extend(br#"","position":{"x":0.0,"y":0.0,"z":0.0},"currentLevel":0}"#);
-        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-        encoder.write_all(&json).expect("compress");
-        BASE64.encode(&encoder.finish().expect("compress"))
+        creation_params(children).expect("params")
     }
 
     fn appearance(params: String) -> serde_json::Value {
@@ -338,6 +355,14 @@ pub(crate) mod tests {
             Some(0),
             "the first hair row is None"
         );
+    }
+
+    #[test]
+    fn a_test_character_saves_its_archetype_and_look() {
+        const PICK: &str = "Archetype_Mystic";
+        let saved = appearance(bot_creation_params(PICK).expect("params"));
+        assert_eq!(saved_backstory(&saved).as_deref(), Some(PICK));
+        assert_eq!(saved_look(&saved), Some(PlayerLook::of_choices(MALE_LOOK)));
     }
 
     #[test]
