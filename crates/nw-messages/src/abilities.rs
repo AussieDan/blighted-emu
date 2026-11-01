@@ -31,6 +31,9 @@ const PERSISTENT_CHILD: u8 = 0;
 const PERSISTENT_BIT: u16 = 1 << PERSISTENT_CHILD;
 /// Most mapped slots of one table (`FUN_14669fb50` refuses 4 or more).
 pub const MAX_MAPPED_SLOTS: usize = 3;
+/// The slot key of each mapped slot, which is also the input number of its ability key 1, 2
+/// and 3 (an input record's slot value x 64 + bit; ability-use-wire note: 402, 115 and 139).
+pub const ABILITY_KEYS: [u32; MAX_MAPPED_SLOTS] = [402, 115, 139];
 const FIELD: &str = "abilities";
 
 /// One mapped slot of an ability table.
@@ -38,8 +41,7 @@ const FIELD: &str = "abilities";
 pub struct MappedSlot {
     /// The ability id; 0 when the slot is empty.
     pub ability: u32,
-    /// The slot key (Unknown meaning; retail sends 402, 115 and 139 for the three slots of
-    /// every table).
+    /// The slot key: the input number of the ability key ([`ABILITY_KEYS`]).
     pub key: u32,
 }
 

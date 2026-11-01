@@ -43,6 +43,11 @@ pub const PLAYER_STAMINA_TICK_RATE: u16 = 0x5100;
 pub const PLAYER_TICK_RATE: u16 = 0;
 /// The `vitalsData` head byte of a dead creature (mob-cards note, section 5).
 const DEAD_HEAD: u8 = 1;
+/// The `vitalsData` head byte of a player at death's door (status effects note 2026-10-31:
+/// `NH-MSQ-5.1` 523.141 s, with `invulnerability` 1, before the dead head).
+const DEATHS_DOOR_HEAD: u8 = 2;
+/// The `invulnerability` of a player at death's door.
+const DEATHS_DOOR_INVULNERABLE: u8 = 1;
 /// The `vitalsData` head byte of a live creature's first state (ship-mobs-lockon-ai note,
 /// section 3.3: every retail tutorial creature card).
 const ALIVE_HEAD: u8 = 0;
@@ -100,9 +105,32 @@ impl VitalsData {
         }
     }
 
+    /// The block of a player who went down to death's door: its head and the server time of its
+    /// last spawn (retail kept `a` as it was).
+    pub const fn player_at_deaths_door(spawned_ms: u64) -> Self {
+        Self {
+            head: DEATHS_DOOR_HEAD,
+            ..Self::player_dead(spawned_ms)
+        }
+    }
+
+    /// The dead block of a player who died at death's door after `door_ms` there (retail
+    /// `NH-MSQ-5.1`: `b` 2430 after a hit 2.43 s in; about 120,033 after the full time).
+    pub const fn player_dead_after_door(spawned_ms: u64, door_ms: u64) -> Self {
+        Self {
+            b: door_ms,
+            ..Self::player_dead(spawned_ms)
+        }
+    }
+
     /// It is the block of a dead body.
     pub const fn is_dead(&self) -> bool {
         self.head == DEAD_HEAD
+    }
+
+    /// It is the block of a player at death's door.
+    pub const fn is_at_deaths_door(&self) -> bool {
+        self.head == DEATHS_DOOR_HEAD
     }
 
     /// The block of a player who lives again at server time `server_ms` (retail 483 to 488 ms
@@ -245,6 +273,9 @@ impl VitalsState {
                 health_amount: Some(health as f32),
                 health_change_flags: Some(FIRST_DAMAGE_FLAGS),
                 vitals_data: Some(data),
+                // Death's door holds the player invulnerable (retail 1 with its head; retail sent
+                // no change of it with the dead and the alive blocks after it).
+                invulnerability: data.is_at_deaths_door().then_some(DEATHS_DOOR_INVULNERABLE),
                 ..VitalsSlot0::default()
             }),
             slot_1: None,
@@ -705,6 +736,22 @@ mod tests {
         assert_eq!(data.a, server_ms * NS_PER_MS);
         assert!(RETAIL_NS - data.a < NS_PER_MS);
         assert_eq!(VitalsData::creature_first(0, server_ms).head, DEAD_HEAD);
+    }
+
+    #[test]
+    fn death_s_door_has_its_head_and_invulnerability_then_the_dead_block_its_time() {
+        const SPAWNED_MS: u64 = 842_881_859_891;
+        const DOOR_MS: u64 = 2_430;
+        let door = VitalsState::player_life(0, VitalsData::player_at_deaths_door(SPAWNED_MS));
+        let slot = door.slot_0.expect("slot 0");
+        let data = slot.vitals_data.expect("data");
+        assert!(data.is_at_deaths_door() && !data.is_dead());
+        assert_eq!(slot.invulnerability, Some(DEATHS_DOOR_INVULNERABLE));
+        let dead = VitalsData::player_dead_after_door(SPAWNED_MS, DOOR_MS);
+        assert!(dead.is_dead());
+        assert_eq!((dead.a, dead.b), (data.a, DOOR_MS), "retail NH-MSQ-5.1");
+        let plain = VitalsState::player_life(0, VitalsData::player_dead(SPAWNED_MS));
+        assert_eq!(plain.slot_0.expect("slot 0").invulnerability, None);
     }
 
     #[test]

@@ -518,6 +518,8 @@ const BOOM_KEYS: [(usize, u32); 3] = [(2, 35), (5, 57), (5, 51)];
 const ACTION_SLOTS: u8 = 19;
 /// The neutral scaled bytes of a record.
 const NEUTRAL_SLOT_BYTES: [u8; SLOT_BYTES] = [128; SLOT_BYTES];
+/// Input bits in one slot value: an input number is its value x 64 + its bit.
+const INPUT_BITS_PER_VALUE: u32 = u64::BITS;
 
 impl InputRecord {
     fn slot_bit(&self, value: usize, bit: u32) -> bool {
@@ -540,6 +542,22 @@ impl InputRecord {
     /// Whether the player presses quick slot 1 in this record.
     pub fn using_quick_slot_1(&self) -> bool {
         self.slot_bit(QUICK_SLOT_1_VALUE, QUICK_SLOT_1_BIT)
+    }
+
+    /// Whether this record holds input number `number` (the place of its action name in the
+    /// client's input actions, [`nw_formats::input_profile`]).
+    pub fn input_on(&self, number: u32) -> bool {
+        self.slot_bit(
+            (number / INPUT_BITS_PER_VALUE) as usize,
+            number % INPUT_BITS_PER_VALUE,
+        )
+    }
+
+    /// The ability key (0, 1 or 2) whose input this record holds ([`crate::ABILITY_KEYS`]).
+    pub fn ability_key(&self) -> Option<usize> {
+        crate::ABILITY_KEYS
+            .iter()
+            .position(|number| self.input_on(*number))
     }
 
     /// Whether the player pressed the attack key in this record.
@@ -1369,6 +1387,18 @@ mod tests {
     }
 
     /// A record with the retail slot values `values`.
+    #[test]
+    fn an_ability_key_is_its_input_number() {
+        // Input 402 (key 1) is value 6 bit 18; 139 (key 3) is value 2 bit 11.
+        let mut values = [0_u64; 10];
+        values[6] = 1 << 18;
+        assert_eq!(with_slots(values).ability_key(), Some(0));
+        let mut values = [0_u64; 10];
+        values[2] = 1 << 11;
+        assert_eq!(with_slots(values).ability_key(), Some(2));
+        assert_eq!(with_slots([0; 10]).ability_key(), None);
+    }
+
     fn with_slots(values: [u64; 10]) -> InputRecord {
         InputRecord {
             slots: InputSlots {

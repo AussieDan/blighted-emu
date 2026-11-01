@@ -87,8 +87,8 @@ pub mod war_signup;
 pub mod wire;
 
 pub use abilities::{
-    ABILITY_COMPONENT, ABILITY_TYPE_INDEX, AbilityState, MAX_MAPPED_SLOTS, MappedSlot, MappedTable,
-    MasteryTreeRespecResponseMsg, PersistentAbilities,
+    ABILITY_COMPONENT, ABILITY_KEYS, ABILITY_TYPE_INDEX, AbilityState, MAX_MAPPED_SLOTS,
+    MappedSlot, MappedTable, MasteryTreeRespecResponseMsg, PersistentAbilities,
 };
 pub use achievements::{
     ACHIEVEMENT_COMPONENT, ACHIEVEMENT_TYPE_INDEX, AchievementBits, AchievementState, ByteChange,
@@ -156,7 +156,8 @@ pub use containers::{
     ItemManagementState, OwnedChange, OwnedItem, OwnedItems,
 };
 pub use cooldowns::{
-    COOLDOWNS_COMPONENT, COOLDOWNS_TYPE_INDEX, ConsumableCooldown, CooldownsState,
+    AbilityCooldown, COOLDOWNS_COMPONENT, COOLDOWNS_TYPE_INDEX, ConsumableCooldown, CooldownChange,
+    CooldownMap, CooldownsState,
 };
 pub use day_phase::{OBSERVED_DAY_PHASE, SYNC_DAY_PHASE_MSG_TYPE_INDEX, SyncDayPhaseMsg};
 pub use economy::{EconomyCall, EconomyMessage};

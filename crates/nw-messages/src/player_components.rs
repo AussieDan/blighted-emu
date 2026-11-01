@@ -61,7 +61,7 @@ use crate::status_effects::{STATUS_EFFECTS_TYPE_INDEX, StatusEffectsState};
 use crate::temporary_affiliation::TEMPORARY_AFFILIATION_TYPE_INDEX;
 use crate::title_choice::{SOCIAL_COMPONENT, SOCIAL_TYPE_INDEX};
 use crate::travel_states::PLAYER_HOME_TYPE_INDEX;
-use crate::vitals::{VITALS_TYPE_INDEX, VitalsData, VitalsState};
+use crate::vitals::{VITALS_TYPE_INDEX, VitalsData, VitalsSlot1, VitalsState};
 use crate::wire::{MessageError, RAW_ID_LEN, Reader, Writer};
 
 /// Type index of `MB::PlayerComponentReplicatedState`.
@@ -148,7 +148,7 @@ pub const PLAYER_EMPTY_COMPONENTS: [(u64, u64); 57] = [
     (44, 4236),
     (45, 2932),
     (ABILITY_COMPONENT, ABILITY_TYPE_INDEX),
-    (47, MANA_TYPE_INDEX),
+    (PLAYER_MANA_COMPONENT, MANA_TYPE_INDEX),
     (48, 5257),
     (49, 3152),
     (50, 4321),
@@ -669,6 +669,9 @@ pub struct PlayerStates<'a> {
     pub cooldowns: Option<&'a CooldownsState>,
     /// The stamina children that changed, when some did.
     pub stamina: Option<StaminaState>,
+    /// The mana when it changed: the mana state's child 0, and the vitals' slot 1 mana (at most
+    /// 100; retail sends both, the vitals 100 ms later).
+    pub mana: Option<f32>,
     /// The combat status children that changed, when some did.
     pub combat_status: Option<CombatStatusState>,
 }
@@ -717,6 +720,11 @@ pub fn player_members(states: PlayerStates<'_>) -> impl Iterator<Item = BundleMe
 pub const PLAYER_VITALS_COMPONENT: u64 = 41;
 /// The own player component of the stamina.
 pub const PLAYER_STAMINA_COMPONENT: u64 = 42;
+/// The player component of the mana (`MB::ManaComponentReplicatedState`).
+pub const PLAYER_MANA_COMPONENT: u64 = 47;
+/// The most mana the vitals show (slot 1 child 0 follows the mana and never goes above 100,
+/// ability-use-wire note).
+const VITALS_MANA_MAX: f32 = 100.0;
 
 /// The members of the states that `states` holds besides the card's: the achievements, the
 /// objectives, the progression, the categorical progression, the progression points, the gear,
@@ -759,6 +767,25 @@ pub fn change_members(states: PlayerStates<'_>) -> Vec<BundleMember> {
             state: MemberState::Stamina(stamina),
         });
     }
+    if let Some(mana) = states.mana {
+        members.push(BundleMember {
+            component: PLAYER_MANA_COMPONENT,
+            state: MemberState::Mana(ManaState {
+                first: Some(mana),
+                ..ManaState::default()
+            }),
+        });
+        members.push(BundleMember {
+            component: PLAYER_VITALS_COMPONENT,
+            state: MemberState::Vitals(VitalsState {
+                slot_0: None,
+                slot_1: Some(VitalsSlot1 {
+                    mana_amount: Some(mana.min(VITALS_MANA_MAX)),
+                    ..VitalsSlot1::default()
+                }),
+            }),
+        });
+    }
     members
 }
 
@@ -791,6 +818,7 @@ pub fn gear_members(gear: &PlayerGear) -> impl Iterator<Item = BundleMember> + '
         cooldowns: None,
         stamina: None,
         combat_status: None,
+        mana: None,
     };
     player_members(states).filter(|member| {
         matches!(
@@ -1107,6 +1135,7 @@ mod tests {
             cooldowns: None,
             stamina: None,
             combat_status: None,
+            mana: None,
         };
         let members: Vec<BundleMember> = player_members(states).collect();
         assert_eq!(members.len(), PLAYER_EMPTY_COMPONENTS.len());
@@ -1176,6 +1205,7 @@ mod tests {
             cooldowns: None,
             stamina: None,
             combat_status: None,
+            mana: None,
         };
         let members: Vec<BundleMember> = player_members(states).collect();
         for member in &members {
@@ -1244,6 +1274,7 @@ mod tests {
             cooldowns: None,
             stamina: None,
             combat_status: None,
+            mana: None,
         };
         let members = change_members(death);
         assert_eq!(members.len(), 2);
@@ -1266,6 +1297,42 @@ mod tests {
             change_members(alive).len(),
             1,
             "a respawn sends the vitals only"
+        );
+    }
+
+    #[test]
+    fn a_mana_change_goes_to_the_mana_and_the_vitals_capped_at_100() {
+        // Retail level 64: the mana state at 110, the vitals at 100 (ability-use-wire note).
+        const MANA: f32 = 110.0;
+        let states = PlayerStates {
+            character_id: CHARACTER_ID,
+            look: None,
+            health: None,
+            gear: None,
+            achievements: None,
+            objectives: None,
+            progression: None,
+            categorical_progression: None,
+            progression_points: None,
+            currency: None,
+            health_change: None,
+            cooldowns: None,
+            stamina: None,
+            combat_status: None,
+            mana: Some(MANA),
+        };
+        let members = change_members(states);
+        assert_eq!(members.len(), 2);
+        assert_eq!(members[0].component, PLAYER_MANA_COMPONENT);
+        assert!(
+            matches!(members[0].state, MemberState::Mana(ManaState { first: Some(mana), .. }) if (mana - MANA).abs() < f32::EPSILON)
+        );
+        let MemberState::Vitals(vitals) = &members[1].state else {
+            panic!("vitals: {:?}", members[1]);
+        };
+        assert_eq!(
+            vitals.slot_1.as_ref().and_then(|slot| slot.mana_amount),
+            Some(VITALS_MANA_MAX)
         );
     }
 
@@ -1300,6 +1367,7 @@ mod tests {
             cooldowns: None,
             stamina: Some(spend),
             combat_status: None,
+            mana: None,
         };
         let members = change_members(states);
         let classes: Vec<u64> = members
@@ -1353,6 +1421,7 @@ mod tests {
             cooldowns: None,
             stamina: None,
             combat_status: None,
+            mana: None,
         };
         let members = change_members(states);
         assert_eq!(
@@ -1399,6 +1468,7 @@ mod tests {
             cooldowns: None,
             stamina: None,
             combat_status: Some(status),
+            mana: None,
         };
         let members = change_members(states);
         assert_eq!(
@@ -1461,6 +1531,7 @@ mod tests {
             cooldowns: None,
             stamina: None,
             combat_status: None,
+            mana: None,
         };
         let members: Vec<BundleMember> = player_members(states).collect();
         let state_of = |component: u64| {
@@ -1713,6 +1784,7 @@ mod tests {
             cooldowns: None,
             stamina: None,
             combat_status: None,
+            mana: None,
         };
         let classes: Vec<u64> = change_members(states)
             .iter()
