@@ -47,7 +47,7 @@ use super::hit_shape::{
     MOB_SWING_HALF_ARC_RAD, PLAYER_CAPSULE, SweptShape, Wedge, body_frame, homing_score, turn,
 };
 use super::mob_timeline::yaw_toward;
-use super::projectile::{AimLine, Shot};
+use super::projectile::{AimLine, Shot, ShotHit};
 use super::stamina::{Dodge, Guard};
 use super::{Body, MESSAGE_CHANNEL, Outgoing, Placement, Player, Position, SimWorld};
 use crate::combat::{AttackOutcome, AttackRefusal, RemoteHit, RespawnRefusal};
@@ -84,6 +84,49 @@ const US_PER_MS: u64 = 1000;
 /// the same attack's 34.05 unblocked).
 const BROKEN_GUARD_DAMAGE_DIVISOR: u32 = 2;
 
+/// A basic attack a player's client plays: when it started and its dodge cancel windows.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PlayingAttack {
+    started_ms: u64,
+    length_ms: u64,
+    /// [`BasicAttack::dodge_cancel_ms`].
+    dodge_cancel_ms: Option<Vec<[u64; 2]>>,
+    /// [`BasicAttack::block_disabled_ms`].
+    block_disabled_ms: Vec<[u64; 2]>,
+}
+
+impl PlayingAttack {
+    /// The attack `attack` started at `started_ms`.
+    pub(super) fn of(attack: &BasicAttack, started_ms: u64) -> Self {
+        Self {
+            started_ms,
+            length_ms: attack.length_ms,
+            dodge_cancel_ms: attack.dodge_cancel_ms.clone(),
+            block_disabled_ms: attack.block_disabled_ms.clone(),
+        }
+    }
+
+    /// Whether the attack holds the block down at `now_ms` (`BlockDisabled`).
+    pub(super) fn block_disabled(&self, now_ms: u64) -> bool {
+        let elapsed = now_ms.saturating_sub(self.started_ms);
+        self.block_disabled_ms
+            .iter()
+            .any(|[from, until]| (*from..*until).contains(&elapsed))
+    }
+
+    /// Whether a dodge may start at `now_ms` (`IfCanDodge`): after the attack, or in one of its
+    /// cancel windows, or always for an attack without them.
+    pub(super) fn dodge_free(&self, now_ms: u64) -> bool {
+        let elapsed = now_ms.saturating_sub(self.started_ms);
+        elapsed >= self.length_ms
+            || self.dodge_cancel_ms.as_ref().is_none_or(|windows| {
+                windows
+                    .iter()
+                    .any(|[from, until]| (*from..*until).contains(&elapsed))
+            })
+    }
+}
+
 /// A player's health and attack times.
 #[derive(Component, Debug, Clone, Copy)]
 pub(super) struct Vitals {
@@ -114,10 +157,18 @@ pub(super) struct Vitals {
     guard_broken: bool,
     /// The player held the dodge key in the newest input record.
     dodge_held: bool,
+    /// A dodge press waits for a cancel window of the playing attack while the key stays held
+    /// (`CanDodgeBuffer`, Inferred: a press let go before the window was refused in retail).
+    dodge_waiting: bool,
     /// The player pressed quick slot 1 in the newest input record.
     quick_slot_held: bool,
     /// The invulnerability of its dodge roll, from and until: mob hits miss.
     invulnerable_ms: Option<(u64, u64)>,
+    /// It went down to death's door then ([`nw_content::deaths_door`]): at 0 health, not dead
+    /// yet.
+    pub(super) deaths_door_since_ms: Option<u64>,
+    /// How long its last death's door lasted, for its dead block.
+    pub(super) deaths_door_ms: Option<u64>,
 }
 
 impl Vitals {
@@ -152,9 +203,24 @@ impl Vitals {
             block_key: false,
             guard_broken: false,
             dodge_held: false,
+            dodge_waiting: false,
             quick_slot_held: false,
             invulnerable_ms: None,
+            deaths_door_since_ms: None,
+            deaths_door_ms: None,
         }
+    }
+
+    /// It is down at death's door.
+    pub(super) const fn downed(&self) -> bool {
+        self.deaths_door_since_ms.is_some()
+    }
+
+    /// Its death's door ends in death at `now_ms`, after `door_ms` there.
+    pub(super) const fn close_deaths_door(&mut self, door_ms: u64, now_ms: u64) {
+        self.deaths_door_since_ms = None;
+        self.deaths_door_ms = Some(door_ms);
+        self.dead_since_ms = Some(now_ms);
     }
 }
 
@@ -610,7 +676,7 @@ impl SimWorld {
         if self
             .world
             .get::<Vitals>(target_entity)
-            .is_none_or(|vitals| vitals.health.is_dead())
+            .is_none_or(|vitals| vitals.health.is_dead() && !vitals.downed())
         {
             return Err(AttackRefusal::TargetDead);
         }
@@ -683,7 +749,7 @@ impl SimWorld {
 
     /// As [`SimWorld::hit`]; the attack interval applies only when `paced` (a second target of
     /// one swing is not a second attack).
-    fn hit_paced(
+    pub(super) fn hit_paced(
         &mut self,
         attacker: &ConnectionRef,
         target: u64,
@@ -1220,6 +1286,7 @@ impl SimWorld {
         if let Some(newest) = records.first() {
             self.stamina_input(entity, number, newest, swimming, now_ms);
         }
+        self.ability_presses(entity, records, now_ms);
         // The weapon the attack key uses: the one in the hand, else, while the hand holds a
         // spread-shot weapon (which fires through its own request), the melee option.
         let data = Arc::clone(&self.combat.data);
@@ -1383,6 +1450,9 @@ impl SimWorld {
             .get::<Player>(entity)
             .and_then(|player| player.view);
         let newest_view = records.first().and_then(|newest| newest.bit_6);
+        if let Some(mut player) = self.world.get_mut::<Player>(entity) {
+            player.attack_playing = Some(PlayingAttack::of(&attack, started_ms));
+        }
         self.player_swings.push(PlayerSwing {
             attacker: connection.clone(),
             aim: Aim {
@@ -1531,6 +1601,11 @@ impl SimWorld {
         now_ms: u64,
     ) {
         let stance = self.hand_stance(entity).cloned();
+        let dodge_free = self
+            .world
+            .get::<Player>(entity)
+            .and_then(|player| player.attack_playing.as_ref())
+            .is_none_or(|playing| playing.dodge_free(now_ms));
         // A potion takes effect at its stance's `Potion` use (333 ms), food at `Eat` (1,000 ms).
         let drink_ms = self
             .world
@@ -1552,8 +1627,14 @@ impl SimWorld {
             vitals.guard_broken = false;
         }
         let dodge = newest.dodging();
-        let dodge_pressed = dodge && !vitals.dodge_held;
+        vitals.dodge_waiting = dodge && (vitals.dodge_waiting || !vitals.dodge_held);
         vitals.dodge_held = dodge;
+        let dodge_pressed = vitals.dodge_waiting && dodge_free;
+        if dodge_pressed {
+            vitals.dodge_waiting = false;
+        } else if vitals.dodge_waiting {
+            tracing::debug!(player = number, "dodge waits for a cancel window");
+        }
         let quick = newest.using_quick_slot_1();
         if quick
             && !vitals.quick_slot_held
@@ -1668,7 +1749,7 @@ impl SimWorld {
     /// Every living, not returning mob, here or a ghost, with its body, at each place where it
     /// stood in the look-back ([`super::mob_trail`]): the client shows it a little behind the
     /// server.
-    fn target_places(&mut self) -> Vec<(u64, Position, Capsule)> {
+    pub(super) fn target_places(&mut self) -> Vec<(u64, Position, Capsule)> {
         let candidates: Vec<(u64, Position, Capsule)> = self
             .mob_states()
             .filter(|(_, _, state)| state.health > 0 && !state.returning)
@@ -1867,7 +1948,7 @@ impl SimWorld {
         };
         Landing::Done(self.cast(
             &swing.attacker,
-            (shot, swing.attack.damage_row.as_str()),
+            (shot, ShotHit::plain(swing.attack.damage_row.as_str())),
             (position, AimLine { yaw, pitch }),
             places,
             now_ms,
@@ -2016,14 +2097,30 @@ impl SimWorld {
         let tag = style.map_or(DEFAULT_HIT_TAG, |style| style.tag);
         let amount = self.player_absorbs(entity, tag, amount);
         self.player_hit_taken(entity);
+        let goes_down = self.goes_down(entity, attacker);
+        let door = &self.content.deaths_door;
+        let delay_ms = door.delay_ms;
         let mut vitals = self.world.get_mut::<Vitals>(entity)?;
         let max_health = amount_of(vitals.health.max());
-        let damage = vitals.health.take(amount);
-        if damage == Damage::Killed {
-            vitals.dead_since_ms = Some(now_ms);
-        }
+        let finishes = vitals.downed();
+        let damage = match vitals.deaths_door_since_ms {
+            // A downed player takes no hit in the door's delay; after it a hit kills it.
+            Some(since) if now_ms < since.saturating_add(delay_ms) => return None,
+            Some(since) => {
+                vitals.close_deaths_door(now_ms.saturating_sub(since), now_ms);
+                Damage::Killed
+            }
+            None => vitals.health.take(amount),
+        };
         if damage == Damage::AlreadyDead {
             return None;
+        }
+        let downs = damage == Damage::Killed && !finishes && goes_down;
+        if downs {
+            vitals.deaths_door_since_ms = Some(now_ms);
+            tracing::debug!(player = target, attacker, "player at death's door");
+        } else if damage == Damage::Killed {
+            vitals.dead_since_ms = Some(now_ms);
         }
         // A hit is combat: it ends the road boost on the frame of the hit
         // (`Traversal_Road_Sprint_Speed_Boost_CombatRemoval` `IfDamaged`).
@@ -2055,9 +2152,44 @@ impl SimWorld {
             connection.clone(),
             &ServerMessage::OnDamage(OnDamageMsg::melee(target, &melee)),
         );
-        if damage == Damage::Hurt {
+        if damage == Damage::Hurt || downs {
             return Some(AttackOutcome::Hit { target, amount });
         }
+        self.player_died(entity, target, attacker, connection);
+        Some(AttackOutcome::Killed { target })
+    }
+
+    /// Whether player `entity` killed by `attacker` goes down to death's door first: the sim's
+    /// game mode allows it and the attacker is not too many levels above
+    /// ([`nw_content::deaths_door::DeathsDoorRules::takes`]).
+    fn goes_down(&mut self, entity: Entity, attacker: u64) -> bool {
+        let attacker_player = self.player_by_number(attacker);
+        let progression = &self.content.progression;
+        let level_of_player = |entity: Entity| {
+            self.world
+                .get::<Player>(entity)
+                .map(|player| progression.level_of(player.experience))
+        };
+        let attacker_level = self
+            .mobs
+            .level(attacker)
+            .or_else(|| attacker_player.and_then(level_of_player));
+        let gap = attacker_level
+            .zip(level_of_player(entity))
+            .map(|(attacker, own)| i64::from(attacker) - i64::from(own));
+        let mode = self.instance_run.as_ref().map(|run| run.game_mode());
+        self.content.deaths_door.takes(mode, gap)
+    }
+
+    /// Player `entity` (`target`) died to `attacker`: its mobs forget it, its worn items wear,
+    /// its weapon goes away, its departure is saved and its client gets its death recap.
+    pub(super) fn player_died(
+        &mut self,
+        entity: Entity,
+        target: u64,
+        attacker: u64,
+        connection: ConnectionRef,
+    ) {
         self.mobs.forget(target);
         self.meta_event(entity, super::meta_achievements::MetaEvent::Died);
         // A death wears the worn items (durability loss, [`super::repair`]); a player killer
@@ -2079,7 +2211,6 @@ impl SimWorld {
             connection,
             &ServerMessage::DeathRecap(DeathRecapMsg::of(target)),
         );
-        Some(AttackOutcome::Killed { target })
     }
 
     /// Where `attacker` stands: a mob or a player, here or as a ghost; the origin when it is
@@ -2341,7 +2472,11 @@ impl SimWorld {
             ),
         };
         let mut player = self.world.get_mut::<Player>(entity)?;
-        let guard = (can_block && vitals.blocking() && player.stamina.current() > 0.0)
+        let block_up = !player
+            .attack_playing
+            .as_ref()
+            .is_some_and(|playing| playing.block_disabled(now_ms));
+        let guard = (can_block && vitals.blocking() && block_up && player.stamina.current() > 0.0)
             .then(|| player.stamina.blocked_hit(block_stamina));
         let stamina = player.stamina.current();
         let connection = player.connection.clone();
@@ -2524,7 +2659,7 @@ mod tests {
     const MOB_HEALTH: u32 = 1000;
     const INTERVAL_MS: u64 = crate::config::DEFAULT_MIN_ATTACK_INTERVAL_MS;
     const TICK_MS: u64 = 33;
-    const MOB_RESPAWN_MS: u64 = 360_000;
+    const MOB_RESPAWN_MS: u64 = crate::config::DEFAULT_MOB_RESPAWN_MS;
     /// The committed `min_respawn_ms`.
     const MIN_RESPAWN_MS: u64 = 2_000;
     /// Far beyond any wait.
@@ -4318,6 +4453,92 @@ mod tests {
             now += TICK_MS;
         }
         panic!("the mob never hit after the roll");
+    }
+
+    /// Retail's sword light attack (`player_sword.adb`, `1H_Melee+Sword` `Attack_Primary`):
+    /// `CanDodgeCancel` 0-200 ms and from 500 ms, `CanDodgeBuffer` between.
+    fn sword_light_playing(started_ms: u64) -> PlayingAttack {
+        PlayingAttack {
+            started_ms,
+            length_ms: 1_420,
+            dodge_cancel_ms: Some(vec![[0, 200], [500, 1_420]]),
+            block_disabled_ms: vec![[200, 533]],
+        }
+    }
+
+    fn dodge_record(held: bool) -> InputRecord {
+        InputRecord {
+            slots: nw_messages::InputSlots {
+                count: 19,
+                values: vec![0, u64::from(held) << 3],
+                bytes: [0; 4],
+            },
+            ..InputRecord::default()
+        }
+    }
+
+    fn stamina_of(world: &mut SimWorld) -> f32 {
+        let entity = world.player_by_number(1).expect("player");
+        world
+            .world
+            .get::<Player>(entity)
+            .expect("player")
+            .stamina
+            .current()
+    }
+
+    #[test]
+    fn a_dodge_in_an_attack_waits_for_its_cancel_window_while_the_key_is_held() {
+        let mut world = fight();
+        let entity = world.player_by_number(1).expect("player");
+        world
+            .world
+            .get_mut::<Player>(entity)
+            .expect("player")
+            .attack_playing = Some(sword_light_playing(NOW));
+        let full = stamina_of(&mut world);
+        // Retail: refused at 252 to 414 ms (the buffer) when let go before 500 ms.
+        world.attack_input(&connection(1), &[dodge_record(true)], NOW + 300);
+        assert!(
+            (stamina_of(&mut world) - full).abs() < f32::EPSILON,
+            "waits"
+        );
+        world.attack_input(&connection(1), &[dodge_record(false)], NOW + 400);
+        world.attack_input(&connection(1), &[dodge_record(false)], NOW + 520);
+        assert!(
+            (stamina_of(&mut world) - full).abs() < f32::EPSILON,
+            "let go: none"
+        );
+        // Held into the window, it rolls there.
+        world
+            .world
+            .get_mut::<Player>(entity)
+            .expect("player")
+            .attack_playing = Some(sword_light_playing(NOW + 2_000));
+        world.attack_input(&connection(1), &[dodge_record(true)], NOW + 2_300);
+        world.attack_input(&connection(1), &[dodge_record(true)], NOW + 2_520);
+        assert!(stamina_of(&mut world) < full, "rolled at the window");
+    }
+
+    #[test]
+    fn a_dodge_is_free_in_the_cancel_windows_and_after_the_attack() {
+        let playing = sword_light_playing(NOW);
+        // Retail: taken at 17, 566 and 1182 ms.
+        for elapsed in [17, 566, 1_182, 1_500] {
+            assert!(playing.dodge_free(NOW + elapsed), "{elapsed} ms");
+        }
+        for elapsed in [252, 400, 414] {
+            assert!(!playing.dodge_free(NOW + elapsed), "{elapsed} ms");
+        }
+        let unmarked = PlayingAttack {
+            dodge_cancel_ms: None,
+            ..sword_light_playing(NOW)
+        };
+        assert!(unmarked.dodge_free(NOW + 300));
+        // The sword light attack's `BlockDisabled` is 200-533 ms.
+        assert!(!playing.block_disabled(NOW + 150));
+        assert!(playing.block_disabled(NOW + 300));
+        assert!(!playing.block_disabled(NOW + 533));
     }
 
     #[test]

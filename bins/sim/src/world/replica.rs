@@ -446,6 +446,7 @@ impl Replica {
                 cooldowns: None,
                 stamina: None,
                 combat_status: None,
+                mana: None,
             };
             let Some(mut group) = entity_group(
                 interest,

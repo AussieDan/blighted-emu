@@ -183,7 +183,7 @@ impl Attributes {
 
     /// The final value of attribute `id`: its base and its spent points; 0 for an id the rules
     /// do not have.
-    fn value(&self, rules: &CharacterPoints, id: u32) -> u32 {
+    pub(super) fn value(&self, rules: &CharacterPoints, id: u32) -> u32 {
         rules
             .attribute(id)
             .map_or(0, |range| range.base.saturating_add(self.spent_on(id)))

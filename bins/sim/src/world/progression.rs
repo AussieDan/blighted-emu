@@ -18,9 +18,9 @@ use nw_content::progression::{AZOTH_PROGRESSION, Mastery, Progression};
 use nw_formats::objectstream::lowercase_crc32;
 use nw_messages::items::FIRST_VERSION;
 use nw_messages::{
-    AbilityState, CategoricalProgressionState, MAX_MAPPED_SLOTS, MappedSlot, MappedTable,
-    MasteryChange, MasteryEntry, MasteryFields, PersistentAbilities, PointEntry, PointPool,
-    PoolCategory, ProgressionPointState,
+    ABILITY_KEYS, AbilityState, CategoricalProgressionState, MAX_MAPPED_SLOTS, MappedSlot,
+    MappedTable, MasteryChange, MasteryEntry, MasteryFields, PersistentAbilities, PointEntry,
+    PointPool, PoolCategory, ProgressionPointState,
 };
 
 use super::{Player, SimWorld};
@@ -31,7 +31,6 @@ const MAX_COINS: u64 = i64::MAX.unsigned_abs();
 const NO_LEVELS: &str = "the content has no level table";
 /// The slot key of each mapped slot of an ability table: retail sends 402, 115 and 139 for the
 /// three slots of all 29 tables (newchar 2026-09-18 and NH-MSQ-2.1 logins; meaning Unknown).
-const RETAIL_SLOT_KEYS: [u32; MAX_MAPPED_SLOTS] = [402, 115, 139];
 /// The most points of one territory standing point (3681 note: territory standing entries
 /// hold up to 14).
 const TERRITORY_POINT_MAX: u16 = 14;
@@ -124,6 +123,24 @@ pub(super) struct Masteries {
 }
 
 impl Masteries {
+    /// The ids of the weapon progression points with points in them: each is the `AbilityID` of
+    /// the ability (or upgrade) it unlocks.
+    pub(super) fn spent_points(&self) -> impl Iterator<Item = &str> + '_ {
+        self.points
+            .iter()
+            .filter(|point| point.level > 0)
+            .map(|point| point.id.as_str())
+    }
+
+    /// The abilities mapped to ability key `key` (0, 1 or 2) over every weapon tree, as CRC-32
+    /// of their lowercase ids; empty slots left out.
+    pub(super) fn mapped_to(&self, key: usize) -> impl Iterator<Item = u32> + '_ {
+        self.slots
+            .values()
+            .filter_map(move |slots| slots.get(key).copied())
+            .filter(|ability| *ability != 0)
+    }
+
     /// The masteries of `saved` (id to total experience): the ones `progression` knows go to
     /// the client; another id is kept unsent, with a log line. The client's lists go on above
     /// `versions` (the 911 and 3681 versions it got from the sim before; 0 for none): retail's
@@ -546,7 +563,7 @@ impl Masteries {
                     let abilities = self.slots.get(table).copied().unwrap_or_default();
                     MappedTable {
                         table: *table,
-                        slots: RETAIL_SLOT_KEYS
+                        slots: ABILITY_KEYS
                             .iter()
                             .zip(abilities)
                             .map(|(key, ability)| MappedSlot { ability, key: *key })

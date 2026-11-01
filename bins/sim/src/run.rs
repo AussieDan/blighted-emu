@@ -20,6 +20,7 @@ use nw_content::datatable_overrides::{self, DatatableOverrideError};
 use nw_content::ftue_entities::FtueLevel;
 use nw_content::gameplay_config::GameplayConfig;
 use nw_content::mob_prefabs::MobPrefabs;
+use nw_content::player_abilities::PlayerAbilities;
 use nw_content::player_attacks::PlayerAttacks;
 use nw_content::player_sequences::PlayerSequences;
 use nw_db::{DbError, GLOBAL_MIGRATOR, WORLD_MIGRATOR, check_schema};
@@ -173,6 +174,16 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
             PlayerAttacks::default()
         }
     };
+    let player_abilities = match PlayerAbilities::load(&config.content_dir, &build) {
+        Ok(table) => {
+            tracing::info!(lists = table.lists.len(), "player ability table");
+            table
+        }
+        Err(error) => {
+            tracing::warn!(%error, "no player ability table: players cannot use abilities");
+            PlayerAbilities::default()
+        }
+    };
     let player_sequences = match PlayerSequences::load(&config.content_dir, &build) {
         Ok(table) => {
             tracing::info!(stances = table.len(), "player sequence table");
@@ -190,6 +201,7 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
     let combat = Arc::new(
         CombatData::from_tables(&bundle.tables, &config.combat.rows())?
             .with_player_attacks(player_attacks)
+            .with_player_abilities(player_abilities)
             .with_player_sequences(player_sequences),
     );
     let (mob_looks, look_assets) = match MobPrefabs::load(&config.content_dir, &build) {

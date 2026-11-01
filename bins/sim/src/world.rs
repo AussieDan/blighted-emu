@@ -40,13 +40,13 @@ use nw_messages::paperdoll::slot::{
 };
 use nw_messages::{
     ABILITY_COMPONENT, ATTRIBUTE_COMPONENT, Adopted, BundleGroup, BundleMember, ClientFacetMsg,
-    ConsumableCooldown, CooldownsState, CurrencyState, DisableCollisionMsg,
-    GatheringInterruptedMsg, Hands, HealthChange, InputRecord, InteractionEndedMsg,
-    InteractionRequest, InteractionValidatedMsg, LOGIN_CLIENT_CONTEXT, LevelSpec, LookDir,
-    LookupRequest, MeleeHitMsg, MemberState, MessageError, PlayerLook, PlayerSeenByAiMsg,
-    PlayerStates, ProgressionState, SelectedAsTargetMsg, ServerMessage, ShownItem, TUTORIAL_LEVEL,
-    TargetMsg, TeleportStep, TimeSynchMsg, UnselectedAsTargetMsg, VitalsData, WorldPosition,
-    facet_entity, put_looking_through_loadout, put_member,
+    ConsumableCooldown, CooldownChange, CooldownMap, CooldownsState, CurrencyState,
+    DisableCollisionMsg, GatheringInterruptedMsg, Hands, HealthChange, InputRecord,
+    InteractionEndedMsg, InteractionRequest, InteractionValidatedMsg, LOGIN_CLIENT_CONTEXT,
+    LevelSpec, LookDir, LookupRequest, MeleeHitMsg, MemberState, MessageError, PlayerLook,
+    PlayerSeenByAiMsg, PlayerStates, ProgressionState, SelectedAsTargetMsg, ServerMessage,
+    ShownItem, TUTORIAL_LEVEL, TargetMsg, TeleportStep, TimeSynchMsg, UnselectedAsTargetMsg,
+    VitalsData, WorldPosition, facet_entity, put_looking_through_loadout, put_member,
 };
 use nw_sim_core::{
     CellBounds, CellGrid, CellOwners, Dice, Footing, Ground, GroundCheck, Health, Interest,
@@ -57,6 +57,7 @@ use nw_world::collision_index::CollisionIndex;
 use thiserror::Error;
 use uuid::Uuid;
 
+mod abilities;
 mod admin;
 mod asset_script;
 mod attack;
@@ -112,6 +113,7 @@ mod slots;
 pub mod social;
 mod social_bus;
 mod social_states;
+mod spell_areas;
 mod stamina;
 mod statics;
 mod status_effects;
@@ -659,12 +661,20 @@ struct Player {
     fall: fall_damage::FallTrack,
     /// The health its client last got (a card or a vitals change).
     health_sent: Option<u32>,
+    /// Its client got its death's door block and not yet the end of it.
+    deaths_door_sent: bool,
     /// The max health its client was last sent; `None` before the first card.
     health_max_sent: Option<u32>,
     /// The server time of its last spawn or respawn (ms since 2000-01-01).
     life_ms: u64,
     /// Its stamina.
     stamina: Stamina,
+    /// Its weapon abilities: the key presses, the running ability actions, the cooldowns and the
+    /// mana ([`abilities`]).
+    abilities: abilities::AbilityRun,
+    /// The basic attack its client plays, for the dodge's cancel windows
+    /// ([`attack::PlayingAttack`]).
+    attack_playing: Option<attack::PlayingAttack>,
     /// Its mounts: the chosen one, their dyes and names, the summon, the ride and its stamina
     /// ([`mount`]).
     mount: mount::PlayerMount,
@@ -881,6 +891,8 @@ pub struct SimWorld {
     boss_phases: HashMap<u64, u32>,
     /// The boss phase each shown boss mob last sent.
     boss_phases_shown: HashMap<u64, u32>,
+    /// The remote effects each shown mob's clients have, with the map's version.
+    mob_effects_shown: HashMap<u64, (u64, Vec<(u16, nw_messages::RemoteEffect)>)>,
     /// The last player each shown mob picked as its target, by entity number.
     look_targets: HashMap<u64, u64>,
     /// The open world's gather nodes that left their default state.
@@ -914,6 +926,10 @@ pub struct SimWorld {
     player_swings: Vec<PlayerSwing>,
     /// The projectiles of ranged and magic attacks on their way to their mob.
     projectile_flights: Vec<projectile::ProjectileFlight>,
+    /// The status effects of friendly ability projectiles on their way to their player.
+    effect_flights: Vec<abilities::EffectFlight>,
+    /// The spell areas of player abilities, open or still to open.
+    spell_areas: Vec<spell_areas::SpellArea>,
     /// The projectiles mobs fired, on their way to where they aimed.
     mob_shots: Vec<mob_shot::MobShot>,
     /// Swings that a tutorial script started, for the next tick.
@@ -1051,6 +1067,7 @@ impl SimWorld {
             mob_health_shown: HashMap::new(),
             boss_phases: HashMap::new(),
             boss_phases_shown: HashMap::new(),
+            mob_effects_shown: HashMap::new(),
             look_targets: HashMap::new(),
             nodes: Nodes::default(),
             stations: crafting::Stations::build(&content.stations, &content.structure_costs),
@@ -1076,6 +1093,8 @@ impl SimWorld {
             swings: Vec::new(),
             player_swings: Vec::new(),
             projectile_flights: Vec::new(),
+            effect_flights: Vec::new(),
+            spell_areas: Vec::new(),
             mob_shots: Vec::new(),
             scripted_swings: Vec::new(),
             stat_events: Vec::new(),
@@ -1979,7 +1998,8 @@ impl SimWorld {
     /// The ids of the mobs that left end with them; a respawned mob is a new spawn with a new
     /// id, and every client that had its old card stops that slot and gets a new card (GDE id
     /// note, "Dynamic entities": retail gave 654 respawns a new `GdeRef` and card, and never
-    /// showed a dead mob's id alive again).
+    /// showed a dead mob's id alive again). A mob that fell asleep starts a new timeline: when a
+    /// player comes near again it plays `Spawn` ([`crate::mobs::Mobs::take_slept`]).
     fn end_mob_ids(&mut self) {
         for entity in self.mobs.take_left() {
             nw_messages::release_raw_id(self.raw_ids, entity);
@@ -1987,6 +2007,9 @@ impl SimWorld {
         for entity in self.mobs.take_respawned() {
             nw_messages::renew_raw_id(entity);
             self.recard(entity);
+        }
+        for entity in self.mobs.take_slept() {
+            self.mob_timelines.forget(entity);
         }
     }
 
@@ -2042,7 +2065,7 @@ impl SimWorld {
 
     /// Every awake mob of this sim and every mob ghost: entity number, position and state. An
     /// asleep mob has no player within its wake radius, so it is in no player's view or reach.
-    fn mob_states(&self) -> impl Iterator<Item = (u64, Position, MobGhost)> + '_ {
+    pub(super) fn mob_states(&self) -> impl Iterator<Item = (u64, Position, MobGhost)> + '_ {
         self.ghosts
             .values()
             .flat_map(|ghosts| &ghosts.entities)
@@ -2134,7 +2157,7 @@ impl SimWorld {
         let places: Vec<(u64, Position)> =
             self.mob_states().map(|(mob, at, _)| (mob, at)).collect();
         self.mob_trails.record(now_ms, places.into_iter());
-        let player_attacks = self.player_swings_due(now_ms);
+        let mut player_attacks = self.player_swings_due(now_ms);
         self.tick_tutorials(now_ms);
         self.tick_quests(now_ms);
         self.tick_events(now_ms);
@@ -2146,6 +2169,7 @@ impl SimWorld {
         self.server_ms = server_time;
         self.tick_max_health();
         self.tick_status_effects(now_ms);
+        self.tick_deaths_door(now_ms);
         self.tick_falls(now_ms);
         self.tick_mounts(now_ms);
         self.tick_quick_courses(now_ms);
@@ -2158,6 +2182,7 @@ impl SimWorld {
         self.crafts_due(now_ms);
         self.tick_fishing(now_ms);
         self.tick_music(now_ms);
+        player_attacks.extend(self.tick_abilities(now_ms));
         self.tick_meta_achievements();
         self.tick_travel(now_ms);
         self.tick_phasing();
@@ -2183,7 +2208,8 @@ impl SimWorld {
         let mut seen: Vec<Seen> = Vec::new();
         let mut query = self.world.query::<(&Player, &Body, &Vitals)>();
         for (player, body, vitals) in query.iter(&self.world) {
-            if vitals.health.is_dead() {
+            // A downed player stays a target: a mob's hit finishes it (retail `NH-MSQ-5.1`).
+            if vitals.health.is_dead() && !vitals.downed() {
                 continue;
             }
             seen.push(Seen {
@@ -3899,6 +3925,20 @@ impl SimWorld {
                 card.boss_phase = Some(phase);
                 card.boss_phase_changed = shown != Some(phase);
             }
+            let effects = self
+                .mob_effects
+                .get(&entity)
+                .map(|held| held.remote_entries(&content.status_effects))
+                .unwrap_or_default();
+            let shown = self.mob_effects_shown.get(&entity);
+            if shown.is_some_and(|(_, entries)| *entries != effects)
+                || (shown.is_none() && !effects.is_empty())
+            {
+                let version = shown.map_or(0, |(version, _)| *version) + 1;
+                self.mob_effects_shown.insert(entity, (version, effects));
+                card.remote_effects_changed = true;
+            }
+            card.remote_effects = self.mob_effects_shown.get(&entity).cloned();
             card.skinned = self.skinned.contains_key(&entity);
             card.skinned_changed = card.skinned && self.skinned_shown.insert(entity);
             let unseen = owner.is_some_and(|owner| !spawned.contains(&owner));
@@ -3945,6 +3985,8 @@ impl SimWorld {
         self.mob_health_shown
             .retain(|entity, _| shown.contains(entity));
         self.boss_phases_shown
+            .retain(|entity, _| shown.contains(entity));
+        self.mob_effects_shown
             .retain(|entity, _| shown.contains(entity));
         self.look_targets.retain(|entity, _| shown.contains(entity));
         let mobs = &self.mobs;
@@ -4192,9 +4234,12 @@ impl SimWorld {
                         status_effects: status_effects::StatusEffects::default(),
                         fall: fall_damage::FallTrack::default(),
                         health_sent: None,
+                        deaths_door_sent: false,
                         health_max_sent: None,
                         life_ms: 0,
                         stamina: Stamina::default(),
+                        abilities: abilities::AbilityRun::default(),
+                        attack_playing: None,
                         mount: mount::PlayerMount::of(&arrival.progression.mounts),
                         fishing: fishing::PlayerFishing::continuing(arrival.fishing_sequence),
                         music: music::PlayerMusicState::of(&arrival.progression.music),
@@ -4783,27 +4828,57 @@ impl Neighbourhood<'_> {
                 // with each quest reward, beach-quests note).
                 let currency = (first || std::mem::take(&mut player.coins_changed))
                     .then(|| CurrencyState::of(player.coins));
-                // The cooldowns and a heal after a potion.
-                let cooldowns = std::mem::take(&mut player.cooldowns_changed).then(|| {
+                // The cooldowns and a heal after a potion; an ability's cooldown goes in the map of
+                // the key that started it, as one changed entry (ability-use-wire note).
+                let consumables = std::mem::take(&mut player.cooldowns_changed).then(|| {
                     player.list_version += 1;
-                    CooldownsState {
-                        consumables: Some(FullList {
-                            version: Some(player.list_version),
-                            elements: player.cooldowns.clone(),
-                        }),
+                    FullList {
+                        version: Some(player.list_version),
+                        elements: player.cooldowns.clone(),
                     }
                 });
+                let mut keys: [Option<CooldownMap>; nw_messages::MAX_MAPPED_SLOTS] =
+                    Default::default();
+                for (key, cooldown) in player.abilities.take_cooldown_changes() {
+                    player.list_version += 1;
+                    let change = CooldownChange {
+                        cooldown,
+                        version: player.list_version,
+                    };
+                    match keys.get_mut(key) {
+                        Some(Some(CooldownMap::Changes(changes))) => changes.push(change),
+                        Some(slot) => *slot = Some(CooldownMap::Changes(vec![change])),
+                        None => {}
+                    }
+                }
+                let cooldowns = (consumables.is_some() || keys.iter().any(Option::is_some))
+                    .then_some(CooldownsState { keys, consumables });
                 // The health goes with each card; between cards, a change of it goes as its own
                 // vitals change (retail: 40 to 110 ms after each damaging 3601, flags 3 on the
                 // first damage from full health).
                 let health = vitals.health.current();
                 // A death and a new life go even with a card: the client shows its death screen
                 // and takes its moves again only on them (open-world note).
+                // Death's door goes first with its own block, then its end with the dead block
+                // and the time spent in it (status effects note 2026-10-31).
                 let life = match player.health_sent {
                     Some(sent) if sent > 0 && health == 0 => {
-                        Some(VitalsData::player_dead(player.life_ms))
+                        player.deaths_door_sent = vitals.downed();
+                        Some(if vitals.downed() {
+                            VitalsData::player_at_deaths_door(player.life_ms)
+                        } else {
+                            VitalsData::player_dead(player.life_ms)
+                        })
+                    }
+                    Some(0) if health == 0 && player.deaths_door_sent && !vitals.downed() => {
+                        player.deaths_door_sent = false;
+                        Some(VitalsData::player_dead_after_door(
+                            player.life_ms,
+                            vitals.deaths_door_ms.unwrap_or_default(),
+                        ))
                     }
                     Some(0) if health > 0 => {
+                        player.deaths_door_sent = false;
                         player.life_ms = self.server_time;
                         Some(VitalsData::player_alive(self.server_time))
                     }
@@ -4861,6 +4936,7 @@ impl Neighbourhood<'_> {
                     cooldowns: cooldowns.as_ref(),
                     stamina,
                     combat_status,
+                    mana: player.abilities.mana.take_change(),
                 };
                 // Every own state carries the own clock, and the place whenever it changed, moving
                 // or not, as retail's ([`OwnPlaces`]); not
@@ -10411,7 +10487,7 @@ mod tests {
     #[test]
     fn a_dead_mob_leaves_the_bundles_and_returns_with_a_new_card() {
         const LETHAL: u32 = 100_000;
-        const MOB_RESPAWN_MS: u64 = 360_000;
+        const MOB_RESPAWN_MS: u64 = crate::config::DEFAULT_MOB_RESPAWN_MS;
         let x = CELL_M / 2.0;
         let mut world = world_with_spawns(vec![test_spawn(x)]);
         world.set_table(&table(&["sim-a", "sim-b"])).expect("table");

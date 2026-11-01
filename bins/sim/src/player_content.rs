@@ -3,11 +3,13 @@
 //! pick, the bit of each achievement, the look of each mob prefab, and the quests.
 
 use nw_bus::MISSION_BOARD_ID_LEN;
+use nw_content::attribute_bonuses::AttributeBonuses;
 use nw_content::camps::CampRules;
 use nw_content::charms::ItemNames;
 use nw_content::chest_lockouts::ChestLockouts;
 use nw_content::crafting::{Recipes, StructureCosts};
 use nw_content::creature_animations::CreatureAnimations;
+use nw_content::deaths_door::DeathsDoorRules;
 use nw_content::drop_rolls::DropRolls;
 use nw_content::equip_load::EquipLoads;
 use nw_content::fishing::FishingRules;
@@ -748,6 +750,11 @@ pub struct PlayerContent {
     pub equip_loads: EquipLoads,
     /// The status effects worn perks hold ([`nw_content::perk_effects`]).
     pub perk_effects: PerkEffects,
+    /// The abilities attribute values hold and their mana and cooldown shares
+    /// ([`nw_content::attribute_bonuses`]).
+    pub attribute_bonuses: AttributeBonuses,
+    /// When a player goes down to death's door first ([`nw_content::deaths_door`]).
+    pub deaths_door: DeathsDoorRules,
     /// The mounts, their types, movement rows and dyes.
     pub mounts: MountRules,
     /// The landmarks, discoverable territories, spawn points and timings of travel.
@@ -1105,6 +1112,8 @@ impl PlayerContent {
             titles: TitleRules::from_tables(tables),
             equip_loads: EquipLoads::from_tables(tables),
             perk_effects: PerkEffects::from_tables(tables),
+            attribute_bonuses: AttributeBonuses::from_tables(tables),
+            deaths_door: DeathsDoorRules::from_tables(tables),
             mounts: MountRules::from_tables(tables),
             item_rules: ItemRules::from_tables(tables),
             status_effects: StatusEffectRules::from_tables(tables),

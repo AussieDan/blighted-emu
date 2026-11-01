@@ -30,6 +30,8 @@ pub(super) struct Shot {
     radius_m: f32,
     /// How it flies; `None` for a hit scan, which is there at once.
     flight: Option<Flight>,
+    /// The radius around the body it meets in which every mob is hit; 0: that body only.
+    splash_m: f32,
 }
 
 impl Shot {
@@ -40,6 +42,7 @@ impl Shot {
             range_m,
             radius_m,
             flight: Some(flight),
+            splash_m: 0.0,
         }
     }
 
@@ -49,18 +52,73 @@ impl Shot {
             range_m,
             radius_m: 0.0,
             flight: None,
+            splash_m: 0.0,
+        }
+    }
+
+    /// How far it goes when it meets nothing, and when it ends there (seconds): its range, or
+    /// where its flight's lifetime ends before it.
+    pub(super) fn end(&self) -> (f32, f32) {
+        match &self.flight {
+            None => (self.range_m, 0.0),
+            Some(flight) => {
+                let distance_m = self.range_m.min(flight.distance_at(flight.lifetime_s));
+                let time_s = flight.time_to(distance_m).unwrap_or(flight.lifetime_s);
+                (distance_m, time_s)
+            }
+        }
+    }
+
+    /// The shot, hitting every mob within `splash_m` of the body it meets.
+    pub(super) const fn with_splash(self, splash_m: f32) -> Self {
+        Self { splash_m, ..self }
+    }
+}
+
+/// What a shot does to the mobs it hits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ShotHit<'a> {
+    /// The `DamageData` row of the hit.
+    pub(super) damage_id: &'a str,
+    /// The status effects it puts on a mob it hurts, with the number of the player they come
+    /// from (an ability spell's `StatusEffects`).
+    pub(super) effects: Option<(&'a [String], u64)>,
+}
+
+impl<'a> ShotHit<'a> {
+    /// A hit of the row `damage_id` and nothing more.
+    pub(super) const fn plain(damage_id: &'a str) -> Self {
+        Self {
+            damage_id,
+            effects: None,
         }
     }
 }
 
 /// A projectile on its way to the mob it hits.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct ProjectileFlight {
     attacker: ConnectionRef,
     target: u64,
     damage_id: String,
     /// When it gets there.
     land_ms: u64,
+    /// [`Shot::with_splash`].
+    splash_m: f32,
+    /// [`ShotHit::effects`].
+    effects: Option<(Vec<String>, u64)>,
+}
+
+/// A flight of `flight_s` seconds in whole milliseconds.
+pub(super) fn flight_ms(flight_s: f32) -> u64 {
+    // A flight of at most its lifetime, a few seconds.
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "a flight of at most a few seconds"
+    )]
+    let flight_ms = (flight_s.max(0.0) * MS_PER_SECOND) as u64;
+    flight_ms
 }
 
 /// Where an attack is aimed: the camera's yaw and pitch (the input's view angles; a positive
@@ -115,36 +173,46 @@ pub(super) fn first_on_line(
 }
 
 impl SimWorld {
-    /// The player of `attacker` at `position` fires `shot` of the attack whose hit is the row
-    /// `damage_id` at `now_ms`, along `aim`. The mob it meets of `places` is hit when the shot
-    /// gets there ([`SimWorld::projectile_flights_due`]).
+    /// The player of `attacker` at `position` fires `shot` of the attack whose hit is `hit` at
+    /// `now_ms`, along `aim`. The mob it meets of `places` is hit when the shot gets there
+    /// ([`SimWorld::projectile_flights_due`]).
     pub(super) fn cast(
         &mut self,
         attacker: &ConnectionRef,
-        (shot, damage_id): (Shot, &str),
+        (shot, hit): (Shot, ShotHit<'_>),
         (position, aim): (Position, AimLine),
         places: &[(u64, Position, Capsule)],
         now_ms: u64,
     ) -> Vec<Result<AttackOutcome, AttackRefusal>> {
         let met = first_on_line(&shot, position, aim, places);
-        tracing::debug!(attacker = ?attacker, damage_id, ?aim, met = ?met, "player cast");
+        tracing::debug!(attacker = ?attacker, damage_id = hit.damage_id, ?aim, met = ?met, "player cast");
         let Some((target, flight_s)) = met else {
             return vec![Ok(AttackOutcome::Missed)];
         };
-        // A flight of at most its lifetime, a few seconds.
-        #[allow(
-            clippy::cast_possible_truncation,
-            clippy::cast_sign_loss,
-            reason = "a flight of at most a few seconds"
-        )]
-        let flight_ms = (flight_s * MS_PER_SECOND) as u64;
+        self.launch(attacker, (shot, hit), target, flight_s, now_ms);
+        Vec::new()
+    }
+
+    /// Sends `shot` of `attacker` with the hit `hit` to mob `target`, which it gets to after
+    /// `flight_s` from `now_ms`.
+    pub(super) fn launch(
+        &mut self,
+        attacker: &ConnectionRef,
+        (shot, hit): (Shot, ShotHit<'_>),
+        target: u64,
+        flight_s: f32,
+        now_ms: u64,
+    ) {
         self.projectile_flights.push(ProjectileFlight {
             attacker: attacker.clone(),
             target,
-            damage_id: damage_id.to_owned(),
-            land_ms: now_ms.saturating_add(flight_ms),
+            damage_id: hit.damage_id.to_owned(),
+            land_ms: now_ms.saturating_add(flight_ms(flight_s)),
+            splash_m: shot.splash_m,
+            effects: hit
+                .effects
+                .map(|(effects, source)| (effects.to_vec(), source)),
         });
-        Vec::new()
     }
 
     /// The yaw of an attack from `from` with the aim of a lock on `lock_target` (toward it when it
@@ -165,7 +233,8 @@ impl SimWorld {
             .or(facing)
     }
 
-    /// Lands the projectiles that got to their mob at `now_ms`.
+    /// Lands the projectiles that got to their mob at `now_ms`: a splash also hits the other
+    /// living mobs within its radius of that mob, and each mob it hurts takes its effects.
     pub(super) fn projectile_flights_due(
         &mut self,
         now_ms: u64,
@@ -174,17 +243,45 @@ impl SimWorld {
             .into_iter()
             .partition(|flight| now_ms >= flight.land_ms);
         self.projectile_flights = later;
-        due.into_iter()
-            .map(|flight| {
-                self.hit(
+        let mut results = Vec::new();
+        for flight in due {
+            let splashed: Vec<u64> = if flight.splash_m > 0.0 {
+                let centre = self
+                    .mob_states()
+                    .find(|(mob, _, _)| *mob == flight.target)
+                    .map(|(_, at, _)| at);
+                centre.map_or_else(Vec::new, |centre| {
+                    self.mob_states()
+                        .filter(|(mob, at, state)| {
+                            *mob != flight.target
+                                && state.health > 0
+                                && at.horizontal_distance(centre) <= flight.splash_m
+                        })
+                        .map(|(mob, _, _)| mob)
+                        .collect()
+                })
+            } else {
+                Vec::new()
+            };
+            let first = std::iter::once((flight.target, true));
+            for (mob, paced) in first.chain(splashed.into_iter().map(|mob| (mob, false))) {
+                let result = self.hit_paced(
                     &flight.attacker,
-                    flight.target,
+                    mob,
                     &flight.damage_id,
                     None,
+                    paced,
                     now_ms,
-                )
-            })
-            .collect()
+                );
+                if let (Ok(AttackOutcome::Hit { target, .. }), Some((effects, source))) =
+                    (&result, &flight.effects)
+                {
+                    self.spell_effects_on_mob(*target, effects, *source, false);
+                }
+                results.push(result);
+            }
+        }
+        results
     }
 }
 
