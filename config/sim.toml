@@ -116,7 +116,8 @@ attack_reach_m = 3.0
 reach_margin_m = 1.0
 # The retail sword's hit spacing, the fastest tutorial weapon (sword 400, axe 700, hammer 830 ms).
 min_attack_interval_ms = 400
-mob_respawn_ms = 360000
+# The retail respawn: 62 s seen in a capture, though the spawner slices say 360 s (rule Unknown).
+mob_respawn_ms = 62000
 # Shortest time from a death to a respawn request (the client asks, type 1938): below the
 # lowest captured gap.
 min_respawn_ms = 2000

@@ -62,6 +62,11 @@ use crate::mobs::MobReach;
 /// tutorial ship's deck high above the sea bed (live 2026-09-12: the sailor dropped under the
 /// ship and vanished).
 pub const MAX_STEP_DOWN_M: f32 = 3.0;
+/// A mob that sees notices a player this near at any bearing: the perception profile's
+/// `m_radiusOfImmediateVicinity` (Inferred value, mobs note 2026-10-31: three beach sailors
+/// alerted 0.3 to 0.65 s after the player stood 3.2 to 3.8 m away beside or behind them, out of
+/// their 90 deg cone; the client default is 2.5 m and the server profile is Unknown).
+pub(crate) const IMMEDIATE_VICINITY_M: f32 = 3.8;
 /// Longest time one AI step may move a mob, so a stalled tick never makes it jump (our
 /// engineering limit).
 const MAX_STEP_MS: u64 = 1_000;
@@ -1042,7 +1047,8 @@ impl MindState {
                 .filter(|player| {
                     let distance = player.position.horizontal_distance(at);
                     let bearing = yaw_gap(self.yaw, yaw_toward(at, player.position)).abs();
-                    distance <= distance_m && bearing.to_degrees() <= angle_deg * HALF
+                    distance <= IMMEDIATE_VICINITY_M
+                        || (distance <= distance_m && bearing.to_degrees() <= angle_deg * HALF)
                 })
                 .min_by(|a, b| {
                     let da = a.position.horizontal_distance(at);

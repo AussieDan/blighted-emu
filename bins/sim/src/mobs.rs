@@ -408,6 +408,8 @@ pub struct Mobs {
     left: Vec<u64>,
     /// Mobs that respawned since the last [`Mobs::take_respawned`].
     respawned: Vec<u64>,
+    /// Mobs that fell asleep since the last [`Mobs::take_slept`].
+    slept: Vec<u64>,
     /// The encounter events the mobs' trees sent since the last
     /// [`Mobs::take_encounter_events`]: (mob, event id).
     encounter_events: Vec<(u64, String)>,
@@ -629,6 +631,7 @@ impl Mobs {
             wake_scans: 0,
             left: Vec::new(),
             respawned: Vec::new(),
+            slept: Vec::new(),
             encounter_events: Vec::new(),
         }
     }
@@ -648,6 +651,14 @@ impl Mobs {
     /// new id and card, as on retail (GDE id note).
     pub fn take_respawned(&mut self) -> Vec<u64> {
         std::mem::take(&mut self.respawned)
+    }
+
+    /// The mobs that fell asleep since the last call, by entity number: when a player comes near
+    /// again each spawns afresh for its clients, as on retail (mobs note 2026-10-31: a beach
+    /// sailor left alone showed the `Spawn` fragment again when the player came back, 960.76 s,
+    /// with no death; Inferred: its id and place stay).
+    pub fn take_slept(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.slept)
     }
 
     /// The encounter events the mobs' trees sent since the last call: (mob, event id).
@@ -1310,6 +1321,7 @@ impl Mobs {
         {
             mob.awake = false;
             self.awake.remove(&index);
+            self.slept.push(mob_entity(index));
         }
     }
 
@@ -2242,6 +2254,52 @@ mod tests {
     }
 
     #[test]
+    fn a_mob_notices_a_player_close_beside_it_out_of_its_sight_cone() {
+        // The beach sailor's ambient vision: 90 deg (`archnav.txt`); the test mob faces +y and
+        // the player stands east of it, 90 deg aside.
+        const SAILOR_CONE_DEG: f32 = 90.0;
+        let mut data = crate::mob_ai::test_support::test_ai_data();
+        data.archetypes[0].ambient_vision = Some(nw_ai::data::Vision {
+            angle_deg: SAILOR_CONE_DEG,
+            distance_m: TEST_SIGHT_M,
+        });
+        let ai = crate::mob_ai::MobAi::new(
+            data,
+            crate::mob_ai::AiRates::default(),
+            [(
+                lowercase_crc32(TEST_MOB),
+                crate::mob_ai::test_support::TEST_ASSET,
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let combat = crate::combat::CombatSettings {
+            ai: Arc::new(ai),
+            ..test_combat()
+        };
+        let aside = |distance_m: f32| {
+            let mut mobs = Mobs::new(
+                vec![spawn_at(SPAWN_X, TEST_MOB, TEST_LEVEL)].into(),
+                &combat,
+            );
+            mobs.set_cells(every);
+            run(
+                &mut mobs,
+                &[player_at(SPAWN_X + distance_m)],
+                0,
+                3 * TICK_MS,
+            );
+            mobs.target(mob_entity(0))
+        };
+        assert_eq!(
+            aside(crate::mob_ai::IMMEDIATE_VICINITY_M - 0.5),
+            Some(PLAYER),
+            "near: noticed"
+        );
+        assert_eq!(aside(TEST_SIGHT_M / 2.0), None, "out of the cone");
+    }
+
+    #[test]
     fn design_profiles_override_the_slice_values() {
         const LEASH_M: f32 = 20.0;
         const INTERVAL_MS: u64 = 5_000;
@@ -2495,6 +2553,10 @@ mod tests {
             next_tick_ms + TICK_MS,
         );
         assert_eq!(mobs.state(mob_entity(0)), Some(MobState::Asleep));
+        assert!(
+            mobs.take_slept().contains(&mob_entity(0)),
+            "its clients see it spawn again"
+        );
         let awake = mobs
             .counts()
             .into_iter()

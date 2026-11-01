@@ -56,8 +56,11 @@ pub const DEFAULT_REACH_MARGIN_M: f32 = 1.0;
 /// Default shortest time between two attacks of a player: the retail sword's hit spacing, the
 /// fastest of the tutorial weapons (swing note: sword 400, axe 700, hammer 830 ms).
 pub const DEFAULT_MIN_ATTACK_INTERVAL_MS: u64 = 400;
-/// Default mob respawn: the one decoded spawner (M6-A spec F6).
-pub const DEFAULT_MOB_RESPAWN_MS: u64 = 360_000;
+/// Default mob respawn: the retail time (Inferred from the one clean retail respawn, mobs note
+/// 2026-10-31: `corrupted_sailor_starterbeach_named_00` came back 62.0 s after its death with the
+/// player within 30 m all the time; its spawner slice says 360 s, and the rule that shortens it
+/// is Unknown).
+pub const DEFAULT_MOB_RESPAWN_MS: u64 = 62_000;
 /// Default shortest time from a death to a respawn request: below the lowest captured gap
 /// (M6-B spec F7).
 pub const DEFAULT_MIN_RESPAWN_MS: u64 = 2_000;
