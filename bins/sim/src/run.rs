@@ -44,7 +44,7 @@ use crate::mobs::{SpawnFilter, sim_spawns, spawns_of_level};
 use crate::player_content::{MobLooks, PlayerContent};
 use crate::server::{
     Databases, LATENCY_BUCKETS_SECONDS, LoopSettings, METRIC_HANDOFF_SECONDS,
-    METRIC_MOB_TICK_SECONDS, METRIC_SNAPSHOT_SECONDS, METRIC_TICK_SECONDS, ServeError,
+    METRIC_SNAPSHOT_SECONDS, METRIC_TICK_PART_SECONDS, METRIC_TICK_SECONDS, ServeError,
     serve as serve_loop,
 };
 
@@ -454,7 +454,7 @@ async fn serve_async(
         })
         .and_then(|builder| {
             builder.set_buckets_for_metric(
-                Matcher::Full(METRIC_MOB_TICK_SECONDS.to_owned()),
+                Matcher::Full(METRIC_TICK_PART_SECONDS.to_owned()),
                 &LATENCY_BUCKETS_SECONDS,
             )
         })

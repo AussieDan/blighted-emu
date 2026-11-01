@@ -418,6 +418,46 @@ pub enum HandoffEnd {
     Gone,
 }
 
+/// Time of each part of one tick, in seconds, in the order they run.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct TickParts {
+    /// Old ghosts, handoffs to start and the ghost lists for other sims.
+    pub ghosts: f64,
+    /// Mob minds, their swings and shots.
+    pub mobs: f64,
+    /// Everything players do: quests, effects, gathers, crafts, abilities, travel.
+    pub gameplay: f64,
+    /// The replicas of the players and the cards of the shown mobs, on one thread.
+    pub cards: f64,
+    /// The bundles of every player and the messages of the tick.
+    pub bundles: f64,
+}
+
+impl TickParts {
+    /// Label value of the ghost part.
+    pub const GHOSTS: &'static str = "ghosts";
+    /// Label value of the mob part.
+    pub const MOBS: &'static str = "mobs";
+    /// Label value of the gameplay part.
+    pub const GAMEPLAY: &'static str = "gameplay";
+    /// Label value of the card part.
+    pub const CARDS: &'static str = "cards";
+    /// Label value of the bundle part.
+    pub const BUNDLES: &'static str = "bundles";
+
+    /// Each part with its label value.
+    #[must_use]
+    pub fn labelled(&self) -> [(&'static str, f64); 5] {
+        [
+            (Self::GHOSTS, self.ghosts),
+            (Self::MOBS, self.mobs),
+            (Self::GAMEPLAY, self.gameplay),
+            (Self::CARDS, self.cards),
+            (Self::BUNDLES, self.bundles),
+        ]
+    }
+}
+
 /// What one tick sends.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct TickOutput {
@@ -433,8 +473,8 @@ pub struct TickOutput {
     pub player_attacks: Vec<Result<AttackOutcome, AttackRefusal>>,
     /// Players who died since the last tick, to save at once (M6-A spec section 8).
     pub deaths: Vec<Departure>,
-    /// Time of the mob part of the tick, in seconds.
-    pub mob_seconds: f64,
+    /// Time of each part of the tick.
+    pub parts: TickParts,
     /// Members put in this tick's bundles: each player's own member and every other entity.
     pub bundle_members: u64,
     /// The script run log lines of this tick.
@@ -446,6 +486,8 @@ pub struct TickOutput {
 struct Bundled {
     outgoing: Vec<Outgoing>,
     members: u64,
+    /// Time of the replicas and mob cards before the bundles, in seconds.
+    cards_seconds: f64,
 }
 
 /// A refused world change.
@@ -2147,12 +2189,14 @@ impl SimWorld {
     /// Returns [`MessageError`] when a message cannot be encoded.
     pub fn tick(&mut self, now_ms: u64, server_time: u64) -> Result<TickOutput, MessageError> {
         self.last_now_ms = now_ms;
+        let ghosts_started = Instant::now();
         let ttl = self.settings.ghost_ttl_ms;
         self.ghosts
             .retain(|_, ghosts| now_ms.saturating_sub(ghosts.received_ms) <= ttl);
         self.release_ghost_ids();
         let handoffs = self.start_handoffs(now_ms);
         let ghosts = self.ghosts_out();
+        let ghost_seconds = ghosts_started.elapsed().as_secs_f64();
         let mobs_started = Instant::now();
         let mut swings = self.tick_mobs(now_ms);
         self.end_mob_ids();
@@ -2161,6 +2205,7 @@ impl SimWorld {
         let mut mob_hits = self.mob_hits(intents, now_ms);
         mob_hits.extend(self.mob_shots_due(now_ms));
         let mob_seconds = mobs_started.elapsed().as_secs_f64();
+        let gameplay_started = Instant::now();
         let places: Vec<(u64, Position)> =
             self.mob_states().map(|(mob, at, _)| (mob, at)).collect();
         self.mob_trails.record(now_ms, places.into_iter());
@@ -2193,10 +2238,19 @@ impl SimWorld {
         self.tick_meta_achievements();
         self.tick_travel(now_ms);
         self.tick_phasing();
+        let gameplay_seconds = gameplay_started.elapsed().as_secs_f64();
+        let bundles_started = Instant::now();
         let mut messages = self.take_messages();
         let bundled = self.bundles(now_ms, server_time)?;
         messages.extend(bundled.outgoing);
         messages.append(&mut self.after_bundles);
+        let parts = TickParts {
+            ghosts: ghost_seconds,
+            mobs: mob_seconds,
+            gameplay: gameplay_seconds,
+            cards: bundled.cards_seconds,
+            bundles: bundles_started.elapsed().as_secs_f64() - bundled.cards_seconds,
+        };
         Ok(TickOutput {
             messages,
             handoffs,
@@ -2205,7 +2259,7 @@ impl SimWorld {
             player_attacks,
             deaths: std::mem::take(&mut self.deaths),
             script_log: self.take_script_log(),
-            mob_seconds,
+            parts,
             bundle_members: bundled.members,
         })
     }
@@ -3830,6 +3884,7 @@ impl SimWorld {
 
     /// A bundle for every player that is not frozen, on `tick_threads` threads for a large world.
     fn bundles(&mut self, now_ms: u64, server_time: u64) -> Result<Bundled, MessageError> {
+        let started = Instant::now();
         let mut bodies = self.world.query::<(&Player, &Body)>();
         let mut everyone: Vec<(u64, Position)> = bodies
             .iter(&self.world)
@@ -4012,6 +4067,7 @@ impl SimWorld {
         for (number, position) in &everyone {
             grid.insert(*number, *position);
         }
+        let cards_seconds = started.elapsed().as_secs_f64();
         let near = Neighbourhood {
             grid: &grid,
             positions: everyone.iter().copied().collect(),
@@ -4041,7 +4097,10 @@ impl SimWorld {
             .min(players.len() / MIN_PLAYERS_PER_THREAD)
             .max(1);
         if threads == 1 {
-            return near.bundles_of(&mut players);
+            return near.bundles_of(&mut players).map(|bundled| Bundled {
+                cards_seconds,
+                ..bundled
+            });
         }
         let chunk = players.len().div_ceil(threads);
         let parts: Vec<Result<Bundled, MessageError>> = std::thread::scope(|scope| {
@@ -4058,7 +4117,10 @@ impl SimWorld {
                 })
                 .collect()
         });
-        let mut bundled = Bundled::default();
+        let mut bundled = Bundled {
+            cards_seconds,
+            ..Bundled::default()
+        };
         for part in parts {
             let part = part?;
             bundled.outgoing.extend(part.outgoing);
@@ -5227,6 +5289,7 @@ impl Neighbourhood<'_> {
         Ok(Bundled {
             outgoing,
             members: counted,
+            ..Bundled::default()
         })
     }
 }
@@ -6264,6 +6327,30 @@ mod tests {
             9 * (2 + PLAYER_EMPTY_COMPONENTS.len() as u64),
             "3 bundles of 3 groups, each a card, the empty player components and a position"
         );
+    }
+
+    #[test]
+    fn a_tick_times_each_of_its_parts_in_run_order() {
+        let mut world = world_with_spawns(Vec::new());
+        join(&mut world, 1, CELL_M / 2.0);
+        let parts = tick(&mut world, NOW + OWN_CARD_DELAY_MS).parts;
+        let labelled = parts.labelled();
+        let labels: Vec<&str> = labelled.iter().map(|(label, _)| *label).collect();
+        assert_eq!(
+            labels,
+            [
+                TickParts::GHOSTS,
+                TickParts::MOBS,
+                TickParts::GAMEPLAY,
+                TickParts::CARDS,
+                TickParts::BUNDLES
+            ]
+        );
+        assert!(
+            labelled.iter().all(|(_, seconds)| *seconds >= 0.0),
+            "{parts:?}"
+        );
+        assert!(parts.bundles > 0.0, "the bundle of a player takes time");
     }
 
     #[test]

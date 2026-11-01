@@ -183,8 +183,10 @@ pub const METRIC_MOB_WAKE_SCANS: &str = "sim_mob_wake_scans_total";
 pub const METRIC_SNAPSHOT_SECONDS: &str = "sim_snapshot_seconds";
 /// Metric: members put in bundles: each player's own member and every other entity.
 pub const METRIC_BUNDLE_MEMBERS: &str = "sim_bundle_members_total";
-/// Metric: time of the mob part of a tick.
-pub const METRIC_MOB_TICK_SECONDS: &str = "sim_mob_tick_seconds";
+/// Metric: time of each part of a tick, by `part`.
+pub const METRIC_TICK_PART_SECONDS: &str = "sim_tick_part_seconds";
+/// Label of a tick part.
+const PART_LABEL: &str = "part";
 /// Label of a mob's state.
 const STATE_LABEL: &str = "state";
 /// Label of a refused move's reason.
@@ -1399,7 +1401,9 @@ impl Loop {
             }
         };
         metrics::histogram!(METRIC_TICK_SECONDS).record(started.elapsed().as_secs_f64());
-        metrics::histogram!(METRIC_MOB_TICK_SECONDS).record(output.mob_seconds);
+        for (part, seconds) in output.parts.labelled() {
+            metrics::histogram!(METRIC_TICK_PART_SECONDS, PART_LABEL => part).record(seconds);
+        }
         metrics::counter!(METRIC_BUNDLE_MEMBERS).increment(output.bundle_members);
         let timeout = Duration::from_millis(self.settings.world.instance_request_timeout_ms);
         for (connection, request) in self.world.take_instance_requests() {
