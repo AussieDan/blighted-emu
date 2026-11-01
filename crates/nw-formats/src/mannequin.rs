@@ -74,11 +74,48 @@ const IF_THEN_ELSE_ELEMENT: &str = "IfThenElse";
 const IF_CONDITION_ELEMENT: &str = "IfCondition";
 const THEN_ACTIVITY_ELEMENT: &str = "ThenActivity";
 const CAST_SPELL_ELEMENT: &str = "CastSpell";
+const CAST_RAYCAST_ELEMENT: &str = "CastSpellRaycast";
+const CAST_TARGETING_ELEMENT: &str = "CastSpellTargeting";
+const ELSE_ACTIVITY_ELEMENT: &str = "ElseActivity";
+const WEAPON_REQUIREMENTS_ATTRIBUTE: &str = "WeaponRequirements";
+/// The separator of a grid list's weapon classes (`Musket+Blunderbuss`).
+const WEAPON_CLASS_SEPARATOR: char = '+';
+const INPUT_TEST_ELEMENT: &str = "IfInput";
+const INPUT_NAME_ATTRIBUTE: &str = "InputName";
+const EXTERNAL_TEST_ELEMENT: &str = "IfExternalCondition";
+const ACTION_STATUS_TEST_ELEMENT: &str = "IfActionStatus";
+const STATUS_ATTRIBUTE: &str = "Status";
+/// `IfActionStatus Status` of a running action.
+const INSTALLED_STATUS: &str = "Installed";
+const FRAGMENT_PLAYING_TEST_ELEMENT: &str = "IfFragmentPlaying";
+const FRAGMENT_DONE_TEST_ELEMENT: &str = "IfFragmentDone";
+const USE_HOST_FRAGMENT_ATTRIBUTE: &str = "UseHostActionFragment";
+const EXIT_OFFSET_ATTRIBUTE: &str = "ExitOffsetSeconds";
+const ABILITY_ACTIVE_TEST_ELEMENT: &str = "IfAbilityActive";
+const ITEM_IN_SLOT_TEST_ELEMENT: &str = "IfItemInSlot";
+const SLOT_ALIAS_ATTRIBUTE: &str = "SlotToCheckAlias";
+const CONDITION_NAME_ATTRIBUTE: &str = "ConditionName";
+const ABILITY_MOVE_TEST_ELEMENT: &str = "IfActiveAbilityMoveName";
+const ABILITY_NAME_ATTRIBUTE: &str = "AbilityName";
+const MANA_COST_TEST_ELEMENT: &str = "IfManaCost";
+const COST_ID_ATTRIBUTE: &str = "CostID";
+const COOLDOWN_TEST_ELEMENT: &str = "IfCooldownTimer";
+const ABILITY_ID_ATTRIBUTE: &str = "AbilityID";
+const PERFORM_ABILITY_ELEMENT: &str = "PerformActiveAbility";
+const SET_COOLDOWN_ELEMENT: &str = "SetCooldownTimer";
+const APPLY_ON_ENTER_ELEMENT: &str = "EffectsToApplyOnEnter";
+const EFFECT_ID_ELEMENT: &str = "EffectId";
+const EFFECT_ID_ATTRIBUTE: &str = "EffectId";
+/// Milliseconds per second.
+const MS_PER_SECOND: f64 = 1_000.0;
+/// How deep named conditions may name others (a named condition that names itself stops there).
+const MAX_EXTERNAL_DEPTH: usize = 8;
 const DEFAULT_ELEMENT: &str = "Default";
 const SPELL_NAME_ATTRIBUTE: &str = "SpellName";
 const STATUS_EFFECT_TEST_ELEMENT: &str = "IfHasStatusEffect";
 const STATUS_EFFECT_ATTRIBUTE: &str = "StatusEffect";
 const ACTIVATION_CONDITION_ELEMENT: &str = "ActivationCondition";
+const DEACTIVATION_CONDITION_ELEMENT: &str = "DeactivationCondition";
 const SET_TAG_ELEMENT: &str = "SetMannequinTag";
 const ACTIVITIES_ELEMENT: &str = "Activities";
 const DRIVEN_MOTION_ELEMENT: &str = "AnimationDrivenMotion";
@@ -407,6 +444,10 @@ pub struct GridList {
     pub path: String,
     /// Its `<AliasMap>` entries, in file order.
     pub aliased: Vec<GridAction>,
+    /// `WeaponRequirements`, split at `+`: the list is on while the weapon in hand has one of
+    /// these item classes (player grid: `LifeStaff`, `Musket+Blunderbuss`); empty when the
+    /// list has none.
+    pub weapon_classes: Vec<String>,
 }
 
 impl GridList {
@@ -450,6 +491,17 @@ impl CageGrid {
                 list.descendants(ACTION_ELEMENT, &mut aliased);
                 Some(GridList {
                     path: list.attribute(PATH_ATTRIBUTE)?.to_owned(),
+                    weapon_classes: list
+                        .attribute(WEAPON_REQUIREMENTS_ATTRIBUTE)
+                        .map(|classes| {
+                            classes
+                                .split(WEAPON_CLASS_SEPARATOR)
+                                .map(str::trim)
+                                .filter(|class| !class.is_empty())
+                                .map(str::to_owned)
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                     aliased: aliased
                         .into_iter()
                         .filter_map(|action| {
@@ -776,10 +828,11 @@ impl AnimDatabase {
     }
 }
 
-/// A CAGE action list condition, as far as a player's base state decides it: the logic
-/// elements, `True`, a Mannequin tag and a fragment marker; any other test (an input, a status
-/// effect, an ability, a lock, ...) is [`Condition::Other`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A CAGE action list condition, as far as a character's tags, the markers of its fragment and
+/// its inputs decide it: the logic elements, `True`, a Mannequin tag, a fragment marker, an
+/// input and a named condition of the list; any other test (a status effect, an ability, a
+/// lock, ...) is [`Condition::Other`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Condition {
     /// `<And>`: every part holds.
     All(Vec<Condition>),
@@ -793,13 +846,136 @@ pub enum Condition {
     Tag(String),
     /// `<IfMannequinMarker MarkerName>`: a clip of the playing fragment sets the marker.
     Marker(String),
+    /// `<IfInput InputName>`: the input is on (a key press, a held key or a virtual input).
+    Input(String),
+    /// `<IfExternalCondition ConditionName>` of a condition the list does not name (a named one
+    /// is put in its place, [`ActionList::parse`]).
+    External(String),
+    /// `<IfActionStatus ActionName Status>`: the action runs (`Installed`), else waits to
+    /// (`Pending`).
+    ActionStatus {
+        /// The action.
+        action: String,
+        /// `Status="Installed"`.
+        installed: bool,
+    },
+    /// `<IfFragmentPlaying FragmentName>`: the fragment plays; `None`: the action's own
+    /// (`UseHostActionFragment`).
+    FragmentPlaying(Option<String>),
+    /// `<IfFragmentDone FragmentName ExitOffsetSeconds>`: the fragment is done, this long
+    /// before its end; `None`: the action's own.
+    FragmentDone {
+        /// The fragment.
+        fragment: Option<String>,
+        /// `ExitOffsetSeconds`, ms.
+        exit_offset_ms: u32,
+    },
+    /// `<IfActiveAbilityMoveName AbilityName>`: the key of this mapped ability is pressed.
+    AbilityMove(String),
+    /// `<IfCooldownTimer AbilityID>`: the ability's cooldown runs.
+    Cooldown(String),
+    /// `<IfManaCost CostID>`: the mana covers the cost.
+    ManaCost(String),
+    /// `<IfHasStatusEffect StatusEffect>`: the character has the effect.
+    StatusEffect(String),
+    /// `<IfAbilityActive AbilityName>`: the passive ability (an upgrade perk) is on.
+    AbilityActive(String),
+    /// `<IfItemInSlot SlotToCheckAlias>`: an item is in the slot.
+    ItemInSlot(String),
     /// Any other test, by element name.
     Other(String),
+}
+
+/// What the tests of an action list read from a character. A test this world does not know is
+/// false.
+pub trait CageWorld {
+    /// It has Mannequin tag `tag` (any case).
+    fn tag(&self, tag: &str) -> bool;
+    /// Its playing fragment sets `marker`.
+    fn marker(&self, marker: &str) -> bool;
+    /// Its input `input` is on.
+    fn input(&self, input: &str) -> bool;
+    /// Action `action` runs (`installed`), else waits to.
+    fn action_status(&self, _action: &str, _installed: bool) -> bool {
+        false
+    }
+    /// Fragment `fragment` plays (`None`: the testing action's own).
+    fn fragment_playing(&self, _fragment: Option<&str>) -> bool {
+        false
+    }
+    /// Fragment `fragment` is done, `exit_offset_ms` before its end (`None`: the testing
+    /// action's own).
+    fn fragment_done(&self, _fragment: Option<&str>, _exit_offset_ms: u32) -> bool {
+        false
+    }
+    /// The key of mapped ability `ability` is pressed.
+    fn ability_move(&self, _ability: &str) -> bool {
+        false
+    }
+    /// The cooldown of `ability` runs.
+    fn cooldown(&self, _ability: &str) -> bool {
+        false
+    }
+    /// The mana covers cost `cost`.
+    fn mana_cost(&self, _cost: &str) -> bool {
+        false
+    }
+    /// It has status effect `effect`.
+    fn status_effect(&self, _effect: &str) -> bool {
+        false
+    }
+    /// Passive ability `ability` is on.
+    fn ability_active(&self, _ability: &str) -> bool {
+        false
+    }
+    /// An item is in slot `slot`.
+    fn item_in_slot(&self, _slot: &str) -> bool {
+        false
+    }
+    /// Another test, by element name.
+    fn other(&self, _test: &str) -> bool {
+        false
+    }
+}
+
+/// What the tests of an action list read from a character: its Mannequin tags (any case), the
+/// markers its playing fragment sets and its inputs that are on; no other state.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CageState<'a> {
+    /// Its tags.
+    pub tags: &'a [&'a str],
+    /// The markers of its fragment.
+    pub markers: &'a [&'a str],
+    /// Its inputs that are on.
+    pub inputs: &'a [&'a str],
+}
+
+impl CageWorld for CageState<'_> {
+    fn tag(&self, tag: &str) -> bool {
+        self.tags.iter().any(|own| own.eq_ignore_ascii_case(tag))
+    }
+
+    fn marker(&self, marker: &str) -> bool {
+        self.markers.contains(&marker)
+    }
+
+    fn input(&self, input: &str) -> bool {
+        self.inputs.contains(&input)
+    }
 }
 
 impl Condition {
     fn of(node: &Node) -> Self {
         let parts = || node.children.iter().map(Self::of).collect();
+        let attribute = |key| node.attribute(key).unwrap_or_default().to_owned();
+        // The action's own fragment, or the one it names.
+        let fragment = || {
+            (node.attribute(USE_HOST_FRAGMENT_ATTRIBUTE) != Some(TRUE_VALUE))
+                .then(|| node.attribute(FRAGMENT_NAME_ATTRIBUTE))
+                .flatten()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        };
         match node.name.as_str() {
             AND_ELEMENT => Self::All(parts()),
             OR_ELEMENT => Self::Any(parts()),
@@ -815,7 +991,31 @@ impl Condition {
                     .unwrap_or_default()
                     .to_owned(),
             ),
-
+            INPUT_TEST_ELEMENT => Self::Input(
+                node.attribute(INPUT_NAME_ATTRIBUTE)
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+            EXTERNAL_TEST_ELEMENT => Self::External(attribute(CONDITION_NAME_ATTRIBUTE)),
+            ACTION_STATUS_TEST_ELEMENT => Self::ActionStatus {
+                action: attribute(ACTION_NAME_ATTRIBUTE),
+                installed: node.attribute(STATUS_ATTRIBUTE) == Some(INSTALLED_STATUS),
+            },
+            FRAGMENT_PLAYING_TEST_ELEMENT => Self::FragmentPlaying(fragment()),
+            FRAGMENT_DONE_TEST_ELEMENT => Self::FragmentDone {
+                fragment: fragment(),
+                exit_offset_ms: node
+                    .attribute(EXIT_OFFSET_ATTRIBUTE)
+                    .and_then(|offset| offset.parse::<f64>().ok())
+                    // A fraction of a fragment's length.
+                    .map_or(0, |seconds| (seconds * MS_PER_SECOND).round() as u32),
+            },
+            ABILITY_MOVE_TEST_ELEMENT => Self::AbilityMove(attribute(ABILITY_NAME_ATTRIBUTE)),
+            COOLDOWN_TEST_ELEMENT => Self::Cooldown(attribute(ABILITY_ID_ATTRIBUTE)),
+            MANA_COST_TEST_ELEMENT => Self::ManaCost(attribute(COST_ID_ATTRIBUTE)),
+            STATUS_EFFECT_TEST_ELEMENT => Self::StatusEffect(attribute(STATUS_EFFECT_ATTRIBUTE)),
+            ABILITY_ACTIVE_TEST_ELEMENT => Self::AbilityActive(attribute(ABILITY_NAME_ATTRIBUTE)),
+            ITEM_IN_SLOT_TEST_ELEMENT => Self::ItemInSlot(attribute(SLOT_ALIAS_ATTRIBUTE)),
             other => Self::Other(other.to_owned()),
         }
     }
@@ -824,15 +1024,90 @@ impl Condition {
     /// markers `markers`, and no other state: no input, status effect, active ability or lock,
     /// so [`Condition::Other`] is false.
     pub fn holds(&self, tags: &[&str], markers: &[&str]) -> bool {
+        self.holds_in(&CageState {
+            tags,
+            markers,
+            inputs: &[],
+        })
+    }
+
+    /// Whether it holds for a character in `world`; an unnamed [`Condition::External`] is
+    /// false.
+    pub fn holds_in(&self, world: &dyn CageWorld) -> bool {
         match self {
-            Self::All(parts) => parts.iter().all(|part| part.holds(tags, markers)),
-            Self::Any(parts) => parts.iter().any(|part| part.holds(tags, markers)),
-            Self::Not(part) => !part.holds(tags, markers),
+            Self::All(parts) => parts.iter().all(|part| part.holds_in(world)),
+            Self::Any(parts) => parts.iter().any(|part| part.holds_in(world)),
+            Self::Not(part) => !part.holds_in(world),
             Self::True => true,
-            Self::Tag(tag) => tags.iter().any(|own| own.eq_ignore_ascii_case(tag)),
-            Self::Marker(marker) => markers.contains(&marker.as_str()),
-            Self::Other(_) => false,
+            Self::Tag(tag) => world.tag(tag),
+            Self::Marker(marker) => world.marker(marker),
+            Self::Input(input) => world.input(input),
+            Self::External(_) => false,
+            Self::ActionStatus { action, installed } => world.action_status(action, *installed),
+            Self::FragmentPlaying(fragment) => world.fragment_playing(fragment.as_deref()),
+            Self::FragmentDone {
+                fragment,
+                exit_offset_ms,
+            } => world.fragment_done(fragment.as_deref(), *exit_offset_ms),
+            Self::AbilityMove(ability) => world.ability_move(ability),
+            Self::Cooldown(ability) => world.cooldown(ability),
+            Self::ManaCost(cost) => world.mana_cost(cost),
+            Self::StatusEffect(effect) => world.status_effect(effect),
+            Self::AbilityActive(ability) => world.ability_active(ability),
+            Self::ItemInSlot(slot) => world.item_in_slot(slot),
+            Self::Other(test) => world.other(test),
         }
+    }
+
+    /// The condition with each [`Condition::External`] that `named` names put in its place,
+    /// itself resolved, down to [`MAX_EXTERNAL_DEPTH`] names deep.
+    fn resolved(self, named: &[(String, Condition)], depth: usize) -> Self {
+        let parts = |parts: Vec<Self>| {
+            parts
+                .into_iter()
+                .map(|part| part.resolved(named, depth))
+                .collect()
+        };
+        match self {
+            Self::All(list) => Self::All(parts(list)),
+            Self::Any(list) => Self::Any(parts(list)),
+            Self::Not(part) => Self::Not(Box::new(part.resolved(named, depth))),
+            Self::External(name) if depth < MAX_EXTERNAL_DEPTH => named
+                .iter()
+                .find(|(own, _)| *own == name)
+                .map_or(Self::External(name), |(_, condition)| {
+                    condition.clone().resolved(named, depth + 1)
+                }),
+            other => other,
+        }
+    }
+
+    /// The element name of a test that reads more than tags and markers (an input, a named
+    /// condition, an action, a fragment, an ability, a cooldown, mana, an effect, a slot or
+    /// another test); `None` for the logic elements, `True`, a tag and a marker.
+    pub fn test_element(&self) -> Option<&str> {
+        Some(match self {
+            Self::All(_)
+            | Self::Any(_)
+            | Self::Not(_)
+            | Self::True
+            | Self::Tag(_)
+            | Self::Marker(_) => {
+                return None;
+            }
+            Self::Input(_) => INPUT_TEST_ELEMENT,
+            Self::External(_) => EXTERNAL_TEST_ELEMENT,
+            Self::ActionStatus { .. } => ACTION_STATUS_TEST_ELEMENT,
+            Self::FragmentPlaying(_) => FRAGMENT_PLAYING_TEST_ELEMENT,
+            Self::FragmentDone { .. } => FRAGMENT_DONE_TEST_ELEMENT,
+            Self::AbilityMove(_) => ABILITY_MOVE_TEST_ELEMENT,
+            Self::Cooldown(_) => COOLDOWN_TEST_ELEMENT,
+            Self::ManaCost(_) => MANA_COST_TEST_ELEMENT,
+            Self::StatusEffect(_) => STATUS_EFFECT_TEST_ELEMENT,
+            Self::AbilityActive(_) => ABILITY_ACTIVE_TEST_ELEMENT,
+            Self::ItemInSlot(_) => ITEM_IN_SLOT_TEST_ELEMENT,
+            Self::Other(test) => test,
+        })
     }
 
     /// The markers it tests, in order.
@@ -841,7 +1116,7 @@ impl Condition {
             Self::All(parts) | Self::Any(parts) => parts.iter().flat_map(Self::markers).collect(),
             Self::Not(part) => part.markers(),
             Self::Marker(marker) => vec![marker.as_str()],
-            Self::True | Self::Tag(_) | Self::Other(_) => Vec::new(),
+            _ => Vec::new(),
         }
     }
 }
@@ -941,9 +1216,8 @@ pub struct Action {
     pub name: String,
     /// `FragmentName`.
     pub fragment: String,
-    /// The spells it casts when a condition holds (an `IfThenElse` whose `ThenActivity` is a
-    /// `CastSpell`): the condition and the spell id, in file order.
-    pub casts: Vec<(Condition, String)>,
+    /// The spells its activities cast, in file order.
+    pub casts: Vec<SpellCast>,
     /// Its activation on a status effect: an `<ActivationCondition>` whose `And` holds one test
     /// `<IfHasStatusEffect>` (not under a `Not`), the effect and the rest of the `And`.
     pub on_status_effect: Option<(String, Condition)>,
@@ -952,6 +1226,140 @@ pub struct Action {
     /// Its `AnimationDrivenMotion` activity, when one is among its activities (not under a
     /// branch).
     pub driven_motion: Option<DrivenMotion>,
+    /// Its `<ActivationCondition>`: it starts while this holds; `None` when it has none (it
+    /// does not start by itself).
+    pub activation: Option<Condition>,
+    /// Its `<DeactivationCondition>`: it stops when this holds; `None` when it has none.
+    pub deactivation: Option<Condition>,
+    /// Its active ability parts; `None` for an action that tests and performs no ability.
+    pub ability: Option<AbilityUse>,
+}
+
+/// How a cast activity aims its spell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum CastKind {
+    /// `CastSpell`: from the caster, as its spell row says.
+    Plain,
+    /// `CastSpellRaycast`: where the caster's aim ray meets something.
+    Raycast,
+    /// `CastSpellTargeting`: at the point the player picks with its targeting slice.
+    Targeting,
+}
+
+/// One spell an action casts.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SpellCast {
+    /// The conditions of the branches it is in; `True` for an unconditional cast.
+    pub condition: Condition,
+    /// The `SpellData` id.
+    pub spell: String,
+    /// How it aims.
+    pub kind: CastKind,
+}
+
+/// The active ability parts of an action (the `playeractions_ability_*` lists).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct AbilityUse {
+    /// `IfActiveAbilityMoveName AbilityName` of its activation (not under a `Not`): the mapped
+    /// ability whose key starts it.
+    pub move_name: Option<String>,
+    /// `IfManaCost CostID` of its activation (not under a `Not`): the cost the mana must cover.
+    pub mana_cost: Option<String>,
+    /// `IfCooldownTimer AbilityID` of its activation under a `Not`: the cooldowns that must be
+    /// over.
+    pub needs_ready: Vec<String>,
+    /// `PerformActiveAbility AbilityName` activities, in file order, once each.
+    pub performs: Vec<String>,
+    /// `SetCooldownTimer AbilityID` activities, in file order, once each.
+    pub starts_cooldowns: Vec<String>,
+    /// The `EffectId`s of its `EffectsToApplyOnEnter` rows (of its `ModifyStatusEffects`), in
+    /// file order, once each.
+    pub applies_on_enter: Vec<String>,
+}
+
+/// The child `element` of `action` (`<ActivationCondition>`, ...) as one condition: all its parts.
+fn condition_of(action: &Node, element: &str) -> Option<Condition> {
+    action
+        .children
+        .iter()
+        .find(|child| child.name == element)
+        .map(|test| Condition::All(test.children.iter().map(Condition::of).collect()))
+}
+
+/// The tests named `element` of `node` and below, split by whether a `Not` holds them.
+fn tests<'a>(node: &'a Node, element: &str, negated: bool, found: &mut Vec<(&'a Node, bool)>) {
+    for child in &node.children {
+        if child.name == element {
+            found.push((child, negated));
+        }
+        tests(child, element, negated ^ (child.name == NOT_ELEMENT), found);
+    }
+}
+
+/// The values of attribute `key` of the elements `element` below `node`, once each, in order.
+fn attribute_values(node: &Node, element: &str, key: &str) -> Vec<String> {
+    let mut nodes = Vec::new();
+    node.descendants(element, &mut nodes);
+    let mut values: Vec<String> = Vec::new();
+    for value in nodes
+        .into_iter()
+        .flat_map(|found| std::iter::once(found).chain(&found.children))
+        .filter_map(|found| found.attribute(key))
+    {
+        if !values.iter().any(|own| own == value) {
+            values.push(value.to_owned());
+        }
+    }
+    values
+}
+
+fn ability_use(action: &Node) -> Option<AbilityUse> {
+    let activation = action
+        .children
+        .iter()
+        .find(|child| child.name == ACTIVATION_CONDITION_ELEMENT);
+    let found = |element: &str| {
+        let mut found = Vec::new();
+        if let Some(activation) = activation {
+            tests(activation, element, false, &mut found);
+        }
+        found
+    };
+    let first_positive = |element: &str, key: &str| {
+        found(element)
+            .into_iter()
+            .find(|(_, negated)| !negated)
+            .and_then(|(test, _)| test.attribute(key).map(str::to_owned))
+    };
+    let mut effect_rows = Vec::new();
+    action.descendants(APPLY_ON_ENTER_ELEMENT, &mut effect_rows);
+    let mut applies_on_enter: Vec<String> = Vec::new();
+    for effect in effect_rows
+        .into_iter()
+        .flat_map(|row| &row.children)
+        .filter(|child| child.name == EFFECT_ID_ELEMENT)
+        .filter_map(|child| child.attribute(EFFECT_ID_ATTRIBUTE))
+    {
+        if !applies_on_enter.iter().any(|own| own == effect) {
+            applies_on_enter.push(effect.to_owned());
+        }
+    }
+    let ability = AbilityUse {
+        move_name: first_positive(ABILITY_MOVE_TEST_ELEMENT, ABILITY_NAME_ATTRIBUTE),
+        mana_cost: first_positive(MANA_COST_TEST_ELEMENT, COST_ID_ATTRIBUTE),
+        needs_ready: found(COOLDOWN_TEST_ELEMENT)
+            .into_iter()
+            .filter(|(_, negated)| *negated)
+            .filter_map(|(test, _)| test.attribute(ABILITY_ID_ATTRIBUTE).map(str::to_owned))
+            .collect(),
+        performs: attribute_values(action, PERFORM_ABILITY_ELEMENT, ABILITY_NAME_ATTRIBUTE),
+        starts_cooldowns: attribute_values(action, SET_COOLDOWN_ELEMENT, ABILITY_ID_ATTRIBUTE),
+        applies_on_enter,
+    };
+    (ability.move_name.is_some()
+        || !ability.performs.is_empty()
+        || !ability.starts_cooldowns.is_empty())
+    .then_some(ability)
 }
 
 fn driven_motion(action: &Node) -> Option<DrivenMotion> {
@@ -1005,31 +1413,83 @@ fn sets_tags(action: &Node) -> Vec<String> {
         .collect()
 }
 
-fn casts(action: &Node) -> Vec<(Condition, String)> {
-    let mut branches = Vec::new();
-    action.descendants(IF_THEN_ELSE_ELEMENT, &mut branches);
-    branches
-        .into_iter()
-        .filter_map(|branch| {
-            let condition = branch
+/// The spells its activities cast, each with the conditions of the branches it is in (`True`
+/// for an unconditional cast), in file order.
+fn casts(action: &Node) -> Vec<SpellCast> {
+    let mut found = Vec::new();
+    for activities in action
+        .children
+        .iter()
+        .filter(|child| child.name == ACTIVITIES_ELEMENT)
+    {
+        branch_casts(activities, &[], &mut found);
+    }
+    found
+}
+
+/// The spell an activity casts and how: `<CastSpell><Default SpellName>`, or a raycast or
+/// targeting cast that names it.
+fn spell_of(activity: &Node) -> Option<(&str, CastKind)> {
+    match activity.name.as_str() {
+        CAST_SPELL_ELEMENT => Some((
+            activity
                 .children
                 .iter()
-                .find(|child| child.name == IF_CONDITION_ELEMENT)
-                .map(|test| Condition::All(test.children.iter().map(Condition::of).collect()))?;
-            let then = branch
-                .children
-                .iter()
-                .find(|child| child.name == THEN_ACTIVITY_ELEMENT)?;
-            let mut casts = Vec::new();
-            then.descendants(CAST_SPELL_ELEMENT, &mut casts);
-            let spell = casts
-                .iter()
-                .flat_map(|cast| &cast.children)
                 .find(|child| child.name == DEFAULT_ELEMENT)?
-                .attribute(SPELL_NAME_ATTRIBUTE)?;
-            Some((condition, spell.to_owned()))
-        })
-        .collect()
+                .attribute(SPELL_NAME_ATTRIBUTE)?,
+            CastKind::Plain,
+        )),
+        CAST_RAYCAST_ELEMENT => {
+            Some((activity.attribute(SPELL_NAME_ATTRIBUTE)?, CastKind::Raycast))
+        }
+        CAST_TARGETING_ELEMENT => Some((
+            activity.attribute(SPELL_NAME_ATTRIBUTE)?,
+            CastKind::Targeting,
+        )),
+        _ => None,
+    }
+}
+
+fn branch_casts(node: &Node, conditions: &[Condition], found: &mut Vec<SpellCast>) {
+    for child in &node.children {
+        if let Some((spell, kind)) = spell_of(child) {
+            let condition = if conditions.is_empty() {
+                Condition::True
+            } else {
+                Condition::All(conditions.to_vec())
+            };
+            found.push(SpellCast {
+                condition,
+                spell: spell.to_owned(),
+                kind,
+            });
+        } else if child.name == IF_THEN_ELSE_ELEMENT {
+            let Some(test) = child
+                .children
+                .iter()
+                .find(|part| part.name == IF_CONDITION_ELEMENT)
+                .map(|test| Condition::All(test.children.iter().map(Condition::of).collect()))
+            else {
+                continue;
+            };
+            for (branch, holds) in [
+                (THEN_ACTIVITY_ELEMENT, true),
+                (ELSE_ACTIVITY_ELEMENT, false),
+            ] {
+                if let Some(activity) = child.children.iter().find(|part| part.name == branch) {
+                    let mut inner = conditions.to_vec();
+                    inner.push(if holds {
+                        test.clone()
+                    } else {
+                        Condition::Not(Box::new(test.clone()))
+                    });
+                    branch_casts(activity, &inner, found);
+                }
+            }
+        } else {
+            branch_casts(child, conditions, found);
+        }
+    }
 }
 
 /// A CAGE action list (`*.actionlist`): its actions and its named conditions.
@@ -1052,7 +1512,7 @@ impl ActionList {
         let root = parse_tree(text)?;
         let mut actions = Vec::new();
         root.descendants(ACTION_ELEMENT, &mut actions);
-        let conditions = root
+        let conditions: Vec<(String, Condition)> = root
             .children
             .iter()
             .filter(|child| child.name == CONDITIONS_ELEMENT)
@@ -1074,10 +1534,22 @@ impl ActionList {
                             .attribute(FRAGMENT_NAME_ATTRIBUTE)
                             .unwrap_or_default()
                             .to_owned(),
-                        casts: casts(action),
-                        on_status_effect: on_status_effect(action),
+                        casts: casts(action)
+                            .into_iter()
+                            .map(|cast| SpellCast {
+                                condition: cast.condition.resolved(&conditions, 0),
+                                ..cast
+                            })
+                            .collect(),
+                        on_status_effect: on_status_effect(action)
+                            .map(|(effect, rest)| (effect, rest.resolved(&conditions, 0))),
                         sets_tags: sets_tags(action),
                         driven_motion: driven_motion(action),
+                        activation: condition_of(action, ACTIVATION_CONDITION_ELEMENT)
+                            .map(|condition| condition.resolved(&conditions, 0)),
+                        deactivation: condition_of(action, DEACTIVATION_CONDITION_ELEMENT)
+                            .map(|condition| condition.resolved(&conditions, 0)),
+                        ability: ability_use(action),
                     })
                 })
                 .collect(),
@@ -1229,6 +1701,21 @@ mod tests {
     }
 
     #[test]
+    fn a_player_grid_list_names_its_weapon_classes() {
+        // `player.grid`.
+        let grid = r#"<Grid><ActionLists>
+  <ActionList WeaponRequirements="Musket+Blunderbuss" Path="SharedAssets/x/PlayerActions_Ability_Musket.actionlist"><AliasMap/></ActionList>
+  <ActionList Path="SharedAssets/x/PlayerActions_Nav.actionlist"><AliasMap/></ActionList>
+</ActionLists></Grid>"#;
+        let lists = CageGrid::lists(grid).expect("grid");
+        assert_eq!(lists[0].weapon_classes, ["Musket", "Blunderbuss"]);
+        assert!(
+            lists[1].weapon_classes.is_empty(),
+            "a list for every weapon"
+        );
+    }
+
+    #[test]
     fn a_grid_without_one_of_its_lists_has_no_numbers() {
         let lists = CageGrid::lists(THORPE_GRID).expect("grid");
         let only_combat = ActionList::parse(THORPE_COMBAT).expect("list");
@@ -1281,8 +1768,6 @@ mod tests {
   </Fragment>
  </Attack_Start_Charge>
 </FragmentList></AnimDB>"#;
-
-    const MS_PER_SECOND: f64 = 1_000.0;
 
     fn ms(seconds: f64) -> u64 {
         (seconds * MS_PER_SECOND).round() as u64
@@ -1533,6 +2018,146 @@ mod tests {
     }
 
     #[test]
+    fn an_ability_action_names_its_ability_cost_cooldown_spells_and_effects() {
+        // `playeractions_ability_lifemagic.actionlist`, Smite, trimmed.
+        let text = r#"<ActionList><Actions>
+ <Action Name="Ability_Life_Staff_Smite" FragmentName="Ability_Life_Staff_Smite">
+  <ActivationCondition><And>
+   <IfActiveAbilityMoveName AbilityName="Ability_Life_Staff_Smite"/>
+   <IfManaCost ComparisonType="GreaterThanOrEqual" CostID="LifeStaff_Smite" SlotToCheckAlias="ACTIVE_MAIN_HAND_WEAPON"/>
+   <Not><IfCooldownTimer AbilityID="Ability_Life_Staff_Smite" SlotToCheckAlias="ACTIVE_MAIN_HAND_WEAPON"/></Not>
+   <Not><IfActiveAbilityMoveName AbilityName="Not_This"/></Not>
+  </And></ActivationCondition>
+  <Activities>
+   <PerformActiveAbility><Default AbilityName="Ability_Life_Staff_Smite"/></PerformActiveAbility>
+   <ModifyStatusEffects><Default><EffectsToApplyOnEnter><EffectId EffectId="Smite_Slow"/></EffectsToApplyOnEnter></Default></ModifyStatusEffects>
+   <IfThenElse><IfCondition><IfExternalCondition ConditionName="NoSmiteUpgrade_RayCast"/></IfCondition>
+    <ThenActivity><CastSpellRaycast SpellName="LifeStaff_Smite"/></ThenActivity>
+    <ElseActivity><Group><SetCooldownTimer><Default AbilityID="Ability_Life_Staff_Smite"/></SetCooldownTimer></Group></ElseActivity>
+   </IfThenElse>
+   <CastSpell><Default SpellName="Always_Cast"/></CastSpell>
+  </Activities>
+ </Action>
+</Actions>
+<Conditions>
+ <And Name="NoSmiteUpgrade_RayCast"><IfInput InputName="attack_shoot"/><IfMannequinTag TagName="Heal"/><IfMannequinMarker MarkerName="Magic_IsReadying_Smite"/></And>
+</Conditions></ActionList>"#;
+        let list = ActionList::parse(text).expect("list");
+        let action = list.action("Ability_Life_Staff_Smite").expect("action");
+        let ability = action.ability.as_ref().expect("an ability action");
+        assert_eq!(
+            ability.move_name.as_deref(),
+            Some("Ability_Life_Staff_Smite")
+        );
+        assert_eq!(ability.mana_cost.as_deref(), Some("LifeStaff_Smite"));
+        assert_eq!(ability.needs_ready, ["Ability_Life_Staff_Smite"]);
+        assert_eq!(ability.performs, ["Ability_Life_Staff_Smite"]);
+        assert_eq!(ability.starts_cooldowns, ["Ability_Life_Staff_Smite"]);
+        assert_eq!(ability.applies_on_enter, ["Smite_Slow"]);
+        let spells: Vec<(&str, CastKind)> = action
+            .casts
+            .iter()
+            .map(|cast| (cast.spell.as_str(), cast.kind))
+            .collect();
+        assert_eq!(
+            spells,
+            [
+                ("LifeStaff_Smite", CastKind::Raycast),
+                ("Always_Cast", CastKind::Plain)
+            ]
+        );
+        let smite = &action.casts[0].condition;
+        let state = |inputs: &'static [&'static str]| CageState {
+            tags: &["Heal"],
+            markers: &["Magic_IsReadying_Smite"],
+            inputs,
+        };
+        assert!(
+            smite.holds_in(&state(&["attack_shoot"])),
+            "the named condition holds"
+        );
+        assert!(!smite.holds_in(&state(&[])), "not without the key");
+        assert!(
+            action.casts[1].condition.holds_in(&state(&[])),
+            "an unconditional cast"
+        );
+        assert!(
+            list.action("Ability_Life_Staff_Smite")
+                .is_some_and(|action| action.ability.is_some())
+        );
+    }
+
+    /// A player whose Smite key is pressed, with mana, and the cooldowns `cooling`.
+    struct Pressed {
+        cooling: &'static [&'static str],
+    }
+
+    impl CageWorld for Pressed {
+        fn tag(&self, _: &str) -> bool {
+            false
+        }
+
+        fn marker(&self, _: &str) -> bool {
+            false
+        }
+
+        fn input(&self, _: &str) -> bool {
+            false
+        }
+
+        fn ability_move(&self, ability: &str) -> bool {
+            ability == "Ability_Life_Staff_Smite"
+        }
+
+        fn cooldown(&self, ability: &str) -> bool {
+            self.cooling.contains(&ability)
+        }
+
+        fn mana_cost(&self, _: &str) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn an_ability_action_starts_on_its_key_when_its_cooldown_is_over() {
+        let text = r#"<ActionList><Actions>
+ <Action Name="Smite" FragmentName="Smite">
+  <ActivationCondition><And>
+   <IfActiveAbilityMoveName AbilityName="Ability_Life_Staff_Smite"/>
+   <IfManaCost ComparisonType="GreaterThanOrEqual" CostID="LifeStaff_Smite" SlotToCheckAlias="ACTIVE_MAIN_HAND_WEAPON"/>
+   <Not><IfCooldownTimer AbilityID="Ability_Life_Staff_Smite" SlotToCheckAlias="ACTIVE_MAIN_HAND_WEAPON"/></Not>
+  </And></ActivationCondition>
+  <DeactivationCondition><IfFragmentDone UseHostActionFragment="true" FragmentName="" ExitOffsetSeconds="0.25"/></DeactivationCondition>
+ </Action>
+</Actions></ActionList>"#;
+        let list = ActionList::parse(text).expect("list");
+        let action = list.action("Smite").expect("action");
+        let activation = action.activation.as_ref().expect("an activation");
+        assert!(activation.holds_in(&Pressed { cooling: &[] }));
+        assert!(!activation.holds_in(&Pressed {
+            cooling: &["Ability_Life_Staff_Smite"]
+        }));
+        assert_eq!(
+            action.deactivation,
+            Some(Condition::All(vec![Condition::FragmentDone {
+                fragment: None,
+                exit_offset_ms: 250
+            }]))
+        );
+    }
+
+    #[test]
+    fn an_action_without_ability_parts_has_none() {
+        let text = r#"<ActionList><Actions><Action Name="Idle" FragmentName="Idle"><Activities/></Action></Actions></ActionList>"#;
+        let list = ActionList::parse(text).expect("list");
+        assert_eq!(
+            list.action("Idle")
+                .and_then(|action| action.ability.as_ref()),
+            None
+        );
+    }
+
+    #[test]
     fn an_action_casts_a_spell_while_its_marker_is_on() {
         // `playeractions_ability_firemagic.actionlist`: the fire staff's light attack.
         let text = r#"<ActionList><Actions>
@@ -1549,14 +2174,14 @@ mod tests {
             action
                 .casts
                 .iter()
-                .find(|(condition, _)| condition.holds(&["Fire"], &[marker]))
-                .map(|(_, spell)| spell.as_str())
+                .find(|cast| cast.condition.holds(&["Fire"], &[marker]))
+                .map(|cast| cast.spell.as_str())
         };
         assert_eq!(
             cast("CastFireProjectile"),
             Some("Elemental_Fire_Projectile")
         );
         assert_eq!(cast("Other"), None, "the melee check never holds");
-        assert_eq!(action.casts[1].0.markers(), ["CastFireProjectile"]);
+        assert_eq!(action.casts[1].condition.markers(), ["CastFireProjectile"]);
     }
 }

@@ -1009,7 +1009,9 @@ fn cage_condition(decoder: &mut TreeDecoder, condition: &Condition) -> CageCondi
         Condition::True => CageCondition::True,
         Condition::Tag(tag) => CageCondition::Tag(decoder.intern(tag)),
         Condition::Marker(marker) => CageCondition::Marker(decoder.intern(marker)),
-        Condition::Other(name) => CageCondition::Other(decoder.intern(name)),
+        // A mob's tree reads tags and markers only: every other test stays a test by its
+        // element name, as before the parser knew them.
+        other => CageCondition::Other(decoder.intern(other.test_element().unwrap_or_default())),
     }
 }
 
