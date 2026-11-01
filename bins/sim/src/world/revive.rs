@@ -8,12 +8,12 @@
 //! dead player comes back where it lies, at 1 health (4 of 4 revived vitals: `hp` 1.0 with the
 //! alive `vitalsData` head), and its health regenerates from there.
 //!
-//! Death's door is not built: the expedition run had 2,659 dead `vitalsData` heads against 6
-//! death's door heads, and none of the 682 deaths of a war and two free-for-all runs went
-//! through it, but 107 of 281 own-player deaths of 75 community ledgers (older builds) did (head
-//! 2 before head 1; open-world quests and catacombs, never an outpost rush, a capture-the-flag, a
-//! 3v3 or an invasion; status effects study 2026-10-31). Which deaths take it is Unknown. A dead
-//! player stays dead until a revive or its respawn request.
+//! Death's door ([`nw_content::deaths_door`]): a lethal hit puts the player down at 0 health
+//! first when the rules allow it; a revive brings a downed or a dead player back, a hit after
+//! the door's delay kills a downed one ([`SimWorld::apply_hit`]), and so does the end of the
+//! door's time ([`SimWorld::tick_deaths_door`]). A dead player stays dead until a revive or its
+//! respawn request (retail sent the respawn request only after the dead block; Inferred: a
+//! downed player cannot ask for it).
 
 use bevy_ecs::entity::Entity;
 use nw_messages::{InteractionEndedMsg, InteractionRequest, ServerMessage};
@@ -121,13 +121,37 @@ impl SimWorld {
             .world
             .get_mut::<Vitals>(target_entity)
             .ok_or(ReviveRefusal::NoTarget)?;
-        if vitals.dead_since_ms.is_none() || !vitals.health.is_dead() {
+        let dead = vitals.dead_since_ms.is_some() && vitals.health.is_dead();
+        if !dead && !vitals.downed() {
             return Err(ReviveRefusal::NotDead);
         }
         vitals.health.heal(REVIVED_HEALTH);
         vitals.dead_since_ms = None;
+        vitals.deaths_door_since_ms = None;
         self.mobs.forget(target);
         Ok(target)
+    }
+}
+
+impl SimWorld {
+    /// Kills each downed player whose death's door time ended at `now_ms` (retail: `b` about
+    /// 120,033 ms in the dead block after the full time).
+    pub(super) fn tick_deaths_door(&mut self, now_ms: u64) {
+        let time_ms = self.content.deaths_door.time_ms;
+        let mut ended = Vec::new();
+        let mut query = self.world.query::<(Entity, &Player, &mut Vitals)>();
+        for (entity, player, mut vitals) in query.iter_mut(&mut self.world) {
+            if let Some(since) = vitals.deaths_door_since_ms
+                && now_ms.saturating_sub(since) >= time_ms
+            {
+                vitals.close_deaths_door(now_ms.saturating_sub(since), now_ms);
+                ended.push((entity, player.number, player.connection.clone()));
+            }
+        }
+        for (entity, number, connection) in ended {
+            tracing::debug!(player = number, "death's door ended");
+            self.player_died(entity, number, number, connection);
+        }
     }
 }
 
@@ -192,6 +216,73 @@ mod tests {
             world.revive(reviver, &revive_of(DEAD)),
             Err(ReviveRefusal::NotDead)
         );
+    }
+
+    /// Retail's death's door: 120 s, 1 s of delay (`VitalsBaseData` `Player`).
+    const DOOR_MS: u64 = 120_000;
+    const DELAY_MS: u64 = 1_000;
+    const NOW: u64 = 10_000;
+
+    fn door_world() -> SimWorld {
+        let mut world = world();
+        std::sync::Arc::make_mut(&mut world.content).deaths_door =
+            nw_content::deaths_door::DeathsDoorRules::new((DOOR_MS, DELAY_MS), &[], Some(10));
+        join(&mut world, REVIVER, 0.0);
+        join(&mut world, DEAD, 2.0);
+        world
+    }
+
+    fn vitals_of(world: &mut SimWorld, number: u64) -> Vitals {
+        let entity = world.player_by_number(number).expect("player");
+        *world.world.get::<Vitals>(entity).expect("vitals")
+    }
+
+    #[test]
+    fn a_lethal_hit_downs_the_player_and_a_hit_after_the_delay_kills_it() {
+        let mut world = door_world();
+        assert!(matches!(
+            world.apply_hit(DEAD, REVIVER, LETHAL, 0, NOW),
+            Some(crate::combat::AttackOutcome::Hit { .. })
+        ));
+        let downed = vitals_of(&mut world, DEAD);
+        assert!(
+            downed.downed() && downed.dead_since_ms.is_none(),
+            "down, not dead"
+        );
+        assert_eq!(health(&mut world, DEAD), 0);
+        assert_eq!(
+            world.apply_hit(DEAD, REVIVER, 1, 0, NOW + DELAY_MS - 1),
+            None,
+            "the delay"
+        );
+        assert!(matches!(
+            world.apply_hit(DEAD, REVIVER, 1, 0, NOW + 2_430),
+            Some(crate::combat::AttackOutcome::Killed { .. })
+        ));
+        let dead = vitals_of(&mut world, DEAD);
+        assert_eq!(
+            (dead.downed(), dead.dead_since_ms, dead.deaths_door_ms),
+            (false, Some(NOW + 2_430), Some(2_430)),
+            "retail NH-MSQ-5.1: b 2430"
+        );
+    }
+
+    #[test]
+    fn a_downed_player_dies_at_the_end_of_the_door_or_is_revived() {
+        let mut world = door_world();
+        world.apply_hit(DEAD, REVIVER, LETHAL, 0, NOW);
+        world.tick_deaths_door(NOW + DOOR_MS - 1);
+        assert!(vitals_of(&mut world, DEAD).downed());
+        world.tick_deaths_door(NOW + DOOR_MS);
+        assert_eq!(vitals_of(&mut world, DEAD).deaths_door_ms, Some(DOOR_MS));
+        // A revive brings a downed player back too.
+        let mut world = door_world();
+        world.apply_hit(DEAD, REVIVER, LETHAL, 0, NOW);
+        let reviver = world.player_by_number(REVIVER).expect("reviver");
+        assert_eq!(world.revive(reviver, &revive_of(DEAD)), Ok(DEAD));
+        let revived = vitals_of(&mut world, DEAD);
+        assert!(!revived.downed());
+        assert_eq!(revived.health.current(), REVIVED_HEALTH);
     }
 
     #[test]
