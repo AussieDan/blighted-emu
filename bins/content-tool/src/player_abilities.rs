@@ -16,12 +16,12 @@ use std::collections::{BTreeMap, HashMap};
 
 use nw_content::generated::{SpellData, Tables};
 use nw_content::player_abilities::{
-    AbilityCast, AbilityList, FragmentMarker, FragmentRow, ListAction, PlayerAbilities,
-    SpellProjectile, SpellRow,
+    AbilityCast, AbilityList, FragmentMarker, FragmentRow, FragmentTransition, ListAction,
+    PlayerAbilities, SpellProjectile, SpellRow,
 };
 use nw_content::player_attacks::stance_tags;
 use nw_formats::input_profile::input_actions;
-use nw_formats::mannequin::{Action, Condition, Fragment, GridList};
+use nw_formats::mannequin::{ActionList, Condition, Fragment, GridList};
 
 use crate::melee_shapes::ms;
 use crate::player_attacks::{
@@ -36,6 +36,14 @@ const EFFECT_SEPARATOR: char = ',';
 const INPUT_PROFILE: &str = "libs/config/defaultprofile.xml";
 /// A text cell that is on (`ClearOnExit`).
 const CELL_TRUE: &str = "1";
+/// The clip that moves a running action on to another, and its parameters.
+const TRANSITION_CLIP: &str = "CAGE-TransitionInstant";
+const TRANSITION_ACTION: &str = "NewAction";
+const TRANSITION_FRAGMENT: &str = "NewFragment";
+const TRANSITION_INPUT: &str = "Input";
+const TRANSITION_CONDITION: &str = "Condition";
+/// The input profile's input that is always on: a transition that names it needs no input.
+const ALWAYS_ON_INPUT: &str = "Test_AlwaysTrue";
 
 /// What the build made and left out.
 #[derive(Debug, Default)]
@@ -228,6 +236,50 @@ fn markers_of(fragments: &[&Fragment], end_ms: u64) -> Vec<FragmentMarker> {
     markers
 }
 
+/// The `CAGE-TransitionInstant` clips of `fragments` that name an action of `list` (`NewAction`,
+/// else the action that plays its `NewFragment`: the ice gauntlet's Ice Storm intro goes on to
+/// `Ability_IceMagic_IceStorm_Aim`, the fragment of `IceMagic_IceStorm_AimSubState`), by start; a
+/// clip without an end lasts to `end_ms`. A clip's named condition is the one of `list`, else of
+/// another of the action lists `all` (the bow's aim fragment tests the archery list's); a name
+/// that none has stays a test that never holds.
+fn transitions_of(
+    fragments: &[&Fragment],
+    end_ms: u64,
+    list: &ActionList,
+    all: &[ActionList],
+) -> Vec<FragmentTransition> {
+    let mut transitions: Vec<FragmentTransition> = fragments
+        .iter()
+        .flat_map(|fragment| fragment.clips_of(TRANSITION_CLIP))
+        .filter_map(|clip| {
+            let named = |key| clip.param(key).filter(|value| !value.is_empty());
+            let action = named(TRANSITION_ACTION).map(str::to_owned).or_else(|| {
+                let fragment = named(TRANSITION_FRAGMENT)?;
+                list.actions
+                    .iter()
+                    .find(|action| action.fragment.eq_ignore_ascii_case(fragment))
+                    .map(|action| action.name.clone())
+            })?;
+            Some(FragmentTransition {
+                action,
+                input: clip
+                    .param(TRANSITION_INPUT)
+                    .filter(|input| !input.is_empty() && *input != ALWAYS_ON_INPUT)
+                    .map(str::to_owned),
+                condition: named(TRANSITION_CONDITION).map(|name| {
+                    list.resolved_condition(name)
+                        .or_else(|| all.iter().find_map(|other| other.resolved_condition(name)))
+                        .unwrap_or_else(|| Condition::External(name.to_owned()))
+                }),
+                start_ms: ms(clip.start_s),
+                end_ms: clip.end_s.map_or(end_ms, ms),
+            })
+        })
+        .collect();
+    transitions.sort_by_key(|transition| transition.start_ms);
+    transitions
+}
+
 /// The cooldown and mana cost ids `condition` tests, into `cooldowns` and `costs`.
 fn tested_ids(condition: &Condition, cooldowns: &mut Vec<String>, costs: &mut Vec<String>) {
     match condition {
@@ -238,20 +290,21 @@ fn tested_ids(condition: &Condition, cooldowns: &mut Vec<String>, costs: &mut Ve
         }
         Condition::Not(part) => tested_ids(part, cooldowns, costs),
         Condition::Cooldown(id) => cooldowns.push(id.clone()),
-        Condition::ManaCost(id) => costs.push(id.clone()),
+        Condition::ManaCost { cost, .. } => costs.push(cost.clone()),
         _ => {}
     }
 }
 
-/// The ability list of the grid list `list`, whose actions are `actions`.
+/// The ability list of the grid list `list`, whose action list is `action_list`.
 fn list_of(
     sources: &AnimationSources,
     rows: &BundleRows,
     data: &AbilityRows<'_>,
     list: &GridList,
-    actions: &[Action],
+    action_list: &ActionList,
     skipped: &mut Vec<(String, String)>,
 ) -> AbilityList {
+    let actions = &action_list.actions;
     let label = list.weapon_classes.join("+");
     let cell = stance_of(rows, &list.weapon_classes);
     if cell.is_none() {
@@ -309,6 +362,7 @@ fn list_of(
             name: action.fragment.clone(),
             length_ms,
             markers: markers_of(&found, length_ms),
+            transitions: transitions_of(&found, length_ms, action_list, &sources.actions),
             hit,
         });
     }
@@ -403,7 +457,7 @@ pub fn build_abilities(
                 rows,
                 &data,
                 list,
-                &sources.actions[index].actions,
+                &sources.actions[index],
                 &mut report.skipped,
             ))
         })

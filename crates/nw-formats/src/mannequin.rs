@@ -94,10 +94,16 @@ const EXIT_OFFSET_ATTRIBUTE: &str = "ExitOffsetSeconds";
 const ABILITY_ACTIVE_TEST_ELEMENT: &str = "IfAbilityActive";
 const ITEM_IN_SLOT_TEST_ELEMENT: &str = "IfItemInSlot";
 const SLOT_ALIAS_ATTRIBUTE: &str = "SlotToCheckAlias";
+const TAG_IN_SLOT_TEST_ELEMENT: &str = "IfMannequinTagInItemSlot";
+const CONFIG_VAR_TEST_ELEMENT: &str = "IfStackConfigVar";
+const STACK_VAR_ATTRIBUTE: &str = "StackVar";
 const CONDITION_NAME_ATTRIBUTE: &str = "ConditionName";
 const ABILITY_MOVE_TEST_ELEMENT: &str = "IfActiveAbilityMoveName";
 const ABILITY_NAME_ATTRIBUTE: &str = "AbilityName";
 const MANA_COST_TEST_ELEMENT: &str = "IfManaCost";
+const COMPARISON_ATTRIBUTE: &str = "ComparisonType";
+const LESS_THAN: &str = "LessThan";
+const LESS_THAN_OR_EQUAL: &str = "LessThanOrEqual";
 const COST_ID_ATTRIBUTE: &str = "CostID";
 const COOLDOWN_TEST_ELEMENT: &str = "IfCooldownTimer";
 const ABILITY_ID_ATTRIBUTE: &str = "AbilityID";
@@ -874,16 +880,54 @@ pub enum Condition {
     AbilityMove(String),
     /// `<IfCooldownTimer AbilityID>`: the ability's cooldown runs.
     Cooldown(String),
-    /// `<IfManaCost CostID>`: the mana covers the cost.
-    ManaCost(String),
+    /// `<IfManaCost CostID ComparisonType>`: the mana compares with the cost so.
+    ManaCost {
+        /// `CostID`.
+        cost: String,
+        /// `ComparisonType`.
+        compare: ManaCompare,
+    },
     /// `<IfHasStatusEffect StatusEffect>`: the character has the effect.
     StatusEffect(String),
     /// `<IfAbilityActive AbilityName>`: the passive ability (an upgrade perk) is on.
     AbilityActive(String),
     /// `<IfItemInSlot SlotToCheckAlias>`: an item is in the slot.
     ItemInSlot(String),
+    /// `<IfMannequinTagInItemSlot TagName SlotToCheckAlias>`: the item in the slot has the
+    /// Mannequin tag (`Flail` in `ACTIVE_MAIN_HAND_WEAPON`: a flail is out).
+    TagInSlot {
+        /// `TagName`.
+        tag: String,
+        /// `SlotToCheckAlias`.
+        slot: String,
+    },
+    /// `<IfStackConfigVar StackVar>`: the client setting is on.
+    ConfigVar(String),
     /// Any other test, by element name.
     Other(String),
+}
+
+/// How an `IfManaCost` compares the mana with the cost (`ComparisonType`; the retail lists use
+/// these three: 83 `GreaterThanOrEqual`, 8 `LessThan`, 5 `LessThanOrEqual`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ManaCompare {
+    /// `GreaterThanOrEqual`: the mana covers the cost.
+    AtLeast,
+    /// `LessThan`.
+    Below,
+    /// `LessThanOrEqual`.
+    AtMost,
+}
+
+impl ManaCompare {
+    /// Whether `mana` compares with `cost` so.
+    pub fn holds(self, mana: f32, cost: f32) -> bool {
+        match self {
+            Self::AtLeast => mana >= cost,
+            Self::Below => mana < cost,
+            Self::AtMost => mana <= cost,
+        }
+    }
 }
 
 /// What the tests of an action list read from a character. A test this world does not know is
@@ -916,8 +960,8 @@ pub trait CageWorld {
     fn cooldown(&self, _ability: &str) -> bool {
         false
     }
-    /// The mana covers cost `cost`.
-    fn mana_cost(&self, _cost: &str) -> bool {
+    /// The mana compares with cost `cost` as `compare` says.
+    fn mana_cost(&self, _cost: &str, _compare: ManaCompare) -> bool {
         false
     }
     /// It has status effect `effect`.
@@ -930,6 +974,14 @@ pub trait CageWorld {
     }
     /// An item is in slot `slot`.
     fn item_in_slot(&self, _slot: &str) -> bool {
+        false
+    }
+    /// The item in slot `slot` has Mannequin tag `tag`.
+    fn tag_in_slot(&self, _tag: &str, _slot: &str) -> bool {
+        false
+    }
+    /// Client setting `variable` is on.
+    fn config_var(&self, _variable: &str) -> bool {
         false
     }
     /// Another test, by element name.
@@ -1012,10 +1064,22 @@ impl Condition {
             },
             ABILITY_MOVE_TEST_ELEMENT => Self::AbilityMove(attribute(ABILITY_NAME_ATTRIBUTE)),
             COOLDOWN_TEST_ELEMENT => Self::Cooldown(attribute(ABILITY_ID_ATTRIBUTE)),
-            MANA_COST_TEST_ELEMENT => Self::ManaCost(attribute(COST_ID_ATTRIBUTE)),
+            MANA_COST_TEST_ELEMENT => Self::ManaCost {
+                cost: attribute(COST_ID_ATTRIBUTE),
+                compare: match node.attribute(COMPARISON_ATTRIBUTE) {
+                    Some(LESS_THAN) => ManaCompare::Below,
+                    Some(LESS_THAN_OR_EQUAL) => ManaCompare::AtMost,
+                    _ => ManaCompare::AtLeast,
+                },
+            },
             STATUS_EFFECT_TEST_ELEMENT => Self::StatusEffect(attribute(STATUS_EFFECT_ATTRIBUTE)),
             ABILITY_ACTIVE_TEST_ELEMENT => Self::AbilityActive(attribute(ABILITY_NAME_ATTRIBUTE)),
             ITEM_IN_SLOT_TEST_ELEMENT => Self::ItemInSlot(attribute(SLOT_ALIAS_ATTRIBUTE)),
+            TAG_IN_SLOT_TEST_ELEMENT => Self::TagInSlot {
+                tag: attribute(TAG_NAME_ATTRIBUTE),
+                slot: attribute(SLOT_ALIAS_ATTRIBUTE),
+            },
+            CONFIG_VAR_TEST_ELEMENT => Self::ConfigVar(attribute(STACK_VAR_ATTRIBUTE)),
             other => Self::Other(other.to_owned()),
         }
     }
@@ -1051,10 +1115,12 @@ impl Condition {
             } => world.fragment_done(fragment.as_deref(), *exit_offset_ms),
             Self::AbilityMove(ability) => world.ability_move(ability),
             Self::Cooldown(ability) => world.cooldown(ability),
-            Self::ManaCost(cost) => world.mana_cost(cost),
+            Self::ManaCost { cost, compare } => world.mana_cost(cost, *compare),
             Self::StatusEffect(effect) => world.status_effect(effect),
             Self::AbilityActive(ability) => world.ability_active(ability),
             Self::ItemInSlot(slot) => world.item_in_slot(slot),
+            Self::TagInSlot { tag, slot } => world.tag_in_slot(tag, slot),
+            Self::ConfigVar(variable) => world.config_var(variable),
             Self::Other(test) => world.other(test),
         }
     }
@@ -1102,10 +1168,12 @@ impl Condition {
             Self::FragmentDone { .. } => FRAGMENT_DONE_TEST_ELEMENT,
             Self::AbilityMove(_) => ABILITY_MOVE_TEST_ELEMENT,
             Self::Cooldown(_) => COOLDOWN_TEST_ELEMENT,
-            Self::ManaCost(_) => MANA_COST_TEST_ELEMENT,
+            Self::ManaCost { .. } => MANA_COST_TEST_ELEMENT,
             Self::StatusEffect(_) => STATUS_EFFECT_TEST_ELEMENT,
             Self::AbilityActive(_) => ABILITY_ACTIVE_TEST_ELEMENT,
             Self::ItemInSlot(_) => ITEM_IN_SLOT_TEST_ELEMENT,
+            Self::TagInSlot { .. } => TAG_IN_SLOT_TEST_ELEMENT,
+            Self::ConfigVar(_) => CONFIG_VAR_TEST_ELEMENT,
             Self::Other(test) => test,
         })
     }
@@ -1567,6 +1635,12 @@ impl ActionList {
         self.action(name)
             .map(|action| action.fragment.as_str())
             .filter(|fragment| !fragment.is_empty())
+    }
+
+    /// The named condition `name` with the named conditions it names put in their place.
+    pub fn resolved_condition(&self, name: &str) -> Option<Condition> {
+        self.condition(name)
+            .map(|condition| condition.clone().resolved(&self.conditions, 1))
     }
 
     /// The named condition `name`.
@@ -2113,8 +2187,8 @@ mod tests {
             self.cooling.contains(&ability)
         }
 
-        fn mana_cost(&self, _: &str) -> bool {
-            true
+        fn mana_cost(&self, _: &str, compare: ManaCompare) -> bool {
+            compare == ManaCompare::AtLeast
         }
     }
 
@@ -2144,6 +2218,68 @@ mod tests {
                 exit_offset_ms: 250
             }]))
         );
+    }
+
+    /// `playeractions_ability_lifemagic.actionlist`: Beacon needs more mana than its cost
+    /// (`Beacon_Mana_Check` is `LessThanOrEqual`), a flail out (`IfMannequinTagInItemSlot`) and
+    /// a client setting (`IfStackConfigVar`).
+    #[test]
+    fn mana_compares_slot_tags_and_settings_read_as_the_list_says() {
+        let text = r#"<ActionList><Conditions>
+ <And Name="Beacon_Mana_Check"><IfManaCost ComparisonType="LessThanOrEqual" CostID="LifeStaff_Beacon"/></And>
+</Conditions><Actions>
+ <Action Name="Beacon" FragmentName="Beacon">
+  <ActivationCondition><And>
+   <Not><IfExternalCondition ConditionName="Beacon_Mana_Check"/></Not>
+   <IfMannequinTagInItemSlot TagName="Flail" SlotToCheckAlias="ACTIVE_MAIN_HAND_WEAPON"/>
+   <IfStackConfigVar StackVar="javelin.enable-ammoless-weapons"/>
+  </And></ActivationCondition>
+ </Action>
+</Actions></ActionList>"#;
+        struct Flail {
+            mana: f32,
+        }
+        impl CageWorld for Flail {
+            fn tag(&self, _: &str) -> bool {
+                false
+            }
+            fn marker(&self, _: &str) -> bool {
+                false
+            }
+            fn input(&self, _: &str) -> bool {
+                false
+            }
+            fn mana_cost(&self, _: &str, compare: ManaCompare) -> bool {
+                compare.holds(self.mana, 30.0)
+            }
+            fn tag_in_slot(&self, tag: &str, slot: &str) -> bool {
+                tag == "Flail" && slot == "ACTIVE_MAIN_HAND_WEAPON"
+            }
+            fn config_var(&self, variable: &str) -> bool {
+                variable == "javelin.enable-ammoless-weapons"
+            }
+        }
+        let list = ActionList::parse(text).expect("list");
+        let activation = list
+            .action("Beacon")
+            .and_then(|action| action.activation.as_ref())
+            .expect("an activation");
+        assert!(
+            activation.holds_in(&Flail { mana: 100.0 }),
+            "more mana than the cost"
+        );
+        assert!(
+            !activation.holds_in(&Flail { mana: 30.0 }),
+            "mana at the cost"
+        );
+        assert_eq!(
+            list.resolved_condition("Beacon_Mana_Check"),
+            Some(Condition::All(vec![Condition::ManaCost {
+                cost: "LifeStaff_Beacon".to_owned(),
+                compare: ManaCompare::AtMost,
+            }]))
+        );
+        assert!(ManaCompare::Below.holds(29.0, 30.0) && !ManaCompare::Below.holds(30.0, 30.0));
     }
 
     #[test]

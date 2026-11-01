@@ -14,18 +14,20 @@
 //! with no pause after a spend. Inferred: the cooldown starts when its action starts (retail
 //! sends it at the cast, 160 to 935 ms after the press).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bevy_ecs::entity::Entity;
 use nw_bus::ConnectionRef;
 use nw_content::attribute_bonuses::AbilityStats;
-use nw_content::player_abilities::{AbilityList, SpellProjectile, SpellRow};
+use nw_content::player_abilities::{AbilityList, ListAction, SpellProjectile, SpellRow};
 use nw_content::player_attacks::stance_tags;
 use nw_content::status_effects::StatusEffectRules;
 #[cfg(test)]
 use nw_formats::mannequin::Condition;
-use nw_formats::mannequin::{CageWorld, CastKind};
+use nw_formats::mannequin::{CageWorld, CastKind, ManaCompare};
 use nw_formats::objectstream::lowercase_crc32;
+use nw_messages::paperdoll::slot;
 use nw_messages::{AbilityCooldown, InputRecord, LookDir};
 use nw_sim_core::Position;
 
@@ -56,12 +58,33 @@ const MS_PER_S: f32 = 1_000.0;
 /// Microseconds per millisecond.
 const US_PER_MS: u64 = 1_000;
 /// Tests the server takes as passing for a standing player with a weapon in the hand, by element
-/// name (Inferred: the client's character fits its controller, the weapon its requirements, and
-/// the client checks its own aim point, which it does not send).
-const PASSING_TESTS: [&str; 3] = [
+/// name (Inferred: the client's character fits its controller, the weapon its requirements and
+/// its slot (the abilities run only while a weapon is in the hand), and the client checks its own
+/// aim point, which it does not send).
+const PASSING_TESTS: [&str; 4] = [
     "IfCanResizeCharacterController",
     "IfHasWeaponPrerequisites",
+    "IfItemInSlotEquippable",
     "ActionConditionSpellSpawnLocationState",
+];
+
+/// The client settings that `IfStackConfigVar` tests and that are on: each one's client default
+/// is on (the creation site of `NewWorld.exe` build 25810808 passes 1) and the retail remote
+/// configuration of 2026-09-18 does not set it. Weapons need no ammo
+/// (`javelin.enable-ammoless-weapons`). A setting not listed is off.
+const CLIENT_SETTINGS_ON: [&str; 4] = [
+    "javelin.enable-ammoless-weapons",
+    "javelin.enable-inventory-while-running",
+    "javelin.enable-running-on-roads",
+    "javelin.musical-performances.enabled",
+];
+/// The slot alias of the weapon in the hand.
+const ACTIVE_MAIN_HAND: &str = "ACTIVE_MAIN_HAND_WEAPON";
+/// The slot aliases of the main-hand options, with their paperdoll slots.
+const MAIN_HAND_OPTIONS: [(&str, u32); 3] = [
+    ("MAIN_HAND_OPTION_1", slot::MAIN_HAND_OPTION_1),
+    ("MAIN_HAND_OPTION_2", slot::MAIN_HAND_OPTION_2),
+    ("MAIN_HAND_OPTION_3", slot::MAIN_HAND_OPTION_3),
 ];
 
 /// Status effects an ability puts on a player are of this potency (the data's own).
@@ -80,6 +103,15 @@ pub(super) trait Holder {
     fn has_effect(&self, effect: &str) -> bool;
     /// An item is in slot `slot` (`ACTIVE_MAIN_HAND_WEAPON`, ...).
     fn item_in_slot(&self, slot: &str) -> bool;
+    /// The Mannequin tags of the item in slot `slot`: those of its weapon stance. By default
+    /// the weapon in the hand has the holder's tags and no other slot has any.
+    fn tags_in_slot(&self, slot: &str) -> Vec<&str> {
+        if slot == ACTIVE_MAIN_HAND {
+            self.tags()
+        } else {
+            Vec::new()
+        }
+    }
     /// Its passive ability or upgrade `ability` is on.
     fn ability_active(&self, ability: &str) -> bool;
     /// What its abilities that are on add to its mana and cooldowns.
@@ -103,6 +135,9 @@ struct Press {
 /// An action that runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Running {
+    /// Its list ([`list_key`]): a weapon has up to three lists (the spear's own and the shared
+    /// `Ranged+Magic+Spear+Hatchet` one), each with its own action indices.
+    list: usize,
     /// Its index in the list.
     action: usize,
     /// When it started.
@@ -207,8 +242,8 @@ pub(super) struct AbilityRun {
     inputs_on: Vec<String>,
     /// The running actions.
     running: Vec<Running>,
-    /// The chain each action started in last, by action index.
-    started_in: Vec<Option<u64>>,
+    /// The chain each action started in last, by list ([`list_key`]) and action index.
+    started_in: HashMap<(usize, usize), u64>,
     /// The current chain.
     chain: u64,
     /// The spells the current chain cast. A chain casts each spell once: its list may cast one
@@ -224,9 +259,12 @@ pub(super) struct AbilityRun {
     pub mana: Mana,
 }
 
-/// The tests of a list, for the run of one player and the action `current` that tests.
+/// The tests of a list, for the run of one player and the action `current` that tests. The lists
+/// of the weapon run as one: a test of a fragment, a marker or an action sees the actions of
+/// every list (the bow's ability list aims with the archery list's `Bow_Aim_UpperBody`).
 struct RunWorld<'a> {
     run: &'a AbilityRun,
+    lists: &'a [&'a AbilityList],
     list: &'a AbilityList,
     holder: &'a dyn Holder,
     tags: Vec<&'a str>,
@@ -235,15 +273,6 @@ struct RunWorld<'a> {
 }
 
 impl RunWorld<'_> {
-    /// How long action `index` runs, when it runs.
-    fn elapsed(&self, index: usize) -> Option<u64> {
-        self.run
-            .running
-            .iter()
-            .find(|running| running.action == index)
-            .map(|running| self.now_ms.saturating_sub(running.started_ms))
-    }
-
     /// The length of action `index`'s fragment, ms.
     fn length(&self, index: usize) -> u64 {
         self.list.actions.get(index).map_or(0, |action| {
@@ -253,27 +282,39 @@ impl RunWorld<'_> {
         })
     }
 
-    /// The running actions that play fragment `fragment` (any case), with how long they run.
-    fn playing(&self, fragment: Option<&str>) -> Vec<(usize, u64)> {
-        let wanted = |index: usize| match fragment {
-            None => Some(index) == self.current,
+    /// The running actions of every list, with their list and action.
+    fn all_running(&self) -> impl Iterator<Item = (&Running, &AbilityList, &ListAction)> {
+        self.run.running.iter().filter_map(|running| {
+            let list = self
+                .lists
+                .iter()
+                .find(|list| list_key(list) == running.list)?;
+            Some((running, *list, list.actions.get(running.action)?))
+        })
+    }
+
+    /// The running actions that play fragment `fragment` (any case; `None`: the testing
+    /// action), each with its fragment's length and how long it runs.
+    fn playing(&self, fragment: Option<&str>) -> Vec<(u64, u64)> {
+        let elapsed = |running: &Running| self.now_ms.saturating_sub(running.started_ms);
+        match fragment {
+            None => self
+                .run
+                .running_in(self.list)
+                .filter(|running| Some(running.action) == self.current)
+                .map(|running| (self.length(running.action), elapsed(running)))
+                .collect(),
             Some(name) => self
-                .list
-                .actions
-                .get(index)
-                .is_some_and(|action| action.fragment.eq_ignore_ascii_case(name)),
-        };
-        self.run
-            .running
-            .iter()
-            .filter(|running| wanted(running.action))
-            .map(|running| {
-                (
-                    running.action,
-                    self.now_ms.saturating_sub(running.started_ms),
-                )
-            })
-            .collect()
+                .all_running()
+                .filter(|(_, _, action)| action.fragment.eq_ignore_ascii_case(name))
+                .map(|(running, list, action)| {
+                    let length = list
+                        .fragment(&action.fragment)
+                        .map_or(0, |fragment| fragment.length_ms);
+                    (length, elapsed(running))
+                })
+                .collect(),
+        }
     }
 }
 
@@ -283,17 +324,12 @@ impl CageWorld for RunWorld<'_> {
     }
 
     fn marker(&self, marker: &str) -> bool {
-        self.run.running.iter().any(|running| {
-            let Some(action) = self.list.actions.get(running.action) else {
-                return false;
-            };
-            self.list
-                .fragment(&action.fragment)
-                .is_some_and(|fragment| {
-                    fragment
-                        .markers_at(self.now_ms.saturating_sub(running.started_ms))
-                        .contains(&marker)
-                })
+        self.all_running().any(|(running, list, action)| {
+            list.fragment(&action.fragment).is_some_and(|fragment| {
+                fragment
+                    .markers_at(self.now_ms.saturating_sub(running.started_ms))
+                    .contains(&marker)
+            })
         })
     }
 
@@ -305,25 +341,19 @@ impl CageWorld for RunWorld<'_> {
     }
 
     fn action_status(&self, action: &str, installed: bool) -> bool {
-        installed
-            && self
-                .list
-                .actions
-                .iter()
-                .position(|own| own.name == action)
-                .is_some_and(|index| self.elapsed(index).is_some())
+        installed && self.all_running().any(|(_, _, own)| own.name == action)
     }
 
     fn fragment_playing(&self, fragment: Option<&str>) -> bool {
         self.playing(fragment)
             .into_iter()
-            .any(|(index, elapsed)| elapsed < self.length(index))
+            .any(|(length, elapsed)| elapsed < length)
     }
 
     fn fragment_done(&self, fragment: Option<&str>, exit_offset_ms: u32) -> bool {
         self.playing(fragment)
             .into_iter()
-            .any(|(index, elapsed)| elapsed + u64::from(exit_offset_ms) >= self.length(index))
+            .any(|(length, elapsed)| elapsed + u64::from(exit_offset_ms) >= length)
     }
 
     fn ability_move(&self, ability: &str) -> bool {
@@ -341,8 +371,11 @@ impl CageWorld for RunWorld<'_> {
             .any(|cooldown| cooldown.ability == crc && cooldown.end_ms > self.now_ms)
     }
 
-    fn mana_cost(&self, cost: &str) -> bool {
-        self.run.mana.current >= self.list.mana_cost(cost).unwrap_or_default()
+    fn mana_cost(&self, cost: &str, compare: ManaCompare) -> bool {
+        compare.holds(
+            self.run.mana.current,
+            self.list.mana_cost(cost).unwrap_or_default(),
+        )
     }
 
     fn status_effect(&self, effect: &str) -> bool {
@@ -355,6 +388,17 @@ impl CageWorld for RunWorld<'_> {
 
     fn ability_active(&self, ability: &str) -> bool {
         self.holder.ability_active(ability)
+    }
+
+    fn tag_in_slot(&self, tag: &str, slot: &str) -> bool {
+        self.holder
+            .tags_in_slot(slot)
+            .iter()
+            .any(|own| own.eq_ignore_ascii_case(tag))
+    }
+
+    fn config_var(&self, variable: &str) -> bool {
+        CLIENT_SETTINGS_ON.contains(&variable)
     }
 
     fn other(&self, test: &str) -> bool {
@@ -403,12 +447,12 @@ impl AbilityRun {
         }
     }
 
-    /// One tick of the list `list` at `now_ms` (`server_ms`: the same time on the server clock,
-    /// ms since 2000-01-01): the mana comes back, actions stop and start, and the running ones
-    /// cast; gives what the world must do.
+    /// One tick of the lists `lists` of the weapon in the hand at `now_ms` (`server_ms`: the same
+    /// time on the server clock, ms since 2000-01-01): the mana comes back, and in each list
+    /// actions move on, stop and start, and the running ones cast; gives what the world must do.
     pub fn tick(
         &mut self,
-        list: &AbilityList,
+        lists: &[&AbilityList],
         holder: &dyn Holder,
         now_ms: u64,
         server_ms: u64,
@@ -416,14 +460,79 @@ impl AbilityRun {
         let stats = holder.stats();
         self.mana.set_stats(stats);
         self.mana.regen(now_ms);
-        self.started_in.resize(list.actions.len(), None);
+        let mut events = Vec::new();
+        for list in lists {
+            self.tick_list(lists, list, holder, (now_ms, server_ms), &mut events);
+        }
+        events
+    }
+
+    /// One tick of list `list` of `lists` at `now_ms` (`server_ms` on the server clock): a
+    /// running action whose fragment's transition clip holds now moves on to the clip's action,
+    /// in its own list or else in another list of the weapon (the bow's ready step goes on to the
+    /// archery list's aim), before the stops (a clip at the fragment's end still moves it on);
+    /// then actions stop and start, and the running ones cast; what the world must do goes in
+    /// `events`.
+    fn tick_list(
+        &mut self,
+        lists: &[&AbilityList],
+        list: &AbilityList,
+        holder: &dyn Holder,
+        (now_ms, server_ms): (u64, u64),
+        events: &mut Vec<AbilityEvent>,
+    ) {
+        let stats = holder.stats();
+        let key = list_key(list);
         let tags = holder.tags();
+        let transitions: Vec<(usize, &AbilityList, usize)> = self
+            .running_in(list)
+            .filter_map(|running| {
+                let fragment = list.fragment(&list.actions[running.action].fragment)?;
+                let since_ms = now_ms.saturating_sub(running.started_ms);
+                let world = self.world(lists, list, holder, &tags, Some(running.action), now_ms);
+                fragment
+                    .transitions
+                    .iter()
+                    .filter(|transition| {
+                        since_ms >= transition.start_ms
+                            && (since_ms < transition.end_ms
+                                || transition.start_ms >= transition.end_ms)
+                            && transition
+                                .input
+                                .as_ref()
+                                .is_none_or(|input| world.input(input))
+                            && transition
+                                .condition
+                                .as_ref()
+                                .is_none_or(|condition| condition.holds_in(&world))
+                    })
+                    .filter_map(|transition| {
+                        std::iter::once(list)
+                            .chain(lists.iter().copied().filter(|other| list_key(other) != key))
+                            .find_map(|target| {
+                                let index = target
+                                    .actions
+                                    .iter()
+                                    .position(|action| action.name == transition.action)?;
+                                Some((target, index))
+                            })
+                    })
+                    .find(|(target, next)| {
+                        !self.running_in(target).any(|other| other.action == *next)
+                    })
+                    .map(|(target, next)| (running.action, target, next))
+            })
+            .collect();
+        for (from, target, to) in transitions {
+            self.running
+                .retain(|running| running.list != key || running.action != from);
+            self.enter(target, to, self.chain, stats, (now_ms, server_ms), events);
+        }
         let stops: Vec<usize> = self
-            .running
-            .iter()
+            .running_in(list)
             .map(|running| running.action)
             .filter(|index| {
-                let world = self.world(list, holder, &tags, Some(*index), now_ms);
+                let world = self.world(lists, list, holder, &tags, Some(*index), now_ms);
                 match list.actions[*index].deactivation.as_ref() {
                     Some(condition) => condition.holds_in(&world),
                     None => world.fragment_done(None, 0),
@@ -431,8 +540,7 @@ impl AbilityRun {
             })
             .collect();
         self.running
-            .retain(|running| !stops.contains(&running.action));
-        let mut events = Vec::new();
+            .retain(|running| running.list != key || !stops.contains(&running.action));
         for index in 0..list.actions.len() {
             let action = &list.actions[index];
             let Some(activation) = action.activation.as_ref() else {
@@ -443,7 +551,7 @@ impl AbilityRun {
                 .as_ref()
                 .is_some_and(|ability| ability.move_name.is_some());
             let in_chain = starts_chain || action.ability.is_some() || !action.casts.is_empty();
-            if !in_chain || self.running.iter().any(|running| running.action == index) {
+            if !in_chain || self.running_in(list).any(|running| running.action == index) {
                 continue;
             }
             if starts_chain && self.press.is_none_or(|press| press.used) {
@@ -454,37 +562,27 @@ impl AbilityRun {
             } else {
                 self.chain
             };
-            if self.started_in[index] == Some(chain) || (!starts_chain && self.chain == 0) {
+            if self.started_in.get(&(key, index)) == Some(&chain)
+                || (!starts_chain && self.chain == 0)
+            {
                 continue;
             }
-            if !activation.holds_in(&self.world(list, holder, &tags, Some(index), now_ms)) {
+            if !activation.holds_in(&self.world(lists, list, holder, &tags, Some(index), now_ms)) {
                 continue;
             }
             if starts_chain {
                 self.chain = chain;
                 self.chain_cast.clear();
             }
-            self.started_in[index] = Some(chain);
-            self.running.push(Running {
-                action: index,
-                started_ms: now_ms,
-            });
-            if let Some(ability) = &action.ability {
-                for id in &ability.starts_cooldowns {
-                    self.start_cooldown(list, id, stats, (now_ms, server_ms));
-                }
-                if !ability.applies_on_enter.is_empty() {
-                    events.push(AbilityEvent::Effects(ability.applies_on_enter.clone()));
-                }
-            }
+            self.enter(list, index, chain, stats, (now_ms, server_ms), events);
             if starts_chain && let Some(press) = self.press.as_mut() {
                 press.used = true;
             }
         }
         let mut casts = Vec::new();
-        for running in &self.running {
+        for running in self.running_in(list) {
             let action = &list.actions[running.action];
-            let world = self.world(list, holder, &tags, Some(running.action), now_ms);
+            let world = self.world(lists, list, holder, &tags, Some(running.action), now_ms);
             for (cast_index, cast) in action.casts.iter().enumerate() {
                 let spell = &cast.spell.id;
                 let cast_before = self.chain_cast.contains(spell)
@@ -510,11 +608,47 @@ impl AbilityRun {
                 kind: cast.kind,
             });
         }
-        events
+    }
+
+    /// Starts action `index` of list `list` in chain `chain` at `now_ms` (`server_ms` on the
+    /// server clock): it starts its ability's cooldowns, and its effects go in `events`.
+    fn enter(
+        &mut self,
+        list: &AbilityList,
+        index: usize,
+        chain: u64,
+        stats: AbilityStats,
+        (now_ms, server_ms): (u64, u64),
+        events: &mut Vec<AbilityEvent>,
+    ) {
+        let key = list_key(list);
+        self.started_in.insert((key, index), chain);
+        self.running.push(Running {
+            list: key,
+            action: index,
+            started_ms: now_ms,
+        });
+        if let Some(ability) = &list.actions[index].ability {
+            for id in &ability.starts_cooldowns {
+                self.start_cooldown(list, id, stats, (now_ms, server_ms));
+            }
+            if !ability.applies_on_enter.is_empty() {
+                events.push(AbilityEvent::Effects(ability.applies_on_enter.clone()));
+            }
+        }
+    }
+
+    /// The running actions of list `list`.
+    fn running_in<'a>(&'a self, list: &AbilityList) -> impl Iterator<Item = &'a Running> + use<'a> {
+        let key = list_key(list);
+        self.running
+            .iter()
+            .filter(move |running| running.list == key)
     }
 
     fn world<'a>(
         &'a self,
+        lists: &'a [&'a AbilityList],
         list: &'a AbilityList,
         holder: &'a dyn Holder,
         tags: &[&'a str],
@@ -523,15 +657,20 @@ impl AbilityRun {
     ) -> RunWorld<'a> {
         let mut all_tags = tags.to_vec();
         for running in &self.running {
+            let action = lists
+                .iter()
+                .find(|own| list_key(own) == running.list)
+                .and_then(|own| own.actions.get(running.action));
             all_tags.extend(
-                list.actions[running.action]
-                    .sets_tags
+                action
                     .iter()
+                    .flat_map(|action| &action.sets_tags)
                     .map(String::as_str),
             );
         }
         RunWorld {
             run: self,
+            lists,
             list,
             holder,
             tags: all_tags,
@@ -594,8 +733,14 @@ impl AbilityRun {
         now_ms: u64,
     ) -> bool {
         let tags = holder.tags();
-        condition.holds_in(&self.world(list, holder, &tags, None, now_ms))
+        condition.holds_in(&self.world(&[list], list, holder, &tags, None, now_ms))
     }
+}
+
+/// The identity of ability list `list`: its place in memory. The lists live in the content for
+/// as long as the server runs, so the key of a list never changes or names another list.
+fn list_key(list: &AbilityList) -> usize {
+    std::ptr::from_ref(list).addr()
 }
 
 /// The ability that a key whose mapped abilities are `mapped` (CRC-32 of lowercase ids) starts
@@ -615,6 +760,8 @@ fn ability_of_key(lists: &[&AbilityList], mut mapped: impl Iterator<Item = u32>)
 /// the perks it wears, the threshold abilities of its attribute values) and their stats.
 struct PlayerHolder<'a> {
     tags: Vec<String>,
+    /// The stance tags of the weapon in each main-hand option slot that holds one, by alias.
+    option_tags: Vec<(&'static str, Vec<String>)>,
     effects: &'a super::status_effects::StatusEffects,
     rules: &'a StatusEffectRules,
     weapon: bool,
@@ -635,6 +782,17 @@ impl Holder for PlayerHolder<'_> {
 
     fn item_in_slot(&self, _slot: &str) -> bool {
         self.weapon
+    }
+
+    fn tags_in_slot(&self, slot: &str) -> Vec<&str> {
+        if slot == ACTIVE_MAIN_HAND {
+            return self.tags();
+        }
+        self.option_tags
+            .iter()
+            .find(|(alias, _)| *alias == slot)
+            .map(|(_, tags)| tags.iter().map(String::as_str).collect())
+            .unwrap_or_default()
     }
 
     fn ability_active(&self, ability: &str) -> bool {
@@ -719,11 +877,20 @@ impl SimWorld {
             if lists.is_empty() {
                 continue;
             }
-            let tags = data
-                .weapon_of_item(item)
-                .and_then(|weapon| data.stance(weapon.stance))
-                .map(|stance| stance_tags(&stance.tags))
-                .unwrap_or_default();
+            let tags_of = |item: &str| {
+                data.weapon_of_item(item)
+                    .and_then(|weapon| data.stance(weapon.stance))
+                    .map(|stance| stance_tags(&stance.tags))
+            };
+            let tags = tags_of(item).unwrap_or_default();
+            let option_tags = player.gear.as_ref().map_or_else(Vec::new, |gear| {
+                MAIN_HAND_OPTIONS
+                    .iter()
+                    .filter_map(|(alias, slot_id)| {
+                        Some((*alias, tags_of(gear.worn_item(*slot_id)?)?))
+                    })
+                    .collect()
+            });
             let mut abilities_on: Vec<&str> = player.masteries.spent_points().collect();
             abilities_on.extend(player.gear.iter().flat_map(|gear| {
                 gear.worn_perks()
@@ -741,16 +908,14 @@ impl SimWorld {
                 .stats_of(abilities_on.iter().copied());
             let holder = PlayerHolder {
                 tags,
+                option_tags,
                 effects: &player.status_effects,
                 rules,
                 weapon: true,
                 abilities_on,
                 stats,
             };
-            let mut events = Vec::new();
-            for list in lists {
-                events.extend(player.abilities.tick(list, &holder, now_ms, server_ms));
-            }
+            let events = player.abilities.tick(&lists, &holder, now_ms, server_ms);
             let number = player.number;
             for event in events {
                 match event {
@@ -1105,7 +1270,9 @@ fn effect_crcs(rules: &StatusEffectRules, effects: &[String]) -> Vec<u32> {
 mod tests {
     use std::collections::BTreeMap;
 
-    use nw_content::player_abilities::{AbilityCast, FragmentMarker, FragmentRow, ListAction};
+    use nw_content::player_abilities::{
+        AbilityCast, FragmentMarker, FragmentRow, FragmentTransition,
+    };
     use nw_content::player_attacks::Flight;
     use nw_content::status_effects::{EffectSourceRow, StatusEffectSource};
     use nw_formats::mannequin::AbilityUse;
@@ -1209,7 +1376,10 @@ mod tests {
             fragment: SMITE.to_owned(),
             activation: Some(Condition::All(vec![
                 Condition::AbilityMove(SMITE.to_owned()),
-                Condition::ManaCost("LifeStaff_Smite".to_owned()),
+                Condition::ManaCost {
+                    cost: "LifeStaff_Smite".to_owned(),
+                    compare: ManaCompare::AtLeast,
+                },
                 Condition::Not(Box::new(Condition::Cooldown(SMITE.to_owned()))),
                 Condition::Tag("Heal".to_owned()),
             ])),
@@ -1254,6 +1424,7 @@ mod tests {
                     start_ms: MARKER_START_MS,
                     end_ms: FRAGMENT_MS,
                 }],
+                transitions: Vec::new(),
                 hit: None,
             }],
             cooldowns_ms: BTreeMap::from([(SMITE.to_owned(), COOLDOWN_MS)]),
@@ -1282,13 +1453,80 @@ mod tests {
         (key == 0).then(|| lowercase_crc32(SMITE))
     }
 
+    /// The fire staff's Incinerate: the intro's fragment moves on to the loop by a transition
+    /// clip, and the loop starts the cooldown. Here the loop is in the weapon's second list,
+    /// whose one action is fewer than the first list's two running ones (the run once read the
+    /// first list's action numbers in the second list and panicked).
+    #[test]
+    fn a_transition_clip_moves_the_running_action_on_into_another_list() {
+        const LOOP: &str = "Ability_Life_Staff_Smite_Loop";
+        const LOOP_COOLDOWN_MS: u64 = 9_000;
+        const TRANSITION_MS: u64 = 500;
+        let mut first = list();
+        first.fragments[0].transitions = vec![FragmentTransition {
+            action: LOOP.to_owned(),
+            input: None,
+            condition: None,
+            start_ms: TRANSITION_MS,
+            end_ms: FRAGMENT_MS,
+        }];
+        let second = AbilityList {
+            weapon_classes: vec!["LifeStaff".to_owned()],
+            actions: vec![ListAction {
+                name: LOOP.to_owned(),
+                fragment: LOOP.to_owned(),
+                activation: None,
+                deactivation: None,
+                sets_tags: Vec::new(),
+                ability: Some(AbilityUse {
+                    starts_cooldowns: vec![LOOP.to_owned()],
+                    ..AbilityUse::default()
+                }),
+                casts: Vec::new(),
+            }],
+            fragments: vec![FragmentRow {
+                name: LOOP.to_owned(),
+                length_ms: FRAGMENT_MS,
+                markers: Vec::new(),
+                transitions: Vec::new(),
+                hit: None,
+            }],
+            cooldowns_ms: BTreeMap::from([(LOOP.to_owned(), LOOP_COOLDOWN_MS)]),
+            mana_costs: BTreeMap::new(),
+        };
+        let lists = [&first, &second];
+        let mut run = AbilityRun::default();
+        run.press(&[key_1(10)], mapped, no_inputs, 0);
+        run.tick(&lists, &Staff, 0, SERVER_MS);
+        run.tick(&lists, &Staff, 100, SERVER_MS);
+        assert_eq!(run.running.len(), 2, "the start and its follow-up");
+        run.take_cooldown_changes();
+        run.tick(&lists, &Staff, TRANSITION_MS, SERVER_MS);
+        let loop_key = list_key(&second);
+        assert!(
+            run.running.iter().any(|running| running.list == loop_key),
+            "the loop runs in the second list"
+        );
+        let changes = run.take_cooldown_changes();
+        assert_eq!(
+            changes
+                .iter()
+                .map(|(_, cooldown)| (cooldown.ability, cooldown.end_us - cooldown.start_us))
+                .collect::<Vec<_>>(),
+            [(lowercase_crc32(LOOP), LOOP_COOLDOWN_MS * US_PER_MS)]
+        );
+    }
+
     #[test]
     fn a_key_press_runs_the_ability_chain_once_with_its_cooldown_mana_and_cast() {
         let list = list();
         let mut run = AbilityRun::default();
-        assert!(run.tick(&list, &Staff, 0, SERVER_MS).is_empty(), "no press");
+        assert!(
+            run.tick(&[&list], &Staff, 0, SERVER_MS).is_empty(),
+            "no press"
+        );
         run.press(&[key_1(10)], mapped, no_inputs, 0);
-        let start = run.tick(&list, &Staff, 0, SERVER_MS);
+        let start = run.tick(&[&list], &Staff, 0, SERVER_MS);
         assert_eq!(
             start,
             [AbilityEvent::Effects(vec!["Smite_Self".to_owned()])]
@@ -1300,10 +1538,10 @@ mod tests {
         assert_eq!(cooldown.end_us - cooldown.start_us, COOLDOWN_MS * US_PER_MS);
         // The follow-up starts on the start's fragment and tag, and casts at the marker.
         assert!(
-            run.tick(&list, &Staff, 100, SERVER_MS).is_empty(),
+            run.tick(&[&list], &Staff, 100, SERVER_MS).is_empty(),
             "before the marker"
         );
-        let cast = run.tick(&list, &Staff, MARKER_START_MS, SERVER_MS);
+        let cast = run.tick(&[&list], &Staff, MARKER_START_MS, SERVER_MS);
         assert!(
             matches!(&cast[..], [AbilityEvent::Cast { spell, kind: CastKind::Raycast, .. }] if spell.id == "LifeStaff_Smite"),
             "{cast:?}"
@@ -1313,17 +1551,17 @@ mod tests {
             "spent, a little back"
         );
         assert!(
-            run.tick(&list, &Staff, MARKER_START_MS + 50, SERVER_MS)
+            run.tick(&[&list], &Staff, MARKER_START_MS + 50, SERVER_MS)
                 .is_empty(),
             "one cast per run"
         );
         // A second press during the cooldown starts nothing.
         run.press(&[key_1(11)], mapped, no_inputs, 2_000);
-        assert!(run.tick(&list, &Staff, 2_000, SERVER_MS).is_empty());
+        assert!(run.tick(&[&list], &Staff, 2_000, SERVER_MS).is_empty());
         assert!(run.take_cooldown_changes().is_empty());
         // After the cooldown it runs again.
         run.press(&[key_1(12)], mapped, no_inputs, 5_000);
-        assert_eq!(run.tick(&list, &Staff, 5_000, SERVER_MS).len(), 1);
+        assert_eq!(run.tick(&[&list], &Staff, 5_000, SERVER_MS).len(), 1);
     }
 
     /// The test staff holder with the shares of Focus 250 (`Foc_Bonus_25_1`, `Foc_Bonus_100_1`).
@@ -1359,17 +1597,17 @@ mod tests {
     fn focus_shares_raise_the_mana_max_and_regen_and_shorten_the_cooldown() {
         let list = list();
         let mut run = AbilityRun::default();
-        run.tick(&list, &FocusedStaff, 0, SERVER_MS);
+        run.tick(&[&list], &FocusedStaff, 0, SERVER_MS);
         assert!((run.mana.max - FOCUS_MANA_MAX).abs() < 1e-3, "retail 110");
         run.mana.current = 0.0;
-        run.tick(&list, &FocusedStaff, 1_000, SERVER_MS);
+        run.tick(&[&list], &FocusedStaff, 1_000, SERVER_MS);
         assert!(
             (run.mana.current - RETAIL_MANA_REGEN_PER_S).abs() < 1e-3,
             "the retail rate at Focus 250"
         );
         run.mana.current = run.mana.max;
         run.press(&[key_1(10)], mapped, no_inputs, 2_000);
-        run.tick(&list, &FocusedStaff, 2_000, SERVER_MS);
+        run.tick(&[&list], &FocusedStaff, 2_000, SERVER_MS);
         let changes = run.take_cooldown_changes();
         let (_, cooldown) = changes[0];
         assert_eq!(
@@ -1591,7 +1829,7 @@ mod tests {
         let ready = Condition::Not(Box::new(Condition::Cooldown(SMITE.to_owned())));
         assert!(run.holds(&list, &staff, &ready, 0));
         run.press(&[key_1(10)], mapped, no_inputs, 0);
-        run.tick(&list, &staff, 0, SERVER_MS);
+        run.tick(&[&list], &staff, 0, SERVER_MS);
         assert!(!run.holds(&list, &staff, &ready, 1), "on cooldown");
         let resize = Condition::Other("IfCanResizeCharacterController".to_owned());
         assert!(run.holds(&list, &staff, &resize, 0), "a passing guard");
@@ -1620,6 +1858,7 @@ mod tests {
 /// player-abilities` first).
 #[cfg(all(test, feature = "local-data"))]
 mod retail_tests {
+    use std::collections::BTreeSet;
     use std::path::Path;
 
     use nw_content::client_build::load_client_build;
@@ -1663,6 +1902,57 @@ mod retail_tests {
         }
     }
 
+    /// A player with a weapon of stance `tags`, no inputs, effects or upgrades.
+    /// A player with a weapon of stance `tags` and the status effects its abilities gave it.
+    struct Armed {
+        tags: &'static [&'static str],
+        effects: Vec<String>,
+    }
+
+    impl Holder for Armed {
+        fn tags(&self) -> Vec<&str> {
+            self.tags.to_vec()
+        }
+
+        fn has_effect(&self, effect: &str) -> bool {
+            self.effects
+                .iter()
+                .any(|own| own.eq_ignore_ascii_case(effect))
+        }
+
+        fn item_in_slot(&self, _: &str) -> bool {
+            true
+        }
+
+        fn ability_active(&self, _: &str) -> bool {
+            false
+        }
+
+        fn stats(&self) -> AbilityStats {
+            AbilityStats::default()
+        }
+    }
+
+    /// Each weapon's ability list class and the stance tags of its weapons (the
+    /// `MannequinTag` cells of the player attack table).
+    const WEAPONS: [(&str, &[&str]); 15] = [
+        ("Sword", &["1H_Melee", "Sword"]),
+        ("Rapier", &["1H_Melee", "Rapier"]),
+        ("Hatchet", &["1H_Melee", "Axe", "Throwable"]),
+        ("Flail", &["1H_Melee", "Flail"]),
+        ("Spear", &["2H_Melee", "Spear", "Throwable"]),
+        ("2HAxe", &["2H_Melee", "GreatAxe"]),
+        ("2hhammer", &["2H_Melee", "Warhammer"]),
+        ("GreatSword", &["2H_Melee", "GreatSword"]),
+        ("Bow", &["Bow"]),
+        ("Musket", &["2H_Ranged", "Rifle"]),
+        ("Blunderbuss", &["2H_Ranged", "Blunderbuss"]),
+        ("FireStaff", &["MagicStaff", "Fire"]),
+        ("LifeStaff", &["MagicStaff", "Heal"]),
+        ("IceMagic", &["MagicGauntlet", "Ice"]),
+        ("VoidGauntlet", &["MagicGauntlet", "VoidGauntlet"]),
+    ];
+
     fn table() -> PlayerAbilities {
         let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let build = load_client_build(&repo.join(CLIENT_BUILD_CONFIG)).expect("client build");
@@ -1679,6 +1969,107 @@ mod retail_tests {
         assert_eq!(names, ["ability1", "ability2", "ability3"]);
     }
 
+    /// A player's steps for one ability, each in one input message, by tick: the key, a click
+    /// that fires an aimed ability (the shoot and attack inputs) about 0.7 s later, then the key
+    /// again (a second press fires some aimed abilities) about 1.2 s after the first. Each
+    /// step's message [`STEP_TICKS`] later holds no key and no input.
+    const STEPS: [(u64, bool, bool); 3] = [(0, true, false), (21, false, true), (36, true, false)];
+    /// The inputs of a click.
+    const CLICK_INPUTS: [&str; 3] = ["attack_shoot", "attack_primary", "aim_shoot_release"];
+    /// How many ticks after a step its key or click ends.
+    const STEP_TICKS: u64 = 3;
+
+    /// The input record of frame `frame`, with the first ability key down or not.
+    fn record(frame: u16, key: bool) -> InputRecord {
+        if key {
+            key_1(frame)
+        } else {
+            InputRecord {
+                u16_after_mask: frame,
+                ..InputRecord::default()
+            }
+        }
+    }
+
+    /// The abilities whose fire step the [`STEPS`] do not make (Unknown: no retail capture holds
+    /// their inputs): the aimed ones fire from a held aim (`aim_draw_active_virtual` held, then
+    /// let go, or the archery list's `Bow_Aim_UpperBody` held), and the ice pylon starts its
+    /// cooldown when its placed pylon's ownership message comes (`IfOwnershipMessageReceived`).
+    const HELD_AIM_OR_PLACED: [&str; 8] = [
+        "Ability_Bow_PenetratingShot",
+        "Ability_Bow_PoisonShot",
+        "Ability_Bow_RainofArrows",
+        "Ability_Musket_ShootersStance",
+        "Ability_Musket_StoppingPower",
+        "Ability_Firestaff_MeteorShower",
+        "IceMagic_IcePylon",
+        "IceMagic_IceStorm",
+    ];
+
+    /// Every active ability of every weapon (an ability with a `Cooldowns_Player` row) but the
+    /// [`HELD_AIM_OR_PLACED`] ones starts from the [`STEPS`] of a player with full mana and no
+    /// cooldown running: it starts its cooldown.
+    #[test]
+    fn every_weapon_ability_starts_from_its_key() {
+        let table = table();
+        let mut refused = Vec::new();
+        let mut started = 0;
+        for (class, tags) in WEAPONS {
+            let lists = table.lists_for(&[class]);
+            let abilities: BTreeSet<&String> = lists
+                .iter()
+                .flat_map(|list| list.cooldowns_ms.keys())
+                .collect();
+            assert!(!abilities.is_empty(), "{class} has abilities");
+            for ability in abilities {
+                let crc = lowercase_crc32(ability);
+                let mapped = |key: usize| (key == 0).then_some(crc);
+                let mut run = AbilityRun::default();
+                let mut holder = Armed {
+                    tags,
+                    effects: Vec::new(),
+                };
+                let mut frame = 10;
+                for tick in 0..=RUN_MS / TICK_MS {
+                    let now = tick * TICK_MS;
+                    for (at, key, click) in STEPS {
+                        if tick != at && tick != at + STEP_TICKS {
+                            continue;
+                        }
+                        let down = tick == at;
+                        let inputs = |_: &InputRecord| {
+                            CLICK_INPUTS
+                                .iter()
+                                .filter(|_| click && down)
+                                .map(|input| (*input).to_owned())
+                                .collect()
+                        };
+                        frame += 1;
+                        run.press(&[record(frame, key && down)], mapped, inputs, now);
+                    }
+                    for event in run.tick(&lists, &holder, now, SERVER_MS) {
+                        if let AbilityEvent::Effects(effects) = event {
+                            holder.effects.extend(effects);
+                        }
+                    }
+                }
+                if run
+                    .take_cooldown_changes()
+                    .iter()
+                    .any(|(_, cooldown)| cooldown.ability == crc)
+                {
+                    started += 1;
+                } else if !HELD_AIM_OR_PLACED.contains(&ability.as_str()) {
+                    refused.push(format!("{class} {ability}"));
+                }
+            }
+        }
+        assert!(
+            refused.is_empty(),
+            "{started} started; refused: {refused:#?}"
+        );
+    }
+
     #[test]
     fn a_sacred_ground_press_casts_its_spell_once_with_its_cooldown_and_mana() {
         let table = table();
@@ -1689,11 +2080,9 @@ mod retail_tests {
         let mut casts = Vec::new();
         let mut now = 0;
         while now <= RUN_MS {
-            for list in &lists {
-                for event in run.tick(list, &LifeStaff, now, SERVER_MS) {
-                    if let AbilityEvent::Cast { spell, .. } = event {
-                        casts.push(spell.id.clone());
-                    }
+            for event in run.tick(&lists, &LifeStaff, now, SERVER_MS) {
+                if let AbilityEvent::Cast { spell, .. } = event {
+                    casts.push(spell.id.clone());
                 }
             }
             now += TICK_MS;

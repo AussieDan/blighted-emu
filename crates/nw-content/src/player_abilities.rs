@@ -53,6 +53,24 @@ pub struct FragmentMarker {
     pub end_ms: u64,
 }
 
+/// A `CAGE-TransitionInstant` clip of a fragment: while it plays, the action it names takes the
+/// place of the action that plays the fragment when its input is on and its condition holds
+/// (the fire staff's `Ability_Fire_Staff_Incinerate_Intro` goes on to its `_Loop`, which only
+/// starts this way).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FragmentTransition {
+    /// `NewAction`.
+    pub action: String,
+    /// `Input`: the input that must be on; `None` for none or `Test_AlwaysTrue`.
+    pub input: Option<String>,
+    /// `Condition`: the list's named condition, resolved; `None` for none.
+    pub condition: Option<Condition>,
+    /// When it starts, ms after the fragment starts.
+    pub start_ms: u64,
+    /// When it ends, ms after the fragment starts.
+    pub end_ms: u64,
+}
+
 /// A fragment the actions of a list play.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct FragmentRow {
@@ -62,6 +80,9 @@ pub struct FragmentRow {
     pub length_ms: u64,
     /// Its markers, by start.
     pub markers: Vec<FragmentMarker>,
+    /// Its transitions, by start.
+    #[serde(default)]
+    pub transitions: Vec<FragmentTransition>,
     /// The hit of its clips (as a basic attack's); `None` for a fragment that holds none.
     pub hit: Option<BasicAttack>,
 }
@@ -341,6 +362,7 @@ mod tests {
                     start_ms: MARKER_START_MS,
                     end_ms: MARKER_END_MS,
                 }],
+                transitions: Vec::new(),
                 hit: None,
             }],
             cooldowns_ms: BTreeMap::from([(COOLDOWN.to_owned(), COOLDOWN_MS)]),
