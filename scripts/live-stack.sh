@@ -6,6 +6,8 @@
 # run `cargo build --release` first; NW_GAME_DIR names the game install)
 # LIVE_STACK_SNAPSHOT_MS sets the sim snapshot interval (default 250; 0 turns snapshots off, to
 # measure what they cost).
+# LIVE_STACK_TICK_THREADS sets the threads of each sim's mob and bundle steps (default 4; 0 = every
+# core of the PC for each sim).
 # It needs the git-ignored local files below. The servers get the secrets of the env file;
 # blighted-admin does not (its bot batches read the env file themselves). Logs go to LOG_DIR.
 # LIVE_STACK_ROOT overrides the repository folder (used by the tests).
@@ -67,7 +69,7 @@ readonly DIRECTOR_METRICS_URL="http://$DIRECTOR_METRICS_LISTEN/metrics"
 # Bot names of a second world (letters only), so they never share an account with the first.
 readonly INSTANCE_BOT_PREFIX="Instbot"
 readonly DEFAULT_SNAPSHOT_INTERVAL_MS=250
-readonly SIM_TICK_THREADS=4
+readonly DEFAULT_SIM_TICK_THREADS=4
 # Bots do not spread evenly over the sims' cells: each sim takes twice its usual 2,000.
 readonly SIM_MAX_PLAYERS=4000
 # Bots log in fast and all from this PC: room for 10,000 of them (the M5 load test settings).
@@ -89,6 +91,12 @@ fi
 snapshot_interval_ms="${LIVE_STACK_SNAPSHOT_MS:-$DEFAULT_SNAPSHOT_INTERVAL_MS}"
 if [[ ! "$snapshot_interval_ms" =~ ^[0-9]+$ ]]; then
   echo "live stack: LIVE_STACK_SNAPSHOT_MS must be a whole number of ms, not '$snapshot_interval_ms'" >&2
+  exit "$EXIT_USAGE"
+fi
+
+sim_tick_threads="${LIVE_STACK_TICK_THREADS:-$DEFAULT_SIM_TICK_THREADS}"
+if [[ ! "$sim_tick_threads" =~ ^[0-9]+$ ]]; then
+  echo "live stack: LIVE_STACK_TICK_THREADS must be a whole number of threads, not '$sim_tick_threads'" >&2
   exit "$EXIT_USAGE"
 fi
 
@@ -157,7 +165,7 @@ start_world() {
     local sim_id="sim-$((index + 1))"
     start_server "$sim_id" env NW_SIM_SIM_ID="$sim_id" NW_SIM_WORLD_ID="$WORLD_ID" \
       NW_SIM_METRICS_LISTEN="127.0.0.1:${SIM_METRICS_PORTS[index]}" \
-      NW_SIM_TICK_THREADS="$SIM_TICK_THREADS" NW_SIM_MAX_PLAYERS="$SIM_MAX_PLAYERS" \
+      NW_SIM_TICK_THREADS="$sim_tick_threads" NW_SIM_MAX_PLAYERS="$SIM_MAX_PLAYERS" \
       NW_SIM_ADMIN__SNAPSHOT_INTERVAL_MS="$snapshot_interval_ms" "$BIN/sim"
   done
 }
