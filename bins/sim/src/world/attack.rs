@@ -2126,6 +2126,7 @@ impl SimWorld {
         // (`Traversal_Road_Sprint_Speed_Boost_CombatRemoval` `IfDamaged`).
         if let Some(mut player) = self.world.get_mut::<Player>(entity) {
             player.tracked.enter_combat();
+            player.combat.hit_taken(now_ms);
         }
         // A hit ends a summon and takes mount stamina; a death ends the ride ([`super::mount`]).
         self.mount_hit(

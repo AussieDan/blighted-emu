@@ -6,8 +6,12 @@
 //! `replicatedCombatConcludedTimePoint` = hit + 10 s, both in server ns since 2000-01-01; the first
 //! hit of a fight also sends `replicatedInCombatFlag` 1. When every hit of that step killed its
 //! mob, the concluded time is hit + 1 s. At the concluded time, with no hit since, it sends the
-//! flag 0 alone. A mob's hit on the player (3601) changes nothing. Thorpe's fight set the flag
-//! without a player hit (455733); that cause is Unknown.
+//! flag 0 alone. A mob's hit on a player in combat changes nothing (83.777 s); a mob's hit on a
+//! player out of combat starts it as a player hit does (`newchar-retail-2026-09-18` 94.211 s:
+//! the 3601, then 24 ms later the flag 1 with the concluded time the hit + 10.00 s, out of
+//! combat since 88.600 s). So a mob that hits a player who does not hit back keeps the
+//! out-of-combat regen off. Thorpe's fight set the flag without a player hit (455733), likely
+//! the same rule.
 
 use nw_messages::{CombatStatusState, NS_PER_MS};
 
@@ -58,6 +62,14 @@ impl CombatTimer {
         self.concluded_ms = Some(concluded_ms);
         self.last_hit_ms = now_ms;
         self.hit_changed = true;
+    }
+
+    /// A mob hit the player at `now_ms`: out of combat it starts combat as a player hit does;
+    /// in combat it changes nothing (module notes).
+    pub(super) fn hit_taken(&mut self, now_ms: u64) {
+        if !self.in_combat() {
+            self.hit(now_ms, false);
+        }
     }
 
     /// Ends the combat when its concluded time came at `now_ms`.
@@ -130,6 +142,23 @@ mod tests {
             })
         );
         assert_eq!(take(&mut timer, HIT_MS + 80), None, "sent once");
+    }
+
+    #[test]
+    fn a_mob_hit_starts_combat_only_out_of_combat() {
+        // Retail newchar 94.211 s: out of combat, the mob's hit started it (concluded hit + 10 s).
+        let mut timer = CombatTimer::default();
+        timer.hit_taken(HIT_MS);
+        assert!(timer.in_combat());
+        assert_eq!(
+            take(&mut timer, HIT_MS + 40).and_then(|state| state.concluded_time),
+            Some(server_ns(HIT_MS + CONCLUDED_AFTER_HIT_MS))
+        );
+        // Retail 83.777 s: in combat, a mob's hit moves nothing.
+        timer.hit_taken(HIT_MS + 5_000);
+        assert_eq!(take(&mut timer, HIT_MS + 5_040), None);
+        timer.tick(HIT_MS + CONCLUDED_AFTER_HIT_MS);
+        assert!(!timer.in_combat(), "ends at the first hit's time");
     }
 
     #[test]
