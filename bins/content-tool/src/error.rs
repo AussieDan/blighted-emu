@@ -97,6 +97,9 @@ pub enum ToolError {
     /// The player attack table cannot be written.
     #[error(transparent)]
     PlayerAttacks(#[from] nw_content::player_attacks::PlayerAttacksError),
+    /// The player ability table cannot be written.
+    #[error(transparent)]
+    PlayerAbilities(#[from] nw_content::player_abilities::PlayerAbilitiesError),
     /// The tutorial static entity scan failed.
     #[error(transparent)]
     FtueEntities(#[from] FtueEntitiesError),

@@ -14,6 +14,7 @@ use thiserror::Error;
 
 use crate::Tables;
 use crate::gameplay_config::ITEM_CLASS_SEPARATOR;
+use crate::player_abilities::{AbilityList, PlayerAbilities};
 use crate::player_attacks::{PlayerAttacks, Stance, stance_key};
 use crate::player_sequences::PlayerSequences;
 
@@ -523,6 +524,10 @@ pub struct CombatData {
     player_table: String,
     /// The basic attacks of each weapon stance.
     player_attacks: PlayerAttacks,
+    /// The ability lists of the player grid.
+    player_abilities: PlayerAbilities,
+    /// The item classes of each weapon item (`ItemClass`, split), by lower-case item id.
+    item_weapon_classes: HashMap<String, Vec<String>>,
     /// The slayer sequences the server starts for each weapon stance.
     player_sequences: PlayerSequences,
     vision_offsets: HashMap<String, f32>,
@@ -588,11 +593,27 @@ impl CombatData {
                 Some((item.to_lowercase(), PLAIN_MOD + adjustment))
             })
             .collect();
-        let item_weapons = source
+        let item_weapons: HashMap<String, WeaponRow> = source
             .item_stats
             .iter()
             .filter_map(|(item, stats)| {
                 Some((item.to_lowercase(), *weapons.get(&stats.to_lowercase())?))
+            })
+            .collect();
+        let item_weapon_classes = source
+            .item_classes
+            .iter()
+            .filter(|(item, _)| item_weapons.contains_key(&item.to_lowercase()))
+            .map(|(item, classes)| {
+                (
+                    item.to_lowercase(),
+                    classes
+                        .split(ITEM_CLASS_SEPARATOR)
+                        .map(str::trim)
+                        .filter(|class| !class.is_empty())
+                        .map(str::to_owned)
+                        .collect(),
+                )
             })
             .collect();
         let profiles: HashMap<String, &String> = source
@@ -689,6 +710,8 @@ impl CombatData {
             table_attacks,
             player_table,
             player_attacks: PlayerAttacks::default(),
+            player_abilities: PlayerAbilities::default(),
+            item_weapon_classes,
             player_sequences: PlayerSequences::default(),
             vision_offsets: source.vision_offsets.into_iter().collect(),
             player_base_health,
@@ -763,6 +786,31 @@ impl CombatData {
             player_attacks: attacks,
             ..self
         }
+    }
+
+    /// This data with the ability lists of the player grid, `abilities`.
+    #[must_use]
+    pub fn with_player_abilities(self, abilities: PlayerAbilities) -> Self {
+        Self {
+            player_abilities: abilities,
+            ..self
+        }
+    }
+
+    /// The CAGE input names of the input numbers `on` holds ([`PlayerAbilities::inputs_on`]).
+    pub fn ability_inputs_on(&self, on: impl Fn(u32) -> bool) -> Vec<String> {
+        self.player_abilities.inputs_on(on)
+    }
+
+    /// The ability lists that weapon item `item_id` turns on (any case), in grid order.
+    pub fn ability_lists_of_item(&self, item_id: &str) -> Vec<&AbilityList> {
+        self.item_weapon_classes
+            .get(&item_id.to_lowercase())
+            .map(|classes| {
+                let classes: Vec<&str> = classes.iter().map(String::as_str).collect();
+                self.player_abilities.lists_for(&classes)
+            })
+            .unwrap_or_default()
     }
 
     /// The same data with the player sequence table `sequences`.
@@ -1248,6 +1296,28 @@ mod tests {
         assert_eq!(data.vision_offset(Some("Beast")), VISION_OFFSET);
         assert_eq!(data.vision_offset(Some("Dragon")), 0.0);
         assert_eq!(data.vision_offset(None), 0.0);
+    }
+
+    #[test]
+    fn a_weapon_item_turns_on_the_ability_lists_of_its_classes() {
+        use crate::player_abilities::AbilityList;
+        let list = |class: &str| AbilityList {
+            weapon_classes: vec![class.to_owned()],
+            actions: Vec::new(),
+            fragments: Vec::new(),
+            cooldowns_ms: std::collections::BTreeMap::new(),
+            mana_costs: std::collections::BTreeMap::new(),
+        };
+        let data = CombatData::build(source(), &rows())
+            .expect("data")
+            .with_player_abilities(PlayerAbilities {
+                lists: vec![list("LifeStaff"), list("Sword")],
+                inputs: Vec::new(),
+            });
+        let lists = data.ability_lists_of_item("1hswordt1");
+        assert_eq!(lists.len(), 1);
+        assert_eq!(lists[0].weapon_classes, ["Sword"]);
+        assert!(data.ability_lists_of_item("NoSuchItem").is_empty());
     }
 
     #[test]

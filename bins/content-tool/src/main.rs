@@ -36,6 +36,7 @@ use content_tool::mob_prefabs::{
     DEFAULT_CAPTURE_ROOTS, LedgerSource, MobPrefabsError, PrefabTable, SourceList,
     find_ledger_sources, run_workers, scan_ledger, vitals_names, worker_process, write_entries,
 };
+use content_tool::player_abilities::{PlayerAbilitiesReport, build_abilities};
 use content_tool::player_attacks::{BundleRows, PlayerAttacksReport, build_stances, read_sources};
 use content_tool::quick_courses::build_quick_courses;
 use content_tool::roads::{RoadsError, RoadsReport, build_level_roads};
@@ -49,6 +50,7 @@ use nw_content::combat::{CombatData, CombatRows};
 use nw_content::creature_animations::{creature_animations_path, write_rows};
 use nw_content::ftue_entities::ftue_entities_path;
 use nw_content::mob_prefabs::{MobPrefabs, mob_prefabs_path};
+use nw_content::player_abilities::player_abilities_path;
 use nw_content::player_attacks::{player_attacks_path, write_stances};
 use nw_design::{DesignMode, DesignPaths, DesignReport, run_design};
 use nw_world::WorldFile;
@@ -265,6 +267,17 @@ enum Command {
         #[arg(long)]
         out: Option<PathBuf>,
         /// Content bundle for the weapon, spell, ammo and consumable rows (default:
+        /// `local-data/content/bundle-<build>.bin`).
+        #[arg(long)]
+        bundle: Option<PathBuf>,
+    },
+    /// Builds the player ability table (each weapon ability list's active abilities: hit,
+    /// markers, cooldowns, mana cost, spells) from the game paks.
+    PlayerAbilities {
+        /// Output file (default: `local-data/content/player-abilities-<build>.json`).
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Content bundle for the weapon, item, cooldown, mana and spell rows (default:
         /// `local-data/content/bundle-<build>.bin`).
         #[arg(long)]
         bundle: Option<PathBuf>,
@@ -613,6 +626,18 @@ fn run(cli: Cli) -> Result<(), ToolError> {
             write_stances(&out, &stances)?;
             print_player_attacks(&report, &out);
         }
+        Command::PlayerAbilities { out, bundle } => {
+            let out = out.unwrap_or_else(|| {
+                player_abilities_path(Path::new(DEFAULT_CONTENT_DIR), &client_build)
+            });
+            let bundle = bundle.unwrap_or_else(|| default_bundle_path(&client_build));
+            let tables = ContentBundle::load(&bundle, &client_build)?.tables;
+            let rows = BundleRows::of(&tables);
+            let source = GameSource::open(game_dir(cli.game_dir.as_deref())?)?;
+            let (table, report) = build_abilities(&read_sources(&source, &rows)?, &rows, &tables);
+            table.write(&out)?;
+            print_player_abilities(&report, &out);
+        }
         Command::CatacombCheck {
             game_mode,
             runs,
@@ -820,6 +845,19 @@ fn print_player_attacks(report: &PlayerAttacksReport, out: &Path) {
     );
     for (stance, why) in &report.skipped {
         println!("  skipped {stance}: {why}");
+    }
+}
+
+fn print_player_abilities(report: &PlayerAbilitiesReport, out: &Path) {
+    println!(
+        "player-abilities: {} lists, {} actions, {} input actions -> {}",
+        report.lists,
+        report.actions,
+        report.inputs,
+        out.display()
+    );
+    for (part, why) in &report.skipped {
+        println!("  skipped {part}: {why}");
     }
 }
 

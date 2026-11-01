@@ -2,6 +2,7 @@
 //! Typed New World game rule tables and the content bundle file.
 
 pub mod achievements;
+pub mod attribute_bonuses;
 pub mod bundle;
 pub mod camps;
 pub mod catacombs;
@@ -15,6 +16,7 @@ pub mod corpse_times;
 pub mod crafting;
 pub mod creature_animations;
 pub mod datatable_overrides;
+pub mod deaths_door;
 pub mod drop_rolls;
 pub mod equip_load;
 pub mod factions;
@@ -45,6 +47,7 @@ pub mod mutations;
 pub mod objective_limits;
 pub mod perk_effects;
 pub mod perks;
+pub mod player_abilities;
 pub mod player_attacks;
 pub mod player_sequences;
 pub mod poi_tags;

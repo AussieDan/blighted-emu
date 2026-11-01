@@ -13,8 +13,8 @@
 //! bags, 525 and 580, give 2.94 and 3.19). A perk without the cell has potency 1
 //! (`Status_Perk_Weapon_OnCritEmpower`, potency 1 in the same map).
 //!
-//! **Unknown**: the perks whose effect comes from an `EquipAbility` (4 of build 25810808), and
-//! `ScalingPerGearScoreAttributes`; those hold nothing here.
+//! A perk with an `EquipAbility` turns that ability on while it is worn ([`PerkEffects::ability_of`]:
+//! the ability lists test it with `IfAbilityActive`). **Unknown**: `ScalingPerGearScoreAttributes`.
 
 use std::collections::HashMap;
 
@@ -81,16 +81,27 @@ fn steps_of(cell: &str) -> Vec<(u32, f64)> {
     steps
 }
 
-/// The effect of every perk that holds one, by lowercase `PerkID`.
+/// The effect of every perk that holds one, and the ability of every perk that turns one on, by
+/// lowercase `PerkID`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PerkEffects {
     by_perk: HashMap<String, PerkEffect>,
+    abilities: HashMap<String, String>,
 }
 
 impl PerkEffects {
     /// The effects of `tables`: each perk with an `Affix` whose `AffixStatData` row names a
-    /// `StatusEffect`.
+    /// `StatusEffect`; and each perk's `EquipAbility`.
     pub fn from_tables(tables: &Tables) -> Self {
+        let abilities = tables
+            .perk_data
+            .iter()
+            .flat_map(|table| &table.rows)
+            .filter_map(|row| {
+                let ability = row.equip_ability.as_deref()?.trim();
+                (!ability.is_empty()).then(|| (row.perk_id.to_lowercase(), ability.to_owned()))
+            })
+            .collect();
         let effects: HashMap<String, &str> = tables
             .affix_stat_data
             .iter()
@@ -117,6 +128,17 @@ impl PerkEffects {
                     ))
                 }),
         )
+        .with_abilities(abilities)
+    }
+
+    /// These effects, with the `EquipAbility` of each perk (lowercase id to ability id).
+    pub fn with_abilities(self, abilities: HashMap<String, String>) -> Self {
+        Self { abilities, ..self }
+    }
+
+    /// The ability perk `perk` (any case) turns on while it is worn.
+    pub fn ability_of(&self, perk: &str) -> Option<&str> {
+        self.abilities.get(&perk.to_lowercase()).map(String::as_str)
     }
 
     /// The effects of `perks` (perk id, effect); the first of an id wins.
@@ -125,7 +147,10 @@ impl PerkEffects {
         for (perk, effect) in perks {
             by_perk.entry(perk.to_lowercase()).or_insert(effect);
         }
-        Self { by_perk }
+        Self {
+            by_perk,
+            abilities: HashMap::new(),
+        }
     }
 
     /// The effect of perk `perk` (any case).
@@ -179,5 +204,19 @@ mod tests {
         let effect = effects.of("perkid_tools_efficiency_mining").expect("perk");
         assert_eq!(effect.status_effect, "Status_Perk_Tools_Efficiency_Mining");
         assert!(effects.of("PerkID_Common_Luck").is_none());
+    }
+
+    #[test]
+    fn a_perk_names_the_ability_it_turns_on_in_any_case() {
+        const ABILITY: &str = "GlobalPerk_Ability_Sword_WhirlingBlade";
+        let effects = PerkEffects::build([]).with_abilities(HashMap::from([(
+            "perkid_ability_sword_whirlingblade".to_owned(),
+            ABILITY.to_owned(),
+        )]));
+        assert_eq!(
+            effects.ability_of("PerkID_Ability_Sword_WhirlingBlade"),
+            Some(ABILITY)
+        );
+        assert_eq!(effects.ability_of("PerkID_Common_Luck"), None);
     }
 }

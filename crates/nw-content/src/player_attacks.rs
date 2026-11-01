@@ -213,6 +213,19 @@ pub struct BasicAttack {
     /// `Firearm_Shoot_HipFire_FullBody`). `None`: the fragment has no such clip.
     #[serde(default)]
     pub can_transition_ms: Option<u64>,
+    /// The windows of its fragment's `CAGE-Named` `CanDodgeCancel` clips, ms: a dodge starts
+    /// only in them while the attack plays (`IfCanDodge`; retail tutorial and open world, the
+    /// sword light attack: dodges at 17, 566 and 1182 ms in the windows 0-200 and 500-1420 were
+    /// taken, the three at 252 to 414 ms in its `CanDodgeBuffer` 200-500 refused). `None`: the
+    /// fragment has no such clip, a dodge is free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dodge_cancel_ms: Option<Vec<[u64; 2]>>,
+    /// The windows of its fragment's `CAGE-Named` `BlockDisabled` clips, ms: the block does not
+    /// rise in them (the action list's `Block_UpperBody` needs `Not IfMannequinMarker
+    /// BlockDisabled`; the sword light attack's 200-533 ms). From the data only: no retail block
+    /// in an attack was matched to it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub block_disabled_ms: Vec<[u64; 2]>,
     /// How it moves the player; `None`: its action leaves the motion to the movement keys.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub motion: Option<AttackMotion>,
@@ -679,6 +692,8 @@ mod tests {
             length_ms: 0,
             links: Vec::new(),
             can_transition_ms: None,
+            dodge_cancel_ms: None,
+            block_disabled_ms: Vec::new(),
             motion: None,
         }
     }
@@ -957,11 +972,15 @@ mod tests {
         let hip_fire = BasicAttack {
             length_ms: 900,
             can_transition_ms: Some(767),
+            dodge_cancel_ms: None,
+            block_disabled_ms: Vec::new(),
             ..melee("Firearm_Shoot_HipFire_FullBody")
         };
         assert_eq!(hip_fire.next_attack_from_ms(), 767);
         let without_marker = BasicAttack {
             can_transition_ms: None,
+            dodge_cancel_ms: None,
+            block_disabled_ms: Vec::new(),
             ..hip_fire
         };
         assert_eq!(without_marker.next_attack_from_ms(), 900);

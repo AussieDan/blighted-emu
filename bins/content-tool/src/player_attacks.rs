@@ -37,7 +37,8 @@ use nw_formats::azcs::{decode_azcs, is_azcs};
 use nw_formats::caf::Caf;
 use nw_formats::character::CharacterDefinition;
 use nw_formats::mannequin::{
-    Action, ActionList, AnimClip, AnimDatabase, DrivenMotion, Fragment, ProcClip,
+    Action, ActionList, AnimClip, AnimDatabase, CageGrid, DrivenMotion, Fragment, GridList,
+    ProcClip,
 };
 use nw_formats::objectstream::{Element, lowercase_crc32, parse_object_stream};
 use nw_formats::skeleton::Skeleton;
@@ -58,6 +59,14 @@ const ADB_SUFFIX: &str = ".adb";
 /// The player action lists.
 const PLAYER_ACTIONS_PREFIX: &str = "sharedassets/springboardentitites/playerdata/cage/";
 const ACTION_LIST_SUFFIX: &str = ".actionlist";
+/// The separator of an item's classes (`EquippableTwoHand+LifeStaff`).
+const ITEM_CLASS_SEPARATOR: char = '+';
+/// The player's CAGE grid: its action lists and the weapon classes each is on for.
+const PLAYER_GRID: &str = "sharedassets/springboardentitites/playerdata/cage/player.grid";
+/// The folder of the client's input profiles ([`nw_formats::input_profile`]).
+const INPUT_PROFILE_FOLDER: &str = "libs/config/";
+/// The suffix of an input profile file.
+const INPUT_PROFILE_SUFFIX: &str = ".xml";
 /// The ranged attack database.
 pub const RANGED_ATTACK_DATABASE: &str = "sharedassets/genericassets/rangedattackdatabase.radb";
 /// A prefab path's slice in the paks.
@@ -90,11 +99,15 @@ const DAMAGE_CLIP: &str = "CAGE-Damage";
 /// The clip of a ranged attack (a player's or a mob's).
 pub const RANGED_CLIP: &str = "CAGE-RangedAttack";
 const CAST_CLIP: &str = "CAGE-CastSpell";
-const NAMED_CLIP: &str = "CAGE-Named";
-const NAMED_CLIP_NAME: &str = "Name";
+pub(crate) const NAMED_CLIP: &str = "CAGE-Named";
+pub(crate) const NAMED_CLIP_NAME: &str = "Name";
 /// The marker whose start lets the next attack action start (the action lists unset
 /// `AttackAction` on it: "Disable AttackAction on CanTransition").
 const CAN_TRANSITION_MARKER: &str = "CanTransition";
+/// The marker clip of the windows a dodge may cancel an attack in ([`BasicAttack::dodge_cancel_ms`]).
+const DODGE_CANCEL_MARKER: &str = "CanDodgeCancel";
+/// The marker clip of the windows the block does not rise in ([`BasicAttack::block_disabled_ms`]).
+const BLOCK_DISABLED_MARKER: &str = "BlockDisabled";
 const HOMING_CLIP: &str = "Homing";
 const INVULNERABILITY_CLIP: &str = "Invulnerability";
 const USE_CLIP: &str = "UsePaperdollItem";
@@ -167,12 +180,18 @@ pub struct AnimationSources {
     pub attach: HashMap<String, AnimDatabase>,
     /// Every player action list.
     pub actions: Vec<ActionList>,
+    /// The pak path of each of `actions`, in the same order.
+    pub action_paths: Vec<String>,
+    /// The action lists of the player grid (`player.grid`), in grid order.
+    pub grid: Vec<GridList>,
     /// The sheathe action of the action lists.
     pub sheathe: Option<SheatheAction>,
     /// The ranged attack database: (profile, attack) to (range, radius, hit scan).
     pub ranged: HashMap<(String, String), (f32, f32, bool)>,
     /// The projectile flights, by lowercase prefab path.
     pub flights: HashMap<String, Flight>,
+    /// The client's input profile files (`libs/config/*.xml` and its includes), by pak path.
+    pub input_files: HashMap<String, String>,
     /// The skeletons, attachments and clips of the hit shapes.
     pub bodies: Bodies,
 }
@@ -213,7 +232,11 @@ impl AnimationSources {
     }
 
     /// The entry of the fragment named `fragment` (any case) for `tags`.
-    fn player_fragment_any_case(&self, fragment: &str, tags: &[&str]) -> Option<&Fragment> {
+    pub(crate) fn player_fragment_any_case(
+        &self,
+        fragment: &str,
+        tags: &[&str],
+    ) -> Option<&Fragment> {
         let name = self
             .player
             .iter()
@@ -305,8 +328,8 @@ fn slice_path(prefab: &str) -> String {
 /// database, ranged profile and ammo prefab of the last row, the equip types and character
 /// definitions of all.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct WeaponStance {
-    attach: Option<String>,
+pub(crate) struct WeaponStance {
+    pub(crate) attach: Option<String>,
     profile: Option<String>,
     ammo_prefab: Option<String>,
     equip_types: BTreeSet<String>,
@@ -317,11 +340,16 @@ struct WeaponStance {
 pub struct BundleRows {
     /// The player weapons' stances: `MannequinTag` cell to its attach database, ranged profile
     /// and ammo prefab.
-    weapons: BTreeMap<String, WeaponStance>,
+    pub(crate) weapons: BTreeMap<String, WeaponStance>,
     /// `SpellData`: spell id to (damage row, ranged profile, ranged attack, prefab).
     spells: HashMap<String, (String, String, String, String)>,
     /// The `MannequinTag`s of the consumables.
     use_tags: BTreeSet<String>,
+    /// The item classes of the items of each player weapon stance (`MasterItemDefinitions`
+    /// `ItemClass` of the items whose `ItemStatsRef` is a weapon row of the stance).
+    pub weapon_classes: BTreeMap<String, BTreeSet<String>>,
+    /// The prefabs of the `SpellData` rows with a ranged attack (the ability spells' flights).
+    ranged_spell_prefabs: BTreeSet<String>,
 }
 
 impl BundleRows {
@@ -334,6 +362,7 @@ impl BundleRows {
             .map(|row| (row.ammo_id.clone(), row.ammo_prefab_path.clone()))
             .collect();
         let mut weapons: BTreeMap<String, WeaponStance> = BTreeMap::new();
+        let mut stance_of_weapon: HashMap<&str, String> = HashMap::new();
         for row in tables
             .weapon_item_definitions
             .iter()
@@ -347,9 +376,9 @@ impl BundleRows {
             else {
                 continue;
             };
-            let weapon = weapons
-                .entry(row.mannequin_tag.clone().unwrap_or_default())
-                .or_default();
+            let cell = row.mannequin_tag.clone().unwrap_or_default();
+            stance_of_weapon.insert(row.weapon_id.as_str(), cell.clone());
+            let weapon = weapons.entry(cell).or_default();
             weapon.attach = Some(attach);
             weapon.profile = row.ranged_attack_profile.clone();
             weapon.ammo_prefab = row
@@ -383,6 +412,35 @@ impl BundleRows {
                 ))
             })
             .collect();
+        let ranged_spell_prefabs = tables
+            .spell_data
+            .iter()
+            .flat_map(|table| &table.rows)
+            .filter(|row| row.ranged_attack_profile.is_some() && row.ranged_attack_name.is_some())
+            .filter_map(|row| row.spell_prefab_path.clone())
+            .collect();
+        let mut weapon_classes: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for item in tables
+            .master_item_definitions
+            .iter()
+            .flat_map(|table| &table.rows)
+        {
+            let Some(cell) = item
+                .item_stats_ref
+                .as_deref()
+                .and_then(|weapon| stance_of_weapon.get(weapon))
+            else {
+                continue;
+            };
+            weapon_classes.entry(cell.clone()).or_default().extend(
+                item.item_class
+                    .iter()
+                    .flat_map(|classes| classes.split(ITEM_CLASS_SEPARATOR))
+                    .map(str::trim)
+                    .filter(|class| !class.is_empty())
+                    .map(str::to_owned),
+            );
+        }
         let use_tags = tables
             .consumable_item_definitions
             .iter()
@@ -394,6 +452,20 @@ impl BundleRows {
             weapons,
             spells,
             use_tags,
+            weapon_classes,
+            ranged_spell_prefabs,
+        }
+    }
+
+    /// Rows with only the item classes `weapon_classes` of each stance cell.
+    #[cfg(test)]
+    pub(crate) fn with_weapon_classes(weapon_classes: BTreeMap<String, BTreeSet<String>>) -> Self {
+        Self {
+            weapons: BTreeMap::new(),
+            spells: HashMap::new(),
+            use_tags: BTreeSet::new(),
+            weapon_classes,
+            ranged_spell_prefabs: BTreeSet::new(),
         }
     }
 
@@ -402,6 +474,7 @@ impl BundleRows {
         self.spells
             .values()
             .map(|(_, _, _, prefab)| prefab.clone())
+            .chain(self.ranged_spell_prefabs.iter().cloned())
             .chain(
                 self.weapons
                     .values()
@@ -433,7 +506,7 @@ impl BundleRows {
 ///
 /// Returns why when the rows' equip types sit on more than one attachment or a skeleton is
 /// missing.
-fn weapon_body<'a>(
+pub(crate) fn weapon_body<'a>(
     bodies: &'a Bodies,
     weapon: &WeaponStance,
 ) -> Result<Option<WeaponBody<'a>>, String> {
@@ -477,7 +550,7 @@ fn attack_of(
 }
 
 /// The attack of fragment `fragment_name` that action `action` plays for `tags` ([`attack_of`]).
-fn fragment_attack(
+pub(crate) fn fragment_attack(
     sources: &AnimationSources,
     rows: &BundleRows,
     weapon: &WeaponStance,
@@ -542,6 +615,17 @@ fn fragment_attack(
         })
     };
     let can_transition_ms = marker_start(CAN_TRANSITION_MARKER).map(ms);
+    let marker_windows = |marker: &str| -> Vec<[u64; 2]> {
+        fragments
+            .iter()
+            .flat_map(|(fragment, _)| fragment.clips_of(NAMED_CLIP))
+            .filter(|clip| clip.param(NAMED_CLIP_NAME) == Some(marker))
+            .map(|clip| [ms(clip.start_s), clip.end_s.map_or(length_ms, ms)])
+            .collect()
+    };
+    let dodge_cancel = marker_windows(DODGE_CANCEL_MARKER);
+    let dodge_cancel_ms = (!dodge_cancel.is_empty()).then_some(dodge_cancel);
+    let block_disabled_ms = marker_windows(BLOCK_DISABLED_MARKER);
     let motion = match (
         sources
             .action(action)
@@ -562,6 +646,8 @@ fn fragment_attack(
         length_ms,
         links: Vec::new(),
         can_transition_ms,
+        dodge_cancel_ms: dodge_cancel_ms.clone(),
+        block_disabled_ms: block_disabled_ms.clone(),
         motion: motion.clone(),
     };
     let (melee, context) = playing_in(DAMAGE_CLIP);
@@ -662,18 +748,14 @@ fn fragment_attack(
         .first()
         .map(|clip| (clip.start_s, clip.param(SPELL_NAME).unwrap_or_default()))
         .or_else(|| {
-            sources
-                .action(action)?
-                .casts
-                .iter()
-                .find_map(|(condition, spell)| {
-                    condition.markers().into_iter().find_map(|marker| {
-                        let start_s = marker_start(marker)?;
-                        condition
-                            .holds(tags, &[marker])
-                            .then_some((start_s, spell.as_str()))
-                    })
+            sources.action(action)?.casts.iter().find_map(|cast| {
+                cast.condition.markers().into_iter().find_map(|marker| {
+                    let start_s = marker_start(marker)?;
+                    cast.condition
+                        .holds(tags, &[marker])
+                        .then_some((start_s, cast.spell.as_str()))
                 })
+            })
         });
     if let Some((start_s, spell)) = cast {
         let (damage_row, profile, name, prefab) = rows
@@ -1167,9 +1249,12 @@ pub fn read_sources(source: &GameSource, rows: &BundleRows) -> Result<AnimationS
         player: Vec::new(),
         attach: HashMap::new(),
         actions: Vec::new(),
+        action_paths: Vec::new(),
+        grid: Vec::new(),
         sheathe: None,
         ranged: HashMap::new(),
         flights: HashMap::new(),
+        input_files: HashMap::new(),
         bodies: Bodies::default(),
     };
     source.for_each_entry(
@@ -1177,6 +1262,8 @@ pub fn read_sources(source: &GameSource, rows: &BundleRows) -> Result<AnimationS
             (path.starts_with(PLAYER_ADB_PREFIX) && path.ends_with(ADB_SUFFIX))
                 || attach_paths.contains(path)
                 || (path.starts_with(PLAYER_ACTIONS_PREFIX) && path.ends_with(ACTION_LIST_SUFFIX))
+                || path == PLAYER_GRID
+                || (path.starts_with(INPUT_PROFILE_FOLDER) && path.ends_with(INPUT_PROFILE_SUFFIX))
                 || path == RANGED_ATTACK_DATABASE
                 || prefab_slices.contains_key(path)
                 || path == PLAYER_DEFINITION
@@ -1210,9 +1297,19 @@ pub fn read_sources(source: &GameSource, rows: &BundleRows) -> Result<AnimationS
                             .insert(path.to_owned(), definition);
                     }
                 }
+            } else if path.starts_with(INPUT_PROFILE_FOLDER) && path.ends_with(INPUT_PROFILE_SUFFIX)
+            {
+                if let Some(text) = text() {
+                    sources.input_files.insert(path.to_owned(), text.to_owned());
+                }
+            } else if path == PLAYER_GRID {
+                if let Some(lists) = text().and_then(|text| CageGrid::lists(text).ok()) {
+                    sources.grid = lists;
+                }
             } else if path.ends_with(ACTION_LIST_SUFFIX) {
                 if let Some(list) = text().and_then(|text| ActionList::parse(text).ok()) {
                     sources.actions.push(list);
+                    sources.action_paths.push(path.to_owned());
                 }
                 if sources.sheathe.is_none() {
                     sources.sheathe = text()
@@ -1389,9 +1486,12 @@ mod tests {
                 AnimDatabase::parse(ATTACH_ADB).expect("attach"),
             )]),
             actions: vec![ActionList::parse(ACTIONS).expect("actions")],
+            action_paths: vec![String::new()],
+            grid: Vec::new(),
             sheathe: SheatheAction::parse(ACTIONS, SHEATHE_ACTION).expect("actions"),
             ranged: HashMap::new(),
             flights: HashMap::new(),
+            input_files: HashMap::new(),
             bodies: crate::melee_shapes::test_support::bodies(),
         }
     }
@@ -1410,6 +1510,8 @@ mod tests {
                 },
             )]),
             spells: HashMap::new(),
+            weapon_classes: BTreeMap::new(),
+            ranged_spell_prefabs: BTreeSet::new(),
             use_tags: BTreeSet::from(["Potion".to_owned()]),
         }
     }
@@ -1624,6 +1726,8 @@ mod tests {
             player: vec![AnimDatabase::parse(AIM_ADB).expect("player")],
             attach: HashMap::new(),
             actions: vec![ActionList::parse(AIM_ACTION_LIST).expect("actions")],
+            action_paths: vec![String::new()],
+            grid: Vec::new(),
             sheathe: None,
             ranged: HashMap::from([
                 (
@@ -1633,6 +1737,7 @@ mod tests {
                 (("Bow".to_owned(), "Basic".to_owned()), (RANGE_M, 0.0, true)),
             ]),
             flights: HashMap::new(),
+            input_files: HashMap::new(),
             bodies: crate::melee_shapes::test_support::bodies(),
         };
         let rows = BundleRows {
@@ -1641,6 +1746,8 @@ mod tests {
                 (BOW.to_owned(), weapon("Bow")),
             ]),
             spells: HashMap::new(),
+            weapon_classes: BTreeMap::new(),
+            ranged_spell_prefabs: BTreeSet::new(),
             use_tags: BTreeSet::new(),
         };
         let (stances, _) = build_stances(&sources, &rows);
