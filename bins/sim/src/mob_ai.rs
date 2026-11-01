@@ -257,6 +257,9 @@ struct Names {
 
 /// The slice asset of each vitals id's most seen look (the mob prefab table's).
 pub type LookAssets = HashMap<u32, [u8; ASSET_ID_LEN]>;
+/// The vitals id of each creature slice asset of the mob prefab table: what a tree's
+/// `ExecuteSpawn` of that slice spawns.
+pub type SliceVitals = HashMap<[u8; ASSET_ID_LEN], u32>;
 
 /// The shared AI of a sim: the data, its runtime, the tick rates, and the slice of each vitals
 /// id's look.
@@ -266,6 +269,7 @@ pub struct MobAi {
     names: Names,
     rates: AiRates,
     looks: LookAssets,
+    slice_vitals: SliceVitals,
 }
 
 impl MobAi {
@@ -305,7 +309,20 @@ impl MobAi {
             names,
             rates,
             looks,
+            slice_vitals: SliceVitals::new(),
         }
+    }
+
+    /// The AI whose trees' `ExecuteSpawn` nodes spawn the creatures of `slice_vitals`.
+    #[must_use]
+    pub fn with_slice_vitals(mut self, slice_vitals: SliceVitals) -> Self {
+        self.slice_vitals = slice_vitals;
+        self
+    }
+
+    /// The vitals id of creature slice asset `asset`: what a summon of that slice spawns.
+    pub fn summoned_vitals(&self, asset: &[u8; ASSET_ID_LEN]) -> Option<u32> {
+        self.slice_vitals.get(asset).copied()
     }
 
     /// The AI data file of `client_build` in `dir`, with tick rates `rates` and the looks
@@ -890,6 +907,20 @@ pub struct Thought {
     /// The encounter events its tree sent (`EncounterEventDecorator`), for the encounter that
     /// spawned it (dungeon scripts).
     pub encounter_events: Vec<NameId>,
+    /// The mobs its tree spawned (`ExecuteSpawn`).
+    pub summons: Vec<Summon>,
+}
+
+/// A tree's `ExecuteSpawn`: `count` mobs of creature slice `asset` at `at` (the node's
+/// `TargetPosBlackboardKey`), else at the summoner.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Summon {
+    /// The creature slice asset (`Slice`).
+    pub asset: [u8; ASSET_ID_LEN],
+    /// `Count`.
+    pub count: u32,
+    /// Where they spawn; `None`: at the summoner.
+    pub at: Option<Position>,
 }
 
 /// The surroundings of a mob in one step.
@@ -1915,14 +1946,38 @@ impl TreeMind {
                 }
                 Command::LockTarget(locked) => self.state.locked = locked,
                 Command::ManualTarget(point) => self.state.manual = point.map(position_of),
-                Command::Action { node, .. } => match ai.data().node(node).kind {
+                Command::Action { node, .. } => match &ai.data().node(node).kind {
+                    NodeKind::ExecuteSpawn {
+                        slice,
+                        count,
+                        position_key,
+                        ..
+                    } => {
+                        let passive = self.passive(ai);
+                        let view = self.state.view(ai, at, now_ms, passive);
+                        let count = self
+                            .brain
+                            .resolve(&ai.runtime, &view, count)
+                            .and_then(Value::as_number)
+                            // A handful of adds.
+                            .map_or(0, |count| count.max(0.0).round() as u32);
+                        let at = position_key.and_then(|key| match self.brain.fact(key) {
+                            Some(Value::Vec3(point)) => Some(position_of(point)),
+                            _ => None,
+                        });
+                        thought.summons.push(Summon {
+                            asset: slice.guid,
+                            count,
+                            at,
+                        });
+                    }
                     NodeKind::SelectWaypoint => {
                         if let Some(route) = &mut self.state.route {
                             route.advance();
                             route.visit(self.state.picks.unit());
                         }
                     }
-                    ref other => tracing::debug!(
+                    other => tracing::debug!(
                         archetype = self.state.archetype,
                         node = ?std::mem::discriminant(other),
                         "tree action the sim does not run"
@@ -2946,6 +3001,53 @@ mod tests {
         assert!((reach.lunge_turn_rad - std::f32::consts::PI).abs() < 1e-6);
         let still = window_reach(&ai, &damage, None);
         assert_eq!((still.lunge_max_m, still.lunge_turn_rad), (0.0, 0.0));
+    }
+
+    /// A tree's `ExecuteSpawn` (retail `medusa_minionsummon_attackbehavior` `Spawn_Boar`:
+    /// `Count` 1, `TargetPosBlackboardKey` unset) gives the sim a summon of its slice at the
+    /// mob.
+    #[test]
+    fn an_execute_spawn_node_summons_its_slice() {
+        const SLICE: [u8; ASSET_ID_LEN] = [3; ASSET_ID_LEN];
+        const COUNT: i64 = 2;
+        let mut data = test_ai_data();
+        let node = u32::try_from(data.nodes.len()).expect("node id");
+        data.nodes.push(nw_ai::node::Node {
+            name: 0,
+            utility: 1.0,
+            interruptable: true,
+            kind: NodeKind::ExecuteSpawn {
+                slice: nw_ai::node::AssetRef {
+                    guid: SLICE,
+                    hint: None,
+                },
+                alias: None,
+                count: Param::literal(Value::Int(COUNT)),
+                position_key: None,
+                use_owner_rotation: true,
+            },
+        });
+        let ai = MobAi::new(data, AiRates::default(), LookAssets::new());
+        let mut mind = TreeMind::new(&ai, 0, START, 0.0, 1, None).expect("a tree");
+        let mut thought = Thought::default();
+        mind.apply(
+            &ai,
+            START,
+            0,
+            vec![Command::Action {
+                node,
+                target_index: None,
+            }],
+            &mut thought,
+        );
+        assert_eq!(
+            thought.summons,
+            [Summon {
+                asset: SLICE,
+                count: 2,
+                at: None,
+            }]
+        );
     }
 
     #[test]

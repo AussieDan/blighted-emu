@@ -39,7 +39,7 @@ use nw_world::world_file::world_file_path;
 use crate::asset_solids::AssetSolids;
 use crate::config::{SimConfig, SimConfigError, SimRole, load_sim_config};
 use crate::gameplay::{GameplayError, load_gameplay};
-use crate::mob_ai::{LookAssets, MobAi, resolve_ai};
+use crate::mob_ai::{LookAssets, MobAi, SliceVitals, resolve_ai};
 use crate::mobs::{SpawnFilter, sim_spawns, spawns_of_level};
 use crate::player_content::{MobLooks, PlayerContent};
 use crate::server::{
@@ -204,15 +204,23 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
             .with_player_abilities(player_abilities)
             .with_player_sequences(player_sequences),
     );
-    let (mob_looks, look_assets) = match MobPrefabs::load(&config.content_dir, &build) {
+    let (mob_looks, look_assets, slice_vitals) = match MobPrefabs::load(&config.content_dir, &build)
+    {
         Ok(prefabs) => {
             let (looks, skipped) = MobLooks::of(&prefabs);
             tracing::info!(prefabs = looks.len(), skipped, "mob prefab table");
-            (looks, prefabs.default_assets().collect::<LookAssets>())
+            (
+                looks,
+                prefabs.default_assets().collect::<LookAssets>(),
+                prefabs
+                    .iter()
+                    .map(|((vitals_id, asset), _)| (asset, vitals_id))
+                    .collect::<SliceVitals>(),
+            )
         }
         Err(error) => {
             tracing::warn!(%error, "no mob prefab table: mobs are not shown to clients");
-            (MobLooks::default(), LookAssets::new())
+            (MobLooks::default(), LookAssets::new(), SliceVitals::new())
         }
     };
     let mob_ai = match MobAi::load(
@@ -235,7 +243,8 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
             tracing::warn!(%error, "no AI data: every mob stands at its spawn");
             MobAi::new(AiData::default(), config.mob_ai, look_assets)
         }
-    };
+    }
+    .with_slice_vitals(slice_vitals);
     let creature_animations = match CreatureAnimations::load(&config.content_dir, &build) {
         Ok(table) => {
             tracing::info!(creatures = table.len(), "creature animation table");

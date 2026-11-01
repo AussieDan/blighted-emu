@@ -3,6 +3,7 @@
 //! `Kick` needs the server loop (it saves and closes the connection): see
 //! [`SimWorld::connection_of`].
 
+use crate::mobs::ring;
 use bevy_ecs::component::Component;
 use nw_bus::{AdminAction, AdminCommand, AdminReply, ConnectionRef, Point};
 use nw_formats::objectstream::lowercase_crc32;
@@ -14,8 +15,6 @@ use super::{Placement, Player, QuestRefusal, SimWorld};
 
 /// Most GM mobs one command spawns.
 pub const MAX_GM_SPAWN: u32 = 50;
-/// Metres between GM mobs of one command, on a ring around the point.
-const GM_SPAWN_SPACING_M: f32 = 2.0;
 const LOWEST_LEVEL: u32 = 1;
 /// The answer for a player whose character has no bag (no starter kit row for it).
 pub const NO_BAG: &str = "the player has no bag (its character has no starter kit)";
@@ -320,22 +319,6 @@ impl SimWorld {
     }
 }
 
-/// `count` points on a ring around (`x`, `y`), [`GM_SPAWN_SPACING_M`] apart; one point is the
-/// centre itself.
-fn ring(x: f32, y: f32, count: u32) -> Vec<(f32, f32)> {
-    if count == 1 {
-        return vec![(x, y)];
-    }
-    let steps = count as f32;
-    let radius = GM_SPAWN_SPACING_M * steps / std::f32::consts::TAU;
-    (0..count)
-        .map(|step| {
-            let angle = std::f32::consts::TAU * step as f32 / steps;
-            (x + radius * angle.cos(), y + radius * angle.sin())
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use nw_bus::{AdminAction, AdminCommand, AdminReply, Point};
@@ -571,7 +554,10 @@ mod tests {
         let (x0, y0) = points[0];
         let (x1, y1) = points[1];
         let apart = ((x1 - x0).powi(2) + (y1 - y0).powi(2)).sqrt();
-        assert!(apart > GM_SPAWN_SPACING_M * 0.8 && apart < GM_SPAWN_SPACING_M * 1.2);
+        assert!(
+            apart > crate::mobs::SPAWN_SPACING_M * 0.8
+                && apart < crate::mobs::SPAWN_SPACING_M * 1.2
+        );
         assert_eq!(ring(5.0, 6.0, 1), [(5.0, 6.0)]);
     }
 }

@@ -40,7 +40,7 @@ pub use nw_world::records::VitalsSpawn;
 
 use crate::combat::CombatSettings;
 use crate::mob_ai::{
-    COMBAT_LEASH_KEY, MobAi, Shown, SpawnAi, Strike, Surroundings, TreeMind, floor_line,
+    COMBAT_LEASH_KEY, MobAi, Shown, SpawnAi, Strike, Summon, Surroundings, TreeMind, floor_line,
     height_after_move,
 };
 use crate::objectives::KillTypes;
@@ -385,6 +385,8 @@ pub struct Mobs {
     personal: HashMap<u32, Personal>,
     /// GM mobs by index, with their spawns; their indexes follow the spawn list too.
     gm: BTreeMap<u32, VitalsSpawn>,
+    /// Mobs a tree spawned (`ExecuteSpawn`) by index; their indexes follow the spawn list too.
+    summoned: HashMap<u32, Summoned>,
     /// The design overrides of each spawn of the spawn list (empty: none).
     overrides: Arc<[Option<SpawnAi>]>,
     next_personal: u32,
@@ -413,6 +415,26 @@ pub struct Mobs {
     /// The encounter events the mobs' trees sent since the last
     /// [`Mobs::take_encounter_events`]: (mob, event id).
     encounter_events: Vec<(u64, String)>,
+}
+
+/// Metres between mobs spawned together (a GM command, a tree's summon), on a ring around the
+/// point.
+pub(crate) const SPAWN_SPACING_M: f32 = 2.0;
+
+/// `count` points on a ring around (`x`, `y`), [`SPAWN_SPACING_M`] apart; one point is the
+/// centre itself.
+pub(crate) fn ring(x: f32, y: f32, count: u32) -> Vec<(f32, f32)> {
+    if count == 1 {
+        return vec![(x, y)];
+    }
+    let steps = count as f32;
+    let radius = SPAWN_SPACING_M * steps / std::f32::consts::TAU;
+    (0..count)
+        .map(|step| {
+            let angle = std::f32::consts::TAU * step as f32 / steps;
+            (x + radius * angle.cos(), y + radius * angle.sin())
+        })
+        .collect()
 }
 
 /// The spawns that a sim of `level` spawns. Every mob of the tutorial is a fight of its quest,
@@ -519,6 +541,16 @@ struct Step {
     ticked: bool,
     /// The encounter events its tree sent.
     encounter_events: Vec<NameId>,
+    /// The mobs its tree spawned.
+    summons: Vec<Summon>,
+}
+
+/// A mob that a tree spawned.
+#[derive(Debug, Clone, PartialEq)]
+struct Summoned {
+    spawn: VitalsSpawn,
+    /// The creature slice it shows (its tree's `ExecuteSpawn` slice).
+    asset: [u8; ASSET_ID_LEN],
 }
 
 /// What every mind reads in a tick.
@@ -553,6 +585,7 @@ impl TickView<'_> {
             sleeps: false,
             ticked: false,
             encounter_events: Vec::new(),
+            summons: Vec::new(),
         };
         if let Mind::Tree(mind) = &mob.mind
             && !mind.due(self.now_ms)
@@ -590,6 +623,7 @@ impl TickView<'_> {
         step.acquired = thought.acquired;
         step.ticked = thought.ticked;
         step.encounter_events = thought.encounter_events;
+        step.summons = thought.summons;
         step.hits = thought
             .hits
             .into_iter()
@@ -613,6 +647,7 @@ impl Mobs {
             spawns,
             personal: HashMap::new(),
             gm: BTreeMap::new(),
+            summoned: HashMap::new(),
             overrides: Arc::from([]),
             next_personal,
             data: Arc::clone(&combat.data),
@@ -847,7 +882,11 @@ impl Mobs {
 
     /// The slice asset of personal mob `entity`'s retail card, when it has one.
     pub fn asset(&self, entity: u64) -> Option<[u8; ASSET_ID_LEN]> {
-        self.personal.get(&spawn_index(entity)?)?.asset
+        let index = spawn_index(entity)?;
+        self.personal
+            .get(&index)
+            .and_then(|personal| personal.asset)
+            .or_else(|| self.summoned.get(&index).map(|summoned| summoned.asset))
     }
 
     /// The state of mob `entity`, when it lives here.
@@ -1059,12 +1098,69 @@ impl Mobs {
         Some((at, position_of(self.spawn_of(index)?)))
     }
 
-    /// The spawn of mob `index`: a world spawn or a personal one.
+    /// The spawn of mob `index`: a world spawn, a personal, GM or summoned one.
     fn spawn_of(&self, index: u32) -> Option<&VitalsSpawn> {
         self.spawns
             .get(index as usize)
             .or_else(|| self.personal.get(&index).map(|personal| &personal.spawn))
             .or_else(|| self.gm.get(&index))
+            .or_else(|| self.summoned.get(&index).map(|summoned| &summoned.spawn))
+    }
+
+    /// Mob `owner`'s tree spawned `summon`: its mobs, of the summoner's level, stand at the
+    /// summon's place (else the summoner's) on a ring, awake. A slice without a vitals id in the
+    /// mob prefab table (no retail card of it) spawns nothing: the client could not show it.
+    /// A summoned mob never respawns; it goes with its corpse, or when it is left alone
+    /// (Inferred: no retail capture shows what becomes of the adds of a boss that resets).
+    fn summon(&mut self, owner: u32, summon: Summon) {
+        let Some(vitals_id) = self.ai.summoned_vitals(&summon.asset) else {
+            tracing::debug!(
+                owner = mob_entity(owner),
+                "summon of a slice without a card"
+            );
+            return;
+        };
+        let (Some(level), Some(home)) = (
+            self.spawn_of(owner).map(|spawn| spawn.level),
+            self.live.get(&owner).map(|mob| mob.position),
+        ) else {
+            return;
+        };
+        let at = summon.at.unwrap_or(home);
+        for (x, y) in ring(at.x, at.y, summon.count) {
+            let spawn = VitalsSpawn {
+                vitals_id,
+                level,
+                position: [x, y, at.z],
+                ..VitalsSpawn::default()
+            };
+            let index = self.next_personal;
+            let Some(mob) = self.make(index, &spawn, Some(summon.asset)) else {
+                return;
+            };
+            let Some(next) = index.checked_add(1) else {
+                return;
+            };
+            self.next_personal = next;
+            self.live.insert(index, mob);
+            self.wake_index(index);
+            self.summoned.insert(
+                index,
+                Summoned {
+                    spawn,
+                    asset: summon.asset,
+                },
+            );
+        }
+    }
+
+    /// Removes summoned mob `index` for good.
+    fn unsummon(&mut self, index: u32) {
+        if self.summoned.remove(&index).is_some() {
+            self.live.remove(&index);
+            self.awake.remove(&index);
+            self.left.push(mob_entity(index));
+        }
     }
 
     /// Spawns the mobs of the spawns that `owns`, and removes the others.
@@ -1219,6 +1315,9 @@ impl Mobs {
                 let name = self.ai.name(event).to_owned();
                 self.encounter_events.push((mob_entity(step.index), name));
             }
+            for summon in step.summons {
+                self.summon(step.index, summon);
+            }
             intents.extend(step.hits);
             if let Some(target) = step.acquired {
                 acquired.push((step.index, target));
@@ -1241,6 +1340,7 @@ impl Mobs {
             .iter()
             .filter(|(index, mob)| {
                 !self.personal.contains_key(index)
+                    && !self.summoned.contains_key(index)
                     && mob.dead_since_ms.is_some_and(|since| {
                         now_ms.saturating_sub(since) >= self.respawn_ms_of(**index)
                     })
@@ -1322,6 +1422,7 @@ impl Mobs {
             mob.awake = false;
             self.awake.remove(&index);
             self.slept.push(mob_entity(index));
+            self.unsummon(index);
         }
     }
 
@@ -1508,11 +1609,16 @@ impl Mobs {
 
     /// The corpse of dead mob `entity` goes: it is not shown again until its respawn.
     pub fn bury(&mut self, entity: u64) {
-        if let Some(mob) = spawn_index(entity)
-            .and_then(|index| self.live.get_mut(&index))
+        let Some(index) = spawn_index(entity) else {
+            return;
+        };
+        if let Some(mob) = self
+            .live
+            .get_mut(&index)
             .filter(|mob| mob.dead_since_ms.is_some())
         {
             mob.buried = true;
+            self.unsummon(index);
         }
     }
 
@@ -1720,11 +1826,11 @@ mod tests {
     use super::*;
     use crate::combat::test_support::{TEST_LEVEL, TEST_MOB};
     use crate::combat::tests::test_combat;
-    use crate::mob_ai::resolve_ai;
     use crate::mob_ai::test_support::{
         TEST_ATTACK_S, TEST_COOLDOWN_S, TEST_GROUP_AGGRO_M, TEST_HIT_S, TEST_LEASH_M, TEST_MOB_ROW,
         TEST_MOB_TABLE, TEST_REACH_M, TEST_SIGHT_M,
     };
+    use crate::mob_ai::{SliceVitals, resolve_ai};
 
     pub(super) const HEIGHT: f32 = 37.5;
     pub(super) const PLAYER: u64 = 3;
@@ -2053,6 +2159,72 @@ mod tests {
         mobs.bury(entity);
         assert_eq!(mobs.corpses().count(), 0);
         assert!(!mobs.awake_states().any(|(mob, ..)| mob == entity));
+    }
+
+    /// A tree's `ExecuteSpawn` (retail `medusa_minionsummon_attackbehavior`: `Spawn_Boar`, one
+    /// boar slice): its mobs stand awake on a ring around the summoner with the summoner's level
+    /// and show the summoned slice; a dead one never respawns and goes with its corpse, and a
+    /// slice without a card spawns nothing.
+    #[test]
+    fn a_summon_spawns_its_slice_beside_the_summoner_once() {
+        const ADDS: u32 = 3;
+        const SLICE: [u8; ASSET_ID_LEN] = [7; ASSET_ID_LEN];
+        let mut mobs = mobs(vec![spawn_at(SPAWN_X, TEST_MOB, TEST_LEVEL)]);
+        mobs.ai = Arc::new(
+            MobAi::empty()
+                .with_slice_vitals(SliceVitals::from([(SLICE, lowercase_crc32(TEST_MOB))])),
+        );
+        mobs.set_cells(every);
+        let before = mobs.live_entities().len();
+        mobs.summon(
+            0,
+            Summon {
+                asset: [9; ASSET_ID_LEN],
+                count: ADDS,
+                at: None,
+            },
+        );
+        assert_eq!(mobs.live_entities().len(), before, "no card, no mob");
+        mobs.summon(
+            0,
+            Summon {
+                asset: SLICE,
+                count: ADDS,
+                at: None,
+            },
+        );
+        let adds: Vec<u64> = mobs
+            .live_entities()
+            .into_iter()
+            .filter(|entity| *entity != mob_entity(0))
+            .collect();
+        assert_eq!(adds.len(), ADDS as usize);
+        for add in &adds {
+            assert_eq!(mobs.asset(*add), Some(SLICE), "the summoned slice's card");
+            let index = spawn_index(*add).expect("index");
+            assert_eq!(
+                mobs.spawn_of(index).map(|spawn| spawn.level),
+                Some(TEST_LEVEL)
+            );
+            let at = mobs.live[&index].position;
+            assert!(
+                (at.x - SPAWN_X).abs() <= SPAWN_SPACING_M * ADDS as f32,
+                "beside it"
+            );
+            assert!(mobs.awake.contains(&index));
+        }
+        let add = adds[0];
+        let mob = mobs.get_mut(add).expect("add");
+        mob.health.take(mob.health.max());
+        mobs.died(add, 1);
+        mobs.respawn_due(u64::MAX);
+        assert!(
+            mobs.live.contains_key(&spawn_index(add).expect("index")),
+            "no respawn"
+        );
+        mobs.bury(add);
+        assert!(!mobs.live_entities().contains(&add), "gone with its corpse");
+        assert!(mobs.take_left().contains(&add));
     }
 
     /// Ground that rises [`SLOPE_RISE`] metres per metre east of [`SPAWN_X`].
