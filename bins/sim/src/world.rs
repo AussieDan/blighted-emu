@@ -6582,6 +6582,49 @@ mod tests {
         const LETHAL: u32 = 100_000;
         /// Far beyond the committed `min_respawn_ms`.
         const RESPAWN_AFTER_MS: u64 = 60_000;
+    #[test]
+    fn a_blocked_mob_hit_sends_the_stamina_change_in_the_own_update() {
+        // Live 2026-11-01: the server blocked (stamina 100 to 76), the stamina bar did not move.
+        const MOB_X: f32 = CELL_M / 2.0;
+        const TICK_MS: u64 = 33;
+        const LONG_MS: u64 = 60_000;
+        /// Slot value 1 bit 62: the block key (`InputRecord::blocking`).
+        const BLOCK_BIT: u32 = 62;
+        let mut world = world_with_spawns(vec![test_spawn(MOB_X)]);
+        world.set_table(&table(&["sim-a", "sim-b"])).expect("table");
+        join(&mut world, 1, MOB_X + 1.5);
+        let block = nw_messages::InputRecord {
+            slots: nw_messages::InputSlots {
+                count: 19,
+                values: vec![0, 1 << BLOCK_BIT],
+                bytes: [0; 4],
+            },
+            ..nw_messages::InputRecord::default()
+        };
+        let card_at = NOW + OWN_CARD_DELAY_MS;
+        tick(&mut world, card_at);
+        let mut now = card_at;
+        let mut sent = Vec::new();
+        while now < card_at + LONG_MS && sent.is_empty() {
+            world.attack_input(&connection(1), std::slice::from_ref(&block), now);
+            let messages = tick(&mut world, now).messages;
+            sent = bundle_of(&messages, &connection(1))
+                .map(|bundle| SlotRead::of(&bundle).expect("read").updates)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(SlotUpdate::is_local_player)
+                .flat_map(|update| update.members)
+                .filter_map(|member| match member.state {
+                    MemberState::Stamina(stamina) => stamina.cur,
+                    _ => None,
+                })
+                .filter(|cur| *cur < 100.0)
+                .collect();
+            now += TICK_MS;
+        }
+        assert!(!sent.is_empty(), "no stamina change went to the client");
+    }
+
         let mut world = world_with_spawns(Vec::new());
         world.set_table(&table(&["sim-a", "sim-b"])).expect("table");
         world
