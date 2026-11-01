@@ -113,6 +113,9 @@ pub struct StatusEffectRule {
     pub remove_on_death: bool,
     /// `RemoveOnRespawn`.
     pub remove_on_respawn: bool,
+    /// `DisablePauseOnPersist`: its time runs on while its holder is away; without it the time
+    /// pauses.
+    pub runs_offline: bool,
     /// `AllowAddIfDead`.
     pub allow_add_if_dead: bool,
     /// `UseLightweightReplication`: it goes in the lightweight map of the 4236 state.
@@ -196,6 +199,8 @@ pub struct EffectSourceRow {
     pub remove_on_death: bool,
     /// `RemoveOnRespawn` is set.
     pub remove_on_respawn: bool,
+    /// `DisablePauseOnPersist`.
+    pub runs_offline: bool,
     /// `AllowAddIfDead`.
     pub allow_add_if_dead: bool,
     /// `UseLightweightReplication`.
@@ -288,6 +293,7 @@ impl EffectSourceRow {
             damage_type: row.damage_type.clone(),
             remove_on_death: set(row.remove_on_death),
             remove_on_respawn: set(row.remove_on_respawn),
+            runs_offline: row.disable_pause_on_persist.unwrap_or(false),
             allow_add_if_dead: row.allow_add_if_dead.unwrap_or(false),
             lightweight: row.use_lightweight_replication.unwrap_or(false),
             client_predicted: row.is_client_predicted.unwrap_or(false),
@@ -538,6 +544,7 @@ fn rule(
         damage_type: row.damage_type.as_deref().and_then(type_of),
         remove_on_death: row.remove_on_death,
         remove_on_respawn: row.remove_on_respawn,
+        runs_offline: row.runs_offline,
         allow_add_if_dead: row.allow_add_if_dead,
         lightweight: row.lightweight,
         client_predicted: row.client_predicted,

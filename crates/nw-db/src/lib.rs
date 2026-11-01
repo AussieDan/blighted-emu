@@ -30,6 +30,7 @@ mod session;
 mod social;
 mod social_graph;
 mod stats;
+mod status_effects;
 mod trading_post;
 mod travel;
 
@@ -86,6 +87,7 @@ pub use stats::{
     BoardEntry, BoardOrder, BoardPage, GLOBAL_ENTITY, StatMerge, StatUpdate, StatValue, StatValues,
     leaderboard_entries, leaderboard_page, stat_values, submit_stats,
 };
+pub use status_effects::SavedStatusEffect;
 pub use trading_post::{
     CharacterOrders, Completed, Delivery, DeliveryNotice, MAX_COUNTED_MATCHES, NewOrder, Order,
     OrderEnd, OrderItem, OrderKind, OrderPage, OrderRefusal, OrderSearch, OrderStatus,

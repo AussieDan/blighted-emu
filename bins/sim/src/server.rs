@@ -44,7 +44,7 @@ use nw_messages::guild_lookup::REQUEST_GET_GUILDS_TYPE_INDEX;
 use nw_messages::social::SocialCall;
 use nw_messages::{
     BodyCodec, ClientFacetMsg, ClientInputMsg, ConversationClientMsg, GmClientMsg, InputRecord,
-    LookupRequest, MetaAchievementRequest, MountClientMsg, ObjectiveInteractorClientMsg,
+    LookupRequest, MetaAchievementRequest, MountClientMsg, NS_PER_MS, ObjectiveInteractorClientMsg,
     PointsClientMsg, RECEIVE_INPUT_FROM_CLIENT_TYPE_INDEX, REQUEST_RESPAWN_TYPE_INDEX,
     RequestRespawnMsg, SPREADSHOT_REQUEST_TYPE_INDEX, SetTitleRequest, SpreadshotRequestMsg,
     TravelClientMsg,
@@ -1837,7 +1837,7 @@ impl Loop {
             save_character_progression(
                 &db,
                 character,
-                &saved_progression(&save.progression),
+                &saved_progression(&save.progression, save.taken_at_ms),
                 save.taken_at_ms,
             )
             .await
@@ -1928,8 +1928,8 @@ fn saved_quests(quests: &PlayerQuests) -> SavedQuests {
     }
 }
 
-/// The progression as the database stores it.
-fn saved_progression(progression: &PlayerProgression) -> SavedProgression {
+/// The progression as the database stores it, taken at unix ms `taken_at_ms`.
+fn saved_progression(progression: &PlayerProgression, taken_at_ms: u64) -> SavedProgression {
     SavedProgression {
         experience: progression.experience,
         coins: progression.coins,
@@ -1975,6 +1975,19 @@ fn saved_progression(progression: &PlayerProgression) -> SavedProgression {
             changes: progression.faction.changes,
             changed_ns: progression.faction.changed_ns,
         },
+        status_effects: progression
+            .status_effects
+            .iter()
+            .map(|effect| nw_db::SavedStatusEffect {
+                status_id: effect.status_id.clone(),
+                consumable_id: effect.consumable_id.clone(),
+                ends_ns: effect.ends_ns,
+                stacks: effect.stacks,
+                runs_offline: effect.runs_offline,
+                repeat: effect.repeat.map(|repeat| (repeat.next_ns, repeat.ends_ns)),
+                saved_ns: taken_at_ms.saturating_mul(NS_PER_MS),
+            })
+            .collect(),
     }
 }
 

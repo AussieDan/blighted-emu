@@ -13,9 +13,9 @@ use nw_bus::{
 };
 use nw_db::{
     AdminRank, PgPool, SavedArena, SavedInventory, SavedItem, SavedItemRolls, SavedMounts,
-    SavedPlace, SavedPosition, SavedProgression, SavedQuests, SavedTravel, account_by_id,
-    admin_rank, character_by_id, character_inventory, character_items, character_position,
-    character_progression, character_quests, next_entity_number,
+    SavedPlace, SavedPosition, SavedProgression, SavedQuests, SavedStatusEffect, SavedTravel,
+    account_by_id, admin_rank, character_by_id, character_inventory, character_items,
+    character_position, character_progression, character_quests, next_entity_number,
 };
 use nw_login::look::{saved_backstory, saved_look};
 use nw_sim_core::{Position, TUTORIAL_FOLDER, TUTORIAL_START};
@@ -239,7 +239,7 @@ pub async fn route_join(
             character_progression(&context.db, join.character)
                 .await
                 .map_err(database)?
-                .map(player_progression)
+                .map(|saved| player_progression(saved, unix_now_ns()))
                 .unwrap_or_default(),
         ),
     };
@@ -364,13 +364,21 @@ fn in_probation(rank: Option<AdminRank>, created_at_unix: Option<i64>, now_unix:
         })
 }
 
-/// Unix seconds now; 0 for a clock before 1970.
-fn unix_now() -> i64 {
+/// The time since 1970; zero for a clock before 1970.
+fn since_unix_epoch() -> Duration {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-        })
+        .unwrap_or_default()
+}
+
+/// Unix seconds now; 0 for a clock before 1970.
+fn unix_now() -> i64 {
+    i64::try_from(since_unix_epoch().as_secs()).unwrap_or(i64::MAX)
+}
+
+/// Unix nanoseconds now; 0 for a clock before 1970.
+fn unix_now_ns() -> u64 {
+    u64::try_from(since_unix_epoch().as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// The saved quests as a sim runs them; a running quest whose run no longer reads is dropped.
@@ -395,8 +403,8 @@ fn player_quests(saved: SavedQuests) -> PlayerQuests {
     }
 }
 
-/// The saved progression as a sim keeps it.
-fn player_progression(saved: SavedProgression) -> PlayerProgression {
+/// The saved progression as a sim keeps it, loaded at unix ns `now_ns`.
+fn player_progression(saved: SavedProgression, now_ns: u64) -> PlayerProgression {
     PlayerProgression {
         experience: saved.experience,
         coins: saved.coins,
@@ -440,6 +448,33 @@ fn player_progression(saved: SavedProgression) -> PlayerProgression {
             changes: saved.faction.changes,
             changed_ns: saved.faction.changed_ns,
         },
+        status_effects: saved
+            .status_effects
+            .into_iter()
+            .map(|effect| player_status_effect(effect, now_ns))
+            .collect(),
+    }
+}
+
+/// A saved consumable effect as a sim keeps it at unix ns `now_ns`: a pausing effect (no
+/// `DisablePauseOnPersist`) and its repeats move on by the time since the save, so it keeps the
+/// time it had left.
+fn player_status_effect(saved: SavedStatusEffect, now_ns: u64) -> nw_bus::PlayerStatusEffect {
+    let paused_ns = if saved.runs_offline {
+        0
+    } else {
+        now_ns.saturating_sub(saved.saved_ns)
+    };
+    nw_bus::PlayerStatusEffect {
+        consumable_id: saved.consumable_id,
+        status_id: saved.status_id,
+        ends_ns: saved.ends_ns.saturating_add(paused_ns),
+        stacks: saved.stacks,
+        runs_offline: saved.runs_offline,
+        repeat: saved.repeat.map(|(next_ns, ends_ns)| nw_bus::EffectRepeat {
+            next_ns: next_ns.saturating_add(paused_ns),
+            ends_ns: ends_ns.saturating_add(paused_ns),
+        }),
     }
 }
 
@@ -645,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn saved_progression_keeps_every_value() {
+    fn saved_progression_keeps_every_value_and_a_paused_effect_its_time_left() {
         let saved = SavedProgression {
             experience: 1_250,
             coins: 375,
@@ -706,9 +741,16 @@ mod tests {
                 changes: 1,
                 changed_ns: 0x18e1_bb69_e04f_ba64,
             },
+            status_effects: vec![
+                saved_food(false),
+                SavedStatusEffect {
+                    repeat: None,
+                    ..saved_food(true)
+                },
+            ],
         };
         assert_eq!(
-            player_progression(saved),
+            player_progression(saved, SAVED_NS + AWAY_NS),
             PlayerProgression {
                 experience: 1_250,
                 coins: 375,
@@ -769,8 +811,51 @@ mod tests {
                     changes: 1,
                     changed_ns: 0x18e1_bb69_e04f_ba64,
                 },
+                status_effects: vec![
+                    nw_bus::PlayerStatusEffect {
+                        consumable_id: "FoodRecoveryT2".to_owned(),
+                        status_id: "FoodRecoveryT2".to_owned(),
+                        ends_ns: SAVED_NS + FOOD_LEFT_NS + AWAY_NS,
+                        stacks: 1,
+                        runs_offline: false,
+                        repeat: Some(nw_bus::EffectRepeat {
+                            next_ns: SAVED_NS + TICK_NS + AWAY_NS,
+                            ends_ns: SAVED_NS + FOOD_LEFT_NS + AWAY_NS,
+                        }),
+                    },
+                    nw_bus::PlayerStatusEffect {
+                        consumable_id: "FoodRecoveryT2".to_owned(),
+                        status_id: "FoodRecoveryT2".to_owned(),
+                        ends_ns: SAVED_NS + FOOD_LEFT_NS,
+                        stacks: 1,
+                        runs_offline: true,
+                        repeat: None,
+                    },
+                ],
             }
         );
+    }
+
+    /// When the food of [`saved_food`] was saved: unix ns.
+    const SAVED_NS: u64 = 1_790_860_000_000_000_000;
+    /// What it had left then (retail `target-lock-test`: 303.5 s).
+    const FOOD_LEFT_NS: u64 = 303_500_000_000;
+    /// When its next heal came.
+    const TICK_NS: u64 = 2_000_000_000;
+    /// How long the player was away.
+    const AWAY_NS: u64 = 3_600_000_000_000;
+
+    /// A saved `FoodRecoveryT2` that pauses unless it `runs_offline`.
+    fn saved_food(runs_offline: bool) -> SavedStatusEffect {
+        SavedStatusEffect {
+            status_id: "FoodRecoveryT2".to_owned(),
+            consumable_id: "FoodRecoveryT2".to_owned(),
+            ends_ns: SAVED_NS + FOOD_LEFT_NS,
+            stacks: 1,
+            runs_offline,
+            repeat: Some((SAVED_NS + TICK_NS, SAVED_NS + FOOD_LEFT_NS)),
+            saved_ns: SAVED_NS,
+        }
     }
 
     #[test]

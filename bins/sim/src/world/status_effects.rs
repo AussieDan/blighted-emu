@@ -16,6 +16,7 @@
 //! would be empty or too long).
 
 use bevy_ecs::entity::Entity;
+use nw_bus::{EffectRepeat, PlayerStatusEffect};
 use nw_content::item_rules::Consumable;
 use nw_content::perk_effects::PerkEffects;
 use nw_content::status_effects::{RowKey, StatusEffectRule, StatusEffectRules};
@@ -27,7 +28,7 @@ use nw_messages::{
 use nw_sim_core::EquipLoad;
 
 use super::attack::Vitals;
-use super::gear::unix_ns;
+use super::gear::{server_ms_of, unix_ns};
 use super::{EQUIP_LOAD_SLOTS, Player, SimWorld, send_now};
 use crate::combat::AttackOutcome;
 
@@ -118,6 +119,20 @@ struct Held {
     next_tick_ms: Option<u64>,
     hit_amount: f64,
     hits_taken: u32,
+    /// What a save and a handoff keep of it: set for a used consumable's effect.
+    kept: Option<Kept>,
+}
+
+/// What a save and a handoff keep of a used consumable's effect (world migration 0026; retail
+/// `target-lock-test`: `FoodRecoveryT2` held with 303.5 s left 1.5 s after the login).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Kept {
+    /// The `ConsumableID` of the consumable that added it.
+    consumable_id: String,
+    /// Its `StatusID`.
+    status_id: String,
+    /// `DisablePauseOnPersist`.
+    runs_offline: bool,
 }
 
 /// One vitals change of a holder's effect.
@@ -302,6 +317,7 @@ impl StatusEffects {
                     .map(|_| now_ms.saturating_add(rule.first_tick_ms)),
                 hit_amount: application.hit_amount,
                 hits_taken: 0,
+                kept: None,
             }),
         }
         self.changed = true;
@@ -314,6 +330,91 @@ impl StatusEffects {
             .iter()
             .find(|held| held.crc == crc)
             .and_then(|held| held.ends_ms)
+    }
+
+    /// Marks the held effect of `rule` as one that consumable `consumable_id` added: a save and
+    /// a handoff keep it.
+    fn keep(&mut self, rule: &StatusEffectRule, consumable_id: &str) {
+        if let Some(index) = self.index(rule.crc) {
+            self.held[index].kept = Some(Kept {
+                consumable_id: consumable_id.to_owned(),
+                status_id: rule.id.clone(),
+                runs_offline: rule.runs_offline,
+            });
+        }
+    }
+
+    /// The held effects of used consumables that have an end, as a save and a handoff keep
+    /// them; `repeat` gives the next change and the end (server ms) of the running repeats of
+    /// the consumable's vitals change of a `StatusID`.
+    pub(super) fn kept(
+        &self,
+        repeat: impl Fn(&str) -> Option<(u64, u64)>,
+    ) -> Vec<PlayerStatusEffect> {
+        self.held
+            .iter()
+            .filter_map(|held| {
+                let kept = held.kept.as_ref()?;
+                Some(PlayerStatusEffect {
+                    consumable_id: kept.consumable_id.clone(),
+                    status_id: kept.status_id.clone(),
+                    ends_ns: unix_ns(held.ends_ms?),
+                    stacks: held.stacks,
+                    runs_offline: kept.runs_offline,
+                    repeat: repeat(&kept.status_id).map(|(next_ms, ends_ms)| EffectRepeat {
+                        next_ns: unix_ns(next_ms),
+                        ends_ns: unix_ns(ends_ms),
+                    }),
+                })
+            })
+            .collect()
+    }
+
+    /// Holds again, from server time `now_ms`, the kept effect `kept` that `consumable` added,
+    /// as it was: its end, stacks and the consumable's potency, applied by `source`. `false`,
+    /// changing nothing, for an effect the data or the consumable does not have, one that
+    /// ended, or one it already holds.
+    fn restore(
+        &mut self,
+        rules: &StatusEffectRules,
+        consumable: &Consumable,
+        kept: &PlayerStatusEffect,
+        source: u64,
+        now_ms: u64,
+    ) -> bool {
+        let Some(rule) = rules.by_id(&kept.status_id) else {
+            return false;
+        };
+        let ends_ms = server_ms_of(kept.ends_ns);
+        if ends_ms <= now_ms
+            || self.holds(rule.crc)
+            || !consumable.status_effects.contains(&rule.crc)
+        {
+            return false;
+        }
+        self.held.push(Held {
+            crc: rule.crc,
+            key: rule.key,
+            source,
+            origin: Origin::Consumable,
+            added_ms: now_ms,
+            ends_ms: Some(ends_ms),
+            potency: consumable.potency,
+            stacks: kept.stacks.clamp(1, rule.stack_max.max(1)),
+            applications: 1,
+            next_tick_ms: rule
+                .tick_ms
+                .map(|_| now_ms.saturating_add(rule.first_tick_ms)),
+            hit_amount: 0.0,
+            hits_taken: 0,
+            kept: Some(Kept {
+                consumable_id: consumable.id.clone(),
+                status_id: rule.id.clone(),
+                runs_offline: rule.runs_offline,
+            }),
+        });
+        self.changed = true;
+        true
     }
 
     /// Adds the effect named `id` (a `StatusID`) of potency `potency`, applied by `source`, at
@@ -713,6 +814,9 @@ impl SimWorld {
         let number = player.number;
         for crc in &consumable.status_effects {
             let added = player.status_effects.add(rules, *crc, application, now_ms);
+            if let Some(rule) = rules.get(*crc).filter(|_| added) {
+                player.status_effects.keep(rule, &consumable.id);
+            }
             let ends_ms = player.status_effects.ends_ms(*crc);
             tracing::debug!(
                 player = number,
@@ -723,6 +827,49 @@ impl SimWorld {
                 ?ends_ms,
                 "consumable effect"
             );
+        }
+    }
+
+    /// Player `entity` holds again the used consumables' effects `kept` that it had (at a
+    /// login, from the save; at a handoff, from the sim before), with the repeats of their
+    /// vitals changes, from the server time now. An effect whose consumable the data does not
+    /// have is dropped.
+    pub(super) fn restore_consumable_effects(
+        &mut self,
+        entity: Entity,
+        kept: &[PlayerStatusEffect],
+    ) {
+        let now_ms = self.server_ms;
+        let rules = &self.content.status_effects;
+        let items = &self.content.item_rules;
+        let Some(mut player) = self.world.get_mut::<Player>(entity) else {
+            return;
+        };
+        let player = &mut *player;
+        for effect in kept {
+            let Some(consumable) = items.consumable(&effect.consumable_id) else {
+                tracing::debug!(player = player.number, consumable = %effect.consumable_id, "kept effect of an unknown consumable");
+                continue;
+            };
+            if !player
+                .status_effects
+                .restore(rules, consumable, effect, player.number, now_ms)
+            {
+                continue;
+            }
+            let repeats = effect.repeat.zip(
+                consumable
+                    .effects
+                    .iter()
+                    .find(|vitals| vitals.status_id.eq_ignore_ascii_case(&effect.status_id)),
+            );
+            if let Some((repeat, vitals)) = repeats {
+                let ends_ms = server_ms_of(repeat.ends_ns);
+                if ends_ms > now_ms {
+                    let next_ms = server_ms_of(repeat.next_ns).max(now_ms);
+                    player.item_effects.resume(vitals, next_ms, ends_ms);
+                }
+            }
         }
     }
 

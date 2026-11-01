@@ -769,6 +769,9 @@ impl Player {
                 })
                 .collect(),
             faction: self.faction,
+            status_effects: self
+                .status_effects
+                .kept(|status_id| self.item_effects.repeat_of(status_id)),
         }
     }
 
@@ -2168,7 +2171,7 @@ impl SimWorld {
         self.tick_dungeon_script(now_ms);
         self.tick_scripts(now_ms);
         self.drink_due(now_ms, server_time);
-        self.tick_item_effects(now_ms);
+        self.tick_item_effects(server_time);
         self.tick_stamina(now_ms);
         self.server_ms = server_time;
         self.tick_max_health();
@@ -4087,7 +4090,7 @@ impl SimWorld {
 
     fn spawn(
         &mut self,
-        arrival: Arrival,
+        mut arrival: Arrival,
         motion: Motion,
         replication: Replication,
         last_time_synch_ms: u64,
@@ -4095,6 +4098,7 @@ impl SimWorld {
         no_handoff_before_ms: u64,
     ) {
         nw_messages::hold_raw_id(self.raw_ids, arrival.number);
+        let kept_effects = std::mem::take(&mut arrival.progression.status_effects);
         let arrival_masteries = tradeskill::arrival_masteries(
             &arrival.progression.masteries,
             arrival.backstory.as_deref(),
@@ -4276,6 +4280,7 @@ impl SimWorld {
                 .id();
         self.by_connection.insert(arrival.connection, entity);
         self.camp_arrived(entity);
+        self.restore_consumable_effects(entity, &kept_effects);
     }
 
     fn leave_all(&mut self, connections: &[ConnectionRef]) -> Vec<Departure> {

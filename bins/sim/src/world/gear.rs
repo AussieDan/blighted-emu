@@ -48,6 +48,12 @@ pub(super) const fn unix_ns(server_ms: u64) -> u64 {
         .saturating_mul(NS_PER_MS)
 }
 
+/// The server time of the ns since 1970-01-01 `unix_ns` ([`unix_ns`] back); 0 before the server
+/// epoch.
+pub(super) const fn server_ms_of(unix_ns: u64) -> u64 {
+    (unix_ns / NS_PER_MS).saturating_sub(crate::server::SERVER_EPOCH_UNIX_MS)
+}
+
 /// The ammo of a main-hand option slot.
 fn ammo_index(slot_id: u32) -> Option<usize> {
     let index = usize::try_from(slot_id.checked_sub(slot::MAIN_HAND_OPTION_1)?).ok()?;

@@ -516,6 +516,10 @@ pub struct PlayerProgression {
     /// Its faction (world migration 0025).
     #[serde(default)]
     pub faction: PlayerFaction,
+    /// The status effects of its used consumables that it keeps over a log out (world migration
+    /// 0026).
+    #[serde(default)]
+    pub status_effects: Vec<PlayerStatusEffect>,
 }
 
 /// A player's faction (world migration 0025), as a join, a handoff and a save carry it: the
@@ -706,6 +710,33 @@ pub struct RecipeCooldownCount {
     /// The crafts made.
     pub count: u32,
     /// Unix nanoseconds when it goes back to 0.
+    pub ends_ns: u64,
+}
+
+/// A status effect a used consumable gave a player, kept over a log out (retail
+/// `target-lock-test`: `FoodRecoveryT2` held with 303.5 s left 1.5 s after the login).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerStatusEffect {
+    /// The `ConsumableID` of the consumable that added it.
+    pub consumable_id: String,
+    /// The `StatusID` of the effect.
+    pub status_id: String,
+    /// Unix nanoseconds when it ends.
+    pub ends_ns: u64,
+    /// Its stacks.
+    pub stacks: u8,
+    /// Its time runs on while the player is away (`DisablePauseOnPersist`); else it pauses.
+    pub runs_offline: bool,
+    /// The repeating vitals change the consumable gives with it, when it has one.
+    pub repeat: Option<EffectRepeat>,
+}
+
+/// The repeats of a consumable's vitals change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EffectRepeat {
+    /// Unix nanoseconds of the next change.
+    pub next_ns: u64,
+    /// Unix nanoseconds after which no change comes.
     pub ends_ns: u64,
 }
 
@@ -1282,6 +1313,17 @@ mod tests {
                 changes: u16::MAX,
                 changed_ns: u64::MAX,
             },
+            status_effects: vec![PlayerStatusEffect {
+                consumable_id: "FoodRecoveryT2".to_owned(),
+                status_id: "FoodRecoveryT2".to_owned(),
+                ends_ns: u64::MAX,
+                stacks: u8::MAX,
+                runs_offline: true,
+                repeat: Some(EffectRepeat {
+                    next_ns: u64::MAX,
+                    ends_ns: u64::MAX,
+                }),
+            }],
         }
     }
 

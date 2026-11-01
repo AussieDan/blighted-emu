@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The progression of a character besides its items and quests (world migrations 0006 to
 //! 0008, 0010 for its travel state, 0012 for its mounts, 0013 for its ability slots and meta
-//! achievements, 0024 for its recipe cooldowns and 0025 for its faction): its experience, coins,
-//! achievement bits, loot limit counts, weapon masteries, spent points, travel state, mounts,
-//! mapped ability slots, meta achievements, recipe cooldown counts and faction. `sim` saves
-//! it; the director loads it at a join.
+//! achievements, 0024 for its recipe cooldowns, 0025 for its faction and 0026 for its consumable
+//! status effects): its experience, coins, achievement bits, loot limit counts, weapon
+//! masteries, spent points, travel state, mounts, mapped ability slots, meta achievements,
+//! recipe cooldown counts, faction and held consumable effects. `sim` saves it; the director
+//! loads it at a join.
 //!
 //! Each save carries the time its state was taken; an older state never overwrites a newer one.
 
@@ -25,6 +26,9 @@ use crate::notifications::{
 use crate::position::SaveOutcome;
 use crate::recipe_cooldowns::{
     SavedRecipeCooldown, character_recipe_cooldowns, save_character_recipe_cooldowns,
+};
+use crate::status_effects::{
+    SavedStatusEffect, character_status_effects, save_character_status_effects,
 };
 use crate::travel::{SavedTravel, character_travel, save_character_travel};
 
@@ -92,6 +96,8 @@ pub struct SavedProgression {
     pub recipe_cooldowns: Vec<SavedRecipeCooldown>,
     /// The faction (world migration 0025).
     pub faction: SavedFaction,
+    /// The held status effects of used consumables, by effect (world migration 0026).
+    pub status_effects: Vec<SavedStatusEffect>,
 }
 
 type ProgressionRow = (bool, i64, i64, Vec<i32>);
@@ -179,6 +185,7 @@ pub async fn character_progression(
     let notifications = character_notifications(world, character_id).await?;
     let recipe_cooldowns = character_recipe_cooldowns(world, character_id).await?;
     let faction = character_faction(world, character_id).await?;
+    let status_effects = character_status_effects(world, character_id).await?;
     Ok(Some(SavedProgression {
         experience: from_column(experience, "experience")?,
         coins: from_column(coins, "coins")?,
@@ -235,6 +242,7 @@ pub async fn character_progression(
         notifications,
         recipe_cooldowns,
         faction,
+        status_effects,
     }))
 }
 
@@ -404,6 +412,8 @@ pub async fn save_character_progression(
     )
     .await?;
     save_character_faction(&mut transaction, character_id, &progression.faction).await?;
+    save_character_status_effects(&mut transaction, character_id, &progression.status_effects)
+        .await?;
     transaction.commit().await?;
     Ok(SaveOutcome::Saved)
 }
@@ -508,6 +518,16 @@ mod infra_tests {
                 changes: 1,
                 changed_ns: 0x18e1_bb69_e04f_ba64,
             },
+            // The retail `target-lock-test` food, 303.5 s left at the save.
+            status_effects: vec![crate::SavedStatusEffect {
+                status_id: "FoodRecoveryT2".to_owned(),
+                consumable_id: "FoodRecoveryT2".to_owned(),
+                ends_ns: 1_790_860_303_500_000_000,
+                stacks: 1,
+                runs_offline: false,
+                repeat: Some((1_790_860_002_000_000_000, 1_790_860_303_500_000_000)),
+                saved_ns: 1_790_860_000_000_000_000,
+            }],
         }
     }
 

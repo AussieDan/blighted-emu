@@ -60,7 +60,7 @@ pub(super) enum UsedFrom {
     Worn(u32),
 }
 
-/// A vitals change of a used consumable that repeats.
+/// A vitals change of a used consumable that repeats; its times are server ms.
 #[derive(Debug, Clone, PartialEq)]
 struct Running {
     effect: VitalsEffect,
@@ -81,6 +81,18 @@ pub(super) struct ItemEffects {
 impl ItemEffects {
     /// Starts the repeats of `effect`, used at `now_ms`.
     fn start(&mut self, effect: &VitalsEffect, now_ms: u64) {
+        if let Some(ticks) = effect.ticks {
+            self.resume(
+                effect,
+                now_ms.saturating_add(ticks.first_ms),
+                now_ms.saturating_add(ticks.duration_ms),
+            );
+        }
+    }
+
+    /// Runs the repeats of `effect` with the next change at `next_ms` and the last at `ends_ms`
+    /// at most; an effect without repeats runs none.
+    pub(super) fn resume(&mut self, effect: &VitalsEffect, next_ms: u64, ends_ms: u64) {
         let Some(ticks) = effect.ticks else {
             return;
         };
@@ -88,10 +100,19 @@ impl ItemEffects {
             .retain(|running| running.effect.status_id != effect.status_id);
         self.running.push(Running {
             effect: effect.clone(),
-            next_ms: now_ms.saturating_add(ticks.first_ms),
-            ends_ms: now_ms.saturating_add(ticks.duration_ms),
+            next_ms,
+            ends_ms,
             every_ms: ticks.every_ms.max(1),
         });
+    }
+
+    /// The next change and the end (server ms) of the running repeats of the effect named
+    /// `status_id`.
+    pub(super) fn repeat_of(&self, status_id: &str) -> Option<(u64, u64)> {
+        self.running
+            .iter()
+            .find(|running| running.effect.status_id.eq_ignore_ascii_case(status_id))
+            .map(|running| (running.next_ms, running.ends_ms))
     }
 
     /// The changes due at `now_ms`; the ended effects go. A dead player loses the effects that
@@ -421,7 +442,8 @@ impl SimWorld {
             .item_rules
             .item(&item_id)
             .is_some_and(|rule| rule.consume_on_use);
-        let now_us = self.server_ms.saturating_mul(US_PER_MS);
+        let server_ms = self.server_ms;
+        let now_us = server_ms.saturating_mul(US_PER_MS);
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
         };
@@ -448,7 +470,7 @@ impl SimWorld {
         }
         player.cooldowns_changed |= consumable.cooldown.is_some();
         for effect in &consumable.effects {
-            player.item_effects.start(effect, now_ms);
+            player.item_effects.start(effect, server_ms);
         }
         let connection = player.connection.clone();
         let instant: Vec<&VitalsEffect> = consumable
@@ -505,8 +527,9 @@ impl SimWorld {
         }
     }
 
-    /// The repeating vitals changes of used consumables due at `now_ms`, for every player, each
-    /// times the multiple the player's held effects give it.
+    /// The repeating vitals changes of used consumables due at server time `now_ms` (their
+    /// repeats run on the server clock, as the status effects they come with), for every player,
+    /// each times the multiple the player's held effects give it.
     pub(super) fn tick_item_effects(&mut self, now_ms: u64) {
         let rules = &self.content.status_effects;
         let mut query = self.world.query::<(&mut Player, &mut Vitals)>();
@@ -852,7 +875,10 @@ mod tests {
         use crate::world::attack::Vitals;
         use crate::world::gear::Gear;
         use crate::world::gear::tests::{BACKSTORY, CHARACTER, FLINT, POTION, kits};
-        use crate::world::tests::{NOW, connection, join, messages_to, tick, world_with_spawns};
+        use crate::world::item_calls::UsedFrom;
+        use crate::world::tests::{
+            NOW, SERVER_TIME, connection, join, messages_to, tick, world_with_spawns,
+        };
         use crate::world::{Player, SimWorld, item_calls::OPEN_STORAGE_KIND};
         use nw_messages::item_calls::LOCATION_BAG;
 
@@ -1029,6 +1055,127 @@ mod tests {
                 (f64::from(alone), f64::from(with_regen)),
                 (share.round(), (share * WITH_REGEN).round())
             );
+        }
+
+        /// Retail `target-lock-test`: a `FoodRecoveryT2` was held with 303.5 s left 1.5 s after
+        /// the login. A used food's effect and its heals go with the progression and come back
+        /// at the next spawn with the time they had left.
+        #[test]
+        fn a_food_effect_and_its_heals_come_back_at_the_next_spawn() {
+            use nw_content::status_effects::{
+                EffectSourceRow, StatusEffectRules, StatusEffectSource,
+            };
+
+            use crate::world::gear::unix_ns;
+            use crate::world::tests::admit_at;
+
+            const FOOD: &str = "FoodRecoveryT2";
+            const DURATION_S: f64 = 1_800.0;
+            const EVERY_S: f64 = 2.0;
+            const FOOD_SHARE: f64 = 0.011;
+            const USED_MS: u64 = 846_118_000_000;
+            const DURATION_MS: u64 = 1_800_000;
+            /// The time it ran before the save: retail had 303.5 s left.
+            const RAN_MS: u64 = DURATION_MS - 303_500;
+            let content = PlayerContent {
+                item_rules: ItemRules::build(ItemRuleSource {
+                    items: Vec::new(),
+                    consumables: vec![ConsumableRow {
+                        id: FOOD.to_owned(),
+                        add_status_effects: Some(FOOD.to_owned()),
+                        potency: Some(1.0),
+                        duration_override_s: Some(0.0),
+                        cooldown_id: None,
+                        cooldown_s: None,
+                        disabled_in_combat: false,
+                        use_tag: Some("Eat".to_owned()),
+                    }],
+                    effects: vec![EffectRow {
+                        status_id: FOOD.to_owned(),
+                        base_duration_s: Some(DURATION_S),
+                        tick_s: Some(EVERY_S),
+                        delay_s: Some(EVERY_S),
+                        health: None,
+                        health_share: Some(FOOD_SHARE),
+                        stamina: None,
+                        remove_on_death: false,
+                        has_fx: false,
+                    }],
+                }),
+                status_effects: StatusEffectRules::build(StatusEffectSource {
+                    effects: vec![EffectSourceRow {
+                        status_id: FOOD.to_owned(),
+                        base_duration_s: Some(DURATION_S),
+                        categories: Some("Recovery+Food".to_owned()),
+                        ..EffectSourceRow::default()
+                    }],
+                    ..StatusEffectSource::default()
+                }),
+                ..PlayerContent::default()
+            };
+            let content = Arc::new(content);
+            let crc = lowercase_crc32(FOOD);
+            let mut before = world_with_spawns(Vec::new());
+            before.content = Arc::clone(&content);
+            join(&mut before, 1, 0.0);
+            let entity = before.by_connection[&connection(1)];
+            before.server_ms = USED_MS;
+            before.consume(entity, 1, FOOD, UsedFrom::Bag(0), NOW);
+            before.server_ms = USED_MS + RAN_MS;
+            let kept = before
+                .world
+                .get::<Player>(entity)
+                .expect("player")
+                .progression()
+                .status_effects;
+            assert_eq!(
+                kept,
+                vec![nw_bus::PlayerStatusEffect {
+                    consumable_id: FOOD.to_owned(),
+                    status_id: FOOD.to_owned(),
+                    ends_ns: unix_ns(USED_MS + DURATION_MS),
+                    stacks: 1,
+                    runs_offline: false,
+                    repeat: Some(nw_bus::EffectRepeat {
+                        next_ns: unix_ns(USED_MS + 2_000),
+                        ends_ns: unix_ns(USED_MS + DURATION_MS),
+                    }),
+                }],
+                "an unended food and its next heal"
+            );
+
+            let mut after = world_with_spawns(Vec::new());
+            after.content = Arc::clone(&content);
+            after.server_ms = USED_MS + RAN_MS;
+            let mut admit = admit_at(1, 0.0, true);
+            admit.progression.status_effects = kept.clone();
+            after.admit(&admit, NOW, SERVER_TIME).expect("admit");
+            let entity = after.by_connection[&connection(1)];
+            let player = after.world.get::<Player>(entity).expect("player");
+            assert_eq!(
+                player.status_effects.ends_ms(crc),
+                Some(USED_MS + DURATION_MS),
+                "held again with its end"
+            );
+            assert_eq!(
+                player.item_effects.repeat_of(FOOD),
+                Some((USED_MS + RAN_MS, USED_MS + DURATION_MS)),
+                "its heals go on from the spawn"
+            );
+            assert_eq!(player.progression().status_effects.len(), 1, "kept again");
+
+            let mut ended = world_with_spawns(Vec::new());
+            ended.content = Arc::clone(&content);
+            ended.server_ms = USED_MS + DURATION_MS;
+            admit.progression.status_effects = kept;
+            ended.admit(&admit, NOW, SERVER_TIME).expect("admit");
+            let entity = ended.by_connection[&connection(1)];
+            let player = ended.world.get::<Player>(entity).expect("player");
+            assert!(
+                !player.status_effects.holds(crc),
+                "an ended food stays gone"
+            );
+            assert_eq!(player.item_effects.repeat_of(FOOD), None);
         }
 
         #[test]
