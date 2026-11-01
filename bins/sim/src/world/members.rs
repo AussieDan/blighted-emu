@@ -17,6 +17,7 @@ use nw_bus::MobGhost;
 use nw_content::mob_prefabs::ASSET_ID_LEN;
 use nw_messages::{
     AlcStamp, AlcState, AssetId, BOSS_PHASE_TYPE_INDEX, BundleGroup, BundleMember, BundlePayload,
+    EffectMap, RemoteEffect, STATUS_EFFECTS_TYPE_INDEX, StatusEffectsState,
     CardPlace, DATA_BITS_ACTIVE, DEPLETED_GATHERABLE, DYNAMIC_SLICE_SUB_ID,
     GATHERABLE_CONTROLLER_TYPE_INDEX, GDE_METADATA_COMPONENT, GatherableControllerState,
     GdeMetadataReplicatedState, InputPosition, LOCAL_PLAYER_INTEREST, LookDir, LookTargetingState,
@@ -57,7 +58,7 @@ pub(super) const MOB_ALC_COMPONENT: u64 = 5;
 const LOOK_TARGETING_COMPONENT: u64 = 4;
 
 /// What a client needs to show one mob: its entity number, where it is and its vitals.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(super) struct MobCard {
     /// The entity number.
     pub(super) entity: u64,
@@ -77,6 +78,11 @@ pub(super) struct MobCard {
     pub(super) boss_phase: Option<u32>,
     /// Its boss phase changed since the last bundle step.
     pub(super) boss_phase_changed: bool,
+    /// The status effects others see on it (`m_remoteEffectsMap`): the map's version and
+    /// entries, once it held one.
+    pub(super) remote_effects: Option<(u64, Vec<(u16, RemoteEffect)>)>,
+    /// Those effects changed since the last bundle step.
+    pub(super) remote_effects_changed: bool,
     /// The slice asset of its look, when it has its own (a personal mob with a retail card).
     pub(super) asset: Option<[u8; ASSET_ID_LEN]>,
     /// The server time of this bundle step (ms since 2000-01-01).
@@ -115,6 +121,8 @@ pub(super) const fn card_of(
         first_damage: false,
         boss_phase: None,
         boss_phase_changed: false,
+        remote_effects: None,
+        remote_effects_changed: false,
         skinned: false,
         skinned_changed: false,
         asset: None,
@@ -204,6 +212,7 @@ pub(super) fn entity_group(
                 cooldowns: None,
                 stamina: None,
                 combat_status: None,
+                mana: None,
             })));
         }
     }
@@ -395,6 +404,26 @@ pub(super) fn mob_group(
                 class: BOSS_PHASE_TYPE_INDEX,
                 body: boss_phase_change(phase),
             },
+        });
+    }
+    // The status effects others see go with the card (after the prefab's empty map) and after
+    // each change, on the component of the prefab's status effects state (status effects note:
+    // retail mob component 8).
+    let effects_component = look
+        .first
+        .iter()
+        .find(|member| member.state.type_index() == STATUS_EFFECTS_TYPE_INDEX)
+        .map(|member| member.component);
+    if let (Some((version, entries)), Some(component)) =
+        (card.remote_effects.as_ref(), effects_component)
+        && (carded || card.remote_effects_changed)
+    {
+        group.members.push(BundleMember {
+            component,
+            state: MemberState::StatusEffects(StatusEffectsState {
+                remote: Some(EffectMap::full(*version, entries.clone())),
+                ..StatusEffectsState::default()
+            }),
         });
     }
     // A skinned corpse's gatherable controller is depleted, on the prefab's controller component
@@ -853,6 +882,7 @@ mod tests {
             cooldowns: None,
             stamina: None,
             combat_status: None,
+            mana: None,
         }
     }
     const SEQUENCE: u64 = 4;
@@ -1376,6 +1406,59 @@ mod tests {
         };
         assert_eq!(flags_of(true), Some(Some(nw_messages::FIRST_DAMAGE_FLAGS)));
         assert_eq!(flags_of(false), Some(None));
+    }
+
+    #[test]
+    fn a_mob_sends_the_effects_others_see_after_each_change_on_its_prefab_component() {
+        // Retail mob component 8 (status effects note 2026-10-31).
+        const EFFECTS_COMPONENT: u64 = 8;
+        const HEX_KEY: u16 = 1_234;
+        let look = MobLook {
+            asset: AssetId {
+                id: [0x3c; GDE_ID_LEN],
+                sub_id: DYNAMIC_SLICE_SUB_ID,
+            },
+            alc_component: MOB_ALC_COMPONENT,
+            vitals_component: 9,
+            alc: None,
+            vitals: None,
+            first: vec![BundleMember {
+                component: EFFECTS_COMPONENT,
+                state: MemberState::StatusEffects(StatusEffectsState::default()),
+            }],
+            death: Vec::new(),
+            drawn: Vec::new(),
+        };
+        let state = MobGhost {
+            health: 100,
+            max_health: 100,
+            returning: false,
+            vitals_id: 1,
+            category_id: 2,
+            level: 1,
+        };
+        let entries = vec![(HEX_KEY, RemoteEffect::of(3, 1.0))];
+        let card = |changed: bool| MobCard {
+            health_changed: false,
+            remote_effects: Some((2, entries.clone())),
+            remote_effects_changed: changed,
+            ..card_of(ENTITY, at(), state, None)
+        };
+        let sent = MemberState::StatusEffects(StatusEffectsState {
+            remote: Some(EffectMap::full(2, entries.clone())),
+            ..StatusEffectsState::default()
+        });
+        let carries = |card: &MobCard, carded: bool| {
+            mob_group(FIRST_REMOTE_INTEREST, card, Some(&look), carded)
+                .expect("encode")
+                .expect("group")
+                .members
+                .iter()
+                .any(|member| member.component == EFFECTS_COMPONENT && member.state == sent)
+        };
+        assert!(carries(&card(true), false), "the change goes out");
+        assert!(!carries(&card(false), false), "no change, nothing");
+        assert!(carries(&card(false), true), "a card carries them");
     }
 
     #[test]

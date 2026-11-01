@@ -21,7 +21,8 @@ use nw_content::perk_effects::PerkEffects;
 use nw_content::status_effects::{RowKey, StatusEffectRule, StatusEffectRules};
 use nw_messages::{
     BundleMember, DamageDealtMsg, DamageItem, EffectMap, HIT_TAG, LocalEffect, MemberState,
-    NEUTRAL_SCALE, OnDamageMsg, STATUS_EFFECTS_COMPONENT, ServerMessage, StatusEffectsState,
+    NEUTRAL_SCALE, OnDamageMsg, RemoteEffect, STATUS_EFFECTS_COMPONENT, ServerMessage,
+    StatusEffectsState,
 };
 use nw_sim_core::EquipLoad;
 
@@ -623,6 +624,24 @@ impl StatusEffects {
             lightweight: send_lightweight.then(|| EffectMap::full(version, lightweight)),
             remote: None,
         }
+    }
+
+    /// The effects others see (`m_remoteEffectsMap`, by key): every held effect that is not
+    /// lightweight, with its stacks and whether its potency is above 0 (Observed: retail sent a
+    /// mob's `Status_Flail_HexDoT` with stacks 1 to 3, `AI_FireResist_Buff`, `ResetAI`).
+    pub(super) fn remote_entries(&self, rules: &StatusEffectRules) -> Vec<(u16, RemoteEffect)> {
+        let mut entries: Vec<(u16, RemoteEffect)> = self
+            .held
+            .iter()
+            .filter_map(|held| {
+                let rule = rules.get(held.crc).filter(|rule| !rule.lightweight)?;
+                // A potency of a few dozen at most.
+                let potency = self.potency(rules, held, rule) as f32;
+                Some((held.key, RemoteEffect::of(held.stacks, potency)))
+            })
+            .collect();
+        entries.sort_by_key(|(key, _)| *key);
+        entries
     }
 
     /// Makes the owner's state anew when its effects changed, with the next version of
