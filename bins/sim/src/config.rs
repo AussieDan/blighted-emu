@@ -268,7 +268,24 @@ pub struct SimConfig {
     /// service and opens the instance first).
     #[serde(default = "default_instance_request_timeout_ms")]
     pub instance_request_timeout_ms: u64,
+    /// Test worlds only: the tools a new character wears at its first spawn (retail gives a new
+    /// character no tool). Empty in every world players use.
+    #[serde(default)]
+    pub start_tools: Vec<StartTool>,
 }
+
+/// A tool a new character of a test world wears ([`SimConfig::start_tools`]).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StartTool {
+    /// The item id (`MasterItemDefinitions` `ItemID`): `LoggingAxeT1`.
+    pub item: String,
+    /// Its paperdoll tool slot: 33 logging, 34 harvesting, 35 skinning, 36 mining, 37 fishing.
+    pub slot: u32,
+}
+
+/// The paperdoll tool slots (`CHOPPING_SLOT` 33 to `FISHING_SLOT` 37).
+const TOOL_SLOTS: std::ops::RangeInclusive<u32> = 33..=37;
 
 /// The role of a sim (architecture spec section 4.4).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
@@ -494,6 +511,25 @@ impl SimConfig {
         })
     }
 
+    /// The start tools, each in a tool slot.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SimConfigError::Invalid`] for a tool in a slot that is no tool slot.
+    pub fn start_tools(&self) -> Result<Vec<StartTool>, SimConfigError> {
+        match self
+            .start_tools
+            .iter()
+            .find(|tool| !TOOL_SLOTS.contains(&tool.slot))
+        {
+            Some(_) => Err(SimConfigError::Invalid {
+                key: "start_tools",
+                reason: "every slot must be a tool slot, 33 to 37",
+            }),
+            None => Ok(self.start_tools.clone()),
+        }
+    }
+
     /// The level this sim names to the client: the open map or the tutorial, or for an instance
     /// sim the level of a game mode of `instances` (each instance names its own frame).
     ///
@@ -595,6 +631,25 @@ pub(crate) mod tests {
     pub(crate) fn committed() -> SimConfig {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(COMMITTED_CONFIG);
         load_sim_config(&path).expect("committed config")
+    }
+
+    #[test]
+    fn start_tools_are_off_and_only_go_in_tool_slots() {
+        let mut config = committed();
+        assert!(
+            config.start_tools().expect("tools").is_empty(),
+            "no tools in a players' world"
+        );
+        config.start_tools = vec![StartTool {
+            item: "LoggingAxeT1".to_owned(),
+            slot: 33,
+        }];
+        assert_eq!(config.start_tools().expect("tools").len(), 1);
+        config.start_tools[0].slot = 24;
+        assert!(
+            config.start_tools().is_err(),
+            "a main-hand slot is no tool slot"
+        );
     }
 
     #[test]

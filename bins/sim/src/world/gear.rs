@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 
 use nw_bus::{CarriedItem, ItemPlace};
 use nw_content::starter::{EquipSlot, KitItem, StarterKits};
+
+use crate::config::StartTool;
 use nw_messages::items::SYNC_MOVED;
 use nw_messages::paperdoll::slot;
 use nw_messages::wire::RAW_ID_LEN;
@@ -244,6 +246,17 @@ impl Gear {
             }
         }
         Some(gear.told_now())
+    }
+
+    /// The gear with each of `tools` worn in its slot; an item `kits` does not know is left out.
+    pub(super) fn with_tools(mut self, kits: &StarterKits, tools: &[StartTool]) -> Self {
+        for tool in tools {
+            if let Some(item) = kits.item(&tool.item) {
+                let worn = self.new_stack(item, 1);
+                self.put_on(tool.slot, worn);
+            }
+        }
+        self
     }
 
     /// The gear whose own client knows its hands as they are.
@@ -1305,6 +1318,32 @@ pub(crate) mod tests {
 
     fn instance(item_id: &str) -> [u8; RAW_ID_LEN] {
         *Uuid::new_v5(&CHARACTER, item_id.as_bytes()).as_bytes()
+    }
+
+    #[test]
+    fn a_test_world_start_tool_is_worn_in_its_tool_slot() {
+        const AXE: &str = "LoggingAxeT1";
+        const LOGGING_SLOT: u32 = 33;
+        let kits = kits_with(&[(AXE, "Tool+LoggingAxe")]);
+        let tools = [
+            StartTool {
+                item: AXE.to_owned(),
+                slot: LOGGING_SLOT,
+            },
+            StartTool {
+                item: "NoSuchTool".to_owned(),
+                slot: LOGGING_SLOT + 1,
+            },
+        ];
+        let gear = Gear::starter(&kits, CHARACTER, Some(BACKSTORY))
+            .expect("gear")
+            .with_tools(&kits, &tools);
+        assert_eq!(gear.worn_item(LOGGING_SLOT), Some(AXE));
+        assert_eq!(
+            gear.worn_item(LOGGING_SLOT + 1),
+            None,
+            "an unknown item is left out"
+        );
     }
 
     #[test]

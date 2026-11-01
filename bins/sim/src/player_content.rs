@@ -803,6 +803,9 @@ pub struct PlayerContent {
     pub trading_post: TradingPostConfig,
     /// The level's settlements and outposts, which trading post orders and storages name.
     pub settlements: Settlements,
+    /// Test worlds only: the tools a new character wears at its first spawn (`start_tools` of
+    /// the config).
+    pub start_tools: Vec<crate::config::StartTool>,
     /// What the shops sell (faction, camp, stable and event shops).
     pub shops: ShopCatalog,
     /// The generic invite activities (trade invites).
@@ -1127,6 +1130,7 @@ impl PlayerContent {
             gear_score_upgrades: GearScoreUpgrades::from_tables(tables),
             trading: TradingCatalog::from_tables(tables),
             trading_post: TradingPostConfig::default(),
+            start_tools: Vec::new(),
             settlements: Settlements::from_capitals(&level.capitals),
             shops: ShopCatalog::from_tables(tables),
             invites: InviteRules::from_tables(tables),

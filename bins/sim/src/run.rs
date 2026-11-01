@@ -281,6 +281,12 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
     content.asset_solids =
         AssetSolids::of(&deferred_level, &collision, &content.tutorial_level.assets);
     content.trading_post = config.trading_post.clone();
+    content.start_tools = config.start_tools()?;
+    for tool in &content.start_tools {
+        if content.kits.item(&tool.item).is_none() {
+            tracing::warn!(item = %tool.item, "start tool is no item of the data: left out");
+        }
+    }
     content.dungeon_scripts =
         match DungeonScripts::load(&dungeon_scripts_path(&config.content_dir, &build)) {
             Ok(scripts) => {
