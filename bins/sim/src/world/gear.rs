@@ -1225,6 +1225,15 @@ pub(crate) mod tests {
 
     /// [`kits`] with the master rows of `extra` items too: (item id, item class).
     pub(crate) fn kits_with(extra: &[(&str, &str)]) -> StarterKits {
+        let extra: Vec<(&str, &str, Option<u32>)> = extra
+            .iter()
+            .map(|(item_id, item_class)| (*item_id, *item_class, None))
+            .collect();
+        kits_with_stacks(&extra)
+    }
+
+    /// [`kits_with`] for `extra` items with a stack size: (item id, item class, `MaxStackSize`).
+    pub(crate) fn kits_with_stacks(extra: &[(&str, &str, Option<u32>)]) -> StarterKits {
         let row = |item_id: &str, item_class: &str| ItemRow {
             item_id: item_id.to_owned(),
             item_class: Some(item_class.to_owned()),
@@ -1243,7 +1252,10 @@ pub(crate) mod tests {
         rows.extend(
             extra
                 .iter()
-                .map(|(item_id, item_class)| row(item_id, item_class)),
+                .map(|(item_id, item_class, max_stack)| ItemRow {
+                    max_stack: *max_stack,
+                    ..row(item_id, item_class)
+                }),
         );
         StarterKits::build(StarterSource {
             item_sheets: vec![("MasterItemDefinitions_Quest".to_owned(), rows)],

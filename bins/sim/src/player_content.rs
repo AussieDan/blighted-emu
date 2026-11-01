@@ -68,7 +68,7 @@ use crate::objectives::{
     KillTypes, ObjectiveTree, TaskBook, TaskRow, counted_game_events, task_rows,
 };
 use crate::shop::ShopCatalog;
-use crate::trading_post::{TradingCatalog, TradingPostConfig};
+use crate::trading_post::{Settlements, TradingCatalog, TradingPostConfig};
 use crate::travel_rules::{TravelRules, capital_id};
 
 /// The tutorial quest's objective id (`Objectives`).
@@ -801,6 +801,8 @@ pub struct PlayerContent {
     pub trading: TradingCatalog,
     /// The trading post's durations, limits, fees and taxes (`[trading_post]` of the config).
     pub trading_post: TradingPostConfig,
+    /// The level's settlements and outposts, which trading post orders and storages name.
+    pub settlements: Settlements,
     /// What the shops sell (faction, camp, stable and event shops).
     pub shops: ShopCatalog,
     /// The generic invite activities (trade invites).
@@ -1125,6 +1127,7 @@ impl PlayerContent {
             gear_score_upgrades: GearScoreUpgrades::from_tables(tables),
             trading: TradingCatalog::from_tables(tables),
             trading_post: TradingPostConfig::default(),
+            settlements: Settlements::from_capitals(&level.capitals),
             shops: ShopCatalog::from_tables(tables),
             invites: InviteRules::from_tables(tables),
             travel,

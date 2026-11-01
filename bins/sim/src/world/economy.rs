@@ -40,7 +40,10 @@ use nw_messages::contracts::{
     SearchResultsMsg, failure, open_filter, reason, role_filter,
 };
 use nw_messages::gear::record;
-use nw_messages::items::{FullList, ItemRecord, SYNC_OWNED};
+use nw_messages::items::{
+    FullList, ItemRecord, SYNC_OWNED, SYNC_TRADING_POST_BOUGHT, SYNC_TRADING_POST_RETURNED,
+    SYNC_TRADING_POST_TAKEN,
+};
 use nw_messages::p2p_trade::{
     OfferedStack, P2P_TRADE_COMPONENT, P2P_TRADE_STATE_KEY, P2PTradeState, TradeCall, TradeMessage,
     failure as trade_failure,
@@ -57,10 +60,11 @@ use uuid::Uuid;
 
 use super::gear::{Gear, MAX_CONTAINER_SLOTS};
 use super::quest_objects::with_coins;
-use super::{Player, SimWorld, gather_answer, send_now};
+use super::{Body, Player, SimWorld, gather_answer, send_now};
 use crate::shop::ShopOffer;
 use crate::trading_post::{
-    MS_PER_DAY, TradeItem, completion_cost, contract_of, next_page_token, order_kind,
+    ContractView, MS_PER_DAY, TradeItem, completion_cost, contract_of, next_page_token, order_kind,
+    settlement_storage,
 };
 
 /// The interaction kind of a trading post (`InteractionUIActions` `OpenTradingPost`).
@@ -183,6 +187,8 @@ pub enum EconomyJob {
         order: Uuid,
         /// Units.
         units: u32,
+        /// The completer's trading tax.
+        tax_rate: f64,
         /// What the sim took for it.
         refund: Refund,
     },
@@ -371,6 +377,7 @@ pub async fn run_job(world: &PgPool, job: EconomyJob) -> Option<EconomyResult> {
             caller,
             order,
             units,
+            tax_rate,
             refund,
         } => EconomyResult::Completed {
             completed: nw_db::complete_order(
@@ -378,6 +385,7 @@ pub async fn run_job(world: &PgPool, job: EconomyJob) -> Option<EconomyResult> {
                 order,
                 caller.character,
                 units,
+                tax_rate,
                 Uuid::from_bytes(caller.request),
                 unix_ms(),
             )
@@ -571,7 +579,7 @@ fn notice(type_index: u64, caller: &Caller, order: &Order) -> ServerMessage {
         type_index,
         header: caller.header,
         request: caller.request,
-        contract: contract_of(order, caller.character),
+        contract: contract_of(order, caller.character, ContractView::Notice),
     }))
 }
 
@@ -834,7 +842,10 @@ impl SimWorld {
 
     /// Player `number` (`entity`) opens the trading post of `request`, whose name its client
     /// sends (`@TradingPostT5_MasterName`): accepted with the name and retail's `u32`
-    /// ([`TRADING_POST_ANSWER_EXTRA`]); the post's settlement is the territory the player is in.
+    /// ([`TRADING_POST_ANSWER_EXTRA`]); the post's settlement is the one whose capital is
+    /// nearest to the player ([`crate::trading_post::Settlements::nearest`]). Without one (a
+    /// level without settlements) the post is opened without a settlement, and a create is
+    /// refused with `InvalidOutpost`.
     pub(super) fn open_trading_post(
         &mut self,
         entity: Entity,
@@ -842,21 +853,29 @@ impl SimWorld {
         request: InteractionRequest,
         name: &[u8],
     ) {
+        let outpost = self
+            .world
+            .get::<Body>(entity)
+            .map(|body| body.motion.position())
+            .and_then(|at| self.content.settlements.nearest(at.x, at.y));
         let Some(player) = self.world.get::<Player>(entity) else {
             return;
         };
-        let outpost = player
-            .territories
-            .first()
-            .map_or(0, |territory| u64::from(*territory));
         let connection = player.connection.clone();
-        self.economy.posts.insert(number, outpost);
+        match outpost {
+            Some(outpost) => {
+                self.economy.posts.insert(number, outpost);
+            }
+            None => {
+                self.economy.posts.remove(&number);
+            }
+        }
         let mut answer = gather_answer(number, request, INTERACTION_ACCEPTED, name);
         if let ServerMessage::InteractionValidated(validated) = &mut answer {
             validated.extra = TRADING_POST_ANSWER_EXTRA;
         }
         send_now(&mut self.combat_messages, &connection, &[answer]);
-        tracing::debug!(player = number, outpost, "trading post opened");
+        tracing::debug!(player = number, ?outpost, "trading post opened");
     }
 
     /// A create call (2972) of player `entity`: checked here, its coins and items taken, then
@@ -960,10 +979,9 @@ impl SimWorld {
         }
         let items = match kind {
             OrderKind::Sell => {
-                let taken = player
-                    .gear
-                    .as_mut()
-                    .is_some_and(|gear| gear.take(&item.item_id, count));
+                let taken = player.gear.as_mut().is_some_and(|gear| {
+                    gear.take_as(&item.item_id, count, SYNC_TRADING_POST_TAKEN)
+                });
                 if !taken {
                     return Err(failure::INSUFFICIENT_ITEMS);
                 }
@@ -995,7 +1013,7 @@ impl SimWorld {
             })
             .map_or_else(
                 || Some(refund.delivery(caller.character)),
-                |entity| self.give(entity, refund.delivery(caller.character)),
+                |entity| self.give(entity, refund.delivery(caller.character), None),
             );
         if let Some(leftover) = leftover {
             self.economy.jobs.push(EconomyJob::Return {
@@ -1004,9 +1022,16 @@ impl SimWorld {
         }
     }
 
-    /// Gives `delivery`'s coins (under the wallet cap) and items to player `entity`; what does
-    /// not fit comes back.
-    fn give(&mut self, entity: Entity, delivery: Delivery) -> Option<Delivery> {
+    /// Gives `delivery`'s coins (under the wallet cap) and items to player `entity`: the items
+    /// into storage `storage` when it names one, else into the bag; what does not fit comes
+    /// back. The items of a completion show [`SYNC_TRADING_POST_BOUGHT`]; those given back (a
+    /// cancel, an expiry, a refused call) [`SYNC_TRADING_POST_RETURNED`].
+    fn give(
+        &mut self,
+        entity: Entity,
+        delivery: Delivery,
+        storage: Option<[u8; RAW_ID_LEN]>,
+    ) -> Option<Delivery> {
         let wallet_cap = self.content.gameplay.wallet_cap;
         let kit = delivery
             .item
@@ -1025,18 +1050,32 @@ impl SimWorld {
             leftover.coins = delivery.coins - (player.coins - before).min(delivery.coins);
         }
         if let Some((item, quantity)) = delivery.item {
-            let given = match (&kit, player.gear.as_mut()) {
-                (Some(kit), Some(gear)) => gear.add(kit, quantity),
-                _ => false,
+            let reason = if delivery.completed_count > 0 {
+                SYNC_TRADING_POST_BOUGHT
+            } else {
+                SYNC_TRADING_POST_RETURNED
             };
-            if !given {
+            // A bag that fills part way keeps what it took: only the rest waits.
+            let given = match (&kit, player.gear.as_mut(), storage) {
+                (Some(kit), Some(gear), Some(storage)) => {
+                    u32::from(gear.store_new(storage, kit, quantity, reason)) * quantity
+                }
+                (Some(kit), Some(gear), None) => {
+                    let before = gear.bag_count(&item);
+                    gear.add_as(kit, quantity, reason);
+                    gear.bag_count(&item).saturating_sub(before).min(quantity)
+                }
+                _ => 0,
+            };
+            if given < quantity {
+                let waiting = quantity - given;
                 tracing::warn!(
                     character = %delivery.character,
                     item = %item,
-                    quantity,
+                    waiting,
                     "a delivery's items do not fit; they wait"
                 );
-                leftover.item = Some((item, quantity));
+                leftover.item = Some((item, waiting));
             }
         }
         metrics::counter!(METRIC_DELIVERIES).increment(1);
@@ -1058,7 +1097,9 @@ impl SimWorld {
                         lookup: caller.request,
                         contracts: orders
                             .iter()
-                            .map(|order| contract_of(order, caller.character))
+                            .map(|order| {
+                                contract_of(order, caller.character, ContractView::LookedUp)
+                            })
                             .collect(),
                     });
                     self.reply(&caller, &[contract_message(ContractMessage::Found(found))]);
@@ -1072,7 +1113,9 @@ impl SimWorld {
                         lookup: caller.request,
                         contracts: orders
                             .iter()
-                            .map(|(order, _)| contract_of(order, caller.character))
+                            .map(|(order, _)| {
+                                contract_of(order, caller.character, ContractView::Listed)
+                            })
                             .collect(),
                     });
                     self.reply(
@@ -1186,7 +1229,7 @@ impl SimWorld {
             contracts: page
                 .orders
                 .iter()
-                .map(|order| contract_of(order, caller.character))
+                .map(|order| contract_of(order, caller.character, ContractView::Listed))
                 .collect(),
             next_page,
             total: page.total,
@@ -1216,11 +1259,12 @@ impl SimWorld {
         if let Some(failure_reason) = failure_reason {
             return self.reply(caller, &[action_failed(caller, failure_reason)]);
         }
-        let Some((coins, items)) = completion_cost(order, call.units) else {
-            return self.reply(caller, &[action_failed(caller, failure::INVALID_REQUEST)]);
-        };
         let Some(entity) = self.by_connection.get(&caller.connection).copied() else {
             return;
+        };
+        let tax_rate = self.completer_rate(entity, order);
+        let Some((coins, items)) = completion_cost(order, call.units, tax_rate) else {
+            return self.reply(caller, &[action_failed(caller, failure::INVALID_REQUEST)]);
         };
         let taken = {
             let Some(mut player) = self.world.get_mut::<Player>(entity) else {
@@ -1232,7 +1276,7 @@ impl SimWorld {
                 let taken = player
                     .gear
                     .as_mut()
-                    .is_some_and(|gear| gear.take(item, *units));
+                    .is_some_and(|gear| gear.take_as(item, *units, SYNC_TRADING_POST_TAKEN));
                 if taken {
                     Ok(())
                 } else {
@@ -1254,12 +1298,35 @@ impl SimWorld {
             caller: caller.clone(),
             order: order.id,
             units: call.units,
+            tax_rate,
             refund: Refund { coins, items },
         });
     }
 
+    /// The trading tax player `entity` pays as the completer of `order`: the tax of the trading
+    /// post it opened. Retail (`buy-sell-TP` and `Hivesellandbuyorder`, both at one settlement):
+    /// the tax a completer paid followed the completer, 2.35 % for one and 5 % for the other, 4
+    /// of 4. A player without an opened trading post pays the order's rate (Inferred: the rate of
+    /// the order's settlement).
+    fn completer_rate(&self, entity: Entity, order: &Order) -> f64 {
+        self.world
+            .get::<Player>(entity)
+            .and_then(|player| self.economy.posts.get(&player.number))
+            .map_or(order.tax_rate, |outpost| {
+                self.content.trading_post.tax_at(*outpost)
+            })
+    }
+
     /// Gives the taken deliveries to their players with their notices (2964 then 1117 for a
-    /// fully completed order, 917 for an expired one); what is not given is owed again.
+    /// fully completed order, 917 for an expired one); what is not given is owed again. Retail
+    /// (`buy-sell-TP` 220.126 s and 224.298 s, `Hivesellandbuyorder` 258.115 s and 262.316 s): the
+    /// 2964 shows the order as its last completion left it and repeats that completion's request;
+    /// the 1117 of the proceeds shows it resolved, under a new request id. The count of a 2964
+    /// after several completions (this server: the last one's units) is Unknown: retail fully
+    /// completed each sample at once. The units of a filled buy order go to its creator's
+    /// storage at the order's settlement ([`crate::world::gear::Gear::store_new`]); an order
+    /// whose outpost is no settlement of the level (posted before settlements were named) fills
+    /// the bag.
     fn deliver(&mut self, taken: Vec<TakenDelivery>) {
         let present: HashMap<Uuid, (Entity, u64, ConnectionRef)> = self
             .by_connection
@@ -1287,19 +1354,22 @@ impl SimWorld {
                     let request = delivery
                         .request
                         .map_or([0; RAW_ID_LEN], |id| *id.as_bytes());
-                    let contract = contract_of(order, character);
                     vec![
                         contract_message(ContractMessage::FullyCompleted(FullyCompletedMsg {
                             header,
                             request,
-                            contract: contract.clone(),
+                            contract: contract_of(
+                                &completed_snapshot(order),
+                                character,
+                                ContractView::Notice,
+                            ),
                             count: delivery.completed_count,
                         })),
                         contract_message(ContractMessage::Notice(ContractNoticeMsg {
                             type_index: CONTRACT_RESOLVED_TYPE_INDEX,
                             header,
-                            request,
-                            contract,
+                            request: *Uuid::new_v4().as_bytes(),
+                            contract: contract_of(order, character, ContractView::Notice),
                         })),
                     ]
                 }
@@ -1309,13 +1379,22 @@ impl SimWorld {
                             type_index: CONTRACT_EXPIRED_TYPE_INDEX,
                             header,
                             request: expiry_batch,
-                            contract: contract_of(order, character),
+                            contract: contract_of(order, character, ContractView::Notice),
                         },
                     ))]
                 }
                 _ => Vec::new(),
             };
-            if let Some(leftover) = self.give(entity, delivery) {
+            let storage = order
+                .as_ref()
+                .filter(|order| {
+                    order.kind == OrderKind::Buy
+                        && order.creator == character
+                        && delivery.completed_count > 0
+                        && self.content.settlements.contains(order.outpost)
+                })
+                .map(|order| settlement_storage(order.outpost));
+            if let Some(leftover) = self.give(entity, delivery, storage) {
                 returned.push(leftover);
             }
             send_now(&mut self.combat_messages, &connection, &messages);
@@ -2005,6 +2084,16 @@ impl SimWorld {
     }
 }
 
+/// `resolved`, a fully completed order its creator took the proceeds of, as its last completion
+/// left it: completed, one version before the take ([`nw_db::take_deliveries`]).
+fn completed_snapshot(resolved: &Order) -> Order {
+    Order {
+        status: OrderStatus::Completed,
+        version: resolved.version.saturating_sub(1),
+        ..resolved.clone()
+    }
+}
+
 /// Logs and counts a refused shop purchase of offer `conversion`.
 fn shop_refused(conversion: u32, refusal: ShopRefusal) {
     count_call("shop", false);
@@ -2037,6 +2126,8 @@ mod tests {
     use super::*;
     use crate::player_content::PlayerContent;
     use crate::shop::ShopCatalog;
+    use crate::trading_post::{Settlement, Settlements};
+    use crate::world::gear;
     use crate::world::tests::{NOW, SERVER_TIME, admit_at, world_with_spawns};
     use nw_content::generated::ItemCurrencyConversionData;
     use nw_content::progression::{Progression, ProgressionSource};
@@ -2418,5 +2509,765 @@ mod tests {
                 .any(|job| matches!(job, EconomyJob::RecordTrade { .. })),
             "the trade is audited"
         );
+    }
+
+    /// The trading post test players: the seller carries [`STACK`] flint.
+    pub(super) const SELLER_NUMBER: u64 = 11;
+    pub(super) const BUYER_NUMBER: u64 = 12;
+    pub(super) const STACK: u32 = 10;
+    pub(super) const COINS_HELD: u64 = 1_000_000;
+    /// The settlement of the retail `buy-sell-TP` orders.
+    pub(super) const OUTPOST: u64 = 0xb325_909b_3cc6_434f;
+    /// Another settlement (retail Morrowtide), far from the test players.
+    const FAR_OUTPOST: u64 = 0x63e5_ce00_1ef4_6668;
+    const FAR_METRES: f32 = 5_000.0;
+
+    /// Content whose one tradable item is flint, and whose trading post at [`OUTPOST`] taxes
+    /// `outpost_tax`.
+    fn trading_content(outpost_tax: f64) -> PlayerContent {
+        PlayerContent {
+            kits: gear::tests::kits_with(&[]),
+            trading: crate::trading_post::TradingCatalog::of([TradeItem {
+                item_id: gear::tests::FLINT.to_owned(),
+                category: "Resources".to_owned(),
+                family: "RawResources".to_owned(),
+                group: "Flint".to_owned(),
+                tier: 1,
+                required_level: None,
+            }]),
+            trading_post: crate::trading_post::TradingPostConfig {
+                outposts: vec![crate::trading_post::OutpostTax {
+                    outpost: OUTPOST,
+                    trading_tax: outpost_tax,
+                }],
+                ..crate::trading_post::TradingPostConfig::default()
+            },
+            settlements: Settlements::of(vec![
+                Settlement {
+                    id: OUTPOST,
+                    x: 0.0,
+                    y: 0.0,
+                },
+                Settlement {
+                    id: FAR_OUTPOST,
+                    x: FAR_METRES,
+                    y: FAR_METRES,
+                },
+            ]),
+            ..PlayerContent::default()
+        }
+    }
+
+    /// Two players at the trading post of [`OUTPOST`] (tax `outpost_tax`) with
+    /// [`COINS_HELD`] each; the seller carries [`STACK`] flint and nothing was sent yet.
+    pub(super) fn traders(outpost_tax: f64) -> (SimWorld, Entity, Entity) {
+        let mut world = world_with_spawns(Vec::new());
+        world.content = Arc::new(trading_content(outpost_tax));
+        let mut entities = Vec::new();
+        for number in [SELLER_NUMBER, BUYER_NUMBER] {
+            let mut admit = admit_at(number, 0.0, true);
+            admit.backstory = Some(gear::tests::BACKSTORY.to_owned());
+            world.admit(&admit, NOW, SERVER_TIME).expect("admit");
+            let entity = world.player_by_number(number).expect("player");
+            world.world.get_mut::<Player>(entity).expect("player").coins = COINS_HELD;
+            world.economy.posts.insert(number, OUTPOST);
+            entities.push(entity);
+        }
+        let flint = world
+            .content
+            .kits
+            .item(gear::tests::FLINT)
+            .cloned()
+            .expect("flint");
+        for (entity, quantity) in [(entities[0], STACK), (entities[1], 0)] {
+            let mut player = world.world.get_mut::<Player>(entity).expect("player");
+            let gear = player.gear.as_mut().expect("gear");
+            let held = gear.bag_count(gear::tests::FLINT);
+            assert!(gear.take(gear::tests::FLINT, held));
+            assert!(quantity == 0 || gear.add(&flint, quantity));
+        }
+        let _ = std::mem::take(&mut world.combat_messages);
+        (world, entities[0], entities[1])
+    }
+
+    /// A player opening a trading post trades at the nearest settlement; a filled buy order's
+    /// units go to the storage of the order's settlement, with no bag change (retail
+    /// `buy-sell-TP` 328.900 s, `Hivesellandbuyorder` 401.71 s).
+    #[test]
+    fn a_trading_post_trades_at_the_nearest_settlement_and_buy_orders_fill_its_storage() {
+        const UNITS: u32 = 3;
+        let (mut world, _, buyer) = traders(crate::trading_post::RETAIL_TRADING_TAX);
+        world.economy.posts.clear();
+        world.open_trading_post(
+            buyer,
+            BUYER_NUMBER,
+            InteractionRequest {
+                target: [7; RAW_ID_LEN],
+                target_entity: 7,
+                interaction: 1,
+                kind: TRADING_POST_KIND,
+                gatherable: None,
+            },
+            b"@TradingPostT5_MasterName",
+        );
+        assert_eq!(world.economy.posts.get(&BUYER_NUMBER), Some(&OUTPOST));
+        let creator = world.world.get::<Player>(buyer).expect("buyer").character;
+        let item = world
+            .content
+            .trading
+            .by_id(gear::tests::FLINT)
+            .expect("tradable")
+            .order_item(0);
+        let filled = Order {
+            id: Uuid::from_u128(5),
+            kind: OrderKind::Buy,
+            status: OrderStatus::Resolved,
+            version: 3,
+            creator,
+            outpost: OUTPOST,
+            item,
+            price: 100,
+            posted: UNITS,
+            open: 0,
+            end: nw_db::OrderEnd::Succeeded,
+            tax_rate: crate::trading_post::RETAIL_TRADING_TAX,
+            created_ms: NOW,
+            expires_ms: NOW + MS_PER_DAY,
+            completed_ms: Some(NOW),
+            updated_ms: NOW,
+        };
+        let units = |order: Order| TakenDelivery {
+            delivery: Delivery {
+                character: creator,
+                order: Some(order.id),
+                notice: DeliveryNotice::FullyCompleted,
+                coins: 0,
+                item: Some((gear::tests::FLINT.to_owned(), UNITS)),
+                completed_count: UNITS,
+                request: None,
+            },
+            order: Some(order),
+        };
+        world.deliver(vec![units(filled.clone())]);
+        let held = |world: &SimWorld| {
+            let player = world.world.get::<Player>(buyer).expect("buyer");
+            let gear = player.gear.as_ref().expect("gear");
+            (
+                gear.bag_count(gear::tests::FLINT),
+                gear.stored_totals().get(gear::tests::FLINT).copied(),
+                gear.stored_items(&settlement_storage(OUTPOST))
+                    .map(|items| items.len()),
+            )
+        };
+        assert_eq!(held(&world), (0, Some(UNITS), Some(1)));
+        // An order of before the settlement ids (a territory number) fills the bag.
+        world.deliver(vec![units(Order {
+            outpost: 2,
+            ..filled
+        })]);
+        assert_eq!(held(&world), (UNITS, Some(UNITS), Some(1)));
+        assert!(world.take_economy_jobs().is_empty(), "nothing waits");
+    }
+
+    /// A delivery into a bag that fills part way: the bag keeps what it took, only the rest
+    /// waits (nothing is given twice).
+    #[test]
+    fn a_delivery_into_a_bag_that_fills_waits_only_for_the_rest() {
+        const SINGLE: &str = "TestSingleT1";
+        const UNITS: u32 = 600;
+        let mut world = world_with_spawns(Vec::new());
+        world.content = Arc::new(PlayerContent {
+            kits: gear::tests::kits_with_stacks(&[(SINGLE, "Resource", Some(1))]),
+            ..PlayerContent::default()
+        });
+        let mut admit = admit_at(BUYER_NUMBER, 0.0, true);
+        admit.backstory = Some(gear::tests::BACKSTORY.to_owned());
+        world.admit(&admit, NOW, SERVER_TIME).expect("admit");
+        let entity = world.player_by_number(BUYER_NUMBER).expect("player");
+        let character = world.world.get::<Player>(entity).expect("player").character;
+        let left = world
+            .give(
+                entity,
+                Delivery {
+                    character,
+                    order: None,
+                    notice: DeliveryNotice::None,
+                    coins: 0,
+                    item: Some((SINGLE.to_owned(), UNITS)),
+                    completed_count: UNITS,
+                    request: None,
+                },
+                None,
+            )
+            .and_then(|left| left.item)
+            .map_or(0, |(_, waiting)| waiting);
+        let held = world
+            .world
+            .get::<Player>(entity)
+            .and_then(|player| player.gear.as_ref())
+            .map_or(0, |gear| gear.bag_count(SINGLE));
+        assert!(
+            held > 0 && left > 0,
+            "the bag filled part way: {held} {left}"
+        );
+        assert_eq!(held + left, UNITS);
+    }
+
+    /// The bag record sync reason of flint in the bag of `entity`.
+    fn flint_reason(world: &SimWorld, entity: Entity) -> Option<u8> {
+        let index = world
+            .content
+            .kits
+            .item(gear::tests::FLINT)
+            .expect("flint")
+            .item_index;
+        let player = world.world.get::<Player>(entity).expect("player");
+        let Some(nw_messages::list_delta::ReplicatedList::Full(bag)) =
+            player.gear.as_ref().expect("gear").states().bag.items
+        else {
+            panic!("a full bag list");
+        };
+        bag.elements
+            .iter()
+            .find(|record| record.item_index == index && record.quantity > 0)
+            .map(|record| record.sync_reason)
+    }
+
+    /// Retail sync reasons: 19 on the stack a sell order takes, 10 on what a buyer receives, 0
+    /// on what a cancel gives back; and a completer pays the tax of its own trading post.
+    #[test]
+    fn the_trading_post_moves_items_with_the_retail_sync_reasons_and_the_completers_tax() {
+        const LISTED: u32 = 3;
+        const STANDING_TAX: f64 = 0.0235;
+        const PRICE: u64 = 10_000;
+        let (mut world, seller, buyer) = traders(STANDING_TAX);
+        world.contract_call(
+            seller,
+            ContractCall::Create {
+                header: FacetHeader::of(CONTRACTS_COMPONENT, SELLER_NUMBER),
+                order: CreateOrder {
+                    kind: ContractKind::Sell.value(),
+                    price: PRICE,
+                    count: LISTED,
+                    days: 3,
+                    item_crc: lowercase_crc32(gear::tests::FLINT),
+                    item_block: [0; nw_messages::contracts::CREATE_ITEM_BLOCK_LEN],
+                },
+                request: [1; RAW_ID_LEN],
+                tail: 0,
+            },
+        );
+        let jobs = world.take_economy_jobs();
+        let Some(EconomyJob::Post { order, refund, .. }) = jobs.first() else {
+            panic!("a post job: {jobs:?}");
+        };
+        assert_eq!(refund.items, Some((gear::tests::FLINT.to_owned(), LISTED)));
+        assert_eq!(
+            order.tax_rate, STANDING_TAX,
+            "the order keeps its settlement's tax"
+        );
+        assert_eq!(flint_reason(&world, seller), Some(SYNC_TRADING_POST_TAKEN));
+        let creator = world.world.get::<Player>(seller).expect("seller").character;
+        let stored = Order {
+            id: order.id,
+            kind: OrderKind::Sell,
+            status: OrderStatus::Available,
+            version: 1,
+            creator,
+            outpost: OUTPOST,
+            item: order.item.clone(),
+            price: PRICE,
+            posted: LISTED,
+            open: LISTED,
+            end: nw_db::OrderEnd::None,
+            tax_rate: crate::trading_post::RETAIL_TRADING_TAX,
+            created_ms: NOW,
+            expires_ms: NOW + MS_PER_DAY,
+            completed_ms: None,
+            updated_ms: NOW,
+        };
+        let caller = world
+            .caller(
+                buyer,
+                FacetHeader::of(CONTRACTS_COMPONENT, BUYER_NUMBER),
+                [2; RAW_ID_LEN],
+            )
+            .expect("caller");
+        world.complete_inspected(
+            &caller,
+            &stored,
+            CompletionCall {
+                kind: ContractKind::Sell.value(),
+                units: 1,
+                item_crc: 0,
+            },
+        );
+        let paid = PRICE + nw_db::tax_of(PRICE, STANDING_TAX);
+        assert_eq!(
+            world.world.get::<Player>(buyer).expect("buyer").coins,
+            COINS_HELD - paid,
+            "the buyer pays its own trading post's tax, not the order's"
+        );
+        let jobs = world.take_economy_jobs();
+        assert!(matches!(
+            jobs.as_slice(),
+            [EconomyJob::Complete { tax_rate, units: 1, .. }] if *tax_rate == STANDING_TAX
+        ));
+        let bought = Delivery {
+            character: caller.character,
+            order: Some(order.id),
+            notice: DeliveryNotice::None,
+            coins: 0,
+            item: Some((gear::tests::FLINT.to_owned(), 1)),
+            completed_count: 1,
+            request: None,
+        };
+        assert_eq!(world.give(buyer, bought, None), None);
+        assert_eq!(flint_reason(&world, buyer), Some(SYNC_TRADING_POST_BOUGHT));
+        let returned = Refund {
+            coins: 0,
+            items: Some((gear::tests::FLINT.to_owned(), LISTED)),
+        }
+        .delivery(creator);
+        assert_eq!(world.give(seller, returned, None), None);
+        assert_eq!(
+            flint_reason(&world, seller),
+            Some(SYNC_TRADING_POST_RETURNED)
+        );
+        assert_eq!(
+            world
+                .world
+                .get::<Player>(seller)
+                .and_then(|player| player.gear.as_ref())
+                .map(|gear| gear.bag_count(gear::tests::FLINT)),
+            Some(STACK)
+        );
+    }
+}
+
+#[cfg(all(test, feature = "infra"))]
+mod infra_tests {
+    //! The trading post end to end on the Docker PostgreSQL world database: two players of one
+    //! sim post, buy, sell and cancel through their calls, the jobs run on the database and
+    //! their answers come back as the loop gives them.
+
+    use super::*;
+    use crate::trading_post::RETAIL_TRADING_TAX;
+    use crate::world::gear::tests::FLINT;
+    use crate::world::tests::messages_for;
+    use nw_db::test_db::with_test_schema;
+    use nw_db::{NewCharacter, OrderEnd, WORLD_MIGRATOR, insert_character, tax_of};
+    use nw_messages::contracts::{CREATE_ITEM_BLOCK_LEN, Contract, status as contract_status};
+    use nw_messages::item_descriptor::ShortItemDescriptor;
+
+    use super::tests::{
+        BUYER_NUMBER as BUYER, COINS_HELD as COINS, OUTPOST, SELLER_NUMBER as SELLER, STACK,
+        traders,
+    };
+
+    const FIRST_BUY: u32 = 1;
+    const PRICE: u64 = 10_000;
+    const DAYS: u32 = 3;
+
+    /// [`traders`], with their characters in the world database `db`.
+    async fn stored_traders(db: &PgPool) -> (SimWorld, Entity, Entity) {
+        let (world, seller, buyer) = traders(RETAIL_TRADING_TAX);
+        for entity in [seller, buyer] {
+            let player = world.world.get::<Player>(entity).expect("player");
+            insert_character(
+                db,
+                &NewCharacter {
+                    id: player.character,
+                    account_id: Uuid::new_v4(),
+                    name: format!("Trader{}", player.number),
+                    appearance: serde_json::json!({}),
+                },
+            )
+            .await
+            .expect("insert");
+        }
+        (world, seller, buyer)
+    }
+
+    /// Runs the queued economy jobs and their follow-ups, then one delivery round, and returns
+    /// what each player was sent.
+    async fn settle(world: &mut SimWorld, db: &PgPool) -> [Vec<ContractMessage>; 2] {
+        for round in 0..2 {
+            if round == 1 {
+                world.economy_round();
+            }
+            loop {
+                let jobs = world.take_economy_jobs();
+                if jobs.is_empty() {
+                    break;
+                }
+                for job in jobs {
+                    if let Some(result) = run_job(db, job).await {
+                        world.economy_done(result);
+                    }
+                }
+            }
+        }
+        let sent = std::mem::take(&mut world.combat_messages);
+        [SELLER, BUYER].map(|number| {
+            messages_for(&sent, &crate::world::tests::connection(number))
+                .into_iter()
+                .filter_map(|message| match message {
+                    ServerMessage::Economy(EconomyMessage::Contract(contract)) => Some(*contract),
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    fn header(number: u64) -> FacetHeader {
+        FacetHeader::of(CONTRACTS_COMPONENT, number)
+    }
+
+    fn coins(world: &SimWorld, entity: Entity) -> u64 {
+        world.world.get::<Player>(entity).expect("player").coins
+    }
+
+    fn flint(world: &SimWorld, entity: Entity) -> u32 {
+        world
+            .world
+            .get::<Player>(entity)
+            .and_then(|player| player.gear.as_ref())
+            .map_or(0, |gear| gear.bag_count(FLINT))
+    }
+
+    fn post(world: &mut SimWorld, seller: Entity, count: u32) {
+        post_as(world, seller, SELLER, ContractKind::Sell, count);
+    }
+
+    fn post_as(world: &mut SimWorld, entity: Entity, number: u64, kind: ContractKind, count: u32) {
+        world.contract_call(
+            entity,
+            ContractCall::Create {
+                header: header(number),
+                order: CreateOrder {
+                    kind: kind.value(),
+                    price: PRICE,
+                    count,
+                    days: DAYS,
+                    item_crc: lowercase_crc32(FLINT),
+                    item_block: [0; CREATE_ITEM_BLOCK_LEN],
+                },
+                request: *Uuid::new_v4().as_bytes(),
+                tail: 0,
+            },
+        );
+    }
+
+    fn complete(
+        world: &mut SimWorld,
+        entity: Entity,
+        number: u64,
+        order: Uuid,
+        units: u32,
+        how: u32,
+    ) {
+        complete_as(world, entity, number, order, ContractKind::Sell, units, how);
+    }
+
+    fn complete_as(
+        world: &mut SimWorld,
+        entity: Entity,
+        number: u64,
+        order: Uuid,
+        kind: ContractKind,
+        units: u32,
+        how: u32,
+    ) {
+        world.contract_call(
+            entity,
+            ContractCall::Complete {
+                header: header(number),
+                contract: *order.as_bytes(),
+                request: *Uuid::new_v4().as_bytes(),
+                kind: kind.value(),
+                count: units,
+                reason: how,
+                item: ShortItemDescriptor {
+                    item_crc: lowercase_crc32(FLINT),
+                    quantity: units,
+                    gear_score: 0,
+                    perks: Vec::new(),
+                },
+                tail: 0,
+            },
+        );
+    }
+
+    /// The contract of `order` in the search answer of `number` and in its own lists.
+    async fn seen(
+        world: &mut SimWorld,
+        db: &PgPool,
+        entity: Entity,
+        number: u64,
+        order: Uuid,
+    ) -> (Option<Contract>, u32, Option<Contract>) {
+        let caller = world
+            .caller(entity, header(number), [0; RAW_ID_LEN])
+            .expect("caller");
+        world.economy.jobs.push(EconomyJob::Search {
+            caller: caller.clone(),
+            search: OrderSearch {
+                kind: OrderKind::Sell,
+                category: None,
+                family: None,
+                group: None,
+                item_id: Some(FLINT.to_owned()),
+                tier: None,
+                outposts: vec![OUTPOST],
+                perks: Vec::new(),
+                start: 0,
+                limit: MAX_PAGE,
+                now_ms: unix_ms(),
+            },
+        });
+        world.economy.jobs.push(EconomyJob::CharacterLookup {
+            wanted: CharacterOrders {
+                closed: true,
+                completed: true,
+                ..transfer_check_orders(caller.character)
+            },
+            caller,
+        });
+        let sent = settle(world, db).await;
+        let index = usize::from(number == BUYER);
+        let mut searched = None;
+        let mut total = 0;
+        let mut listed = None;
+        for message in &sent[index] {
+            match message {
+                ContractMessage::SearchResults(results) => {
+                    total = results.total;
+                    searched = results
+                        .contracts
+                        .iter()
+                        .find(|c| c.id == *order.as_bytes())
+                        .cloned();
+                }
+                ContractMessage::LookedUp(list) => {
+                    listed = list
+                        .0
+                        .contracts
+                        .iter()
+                        .find(|c| c.id == *order.as_bytes())
+                        .cloned();
+                }
+                _ => {}
+            }
+        }
+        (searched, total, listed)
+    }
+
+    /// The owner's case: A lists 10, B buys 1, both see 9; B buys the other 9, the listing is
+    /// gone for both, B holds all 10 and A has the price of all 10 less the 5 % kept back
+    /// (retail `buy-sell-TP` 224.298 s and `Hivesellandbuyorder` 262.326 s: 95 % of each sale).
+    #[tokio::test]
+    async fn a_stack_of_ten_bought_one_then_nine_shows_the_rest_to_both_and_pays_out() {
+        let checked = with_test_schema(async |db| {
+            WORLD_MIGRATOR.run(db).await.expect("migrate");
+            let (mut world, seller, buyer) = stored_traders(db).await;
+            post(&mut world, seller, STACK);
+            let sent = settle(&mut world, db).await;
+            let created = sent[0]
+                .iter()
+                .find_map(|message| match message {
+                    ContractMessage::Notice(notice)
+                        if notice.type_index == CONTRACT_CREATED_TYPE_INDEX =>
+                    {
+                        Some(notice.contract.clone())
+                    }
+                    _ => None,
+                })
+                .expect("634");
+            assert_eq!(created.version, 0, "retail 634 v0");
+            assert_eq!(created.quantity, STACK);
+            assert_eq!(flint(&world, seller), 0, "the stack is listed");
+            let order = Uuid::from_bytes(created.id);
+
+            complete(
+                &mut world,
+                buyer,
+                BUYER,
+                order,
+                FIRST_BUY,
+                reason::SUCCEEDED,
+            );
+            let sent = settle(&mut world, db).await;
+            let resolved = sent[1]
+                .iter()
+                .find_map(|message| match message {
+                    ContractMessage::Notice(notice)
+                        if notice.type_index == CONTRACT_RESOLVED_TYPE_INDEX =>
+                    {
+                        Some(notice.contract.clone())
+                    }
+                    _ => None,
+                })
+                .expect("1117");
+            let left = STACK - FIRST_BUY;
+            assert_eq!(resolved.status, contract_status::AVAILABLE);
+            assert_eq!(resolved.quantity, left);
+            assert!(
+                sent[0].is_empty(),
+                "no retail notice of a part sale to its seller"
+            );
+            assert_eq!(flint(&world, buyer), FIRST_BUY);
+            let tax = tax_of(PRICE, RETAIL_TRADING_TAX);
+            assert_eq!(coins(&world, buyer), COINS - PRICE - tax);
+            assert_eq!(coins(&world, seller), COINS + PRICE - tax);
+            for (entity, number) in [(seller, SELLER), (buyer, BUYER)] {
+                let (searched, total, listed) = seen(&mut world, db, entity, number, order).await;
+                let searched = searched.expect("found");
+                assert_eq!(total, 1);
+                assert_eq!(searched.quantity, left);
+                assert_eq!(searched.events[0].1.completion_count, left);
+                assert_eq!(searched.sold_item.map(|item| item.quantity), Some(left));
+                assert_eq!(listed.expect("listed").quantity, left);
+            }
+
+            complete(&mut world, buyer, BUYER, order, left, reason::SUCCEEDED);
+            let sent = settle(&mut world, db).await;
+            let fully = sent[0]
+                .iter()
+                .find_map(|message| match message {
+                    ContractMessage::FullyCompleted(fully) => Some(fully.clone()),
+                    _ => None,
+                })
+                .expect("2964");
+            assert_eq!(fully.contract.status, contract_status::COMPLETED);
+            assert_eq!(fully.contract.completed_ns, 0);
+            assert!(sent[0].iter().any(|message| matches!(
+                message,
+                ContractMessage::Notice(notice)
+                    if notice.type_index == CONTRACT_RESOLVED_TYPE_INDEX
+                        && notice.contract.status == contract_status::RESOLVED
+            )));
+            assert_eq!(flint(&world, buyer), STACK, "the buyer holds all 10");
+            let rest = u64::from(left) * PRICE;
+            let rest_tax = tax_of(rest, RETAIL_TRADING_TAX);
+            assert_eq!(coins(&world, buyer), COINS - PRICE - tax - rest - rest_tax);
+            assert_eq!(coins(&world, seller), COINS + PRICE - tax + rest - rest_tax);
+            for (entity, number) in [(seller, SELLER), (buyer, BUYER)] {
+                let (searched, total, listed) = seen(&mut world, db, entity, number, order).await;
+                assert!(searched.is_none() && total == 0, "the listing is gone");
+                let listed = listed.expect("still in the lists");
+                assert_eq!(listed.quantity, 0);
+                assert_eq!(listed.status, contract_status::RESOLVED);
+                assert_eq!(listed.events[0].1.reason, OrderEnd::Succeeded.value());
+                assert_eq!(listed.events[0].1.completion_count, STACK);
+            }
+            true
+        })
+        .await;
+        assert!(checked);
+    }
+
+    /// A cancel of a partly bought listing gives the units left back to the seller's bag;
+    /// the buyer keeps what it bought, and another buy of it is refused.
+    #[tokio::test]
+    async fn a_cancel_after_a_part_sale_gives_the_rest_back() {
+        const BOUGHT: u32 = 4;
+        let checked = with_test_schema(async |db| {
+            WORLD_MIGRATOR.run(db).await.expect("migrate");
+            let (mut world, seller, buyer) = stored_traders(db).await;
+            post(&mut world, seller, STACK);
+            let sent = settle(&mut world, db).await;
+            let order = sent[0]
+                .iter()
+                .find_map(|message| match message {
+                    ContractMessage::Notice(notice) => Some(Uuid::from_bytes(notice.contract.id)),
+                    _ => None,
+                })
+                .expect("634");
+            complete(&mut world, buyer, BUYER, order, BOUGHT, reason::SUCCEEDED);
+            settle(&mut world, db).await;
+            complete(&mut world, seller, SELLER, order, 0, reason::CANCELED);
+            let sent = settle(&mut world, db).await;
+            let canceled = sent[0]
+                .iter()
+                .find_map(|message| match message {
+                    ContractMessage::Notice(notice)
+                        if notice.type_index == CONTRACT_CANCELED_TYPE_INDEX =>
+                    {
+                        Some(notice.contract.clone())
+                    }
+                    _ => None,
+                })
+                .expect("2965");
+            assert_eq!(canceled.status, contract_status::RESOLVED);
+            assert_eq!(canceled.quantity, STACK - BOUGHT);
+            assert_eq!(canceled.events[0].1.reason, reason::CANCELED);
+            assert_eq!(flint(&world, seller), STACK - BOUGHT);
+            assert_eq!(flint(&world, buyer), BOUGHT);
+            complete(&mut world, buyer, BUYER, order, 1, reason::SUCCEEDED);
+            let sent = settle(&mut world, db).await;
+            assert!(sent[1].iter().any(|message| matches!(
+                message,
+                ContractMessage::Failed(failed) if failed.reason == failure::ALREADY_RESOLVED
+            )));
+            assert_eq!(flint(&world, buyer), BOUGHT);
+            true
+        })
+        .await;
+        assert!(checked);
+    }
+
+    /// A buy order of 10 filled by 4 then 6: the seller's flint leaves its bag and it gets the
+    /// price less its tax each time; the creator's 10 go to the storage of the order's
+    /// settlement, with no bag change (retail `buy-sell-TP` 328.900 s, `Hivesellandbuyorder`
+    /// 401.71 s).
+    #[tokio::test]
+    async fn a_buy_order_filled_in_parts_fills_the_settlements_storage() {
+        const FIRST_SALE: u32 = 4;
+        let checked = with_test_schema(async |db| {
+            WORLD_MIGRATOR.run(db).await.expect("migrate");
+            let (mut world, seller, buyer) = stored_traders(db).await;
+            post_as(&mut world, buyer, BUYER, ContractKind::Buy, STACK);
+            let sent = settle(&mut world, db).await;
+            let order = sent[1]
+                .iter()
+                .find_map(|message| match message {
+                    ContractMessage::Notice(notice) => Some(Uuid::from_bytes(notice.contract.id)),
+                    _ => None,
+                })
+                .expect("634");
+            let escrow = u64::from(STACK) * PRICE;
+            assert_eq!(coins(&world, buyer), COINS - escrow);
+            for units in [FIRST_SALE, STACK - FIRST_SALE] {
+                complete_as(
+                    &mut world,
+                    seller,
+                    SELLER,
+                    order,
+                    ContractKind::Buy,
+                    units,
+                    reason::SUCCEEDED,
+                );
+                settle(&mut world, db).await;
+            }
+            let first = u64::from(FIRST_SALE) * PRICE;
+            let rest = escrow - first;
+            assert_eq!(
+                coins(&world, seller),
+                COINS + first - tax_of(first, RETAIL_TRADING_TAX) + rest
+                    - tax_of(rest, RETAIL_TRADING_TAX)
+            );
+            assert_eq!(flint(&world, seller), 0);
+            assert_eq!(flint(&world, buyer), 0, "no bag change");
+            let stored = world
+                .world
+                .get::<Player>(buyer)
+                .and_then(|player| player.gear.as_ref())
+                .and_then(|gear| gear.stored_totals().get(FLINT).copied());
+            assert_eq!(stored, Some(STACK));
+            true
+        })
+        .await;
+        assert!(checked);
     }
 }

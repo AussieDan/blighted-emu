@@ -828,6 +828,46 @@ impl Gear {
         Ok(())
     }
 
+    /// Puts `quantity` of `item` into storage chest `storage` in new stacks of at most the
+    /// item's stack size, each with sync reason `reason`: the units of a filled buy order, which
+    /// retail gave to the storage of the order's settlement (`buy-sell-TP` 328.900 s and
+    /// `Hivesellandbuyorder` 401.71 s: a 7048 with the 1117 of the order and no bag change, 2 of
+    /// 2). Whether they join a stored stack of the item is Unknown; a deposit makes its own
+    /// stack (`storage_open_deposit_withdraw_transfer`), and so does this. Nothing is stored
+    /// when they do not all fit; whether it fit.
+    pub(in crate::world) fn store_new(
+        &mut self,
+        storage: [u8; RAW_ID_LEN],
+        item: &KitItem,
+        quantity: u32,
+        reason: u8,
+    ) -> bool {
+        if quantity == 0 {
+            return false;
+        }
+        let limit = item
+            .max_stack
+            .unwrap_or(MAX_STACK_QUANTITY)
+            .clamp(1, MAX_STACK_QUANTITY);
+        let needed = quantity.div_ceil(limit);
+        let slots = self.holdings.storages.entry(storage).or_default();
+        let free = slots.iter().filter(|slot| slot.is_none()).count()
+            + MAX_CONTAINER_SLOTS.saturating_sub(slots.len());
+        if usize::try_from(needed).map_or(true, |needed| needed > free) {
+            return false;
+        }
+        let mut left = quantity;
+        while left > 0 {
+            let part = left.min(limit);
+            let mut new = self.new_stack(item, part);
+            new.reason = reason;
+            put_in(self.holdings.storages.entry(storage).or_default(), new);
+            left -= part;
+        }
+        self.touched();
+        true
+    }
+
     /// Puts `quantity` of the open storage's stack of instance `instance` on in paperdoll slot
     /// `slot_id` (1461); an item worn there goes into the storage. The id of the equipped item.
     pub(in crate::world) fn equip_from_storage(

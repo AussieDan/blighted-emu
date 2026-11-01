@@ -51,6 +51,17 @@ pub const SYNC_SALVAGE_OPENED: u8 = 26;
 /// Sync reason of the bag stacks a salvage of an item with durability gave (retail
 /// `20261008-145727-200` 1622.944 s: a gear item of durability 1500 and gear score 350).
 pub const SYNC_SALVAGE_GEAR: u8 = 33;
+/// Sync reason of a bag stack the trading post took: the units of a sell order the player posts
+/// and the units it sells to a buy order (retail `tradepost_post_sell_cancel_buyorder_sellorder`
+/// 35.910 s, 46.806 s, 56.559 s, 65.209 s and 77.059 s; `buy-sell-TP` 362.241 s: 6 of 6).
+pub const SYNC_TRADING_POST_TAKEN: u8 = 19;
+/// Sync reason of a bag stack the trading post gave a buyer (retail `buy-sell-TP` 222.915 s,
+/// `tradepost_post_sell_cancel_buyorder_sellorder` 22.305 s, 222.240 s, 375.037 s and 533.513 s:
+/// 5 of 5).
+pub const SYNC_TRADING_POST_BOUGHT: u8 = 10;
+/// Sync reason of a bag stack a canceled sell order gave back (retail
+/// `tradepost_post_sell_cancel_buyorder_sellorder` 87.406 s and 93.506 s: 2 of 2).
+pub const SYNC_TRADING_POST_RETURNED: u8 = 0;
 /// Item flags bit 0: bound to the character.
 pub const ITEM_BOUND: u8 = 0x01;
 /// Item flags bit 1: locked by its owner (retail 2549 set it and cleared it: flags 1 to 3 and

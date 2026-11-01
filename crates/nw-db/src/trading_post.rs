@@ -9,11 +9,12 @@
 //! transfer and gives them back when the transfer is refused; what a player receives waits here
 //! as a delivery until its sim takes it ([`take_deliveries`]).
 //!
-//! The tax rules are the retail ones of the captured trades (economy note, section 3): the buyer
-//! of a sell order pays the price and the tax on it; the seller of a sell order gets the price
-//! less the tax; the seller to a buy order gets the price less the tax; the creator of a buy
-//! order pays the price and the posting fee when it posts, and nothing at its completion. Each
-//! tax is the price times the rate, rounded down ([`tax_of`]).
+//! The tax rules are the retail ones of the captured trades (economy note, section 3, and the
+//! storage and trading post note of 2026-11-01): the buyer of a sell order pays the price and the
+//! tax on it at the completer's rate; the seller of a sell order gets the price less the tax at
+//! the order's rate; the seller to a buy order gets the price less the tax at the completer's
+//! rate; the creator of a buy order pays the price and the posting fee when it posts, and nothing
+//! at its completion. Each tax is the price times the rate, rounded down ([`tax_of`]).
 
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -321,7 +322,8 @@ pub struct Completed {
     pub units: u32,
     /// The price of those units, hundredths.
     pub total: u64,
-    /// The tax the completer paid (a buyer, on top of the total) or had kept back (a seller).
+    /// The tax the completer paid (a buyer, on top of the total) or had kept back (a seller), at
+    /// its own rate.
     pub completer_tax: u64,
 }
 
@@ -803,9 +805,14 @@ async fn try_post_order(
     Ok(Ok(posted))
 }
 
-/// Completes `units` of order `order` for `completer` (request id `request`) at `now_ms`: a
-/// buyer of a sell order paid the total and its tax before; a seller to a buy order gave the
-/// items before. What each side gets waits as deliveries ([`take_deliveries`]).
+/// Completes `units` of order `order` for `completer` (request id `request`, trading tax
+/// `completer_rate`) at `now_ms`: a buyer of a sell order paid the total and its tax at
+/// `completer_rate` before; a seller to a buy order gave the items before. The tax the completer
+/// pays or has kept back is at `completer_rate`; the creator of a sell order has the tax at the
+/// order's rate kept back (retail `buy-sell-TP` and `Hivesellandbuyorder`, one settlement: the
+/// buyer and the seller to a buy order paid 2.35 % for one character and 5 % for the other, 4 of
+/// 4; each sell order's creator got 95 %, 2 of 2). What each side gets waits as deliveries
+/// ([`take_deliveries`]).
 ///
 /// # Errors
 ///
@@ -816,11 +823,18 @@ pub async fn complete_order(
     order: Uuid,
     completer: Uuid,
     units: u32,
+    completer_rate: f64,
     request: Uuid,
     now_ms: u64,
 ) -> Result<Result<Completed, OrderRefusal>, DbError> {
     with_retries!(try_complete_order(
-        world, order, completer, units, request, now_ms
+        world,
+        order,
+        completer,
+        units,
+        completer_rate,
+        request,
+        now_ms
     ))
 }
 
@@ -829,6 +843,7 @@ async fn try_complete_order(
     order: Uuid,
     completer: Uuid,
     units: u32,
+    completer_rate: f64,
     request: Uuid,
     now_ms: u64,
 ) -> Result<Result<Completed, OrderRefusal>, DbError> {
@@ -849,7 +864,8 @@ async fn try_complete_order(
         .price
         .checked_mul(u64::from(units))
         .ok_or_else(|| out_of_range("price"))?;
-    let tax = tax_of(total, stored.tax_rate);
+    let tax = tax_of(total, completer_rate);
+    let creator_tax = tax_of(total, stored.tax_rate);
     stored.open -= units;
     stored.version += 1;
     stored.updated_ms = now_ms;
@@ -883,7 +899,7 @@ async fn try_complete_order(
                 character: stored.creator,
                 order: Some(order),
                 notice,
-                coins: total - tax,
+                coins: total - creator_tax,
                 item: None,
                 completed_count: units,
                 request: Some(request),
@@ -1552,13 +1568,13 @@ mod infra_tests {
             )
             .await
             .expect("search");
-            let completed = complete_order(pool, posted.id, buyer, 2, Uuid::new_v4(), NOW_MS)
+            let completed = complete_order(pool, posted.id, buyer, 2, RATE, Uuid::new_v4(), NOW_MS)
                 .await
                 .expect("complete")
                 .expect("completed");
             let seller_gets = take_deliveries(pool, &[seller]).await.expect("take");
             let buyer_gets = take_deliveries(pool, &[buyer]).await.expect("take");
-            let again = complete_order(pool, posted.id, buyer, 1, Uuid::new_v4(), NOW_MS)
+            let again = complete_order(pool, posted.id, buyer, 1, RATE, Uuid::new_v4(), NOW_MS)
                 .await
                 .expect("complete");
             (page, completed, seller_gets, buyer_gets, again)
@@ -1587,6 +1603,219 @@ mod infra_tests {
             Some(("BeeswaxT1".to_owned(), 2))
         );
         assert_eq!(again, Err(OrderRefusal::NotOpen));
+    }
+
+    fn sell_search(now_ms: u64) -> OrderSearch {
+        OrderSearch {
+            kind: OrderKind::Sell,
+            category: None,
+            family: None,
+            group: None,
+            item_id: Some("BeeswaxT1".to_owned()),
+            tier: None,
+            outposts: Vec::new(),
+            perks: Vec::new(),
+            start: 0,
+            limit: 100,
+            now_ms,
+        }
+    }
+
+    fn lists_of(character: Uuid) -> CharacterOrders {
+        CharacterOrders {
+            character,
+            open: true,
+            closed: true,
+            created: true,
+            completed: true,
+            kinds: vec![OrderKind::Buy, OrderKind::Sell],
+            start: 0,
+            limit: 100,
+        }
+    }
+
+    /// The owner's case: a stack of 10 listed, 1 bought, then the other 9. Each player sees
+    /// what is left after each buy; the buyer gets all 10 and the seller the price of all 10
+    /// less the tax at the order's rate, while the buyer paid the tax at its own rate.
+    #[tokio::test]
+    async fn a_stack_of_ten_is_bought_one_then_nine() {
+        const STACK: u32 = 10;
+        const FIRST_BUY: u32 = 1;
+        const BUYER_RATE: f64 = 0.0235;
+        let (
+            after_one,
+            seller_list,
+            buyer_list,
+            after_all,
+            first,
+            rest,
+            seller_gets,
+            buyer_gets,
+            closed,
+        ) = with_test_schema(async |pool| {
+            WORLD_MIGRATOR.run(pool).await.expect("migrate");
+            let seller = character(pool, "Seller").await;
+            let buyer = character(pool, "Buyer").await;
+            let posted = post_order(pool, &order(OrderKind::Sell, seller, STACK))
+                .await
+                .expect("post")
+                .expect("posted");
+            let first = complete_order(
+                pool,
+                posted.id,
+                buyer,
+                FIRST_BUY,
+                BUYER_RATE,
+                Uuid::new_v4(),
+                NOW_MS,
+            )
+            .await
+            .expect("complete")
+            .expect("completed");
+            let after_one = search_orders(pool, &sell_search(NOW_MS))
+                .await
+                .expect("search");
+            let seller_list = character_orders(pool, &lists_of(seller))
+                .await
+                .expect("list");
+            let buyer_list = character_orders(pool, &lists_of(buyer))
+                .await
+                .expect("list");
+            let rest = complete_order(
+                pool,
+                posted.id,
+                buyer,
+                STACK - FIRST_BUY,
+                BUYER_RATE,
+                Uuid::new_v4(),
+                NOW_MS,
+            )
+            .await
+            .expect("complete")
+            .expect("completed");
+            let after_all = search_orders(pool, &sell_search(NOW_MS))
+                .await
+                .expect("search");
+            let seller_gets = take_deliveries(pool, &[seller]).await.expect("take");
+            let buyer_gets = take_deliveries(pool, &[buyer]).await.expect("take");
+            let closed = character_orders(pool, &lists_of(seller))
+                .await
+                .expect("list");
+            (
+                after_one,
+                seller_list,
+                buyer_list,
+                after_all,
+                first,
+                rest,
+                seller_gets,
+                buyer_gets,
+                closed,
+            )
+        })
+        .await;
+        let left = STACK - FIRST_BUY;
+        assert_eq!(after_one.total, 1);
+        assert_eq!(after_one.orders[0].open, left);
+        assert_eq!(seller_list[0].0.open, left);
+        assert!(seller_list[0].1, "the seller created it");
+        assert_eq!(buyer_list[0].0.open, left);
+        assert!(!buyer_list[0].1, "the buyer completed part of it");
+        assert_eq!(first.order.status, OrderStatus::Available);
+        assert_eq!(first.completer_tax, tax_of(PRICE, BUYER_RATE));
+        assert_eq!(rest.order.status, OrderStatus::Completed);
+        assert_eq!(rest.order.open, 0);
+        assert_eq!(after_all.total, 0, "the listing is gone for everyone");
+        assert!(after_all.orders.is_empty());
+        let rest_total = u64::from(left) * PRICE;
+        let coins: u64 = seller_gets.iter().map(|taken| taken.delivery.coins).sum();
+        assert_eq!(
+            coins,
+            PRICE - tax_of(PRICE, RATE) + rest_total - tax_of(rest_total, RATE)
+        );
+        assert!(
+            seller_gets
+                .iter()
+                .all(|taken| taken.delivery.item.is_none())
+        );
+        let items: u32 = buyer_gets
+            .iter()
+            .filter_map(|taken| taken.delivery.item.as_ref())
+            .map(|(item, quantity)| {
+                assert_eq!(item, "BeeswaxT1");
+                *quantity
+            })
+            .sum();
+        assert_eq!(items, STACK);
+        assert!(buyer_gets.iter().all(|taken| taken.delivery.coins == 0));
+        assert_eq!(closed[0].0.status, OrderStatus::Resolved);
+        assert_eq!(closed[0].0.end, OrderEnd::Succeeded);
+    }
+
+    /// A buy order of 10 sold into twice: the creator gets every unit; each seller the price
+    /// less the tax at its own rate. A cancel of a partly bought sell order gives back the rest.
+    #[tokio::test]
+    async fn a_buy_order_is_filled_in_parts_and_a_cancel_gives_back_the_rest() {
+        const STACK: u32 = 10;
+        const FIRST_SALE: u32 = 4;
+        let (creator_gets, seller_gets, refund) = with_test_schema(async |pool| {
+            WORLD_MIGRATOR.run(pool).await.expect("migrate");
+            let creator = character(pool, "Wanting").await;
+            let seller = character(pool, "Having").await;
+            let buy = post_order(pool, &order(OrderKind::Buy, creator, STACK))
+                .await
+                .expect("post")
+                .expect("posted");
+            for units in [FIRST_SALE, STACK - FIRST_SALE] {
+                complete_order(pool, buy.id, seller, units, RATE, Uuid::new_v4(), NOW_MS)
+                    .await
+                    .expect("complete")
+                    .expect("completed");
+            }
+            let creator_gets = take_deliveries(pool, &[creator]).await.expect("take");
+            let seller_gets = take_deliveries(pool, &[seller]).await.expect("take");
+            let sell = post_order(pool, &order(OrderKind::Sell, creator, STACK))
+                .await
+                .expect("post")
+                .expect("posted");
+            complete_order(
+                pool,
+                sell.id,
+                seller,
+                FIRST_SALE,
+                RATE,
+                Uuid::new_v4(),
+                NOW_MS,
+            )
+            .await
+            .expect("complete")
+            .expect("completed");
+            take_deliveries(pool, &[creator]).await.expect("take");
+            cancel_order(pool, sell.id, creator, NOW_MS)
+                .await
+                .expect("cancel")
+                .expect("canceled");
+            let refund = take_deliveries(pool, &[creator]).await.expect("take");
+            (creator_gets, seller_gets, refund)
+        })
+        .await;
+        let units: u32 = creator_gets
+            .iter()
+            .filter_map(|taken| taken.delivery.item.as_ref().map(|(_, quantity)| *quantity))
+            .sum();
+        assert_eq!(units, STACK);
+        let first = u64::from(FIRST_SALE) * PRICE;
+        let second = u64::from(STACK - FIRST_SALE) * PRICE;
+        let coins: u64 = seller_gets.iter().map(|taken| taken.delivery.coins).sum();
+        assert_eq!(
+            coins,
+            first - tax_of(first, RATE) + second - tax_of(second, RATE)
+        );
+        assert_eq!(refund.len(), 1);
+        assert_eq!(
+            refund[0].delivery.item,
+            Some(("BeeswaxT1".to_owned(), STACK - FIRST_SALE))
+        );
     }
 
     #[tokio::test]

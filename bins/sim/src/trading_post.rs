@@ -22,10 +22,12 @@ use nw_messages::contracts::{
     ParticipantEvent, reason, status,
 };
 use nw_messages::item_descriptor::ItemDescriptor;
+use nw_world::records::Capital;
 use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::config::SimConfigError;
+use crate::travel_rules::capital_id;
 
 /// Nanoseconds per millisecond: contract times are Unix nanoseconds.
 const NS_PER_MS: u64 = 1_000_000;
@@ -285,6 +287,115 @@ impl TradingCatalog {
     }
 }
 
+/// The slice folder of the settlements' capitals.
+const SETTLEMENT_FOLDER: &str = "structures/settlements/v2_settlements/";
+/// The slice name end of a settlement's capital.
+const SETTLEMENT_SUFFIX: &str = "_complete";
+/// The slice file name start of an outpost's capital.
+const OUTPOST_PREFIX: &str = "outpost_";
+/// Outpost slices that hold no trading post or storage: watchtower camps and the Outpost Rush
+/// layouts.
+const NOT_SETTLEMENT_PREFIXES: [&str; 2] = ["outpost_watchtower", "outpostrush"];
+/// The separators of a slice path.
+const SLICE_PATH_SEPARATORS: [char; 2] = ['/', '\\'];
+
+/// Whether `slice` (a capital's slice path) is a settlement's or an outpost's: the capitals whose
+/// entity ids the trading post and the storage name as their settlement (retail, 22 of 22 ids of
+/// the 5 trading post and storage captures: 13 `Structures/Settlements/V2_Settlements/*_Complete`,
+/// 7 `POI/Outpost/Outpost_*`, 2 generated `Outpost_FirstLight_*`).
+pub fn is_settlement_slice(slice: &str) -> bool {
+    let path = slice.to_ascii_lowercase();
+    let file = path
+        .rsplit(SLICE_PATH_SEPARATORS)
+        .next()
+        .unwrap_or_default();
+    let settlement = path.contains(SETTLEMENT_FOLDER) && path.ends_with(SETTLEMENT_SUFFIX);
+    let outpost = file.starts_with(OUTPOST_PREFIX)
+        && !NOT_SETTLEMENT_PREFIXES
+            .iter()
+            .any(|prefix| file.starts_with(prefix));
+    settlement || outpost
+}
+
+/// The wire form of a settlement id: the capital's entity id ([`capital_id`]) as the `u64` of
+/// its little-endian bytes read big-endian. Retail: contract `outpost` `b325909b3cc6434f` is the
+/// Ebonscale Reach capital `0x4f43c63c9b9025b3`, whose bytes the client also sends in its storage
+/// calls (387) and in a search's settlement filter (`B325909B3CC6434F0000000000000000`).
+pub const fn settlement_wire_id(capital: u64) -> u64 {
+    u64::from_be_bytes(capital.to_le_bytes())
+}
+
+/// The storage of the settlement of wire id `outpost`: the id's bytes and 8 zero bytes, as the
+/// client names the storage it uses (retail `storage_open_deposit_withdraw_transfer` 14.641 s:
+/// the storage interaction's target `6bbf90ec53d9f35f` and 8 zero bytes, the Brimstone outpost).
+pub fn settlement_storage(outpost: u64) -> [u8; nw_messages::wire::RAW_ID_LEN] {
+    let mut storage = [0; nw_messages::wire::RAW_ID_LEN];
+    storage[..size_of::<u64>()].copy_from_slice(&outpost.to_be_bytes());
+    storage
+}
+
+/// A settlement or outpost of the level: its wire id and its capital's place.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Settlement {
+    /// The wire id ([`settlement_wire_id`]).
+    pub id: u64,
+    /// East.
+    pub x: f32,
+    /// North.
+    pub y: f32,
+}
+
+/// The settlements and outposts of the level, which the trading post and the storage name.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Settlements {
+    all: Vec<Settlement>,
+}
+
+impl Settlements {
+    /// The settlements of the level's `capitals` ([`is_settlement_slice`]).
+    pub fn from_capitals(capitals: &[Capital]) -> Self {
+        Self {
+            all: capitals
+                .iter()
+                .filter(|capital| is_settlement_slice(&capital.slice_name))
+                .filter_map(|capital| {
+                    Some(Settlement {
+                        id: settlement_wire_id(capital_id(&capital.id)?),
+                        x: capital.position[0],
+                        y: capital.position[1],
+                    })
+                })
+                .collect(),
+        }
+    }
+
+    /// The settlements of `all`.
+    #[cfg(test)]
+    pub fn of(all: Vec<Settlement>) -> Self {
+        Self { all }
+    }
+
+    /// Whether `outpost` is the wire id of a settlement of the level (an order posted before
+    /// settlements were named carries a territory number instead).
+    pub fn contains(&self, outpost: u64) -> bool {
+        self.all.iter().any(|settlement| settlement.id == outpost)
+    }
+
+    /// The wire id of the settlement whose capital is nearest to `(x, y)`; `None` for a level
+    /// without one. Retail: a trading post's orders and a used storage name the nearest
+    /// settlement's capital (the player 21 m from the Morrowtide capital, 46 m from Ebonscale
+    /// Reach, 15 m from North Windsward, 10 m from the Brimstone outpost; 4 of 4).
+    pub fn nearest(&self, x: f32, y: f32) -> Option<u64> {
+        self.all
+            .iter()
+            .min_by(|a, b| {
+                let distance = |s: &Settlement| (s.x - x).powi(2) + (s.y - y).powi(2);
+                distance(a).total_cmp(&distance(b))
+            })
+            .map(|settlement| settlement.id)
+    }
+}
+
 /// The contract kind of an order kind.
 pub const fn contract_kind(kind: OrderKind) -> ContractKind {
     match kind {
@@ -313,32 +424,83 @@ fn ns(ms: u64) -> u64 {
     ms.saturating_mul(NS_PER_MS)
 }
 
-/// `order` as the contract that character `viewer` sees: its own orders carry their end in
-/// their event (retail: the event's reason on the creator's lists, none on searches) and the
-/// local creator flag.
-pub fn contract_of(order: &Order, viewer: Uuid) -> Contract {
+/// Where a contract is shown, which decides some of its fields.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractView {
+    /// A search answer (2538) or a character's orders (2278): the order as stored.
+    Listed,
+    /// A lookup by id (223).
+    LookedUp,
+    /// A notice of a change (634, 1117, 2965, 2964, 917): the order as the change left it, with
+    /// the version and completion time it had before the change.
+    Notice,
+}
+
+/// The event's completion count of `order` for `viewer` in `view`. Retail (the 4 trading post
+/// captures of the storage and trading post note, 2026-11-01): the units open in each of 6,152
+/// searched contracts and in each open, canceled or expired order of its creator's lists; the
+/// units done in a fully completed one (2278, 2964, 1117); 0 in each lookup by id of another
+/// player's order (13 of 13). After a partial completion the completer's 1117 carried 100 (1 of
+/// 50 bought) and 10,000 (72 of 8,226 sold), which no rule found explains (Unknown); this server
+/// sends the units open there (Inferred, as a search).
+fn completion_count(order: &Order, mine: bool, view: ContractView) -> u32 {
+    if view == ContractView::LookedUp && !mine {
+        0
+    } else if order.status != OrderStatus::Available && order.end == OrderEnd::Succeeded {
+        order.completed_units()
+    } else {
+        order.open
+    }
+}
+
+/// `order` as the contract that character `viewer` sees in `view`. Retail (same captures):
+/// the event's reason is the order's end once it is closed (status 3 or 4), for its creator and
+/// for its completer alike, and none while it is open (every searched and listed open order);
+/// the completion time is set only for a completed order, never for a canceled or expired one
+/// (9 of 9 listed); a notice carries the version before its change (634 v0 then lists v1, a
+/// completion's 1117 and 2964 v1 after lists v1 then lists v2, the proceeds' 1117 v2 then lists
+/// v3, a cancel's 2965 v1 then lists v2) and no completion time for the change that completed
+/// the order (the completer's 1117 and the creator's 2964, done time 0; the lists after it carry
+/// the time).
+pub fn contract_of(order: &Order, viewer: Uuid, view: ContractView) -> Contract {
     let mine = order.creator == viewer;
-    let event_reason = if mine {
+    let closed = order.status != OrderStatus::Available;
+    let event_reason = if closed {
         order.end.value()
     } else {
         OrderEnd::None.value()
+    };
+    let notice = view == ContractView::Notice;
+    let completed_ns = match order.completed_ms {
+        Some(ms)
+            if order.end == OrderEnd::Succeeded
+                && !(notice && order.status == OrderStatus::Completed) =>
+        {
+            ns(ms)
+        }
+        _ => 0,
+    };
+    let version = if notice {
+        order.version.saturating_sub(1)
+    } else {
+        order.version
     };
     let perk_count = u32::try_from(order.item.perks.len()).unwrap_or(u32::MAX);
     let gear_score = u16::try_from(order.item.gear_score).unwrap_or(u16::MAX);
     Contract {
         kind: contract_kind(order.kind),
         id: *order.id.as_bytes(),
-        version: order.version,
+        version,
         status: status_value(order.status),
         created_ns: ns(order.created_ms),
-        completed_ns: order.completed_ms.map_or(0, ns),
+        completed_ns,
         updated_ns: ns(order.updated_ms),
         duration_ns: ns(order.expires_ms.saturating_sub(order.created_ms)),
         visibility: Participant::NONE,
         local_creator: mine,
         events: vec![(
             Participant::NONE,
-            ParticipantEvent::of(event_reason, order.posted),
+            ParticipantEvent::of(event_reason, completion_count(order, mine, view)),
         )],
         item: ContractItemData {
             category: order.item.category.as_bytes().to_vec(),
@@ -383,14 +545,19 @@ pub fn next_page_token(last: &Order) -> Vec<u8> {
     data_encoding::BASE64.encode(text.as_bytes()).into_bytes()
 }
 
-/// The coins and items of `units` of order `order` that a completer pays and brings: a sell
-/// order's buyer pays the total and its tax ([`nw_db::tax_of`] at the order's rate); a buy
-/// order's seller brings the units.
-pub fn completion_cost(order: &Order, units: u32) -> Option<(u64, Option<(String, u32)>)> {
+/// The coins and items of `units` of order `order` that a completer of trading tax
+/// `completer_rate` pays and brings: a sell order's buyer pays the total and its tax
+/// ([`nw_db::tax_of`] at its own rate, as [`nw_db::complete_order`]); a buy order's seller
+/// brings the units.
+pub fn completion_cost(
+    order: &Order,
+    units: u32,
+    completer_rate: f64,
+) -> Option<(u64, Option<(String, u32)>)> {
     let total = order.price.checked_mul(u64::from(units))?;
     Some(match order.kind {
         OrderKind::Sell => (
-            total.checked_add(nw_db::tax_of(total, order.tax_rate))?,
+            total.checked_add(nw_db::tax_of(total, completer_rate))?,
             None,
         ),
         OrderKind::Buy => (0, Some((order.item.item_id.clone(), units))),
@@ -403,6 +570,8 @@ mod tests {
     use nw_messages::wire::{Reader, Writer};
 
     const NOW_MS: u64 = 1_781_457_196_968;
+    /// The trading tax of the retail `buy-sell-TP` character (a standing bonus).
+    const STANDING_TRADING_TAX: f64 = 0.0235;
 
     fn beeswax() -> TradeItem {
         TradeItem {
@@ -443,6 +612,7 @@ mod tests {
         let contract = contract_of(
             &order(OrderKind::Buy, Uuid::from_u128(1)),
             Uuid::from_u128(2),
+            ContractView::Listed,
         );
         assert_eq!(contract.kind, ContractKind::Buy);
         assert!(!contract.local_creator);
@@ -464,12 +634,83 @@ mod tests {
         let mut sold = order(OrderKind::Sell, creator);
         sold.end = OrderEnd::Canceled;
         sold.status = OrderStatus::Resolved;
-        let contract = contract_of(&sold, creator);
+        let contract = contract_of(&sold, creator, ContractView::Listed);
         assert!(contract.local_creator);
         assert_eq!(contract.status, status::RESOLVED);
         assert_eq!(contract.events[0].1.reason, reason::CANCELED);
         let item = contract.sold_item.expect("a sell order's item");
         assert_eq!((item.item_crc, item.quantity), (0xd0a8_26e7, 1));
+    }
+
+    /// The owner's case on the wire: 10 listed, 1 bought. Retail: the units open in searches
+    /// and in the creator's list (`buy-sell-TP` 214.948 s), no reason while open, 0 units in a
+    /// lookup of another player's order (219.826 s) and the version before the change in the
+    /// completer's 1117 (`tradepost_post_sell_cancel_buyorder_sellorder` 22.292 s: v2, status 0,
+    /// 49 of 50 left).
+    #[test]
+    fn a_partly_bought_order_shows_the_units_left_everywhere() {
+        let seller = Uuid::from_u128(1);
+        let buyer = Uuid::from_u128(2);
+        let mut listed = order(OrderKind::Sell, seller);
+        listed.posted = 10;
+        listed.open = 9;
+        listed.version = 3;
+        listed.end = OrderEnd::Succeeded;
+        for (viewer, view) in [
+            (buyer, ContractView::Listed),
+            (seller, ContractView::Listed),
+            (buyer, ContractView::Notice),
+        ] {
+            let contract = contract_of(&listed, viewer, view);
+            assert_eq!(contract.quantity, 9);
+            assert_eq!(contract.sold_item.map(|item| item.quantity), Some(9));
+            assert_eq!(contract.events[0].1.completion_count, 9);
+            assert_eq!(contract.events[0].1.reason, reason::NONE);
+        }
+        assert_eq!(
+            contract_of(&listed, buyer, ContractView::LookedUp).events[0]
+                .1
+                .completion_count,
+            0
+        );
+        assert_eq!(contract_of(&listed, buyer, ContractView::Notice).version, 2);
+        assert_eq!(contract_of(&listed, buyer, ContractView::Listed).version, 3);
+    }
+
+    /// The rest bought: retail `buy-sell-TP` 222.892 s (the completer's 1117: status 3, reason 1,
+    /// the units done, no completion time, the version before) and 248.487 s (the creator's list
+    /// after the proceeds: status 4 with the completion time).
+    #[test]
+    fn a_fully_bought_order_shows_its_units_done_and_its_end() {
+        let seller = Uuid::from_u128(1);
+        let buyer = Uuid::from_u128(2);
+        let mut done = order(OrderKind::Sell, seller);
+        done.posted = 10;
+        done.open = 0;
+        done.version = 4;
+        done.end = OrderEnd::Succeeded;
+        done.status = OrderStatus::Completed;
+        done.completed_ms = Some(NOW_MS);
+        let notice = contract_of(&done, buyer, ContractView::Notice);
+        assert_eq!(notice.status, status::COMPLETED);
+        assert_eq!(notice.events[0].1.reason, reason::SUCCEEDED);
+        assert_eq!(notice.events[0].1.completion_count, 10);
+        assert_eq!(notice.completed_ns, 0);
+        assert_eq!(notice.version, 3);
+        assert_eq!(notice.quantity, 0);
+        done.status = OrderStatus::Resolved;
+        let listed = contract_of(&done, seller, ContractView::Listed);
+        assert_eq!(listed.completed_ns, NOW_MS * NS_PER_MS);
+        assert_eq!(listed.events[0].1.completion_count, 10);
+        let mut canceled = done.clone();
+        canceled.end = OrderEnd::Canceled;
+        canceled.open = 3;
+        let listed = contract_of(&canceled, seller, ContractView::Listed);
+        assert_eq!(
+            listed.completed_ns, 0,
+            "retail: no time on a canceled order"
+        );
+        assert_eq!(listed.events[0].1.completion_count, 3);
     }
 
     #[test]
@@ -505,10 +746,18 @@ mod tests {
     #[test]
     fn a_buyer_pays_the_total_and_its_tax() {
         let sell = order(OrderKind::Sell, Uuid::from_u128(1));
-        assert_eq!(completion_cost(&sell, 1), Some((10_500, None)));
+        assert_eq!(
+            completion_cost(&sell, 1, RETAIL_TRADING_TAX),
+            Some((10_500, None))
+        );
+        // Retail `buy-sell-TP` 221.764 s: 2 at 10,000 cost a buyer of rate 2.35 % 20,470.
+        assert_eq!(
+            completion_cost(&sell, 2, STANDING_TRADING_TAX),
+            Some((20_470, None))
+        );
         let buy = order(OrderKind::Buy, Uuid::from_u128(1));
         assert_eq!(
-            completion_cost(&buy, 1),
+            completion_cost(&buy, 1, RETAIL_TRADING_TAX),
             Some((0, Some(("BeeswaxT1".to_owned(), 1))))
         );
     }
@@ -524,6 +773,88 @@ mod tests {
                 NOW_MS + 3 * MS_PER_DAY
             )
         );
+    }
+
+    /// A capital of the level at `(x, y)`.
+    fn capital(guid: &str, x: f32, y: f32, slice: &str) -> Capital {
+        Capital {
+            id: guid.to_owned(),
+            position: [x, y, 0.0],
+            rotation: [0.0, 0.0, 0.0, 1.0],
+            scale: None,
+            slice_name: slice.to_owned(),
+            variant_name: None,
+            slice_asset_id: String::new(),
+        }
+    }
+
+    /// The retail settlement ids and the capitals of the level file that make them (outposts
+    /// probe of the storage and trading post note, 2026-11-01): Ebonscale Reach is the outpost
+    /// of the `buy-sell-TP` and `Hivesellandbuyorder` orders, Morrowtide of the orders of
+    /// `tradepost_post_sell_cancel_buyorder_sellorder`, the Brimstone outpost the storage of
+    /// `storage_open_deposit_withdraw_transfer`; each player stood nearest to that capital.
+    #[test]
+    fn a_trading_post_names_the_nearest_settlements_retail_id() {
+        const EBONSCALE: u64 = 0xb325_909b_3cc6_434f;
+        const MORROWTIDE: u64 = 0x63e5_ce00_1ef4_6668;
+        const BRIMSTONE_OUTPOST: u64 = 0x6bbf_90ec_53d9_f35f;
+        let settlements = Settlements::from_capitals(&[
+            capital(
+                "1883e77a-123e-9781-57c0-214689aeb235",
+                7292.633,
+                5374.028,
+                "Structures/Settlements/V2_Settlements/Ebonscale_Reach_Settlement_Complete",
+            ),
+            capital(
+                "f0359664-e376-3f5e-9853-627ae3b8da3d",
+                13177.792,
+                6974.558,
+                "Structures/Settlements/V2_Settlements/Settlement_Morrowtide_Complete",
+            ),
+            capital(
+                "4590ff67-957f-3867-1a63-263479ef870b",
+                7731.22,
+                7203.719,
+                "POI/Outpost/Outpost_Brimstone_A",
+            ),
+            capital(
+                "7df376b2-a316-3687-bd77-5b459cf1192a",
+                7300.0,
+                5380.0,
+                "Structures/Settlements/V2_Settlements/Settlement_Station_Kiln_Master",
+            ),
+        ]);
+        assert_eq!(settlements.nearest(7252.04, 5396.73), Some(EBONSCALE));
+        assert_eq!(settlements.nearest(13158.09, 6966.27), Some(MORROWTIDE));
+        assert_eq!(
+            settlements.nearest(7727.03, 7193.73),
+            Some(BRIMSTONE_OUTPOST)
+        );
+        assert!(settlements.contains(EBONSCALE) && !settlements.contains(2));
+        assert_eq!(Settlements::default().nearest(0.0, 0.0), None);
+        assert_eq!(settlement_wire_id(0x4f43_c63c_9b90_25b3), EBONSCALE);
+        let mut storage = [0; nw_messages::wire::RAW_ID_LEN];
+        storage[..8].copy_from_slice(&[0x6b, 0xbf, 0x90, 0xec, 0x53, 0xd9, 0xf3, 0x5f]);
+        assert_eq!(settlement_storage(BRIMSTONE_OUTPOST), storage);
+    }
+
+    #[test]
+    fn settlement_and_outpost_capitals_are_told_from_the_rest() {
+        for slice in [
+            "Structures/Settlements/V2_Settlements/Shanty_WeaversFen_Complete",
+            "POI/Outpost/Outpost_T3_B_Sanctuary_VLG",
+            "CoatGen\\1d6a7490\\Outpost_FirstLight_A_491652771.dynamicslice",
+        ] {
+            assert!(is_settlement_slice(slice), "{slice}");
+        }
+        for slice in [
+            "Structures/Settlements/V2_Settlements/Settlement_Station_Kiln_Master",
+            "CoatGen\\x\\Outpost_Watchtower_C_06_Windsward_1.dynamicslice",
+            "POIs/OutpostRush/OutpostRush_Layout_00",
+            "Zone_CapitalPlot_NoSettlement_Master",
+        ] {
+            assert!(!is_settlement_slice(slice), "{slice}");
+        }
     }
 
     #[test]
