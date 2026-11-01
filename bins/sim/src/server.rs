@@ -1060,6 +1060,10 @@ impl Loop {
     /// Runs the economy jobs of the world, each in its own task (economy module).
     fn run_economy_jobs(&mut self) {
         for job in self.world.take_economy_jobs() {
+            let movers = job.movers();
+            for departure in self.world.positions_of(&movers) {
+                self.save(&departure);
+            }
             let db = self.db.clone();
             self.economy_jobs
                 .spawn(async move { run_job(&db, job).await });
@@ -1092,7 +1096,13 @@ impl Loop {
     /// Gives the answer of an economy job to the world.
     fn economy_done(&mut self, done: Result<Option<EconomyResult>, tokio::task::JoinError>) {
         match done {
-            Ok(Some(result)) => self.world.economy_done(result),
+            Ok(Some(result)) => {
+                let movers = result.movers();
+                self.world.economy_done(result);
+                for departure in self.world.positions_of(&movers) {
+                    self.save(&departure);
+                }
+            }
             Ok(None) => {}
             Err(error) => tracing::error!(%error, "economy job task failed"),
         }

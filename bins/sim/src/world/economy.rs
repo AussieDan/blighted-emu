@@ -230,6 +230,49 @@ pub enum EconomyJob {
     },
 }
 
+impl EconomyResult {
+    /// The characters whose coins or items the answer moves in this sim (a buy or a cancel
+    /// that the database took, the deliveries it gave out): their state is saved at once after
+    /// it, so a sim that stops before its next save round cannot lose what the database gave.
+    pub fn movers(&self) -> Vec<Uuid> {
+        match self {
+            Self::Posted { caller, .. }
+            | Self::Completed { caller, .. }
+            | Self::Canceled { caller, .. } => vec![caller.character],
+            Self::Taken { characters, .. } => characters.clone(),
+            Self::ShopClaimed { claim, .. } => vec![claim.character],
+            Self::Searched { .. }
+            | Self::Found { .. }
+            | Self::Listed { .. }
+            | Self::Inspected { .. } => Vec::new(),
+        }
+    }
+}
+
+impl EconomyJob {
+    /// The characters whose coins or items this sim moved for the job before the database has
+    /// it (a post, a buy, a cancel, a delivery taken, a player trade, a shop claim): their state
+    /// is saved at once, so a sim that stops before its next save round cannot give the goods
+    /// back to a player whose order or trade the database keeps.
+    pub fn movers(&self) -> Vec<Uuid> {
+        match self {
+            Self::Post { caller, .. }
+            | Self::Complete { caller, .. }
+            | Self::Cancel { caller, .. } => {
+                vec![caller.character]
+            }
+            Self::Take { characters } => characters.clone(),
+            Self::RecordTrade { first, second } => vec![first.character, second.character],
+            Self::ClaimShop { claim } | Self::ReleaseShop { claim, .. } => vec![claim.character],
+            Self::Search { .. }
+            | Self::Lookup { .. }
+            | Self::CharacterLookup { .. }
+            | Self::Inspect { .. }
+            | Self::Return { .. } => Vec::new(),
+        }
+    }
+}
+
 /// A shop purchase whose offer has a cooldown, while its claim runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShopClaim {
@@ -2132,6 +2175,63 @@ mod tests {
     use nw_content::generated::ItemCurrencyConversionData;
     use nw_content::progression::{Progression, ProgressionSource};
     use nw_messages::contracts::Participant;
+
+    #[test]
+    fn the_jobs_and_answers_that_move_goods_name_their_players_for_a_save() {
+        let buyer = Uuid::from_u128(1);
+        let seller = Uuid::from_u128(2);
+        let caller = Caller {
+            connection: crate::world::tests::connection(1),
+            character: buyer,
+            header: FacetHeader::of(0, 0),
+            request: [0; RAW_ID_LEN],
+        };
+        let side = |character| TradeSide {
+            character,
+            coins: 100,
+            items: Vec::new(),
+        };
+        assert_eq!(
+            EconomyJob::RecordTrade {
+                first: side(buyer),
+                second: side(seller)
+            }
+            .movers(),
+            [buyer, seller]
+        );
+        assert_eq!(
+            EconomyJob::Take {
+                characters: vec![seller]
+            }
+            .movers(),
+            [seller]
+        );
+        assert_eq!(
+            EconomyJob::Cancel {
+                caller: caller.clone(),
+                order: Uuid::from_u128(3),
+            }
+            .movers(),
+            [buyer]
+        );
+        assert!(
+            EconomyJob::Lookup {
+                caller: caller.clone(),
+                ids: Vec::new(),
+            }
+            .movers()
+            .is_empty(),
+            "a look-up moves nothing"
+        );
+        assert_eq!(
+            EconomyResult::Taken {
+                characters: vec![seller],
+                taken: Ok(Vec::new()),
+            }
+            .movers(),
+            [seller]
+        );
+    }
 
     #[test]
     fn a_search_query_becomes_an_order_search() {

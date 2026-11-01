@@ -2162,12 +2162,25 @@ impl SimWorld {
     /// Every player's character and position, for the periodic save, with the items that
     /// changed since the last save.
     pub fn positions(&mut self) -> Vec<Departure> {
+        self.positions_where(|_| true)
+    }
+
+    /// The departures of the players of `characters` with what changed since their last save
+    /// ([`SimWorld::positions`]).
+    pub fn positions_of(&mut self, characters: &[Uuid]) -> Vec<Departure> {
+        self.positions_where(|character| characters.contains(&character))
+    }
+
+    /// The departures of the players whose character `picked` picks, with what changed since
+    /// their last save.
+    fn positions_where(&mut self, picked: impl Fn(Uuid) -> bool) -> Vec<Departure> {
         let saves = !self.is_tutorial();
         let quests = &self.quests;
         let now_ms = self.last_now_ms;
         let mut query = self.world.query::<(&mut Player, &Body)>();
         query
             .iter_mut(&mut self.world)
+            .filter(|(player, _)| picked(player.character))
             .map(|(mut player, body)| {
                 let items = player
                     .gear
