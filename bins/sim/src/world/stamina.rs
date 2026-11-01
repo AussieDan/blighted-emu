@@ -156,8 +156,8 @@ impl Stamina {
     }
 
     /// One server tick at `now_ms`: the second start of a dodge's delay, the delay counting down,
-    /// or regen.
-    pub(super) fn tick(&mut self, now_ms: u64) {
+    /// or regen at `regen_scale` times the plain rate (the held effects' `StaminaRate`).
+    pub(super) fn tick(&mut self, now_ms: u64, regen_scale: f32) {
         let elapsed_ms = self
             .last_tick_ms
             .map_or(0, |last| now_ms.saturating_sub(last));
@@ -175,7 +175,7 @@ impl Stamina {
         }
         if self.cur < MAX_STAMINA && !self.block_held {
             #[allow(clippy::cast_precision_loss, reason = "a tick is a few ms")]
-            let step = REGEN_PER_SECOND * elapsed_ms as f32 / MS_PER_SECOND;
+            let step = REGEN_PER_SECOND * regen_scale * elapsed_ms as f32 / MS_PER_SECOND;
             self.cur = (self.cur + step).min(MAX_STAMINA);
             self.change.cur = Some(self.cur);
             // Retail sends `regen` 0 once more with the first step.
@@ -203,6 +203,7 @@ mod tests {
 
     const NOW: u64 = 10_000;
     const TICK: u64 = 33;
+    const PLAIN_REGEN: f32 = 1.0;
     const CLOSE: f32 = 0.01;
 
     fn change(cur: Option<f32>, regen: Option<f32>) -> Option<StaminaState> {
@@ -217,7 +218,7 @@ mod tests {
     fn run(stamina: &mut Stamina, from: u64, to: u64) -> u64 {
         let mut now = from;
         while now < to {
-            stamina.tick(now);
+            stamina.tick(now, PLAIN_REGEN);
             stamina.take_change();
             now += TICK;
         }
@@ -227,21 +228,21 @@ mod tests {
     #[test]
     fn a_land_dodge_takes_45_and_starts_the_delay_twice() {
         let mut stamina = Stamina::default();
-        stamina.tick(NOW);
+        stamina.tick(NOW, PLAIN_REGEN);
         assert!(stamina.dodge(Dodge::Roll, NOW));
         assert_eq!(
             stamina.take_change(),
             change(Some(55.0), Some(1.0)),
             "retail 01 09"
         );
-        stamina.tick(NOW + TICK);
+        stamina.tick(NOW + TICK, PLAIN_REGEN);
         assert_eq!(
             stamina.take_change(),
             change(None, Some(0.967)),
             "retail 01 08"
         );
         let now = run(&mut stamina, NOW + 2 * TICK, NOW + DODGE_RESTART_MS);
-        stamina.tick(now);
+        stamina.tick(now, PLAIN_REGEN);
         assert_eq!(
             stamina.take_change(),
             change(None, Some(1.0)),
@@ -249,39 +250,61 @@ mod tests {
         );
         let now = run(&mut stamina, now + TICK, now + REGEN_DELAY_MS);
         assert_eq!(stamina.current(), 55.0, "no regen during the delay");
-        stamina.tick(now);
+        stamina.tick(now, PLAIN_REGEN);
         assert_eq!(
             stamina.take_change(),
             change(None, Some(0.0)),
             "retail 01 08 0"
         );
-        stamina.tick(now + TICK);
+        stamina.tick(now + TICK, PLAIN_REGEN);
         let first = stamina.take_change().expect("first step");
         assert_eq!(first.regen, Some(0.0), "retail 01 09 cur 0");
         assert!((first.cur.expect("cur") - 56.1).abs() < CLOSE);
-        stamina.tick(now + 2 * TICK);
+        stamina.tick(now + 2 * TICK, PLAIN_REGEN);
         assert_eq!(stamina.take_change().and_then(|state| state.regen), None);
         run(&mut stamina, now + 3 * TICK, now + 3 * MS_PER_SECOND as u64);
         assert_eq!(stamina.current(), MAX_STAMINA, "full and no higher");
-        stamina.tick(now + 4 * MS_PER_SECOND as u64);
+        stamina.tick(now + 4 * MS_PER_SECOND as u64, PLAIN_REGEN);
         assert_eq!(stamina.take_change(), None, "nothing to send when full");
+    }
+
+    #[test]
+    fn an_exhaust_effect_slows_the_regen_by_its_stamina_rate() {
+        const EXHAUSTED: f32 = 0.85;
+        let mut plain = Stamina::default();
+        let mut exhausted = Stamina::default();
+        for stamina in [&mut plain, &mut exhausted] {
+            stamina.tick(NOW, PLAIN_REGEN);
+            assert!(stamina.dodge(Dodge::Roll, NOW));
+        }
+        let after_delay = NOW + DODGE_RESTART_MS + REGEN_DELAY_MS + 2 * TICK;
+        let end = after_delay + MS_PER_SECOND as u64;
+        let mut now = NOW + TICK;
+        while now < end {
+            plain.tick(now, PLAIN_REGEN);
+            exhausted.tick(now, EXHAUSTED);
+            now += TICK;
+        }
+        let gained = |stamina: &Stamina| stamina.current() - (MAX_STAMINA - DODGE_STAMINA);
+        assert!(gained(&plain) > 0.0);
+        assert!((gained(&exhausted) - gained(&plain) * EXHAUSTED).abs() < CLOSE);
     }
 
     #[test]
     fn a_swim_dash_takes_50_and_starts_the_delay_once() {
         let mut stamina = Stamina::default();
-        stamina.tick(NOW);
+        stamina.tick(NOW, PLAIN_REGEN);
         assert!(stamina.dodge(Dodge::SwimDash, NOW));
         assert_eq!(stamina.take_change(), change(Some(50.0), Some(1.0)));
         let now = run(&mut stamina, NOW + TICK, NOW + REGEN_DELAY_MS + TICK);
-        stamina.tick(now);
+        stamina.tick(now, PLAIN_REGEN);
         assert!(stamina.current() > 50.0, "regen runs after one delay only");
     }
 
     #[test]
     fn a_dodge_needs_stamina_above_zero_and_takes_at_most_all() {
         let mut stamina = Stamina::default();
-        stamina.tick(NOW);
+        stamina.tick(NOW, PLAIN_REGEN);
         assert!(stamina.dodge(Dodge::Roll, NOW));
         stamina.take_change();
         assert!(stamina.dodge(Dodge::Roll, NOW + TICK), "55 is enough");
@@ -299,7 +322,7 @@ mod tests {
     #[test]
     fn a_blocked_hit_takes_its_loss_and_a_release_starts_the_delay() {
         let mut stamina = Stamina::default();
-        stamina.tick(NOW);
+        stamina.tick(NOW, PLAIN_REGEN);
         assert_eq!(stamina.blocked_hit(25.55), Guard::Held);
         let hit = stamina.take_change().expect("hit");
         assert!((hit.cur.expect("cur") - 74.45).abs() < CLOSE, "retail");
@@ -323,7 +346,7 @@ mod tests {
     fn no_regen_runs_while_the_block_key_is_held() {
         // Retail newchar: `cur` stayed 54.79 from 418195 to 421256 with block held.
         let mut stamina = Stamina::default();
-        stamina.tick(NOW);
+        stamina.tick(NOW, PLAIN_REGEN);
         stamina.blocked_hit(45.0);
         stamina.hold_block(true);
         let now = run(&mut stamina, NOW + TICK, NOW + 3 * REGEN_DELAY_MS);

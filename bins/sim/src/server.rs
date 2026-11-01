@@ -1262,7 +1262,11 @@ impl Loop {
                 hit.target,
                 hit.attacker,
                 hit.amount,
-                (block_stamina, hit.ranged),
+                crate::world::Blow {
+                    stamina: block_stamina,
+                    ranged: hit.ranged,
+                    blockable: !hit.unblockable,
+                },
                 now_ms,
             ),
             None => self

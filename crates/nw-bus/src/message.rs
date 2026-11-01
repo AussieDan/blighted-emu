@@ -1012,6 +1012,9 @@ pub struct Hit {
     /// A mob's hit by a projectile (only a weapon with `CanBlockRanged` blocks it).
     #[serde(default)]
     pub ranged: bool,
+    /// A mob's hit that no block stops (its row is `Unblockable` or not `CanBeBlocked`).
+    #[serde(default)]
+    pub unblockable: bool,
 }
 
 /// Thousandths per unit of [`Hit::block_stamina_milli`].
@@ -1730,6 +1733,7 @@ mod tests {
             threat: 43,
             block_stamina_milli: None,
             ranged: false,
+            unblockable: false,
         });
         round_trip(Hit {
             target: CONNECTION,
@@ -1739,6 +1743,7 @@ mod tests {
             threat: 0,
             block_stamina_milli: Some(16_500),
             ranged: true,
+            unblockable: true,
         });
     }
 

@@ -218,15 +218,19 @@ impl Attributes {
     }
 }
 
-/// The max health of a player of `experience` with `attributes` and the base health `base`.
+/// The max health of a player of `experience` with `attributes`, `bonus` more Constitution
+/// (from its held effects: food) and the base health `base`.
 fn max_health(
     progression: &Progression,
     base: u32,
     experience: u32,
     attributes: &Attributes,
+    bonus: u32,
 ) -> u32 {
     let level = progression.level_of(experience);
-    let constitution = attributes.value(&progression.points, CONSTITUTION);
+    let constitution = attributes
+        .value(&progression.points, CONSTITUTION)
+        .saturating_add(bonus);
     player_max_health(
         base,
         level,
@@ -242,11 +246,13 @@ impl SimWorld {
             self.combat.data.player_base_health(),
             experience,
             &Attributes::of(spent, FIRST_VERSION),
+            0,
         )
     }
 
-    /// Moves each player's max health to its level and Constitution: after a level up, a spend
-    /// and a refund (the vitals change goes with the next bundle).
+    /// Moves each player's max health to its level and Constitution: after a level up, a spend,
+    /// a refund and a food that adds Constitution (`MODConstitution`; the vitals change goes with
+    /// the next bundle).
     pub(super) fn tick_max_health(&mut self) {
         let content = std::sync::Arc::clone(&self.content);
         let base = self.combat.data.player_base_health();
@@ -257,6 +263,9 @@ impl SimWorld {
                 base,
                 player.experience,
                 &player.attributes,
+                player
+                    .status_effects
+                    .attribute_bonus(&content.status_effects, CONSTITUTION as usize),
             );
             if vitals.health.max() != max {
                 vitals.health.set_max(max);
@@ -915,6 +924,53 @@ mod tests {
                 max_changes(&mut world, later, STATE_TICKS).is_empty(),
                 "no change"
             );
+        }
+
+        #[test]
+        fn a_food_that_adds_constitution_raises_the_max_health_while_it_is_held() {
+            use nw_content::status_effects::{
+                EffectSourceRow, StatusEffectRules, StatusEffectSource,
+            };
+            const FOOD: &str = "FoodCONT1";
+            let mut world = world();
+            let mut content = (*world.content).clone();
+            content.status_effects = StatusEffectRules::build(StatusEffectSource {
+                effects: vec![EffectSourceRow {
+                    status_id: FOOD.to_owned(),
+                    attribute_mods: [Some(5), None, None, None, None],
+                    ..EffectSourceRow::default()
+                }],
+                damage_types: Vec::new(),
+                hit_effects: Vec::new(),
+            });
+            world.content = Arc::new(content);
+            let base = world.combat.data.player_base_health();
+            let at_level = base + LEVEL_TWO_HEALTH;
+            let entity = world.player_by_number(PLAYER).expect("player");
+            let rules = world.content.status_effects.clone();
+            let crc = rules.by_id(FOOD).expect("food").crc;
+            let held = |world: &mut SimWorld, hold: bool| {
+                let mut player = world.world.get_mut::<Player>(entity).expect("player");
+                if hold {
+                    assert!(
+                        player
+                            .status_effects
+                            .add_by_id(&rules, FOOD, 1.0, PLAYER, NOW)
+                    );
+                } else {
+                    player.status_effects.remove(crc);
+                }
+            };
+            held(&mut world, true);
+            world.tick_max_health();
+            assert_eq!(
+                health(&mut world).1,
+                at_level + 200,
+                "5 more Constitution: 10"
+            );
+            held(&mut world, false);
+            world.tick_max_health();
+            assert_eq!(health(&mut world).1, at_level, "back when it ends");
         }
     }
 }

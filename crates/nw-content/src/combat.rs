@@ -192,6 +192,29 @@ pub struct AffixDamage {
     pub damage_type: u8,
 }
 
+/// The `Category` of a `DamageTypeData` row: which armor takes a hit of the type off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DamageCategory {
+    /// `True` (`True`, `Falling`, `Brimstone`): no armor.
+    True,
+    /// `Physical` (`Standard`, `Slash`, `Thrust`, `Strike`, `PhysFire`, `Siege`).
+    #[default]
+    Physical,
+    /// `Elemental` (`Arcane`, `Fire`, `Lightning`, `Corruption`, `Ice`, `Nature`, `Acid`).
+    Elemental,
+}
+
+impl DamageCategory {
+    /// The category of a `Category` cell.
+    fn of(cell: &str) -> Self {
+        match cell {
+            "True" => Self::True,
+            "Elemental" => Self::Elemental,
+            _ => Self::Physical,
+        }
+    }
+}
+
 /// One attack of `DamageData`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AttackRow {
@@ -210,6 +233,10 @@ pub struct AttackRow {
     /// `BlockStaminaDmgMod`: multiplies the attacker weapon's `BlockStaminaDamage` when a blocker
     /// takes the hit; 0 without a number.
     pub block_stamina_mod: f64,
+    /// Whether a block stops it: not `Unblockable` and not `CanBeBlocked` false.
+    pub blockable: bool,
+    /// The `Category` of its damage type (physical when the row names none).
+    pub category: DamageCategory,
     /// The extra damage of its first affix with one (`Affixes`, `AffixStatData`).
     pub affix: Option<AffixDamage>,
 }
@@ -268,6 +295,12 @@ impl CombatSource {
             .iter()
             .flat_map(|table| &table.rows)
             .filter_map(|row| Some((row.type_id.as_str(), u8::try_from(row.int_id).ok()?)))
+            .collect();
+        let categories: HashMap<&str, DamageCategory> = tables
+            .damage_type_data
+            .iter()
+            .flat_map(|table| &table.rows)
+            .map(|row| (row.type_id.as_str(), DamageCategory::of(&row.category)))
             .collect();
         let affixes: HashMap<&str, AffixDamage> = tables
             .affix_stat_data
@@ -430,6 +463,14 @@ impl CombatSource {
                         .as_deref()
                         .and_then(|cell| cell.trim().parse().ok())
                         .unwrap_or(0.0),
+                    // 145 rows are `Unblockable` (boss wipes, howls, spells) and 5 not
+                    // `CanBeBlocked` (the admiral's cannon storm).
+                    blockable: row.unblockable != Some(true) && row.can_be_blocked != Some(false),
+                    category: row
+                        .damage_type
+                        .as_deref()
+                        .and_then(|name| categories.get(name).copied())
+                        .unwrap_or_default(),
                     affix: row.affixes.as_deref().and_then(|cell| {
                         cell.split(AFFIX_SEPARATOR)
                             .find_map(|affix| affixes.get(affix.trim()).copied())
@@ -977,6 +1018,8 @@ mod tests {
         let warhammer = 27.0;
         let row = |mod_: f64| AttackRow {
             block_stamina_mod: mod_,
+            blockable: true,
+            category: DamageCategory::Physical,
             ..source().attacks[0].clone()
         };
         let weapon = |damage: f64| WeaponRow {
@@ -1104,6 +1147,8 @@ mod tests {
                     damage_type: None,
                     table: PLAYER_TABLE.to_owned(),
                     block_stamina_mod: 0.0,
+                    blockable: true,
+                    category: DamageCategory::Physical,
                     affix: None,
                 })
                 .to_vec(),

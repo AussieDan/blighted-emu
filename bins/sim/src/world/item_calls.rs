@@ -136,14 +136,20 @@ impl ItemEffects {
 }
 
 /// Changes `vitals` and `stamina` by `effect` times `scale` (the multiple the user's held
-/// effects give it, [`super::status_effects`]), at most to their maximum: the health it gave.
-fn apply(effect: &VitalsEffect, scale: f64, vitals: &mut Vitals, stamina: &mut Stamina) -> u32 {
+/// effects give it, [`super::status_effects`]), its heal also times `heal_scale` (the held
+/// `HealMod`s and `ConsumableHealMod`s), at most to their maximum: the health it gave.
+fn apply(
+    effect: &VitalsEffect,
+    (scale, heal_scale): (f64, f64),
+    vitals: &mut Vitals,
+    stamina: &mut Stamina,
+) -> u32 {
     if vitals.health.is_dead() {
         return 0;
     }
     let max = f64::from(vitals.health.max());
     // The heal is a few times the max health plus a flat amount of a few thousand.
-    let amount = ((effect.health + effect.health_share * max) * scale)
+    let amount = ((effect.health + effect.health_share * max) * scale * heal_scale)
         .max(0.0)
         .round() as u32;
     // Stamina values of a few dozen.
@@ -505,12 +511,14 @@ impl SimWorld {
         }
         let rules = &self.content.status_effects;
         let Some((mut stamina, scales)) = self.world.get::<Player>(entity).map(|player| {
-            let scales: Vec<f64> = effects
+            let heal_scale = player.status_effects.heal_scale(rules, true);
+            let scales: Vec<(f64, f64)> = effects
                 .iter()
                 .map(|effect| {
-                    player
+                    let potency = player
                         .status_effects
-                        .potency_scale(rules, &effect.status_id)
+                        .potency_scale(rules, &effect.status_id);
+                    (potency, heal_scale)
                 })
                 .collect();
             (player.stamina, scales)
@@ -539,7 +547,13 @@ impl SimWorld {
                 let scale = player
                     .status_effects
                     .potency_scale(rules, &effect.status_id);
-                apply(&effect, scale, &mut vitals, &mut player.stamina);
+                let heal_scale = player.status_effects.heal_scale(rules, true);
+                apply(
+                    &effect,
+                    (scale, heal_scale),
+                    &mut vitals,
+                    &mut player.stamina,
+                );
             }
         }
     }

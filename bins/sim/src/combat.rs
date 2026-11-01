@@ -171,7 +171,8 @@ pub struct CombatSettings {
 #[cfg(any(test, feature = "test-util"))]
 pub mod test_support {
     use nw_content::combat::{
-        AttackRow, CombatData, CombatRows, CombatSource, LevelRow, MobType, WeaponRow,
+        AttackRow, CombatData, CombatRows, CombatSource, DamageCategory, LevelRow, MobType,
+        WeaponRow,
     };
     use nw_content::player_attacks::{AttackKind, PlayerAttacks, stance_key};
 
@@ -274,6 +275,8 @@ pub mod test_support {
             damage_type: None,
             table: crate::mob_ai::test_support::TEST_MOB_TABLE.to_owned(),
             block_stamina_mod: 0.0,
+            blockable: true,
+            category: DamageCategory::Physical,
             affix: None,
         }
     }
@@ -302,6 +305,8 @@ pub mod test_support {
                 damage_type: None,
                 table: table.to_owned(),
                 block_stamina_mod: 0.0,
+                blockable: true,
+                category: DamageCategory::Physical,
                 affix: None,
             })
             .collect()

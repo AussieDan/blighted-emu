@@ -19,7 +19,7 @@ use bevy_ecs::entity::Entity;
 use nw_bus::{EffectRepeat, PlayerStatusEffect};
 use nw_content::item_rules::Consumable;
 use nw_content::perk_effects::PerkEffects;
-use nw_content::status_effects::{RowKey, StatusEffectRule, StatusEffectRules};
+use nw_content::status_effects::{Control, RowKey, StatusEffectRule, StatusEffectRules};
 use nw_messages::{
     BundleMember, DamageDealtMsg, DamageItem, EffectMap, HIT_TAG, LocalEffect, MemberState,
     NEUTRAL_SCALE, OnDamageMsg, RemoteEffect, STATUS_EFFECTS_COMPONENT, ServerMessage,
@@ -310,7 +310,7 @@ impl StatusEffects {
                 added_ms: now_ms,
                 ends_ms,
                 potency: application.potency,
-                stacks: 1,
+                stacks: rule.initial_stacks.unwrap_or(1).min(rule.stack_max),
                 applications: 1,
                 next_tick_ms: rule
                     .tick_ms
@@ -471,18 +471,30 @@ impl StatusEffects {
         self.changed |= self.held.len() != before;
     }
 
-    /// The holder is `dead` now: a death ends the effects with `RemoveOnDeath`, a new life those
-    /// with `RemoveOnRespawn`.
-    pub(super) fn set_dead(&mut self, rules: &StatusEffectRules, dead: bool) {
+    /// The holder is `dead` now, at server time `now_ms`: a death ends the effects with
+    /// `RemoveOnDeath` and adds the `OnDeathStatusEffect`s of the held ones, a new life ends
+    /// those with `RemoveOnRespawn`.
+    pub(super) fn set_dead(&mut self, rules: &StatusEffectRules, dead: bool, now_ms: u64) {
         if dead == self.dead {
             return;
         }
-        self.dead = dead;
         if dead {
+            // The effects a death adds (`OnDeathStatusEffect`) come from the effects held at it,
+            // and go on while the holder still counts as alive.
+            let added: Vec<(u32, u64)> = self
+                .held
+                .iter()
+                .filter_map(|held| Some((rules.get(held.crc)?, held.source)))
+                .flat_map(|(rule, source)| rule.on_death.iter().map(move |crc| (*crc, source)))
+                .collect();
             self.remove_where(rules, |rule| rule.remove_on_death);
+            for (crc, source) in added {
+                self.add(rules, crc, Application::plain(source), now_ms);
+            }
         } else {
             self.remove_where(rules, |rule| rule.remove_on_respawn);
         }
+        self.dead = dead;
     }
 
     /// The vitals changes due at server time `now_ms` for a holder of `max_health`, the effects
@@ -496,6 +508,10 @@ impl StatusEffects {
     ) -> Vec<VitalsTick> {
         let mut changes = Vec::new();
         let mut follow_ups: Vec<(u32, u64)> = Vec::new();
+        // A heal is scaled by the held `HealMod`s, the out-of-combat regen also by the
+        // `HealthRate`s (and stops under `NoHealthRegen`).
+        let heal_scale = self.heal_scale(rules, false);
+        let regen_scale = heal_scale * self.health_regen_scale(rules);
         for index in 0..self.held.len() {
             let held = &self.held[index];
             let Some(rule) = rules.get(held.crc) else {
@@ -509,12 +525,18 @@ impl StatusEffects {
             let (source, origin, hit_amount) = (held.source, held.origin, held.hit_amount);
             while next_ms <= now_ms && ends_ms.is_none_or(|ends| next_ms <= ends) {
                 if origin == Origin::World && rule.changes_vitals() {
+                    let health = (rule.health
+                        + rule.health_share * max_health
+                        + rule.hit_share * hit_amount)
+                        * potency;
+                    let scale = match (health > 0.0, rule.id == OUT_OF_COMBAT_REGEN) {
+                        (false, _) => PLAIN_POTENCY,
+                        (true, false) => heal_scale,
+                        (true, true) => regen_scale,
+                    };
                     changes.push(VitalsTick {
                         source,
-                        health: (rule.health
-                            + rule.health_share * max_health
-                            + rule.hit_share * hit_amount)
-                            * potency,
+                        health: health * scale,
                         stamina: rule.stamina * potency,
                         damage_type: rule.damage_type,
                     });
@@ -546,10 +568,95 @@ impl StatusEffects {
         changes
     }
 
-    /// The share of a hit of damage type `tag` the held effects take off (`Abs*`), 0 to 1.
-    pub(super) fn absorption(&self, rules: &StatusEffectRules, tag: u8) -> f64 {
-        self.sum_by_type(rules, tag, |rule| &rule.absorption)
-            .clamp(0.0, 1.0)
+    /// The share of a hit of damage type `tag` the held effects let through: one less their
+    /// absorption (`Abs*`) plus their weakness (`WKN*`), at least 0 (Inferred: the two add, as
+    /// the stance pair `Greatsword_Stance_Offense` 0.15 and `_Defense` -0.15 of one type does).
+    pub(super) fn taken_share(&self, rules: &StatusEffectRules, tag: u8) -> f64 {
+        let absorbed = self.sum_by_type(rules, tag, |rule| &rule.absorption);
+        let weakness = self.sum_by_type(rules, tag, |rule| &rule.weakness);
+        (PLAIN_POTENCY - absorbed + weakness).max(0.0)
+    }
+
+    /// One plus the sum of `value` over the held effects, at least 0: the multiple of a rate the
+    /// effects raise or lower.
+    fn scale_of(&self, rules: &StatusEffectRules, value: impl Fn(&StatusEffectRule) -> f64) -> f64 {
+        (PLAIN_POTENCY + self.sum_of(rules, value)).max(0.0)
+    }
+
+    /// The multiple of the holder's stamina regen (`StaminaRate`: the exhaust effects).
+    pub(super) fn stamina_regen_scale(&self, rules: &StatusEffectRules) -> f64 {
+        self.scale_of(rules, |rule| rule.stamina_rate)
+    }
+
+    /// The multiple of the stamina the holder's hits take from a blocker
+    /// (`StaminaDamageModifier`: the mob empower buffs).
+    pub(super) fn block_stamina_scale(&self, rules: &StatusEffectRules) -> f64 {
+        self.scale_of(rules, |rule| rule.block_stamina_mod)
+    }
+
+    /// The points the held effects add to attribute `index` (`MOD*`, in
+    /// `ATTRIBUTE_NAMES` order: food), at least 0 in sum.
+    pub(super) fn attribute_bonus(&self, rules: &StatusEffectRules, index: usize) -> u32 {
+        let points = self.sum_of(rules, |rule| {
+            // Attribute points: a few dozen.
+            rule.attribute_mods.get(index).copied().unwrap_or(0) as f64
+        });
+        // A few dozen points.
+        points.max(0.0).round() as u32
+    }
+
+    /// The chance and the damage share the held effects add to the holder's crits
+    /// (`CritChanceModifier`, `CritDamageModifier`).
+    pub(super) fn crit_mods(&self, rules: &StatusEffectRules) -> (f64, f64) {
+        (
+            self.sum_of(rules, |rule| rule.crit_chance),
+            self.sum_of(rules, |rule| rule.crit_damage),
+        )
+    }
+
+    /// The multiple of a heal the holder gets (`HealMod`; a consumable's heal also
+    /// `ConsumableHealMod`).
+    pub(super) fn heal_scale(&self, rules: &StatusEffectRules, consumable: bool) -> f64 {
+        self.scale_of(rules, |rule| {
+            rule.heal_mod
+                + if consumable {
+                    rule.consumable_heal_mod
+                } else {
+                    0.0
+                }
+        })
+    }
+
+    /// The multiple of the holder's armor against a hit of physical (`true`) or elemental damage
+    /// (`PhysicalArmor`, `ElementalArmor`: the rend effects).
+    pub(super) fn armor_scale(&self, rules: &StatusEffectRules, physical: bool) -> f64 {
+        self.scale_of(rules, |rule| {
+            if physical {
+                rule.physical_armor
+            } else {
+                rule.elemental_armor
+            }
+        })
+    }
+
+    /// The multiple of the holder's health regen (`HealthRate`; 0 under `NoHealthRegen`).
+    pub(super) fn health_regen_scale(&self, rules: &StatusEffectRules) -> f64 {
+        if self.control(rules).no_health_regen {
+            return 0.0;
+        }
+        self.scale_of(rules, |rule| rule.health_rate)
+    }
+
+    /// What the held effects keep the holder from doing.
+    pub(super) fn control(&self, rules: &StatusEffectRules) -> Control {
+        self.rules(rules).fold(Control::default(), |control, rule| {
+            control.with(rule.control)
+        })
+    }
+
+    /// The holder went to death's door: the effects with `RemoveOnDeathsDoor` end.
+    pub(super) fn deaths_door(&mut self, rules: &StatusEffectRules) {
+        self.remove_where(rules, |rule| rule.remove_on_deaths_door);
     }
 
     /// The multiple the held effects give the holder's hits of damage type `tag` (`Dmg*`).
@@ -925,7 +1032,7 @@ impl SimWorld {
     pub(super) fn player_absorbs(&self, entity: Entity, tag: u8, amount: u32) -> u32 {
         let rules = &self.content.status_effects;
         self.world.get::<Player>(entity).map_or(amount, |player| {
-            let through = 1.0 - player.status_effects.absorption(rules, tag);
+            let through = player.status_effects.taken_share(rules, tag);
             // A hit of a few thousand points.
             (f64::from(amount) * through).round() as u32
         })
@@ -941,9 +1048,10 @@ impl SimWorld {
             .map_or(PLAIN_POTENCY, |player| {
                 player.status_effects.damage_scale(rules, tag)
             });
-        let through = self.mob_effects.get(&mob).map_or(PLAIN_POTENCY, |effects| {
-            1.0 - effects.absorption(rules, tag)
-        });
+        let through = self
+            .mob_effects
+            .get(&mob)
+            .map_or(PLAIN_POTENCY, |effects| effects.taken_share(rules, tag));
         own * through
     }
 
@@ -1011,7 +1119,7 @@ impl SimWorld {
         for (entity, mut player, vitals) in query.iter_mut(&mut self.world) {
             let player = &mut *player;
             let dead = vitals.health.is_dead();
-            player.status_effects.set_dead(rules, dead);
+            player.status_effects.set_dead(rules, dead, server_ms);
             if let Some(regen) = regen {
                 let in_combat = player.combat.in_combat();
                 let hurt = vitals.health.current() < vitals.health.max();
@@ -1325,6 +1433,144 @@ mod tests {
     }
 
     #[test]
+    fn held_effects_change_damage_taken_stamina_attributes_heals_armor_and_control() {
+        // Values of the retail rows of the same names (build 25810808).
+        const STANDARD: u8 = 1;
+        let typed = |value: f64| vec![("Standard".to_owned(), value)];
+        let rules = StatusEffectRules::build(StatusEffectSource {
+            effects: vec![
+                EffectSourceRow {
+                    weakness: typed(0.15),
+                    ..row("Greatsword_Stance_Offense")
+                },
+                EffectSourceRow {
+                    absorption: typed(0.25),
+                    ..row("Absorb_Standard")
+                },
+                EffectSourceRow {
+                    stamina_rate: Some(-0.15),
+                    ..row("Status_Dagger_Exhaust")
+                },
+                EffectSourceRow {
+                    block_stamina_mod: Some(0.15),
+                    ..row("AI_AnubianGuardian_Goliath_Empower")
+                },
+                EffectSourceRow {
+                    attribute_mods: [Some(20), None, None, None, None],
+                    ..row("FoodCONT3")
+                },
+                EffectSourceRow {
+                    heal_mod: Some(-0.04),
+                    ..row("AI_PlagueRat_Disease")
+                },
+                EffectSourceRow {
+                    consumable_heal_mod: Some(0.03),
+                    ..row("Status_Perk_Armor_ConsumableHealing")
+                },
+                EffectSourceRow {
+                    physical_armor: Some(-0.1),
+                    ..row("WarHammer_WeakenVictim")
+                },
+                EffectSourceRow {
+                    health_rate: Some(-0.5),
+                    ..row("Erosion_lv1")
+                },
+                EffectSourceRow {
+                    control: Control {
+                        stunned: true,
+                        ..Control::default()
+                    },
+                    remove_on_deaths_door: true,
+                    ..row("AI_Stun_2sec")
+                },
+                EffectSourceRow {
+                    control: Control {
+                        no_health_regen: true,
+                        ..Control::default()
+                    },
+                    ..row("IceMagic_Entombed")
+                },
+                EffectSourceRow {
+                    on_death: Some("Status_SeasonalServer_DeathCount".to_owned()),
+                    remove_on_death: true,
+                    ..row("Status_SeasonalServer_DeathTracker")
+                },
+                row("Status_SeasonalServer_DeathCount"),
+                EffectSourceRow {
+                    stack_max: Some(10),
+                    initial_stacks: Some(5),
+                    ..row("AI_Dahut_DoD_Count")
+                },
+            ],
+            damage_types: vec![("Standard".to_owned(), STANDARD)],
+            hit_effects: Vec::new(),
+        });
+        let mut effects = StatusEffects::default();
+        let add = |effects: &mut StatusEffects, id: &str| {
+            assert!(effects.add(
+                &rules,
+                crc(&rules, id),
+                Application::plain(PLAYER),
+                START_MS
+            ));
+        };
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        assert!(close(effects.taken_share(&rules, STANDARD), 1.0));
+        assert_eq!(effects.control(&rules), Control::default());
+        for id in [
+            "Greatsword_Stance_Offense",
+            "Absorb_Standard",
+            "Status_Dagger_Exhaust",
+            "AI_AnubianGuardian_Goliath_Empower",
+            "FoodCONT3",
+            "AI_PlagueRat_Disease",
+            "Status_Perk_Armor_ConsumableHealing",
+            "WarHammer_WeakenVictim",
+            "Erosion_lv1",
+            "AI_Stun_2sec",
+        ] {
+            add(&mut effects, id);
+        }
+        assert!(
+            close(effects.taken_share(&rules, STANDARD), 0.9),
+            "1 - 0.25 + 0.15"
+        );
+        assert!(close(effects.stamina_regen_scale(&rules), 0.85));
+        assert!(close(effects.block_stamina_scale(&rules), 1.15));
+        assert_eq!(effects.attribute_bonus(&rules, 0), 20, "Constitution");
+        assert_eq!(effects.attribute_bonus(&rules, 1), 0, "Focus");
+        assert!(close(effects.heal_scale(&rules, false), 0.96));
+        assert!(close(effects.heal_scale(&rules, true), 0.99));
+        assert!(close(effects.armor_scale(&rules, true), 0.9));
+        assert!(close(effects.armor_scale(&rules, false), 1.0));
+        assert!(close(effects.health_regen_scale(&rules), 0.5));
+        let control = effects.control(&rules);
+        assert!(!control.may_dodge() && !control.may_cast() && !control.may_fight());
+        effects.deaths_door(&rules);
+        assert!(
+            !effects.holds(crc(&rules, "AI_Stun_2sec")),
+            "RemoveOnDeathsDoor"
+        );
+        assert!(effects.control(&rules).may_fight());
+        add(&mut effects, "IceMagic_Entombed");
+        assert!(
+            close(effects.health_regen_scale(&rules), 0.0),
+            "NoHealthRegen"
+        );
+        add(&mut effects, "Status_SeasonalServer_DeathTracker");
+        effects.set_dead(&rules, true, START_MS);
+        assert!(!effects.holds(crc(&rules, "Status_SeasonalServer_DeathTracker")));
+        assert!(
+            effects.holds(crc(&rules, "Status_SeasonalServer_DeathCount")),
+            "OnDeathStatusEffect"
+        );
+        let mut counts = StatusEffects::default();
+        add(&mut counts, "AI_Dahut_DoD_Count");
+        let held = counts.held.first().expect("held");
+        assert_eq!(held.stacks, 5, "InitialStackSize");
+    }
+
+    #[test]
     fn held_tradeskill_effects_add_gather_speed_and_craft_gear_score() {
         // Retail rows `MusicBuff_GatheringSpeed_T4_Amazing` (`EFF_Mining` 0.75, also Logging,
         // Harvesting, Skinning) and `FoodArmorerT5` (`MGS_Armoring` and `MaxGS_Armoring` 15).
@@ -1393,8 +1639,8 @@ mod tests {
         effects.set_perk_effects(&rules, wanted.clone(), PLAYER, START_MS);
         let gathers = |effects: &StatusEffects| effects.gather_efficiency(&rules, "Mining");
         assert!((gathers(&effects) - EFFICIENCY * potency).abs() < 1e-9);
-        effects.set_dead(&rules, true);
-        effects.set_dead(&rules, false);
+        effects.set_dead(&rules, true, START_MS);
+        effects.set_dead(&rules, false, START_MS);
         effects.set_perk_effects(&rules, wanted, PLAYER, START_MS);
         assert!(
             (gathers(&effects) - EFFICIENCY * potency).abs() < 1e-9,
@@ -1506,7 +1752,7 @@ mod tests {
             Application::plain(PLAYER),
             START_MS,
         );
-        effects.set_dead(&rules, true);
+        effects.set_dead(&rules, true, START_MS);
         assert!(!effects.holds(crc(&rules, BLEED)));
         assert!(effects.holds(crc(&rules, FOOD)), "no RemoveOnDeath");
         assert!(

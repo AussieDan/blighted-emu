@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use nw_formats::objectstream::lowercase_crc32;
 
 use crate::Tables;
+use crate::character_points::ATTRIBUTE_COUNT;
 use crate::generated::StatusEffectData;
 
 /// Separates the entries of a list cell (`EffectCategories`, `AddStatusEffects`, mods).
@@ -141,6 +142,91 @@ pub struct StatusEffectRule {
     /// The `MGS_*` and `MaxGS_*` columns: (crafting tradeskill, gear score added to the least
     /// and to the most gear score of its crafts).
     pub craft_gear_score: Vec<(String, i64, i64)>,
+    /// The `WKN*` columns: (damage type `IntID`, share added to the hits the holder takes;
+    /// `Greatsword_Stance_Offense` 0.15, `Greatsword_Stance_Defense` -0.15).
+    pub weakness: Vec<(u8, f64)>,
+    /// `StaminaRate`: the share added to the holder's stamina regen (the `*_Exhaust` effects
+    /// -0.1 to -0.2).
+    pub stamina_rate: f64,
+    /// `StaminaDamageModifier`: the share added to the stamina the holder's hits take from a
+    /// blocker (the `AI_*_Empower` mob buffs 0.15 to 0.3).
+    pub block_stamina_mod: f64,
+    /// The `MOD*` columns: the points added to each attribute, in
+    /// [`crate::character_points::ATTRIBUTE_NAMES`] order (the `Food*` meals 10 to 24).
+    pub attribute_mods: [i64; ATTRIBUTE_COUNT],
+    /// `CritChanceModifier`: the chance added to the holder's crits.
+    pub crit_chance: f64,
+    /// `CritDamageModifier`: the share added to the holder's crit damage.
+    pub crit_damage: f64,
+    /// `HealMod`: the share added to the heals the holder gets (the disease effects -0.01 to
+    /// -0.3).
+    pub heal_mod: f64,
+    /// `ConsumableHealMod`: the share added to the heals of the holder's consumables.
+    pub consumable_heal_mod: f64,
+    /// `PhysicalArmor`: the share added to the holder's physical armor (the rend effects -0.02
+    /// to -0.1).
+    pub physical_armor: f64,
+    /// `ElementalArmor`: the share added to the holder's elemental armor.
+    pub elemental_armor: f64,
+    /// `HealthRate`: the share added to the holder's health regen (`Erosion_lv1` -0.5).
+    pub health_rate: f64,
+    /// What it keeps its holder from doing.
+    pub control: Control,
+    /// `RemoveOnDeathsDoor`: it ends when its holder goes to death's door.
+    pub remove_on_deaths_door: bool,
+    /// `OnDeathStatusEffect`: added when its holder dies (CRC-32 of the lowercase ids).
+    pub on_death: Vec<u32>,
+    /// `InitialStackSize`: the stacks of its first application, when more than one.
+    pub initial_stacks: Option<u8>,
+}
+
+/// What a status effect keeps its holder from doing (the flag columns of `StatusEffectData`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Control {
+    /// `NoDodge`: no dodge (79 effects, the roots and tethers).
+    pub no_dodge: bool,
+    /// `Stunned`: no attack, dodge, block or ability (48 effects, `AI_Stun_2sec`).
+    pub stunned: bool,
+    /// `Silenced`: no ability (40 effects, `AI_Silence_6sec`).
+    pub silenced: bool,
+    /// `NoSprint`: no sprint (130 effects).
+    pub no_sprint: bool,
+    /// `NoHealthRegen`: no health regen (`IceMagic_Entombed`).
+    pub no_health_regen: bool,
+}
+
+impl Control {
+    /// Whether it keeps its holder from anything.
+    pub const fn any(self) -> bool {
+        self.no_dodge || self.stunned || self.silenced || self.no_sprint || self.no_health_regen
+    }
+
+    /// What `self` and `other` keep the holder from together.
+    #[must_use]
+    pub const fn with(self, other: Self) -> Self {
+        Self {
+            no_dodge: self.no_dodge || other.no_dodge,
+            stunned: self.stunned || other.stunned,
+            silenced: self.silenced || other.silenced,
+            no_sprint: self.no_sprint || other.no_sprint,
+            no_health_regen: self.no_health_regen || other.no_health_regen,
+        }
+    }
+
+    /// Whether the holder may dodge.
+    pub const fn may_dodge(self) -> bool {
+        !self.no_dodge && !self.stunned
+    }
+
+    /// Whether the holder may use an ability.
+    pub const fn may_cast(self) -> bool {
+        !self.silenced && !self.stunned
+    }
+
+    /// Whether the holder may attack or block.
+    pub const fn may_fight(self) -> bool {
+        !self.stunned
+    }
 }
 
 impl StatusEffectRule {
@@ -227,6 +313,36 @@ pub struct EffectSourceRow {
     pub gather_efficiency: Vec<(String, f64)>,
     /// The `MGS_*` and `MaxGS_*` columns: (crafting tradeskill, least, most).
     pub craft_gear_score: Vec<(String, i64, i64)>,
+    /// The `WKN*` columns: (damage type `TypeID`, value).
+    pub weakness: Vec<(String, f64)>,
+    /// `StaminaRate`.
+    pub stamina_rate: Option<f64>,
+    /// `StaminaDamageModifier`.
+    pub block_stamina_mod: Option<f64>,
+    /// The `MOD*` columns, in [`crate::character_points::ATTRIBUTE_NAMES`] order.
+    pub attribute_mods: [Option<i64>; ATTRIBUTE_COUNT],
+    /// `CritChanceModifier`.
+    pub crit_chance: Option<f64>,
+    /// `CritDamageModifier`.
+    pub crit_damage: Option<f64>,
+    /// `HealMod`.
+    pub heal_mod: Option<f64>,
+    /// `ConsumableHealMod`.
+    pub consumable_heal_mod: Option<f64>,
+    /// `PhysicalArmor`.
+    pub physical_armor: Option<f64>,
+    /// `ElementalArmor`.
+    pub elemental_armor: Option<f64>,
+    /// `HealthRate`.
+    pub health_rate: Option<f64>,
+    /// The control flag columns.
+    pub control: Control,
+    /// `RemoveOnDeathsDoor` is set.
+    pub remove_on_deaths_door: bool,
+    /// `OnDeathStatusEffect`.
+    pub on_death: Option<String>,
+    /// `InitialStackSize`.
+    pub initial_stacks: Option<i64>,
 }
 
 impl EffectSourceRow {
@@ -260,6 +376,21 @@ impl EffectSourceRow {
             row.dmg_standard,
             row.dmg_strike,
             row.dmg_thrust,
+        ];
+        // The weakness columns: every damage type but acid has one.
+        let weakness = [
+            None,
+            row.wkn_arcane,
+            row.wkn_corruption,
+            row.wkn_fire,
+            row.wkn_ice,
+            row.wkn_lightning,
+            row.wkn_nature,
+            row.wkn_siege,
+            row.wkn_slash,
+            row.wkn_standard,
+            row.wkn_strike,
+            row.wkn_thrust,
         ];
         let by_type = |values: [Option<f64>; DAMAGE_TYPE_COUNT]| -> Vec<(String, f64)> {
             DAMAGE_TYPE_COLUMNS
@@ -337,6 +468,33 @@ impl EffectSourceRow {
                     )
                 })
                 .collect(),
+            weakness: by_type(weakness),
+            stamina_rate: row.stamina_rate,
+            block_stamina_mod: row.stamina_damage_modifier,
+            attribute_mods: [
+                row.mod_constitution,
+                row.mod_focus,
+                row.mod_strength,
+                row.mod_dexterity,
+                row.mod_intelligence,
+            ],
+            crit_chance: row.crit_chance_modifier,
+            crit_damage: row.crit_damage_modifier,
+            heal_mod: row.heal_mod,
+            consumable_heal_mod: row.consumable_heal_mod,
+            physical_armor: row.physical_armor,
+            elemental_armor: row.elemental_armor,
+            health_rate: row.health_rate,
+            control: Control {
+                no_dodge: set(row.no_dodge),
+                stunned: set(row.stunned),
+                silenced: set(row.silenced),
+                no_sprint: set(row.no_sprint),
+                no_health_regen: set(row.no_health_regen),
+            },
+            remove_on_deaths_door: set(row.remove_on_deaths_door),
+            on_death: row.on_death_status_effect.clone(),
+            initial_stacks: row.initial_stack_size,
         }
     }
 }
@@ -561,6 +719,24 @@ fn rule(
         damage_mods: typed(&row.damage_mods),
         gather_efficiency: row.gather_efficiency.clone(),
         craft_gear_score: row.craft_gear_score.clone(),
+        weakness: typed(&row.weakness),
+        stamina_rate: row.stamina_rate.unwrap_or(0.0),
+        block_stamina_mod: row.block_stamina_mod.unwrap_or(0.0),
+        attribute_mods: row.attribute_mods.map(Option::unwrap_or_default),
+        crit_chance: row.crit_chance.unwrap_or(0.0),
+        crit_damage: row.crit_damage.unwrap_or(0.0),
+        heal_mod: row.heal_mod.unwrap_or(0.0),
+        consumable_heal_mod: row.consumable_heal_mod.unwrap_or(0.0),
+        physical_armor: row.physical_armor.unwrap_or(0.0),
+        elemental_armor: row.elemental_armor.unwrap_or(0.0),
+        health_rate: row.health_rate.unwrap_or(0.0),
+        control: row.control,
+        remove_on_deaths_door: row.remove_on_deaths_door,
+        on_death: ids(row.on_death.as_deref()),
+        initial_stacks: row
+            .initial_stacks
+            .and_then(|stacks| u8::try_from(stacks).ok())
+            .filter(|stacks| *stacks > 1),
     }
 }
 
@@ -660,6 +836,45 @@ mod tests {
                 status_effects: "AI_Bleed_9, AI_Bleed_9".to_owned(),
             }],
         }
+    }
+
+    #[test]
+    fn a_row_gives_its_weakness_stamina_attribute_heal_armor_and_control_columns() {
+        let mut source = source();
+        source.effects.push(EffectSourceRow {
+            status_id: "Greatsword_Stance_Offense".to_owned(),
+            weakness: vec![("Slash".to_owned(), 0.15), ("Nowhere".to_owned(), 1.0)],
+            stamina_rate: Some(-0.15),
+            block_stamina_mod: Some(0.2),
+            attribute_mods: [Some(18), None, Some(12), None, None],
+            heal_mod: Some(-0.05),
+            physical_armor: Some(-0.1),
+            control: Control {
+                stunned: true,
+                ..Control::default()
+            },
+            remove_on_deaths_door: true,
+            on_death: Some("AI_Bleed_9".to_owned()),
+            initial_stacks: Some(5),
+            ..EffectSourceRow::default()
+        });
+        let rules = StatusEffectRules::build(source);
+        let rule = rules.by_id("Greatsword_Stance_Offense").expect("rule");
+        assert_eq!(
+            rule.weakness,
+            vec![(SLASH, 0.15)],
+            "an unknown type is left out"
+        );
+        assert_eq!(rule.stamina_rate, -0.15);
+        assert_eq!(rule.block_stamina_mod, 0.2);
+        assert_eq!(rule.attribute_mods, [18, 0, 12, 0, 0]);
+        assert_eq!((rule.heal_mod, rule.physical_armor), (-0.05, -0.1));
+        assert!(!rule.control.may_dodge() && !rule.control.may_cast() && !rule.control.may_fight());
+        assert!(rule.remove_on_deaths_door);
+        assert_eq!(rule.on_death, vec![lowercase_crc32("ai_bleed_9")]);
+        assert_eq!(rule.initial_stacks, Some(5));
+        let bleed = rules.by_id("AI_Bleed_9").expect("bleed");
+        assert!(!bleed.control.any() && bleed.initial_stacks.is_none());
     }
 
     #[test]

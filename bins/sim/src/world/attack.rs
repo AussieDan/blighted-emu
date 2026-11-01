@@ -27,10 +27,10 @@ use bevy_ecs::entity::Entity;
 use nw_bus::{BusId, ConnectionRef, Hit};
 use std::sync::Arc;
 
-use nw_content::combat::{AffixDamage, AttackRow, RangedBlock, WeaponRow};
+use nw_content::combat::{AffixDamage, AttackRow, DamageCategory, RangedBlock, WeaponRow};
 use nw_content::player_attacks::{AttackHit, AttackKind, BasicAttack, Homing, MeleeShape, Stance};
 use nw_content::respawn_points::{nearest_respawn_point, respawn_point};
-use nw_content::status_effects::RowKey;
+use nw_content::status_effects::{Control, RowKey};
 use nw_formats::objectstream::lowercase_crc32;
 use nw_messages::paperdoll::slot;
 use nw_messages::{
@@ -74,6 +74,20 @@ const ARMOR_FIT_POWER: f64 = 1.2013;
 /// The share of a hit that a mob of armor rating `armor` takes off a weapon of `gear_score`.
 fn armor_share(armor: f64, gear_score: u32) -> f64 {
     armor / (armor + ARMOR_FIT_SCALE * f64::from(gear_score).powf(ARMOR_FIT_POWER))
+}
+
+/// The share of a hit that armor taking off `share` takes off once the armor is `scale` times
+/// as much (a rend effect: `PhysicalArmor` -0.1 is 0.9): `armor / (armor + k)` with the armor
+/// scaled, from the share alone. A hit of the `True` category takes no armor.
+fn rent_share(share: f64, scale: f64, category: DamageCategory) -> f64 {
+    if category == DamageCategory::True || share <= 0.0 {
+        return 0.0;
+    }
+    if share >= 1.0 {
+        return share;
+    }
+    let armor = share / (1.0 - share) * scale;
+    armor / (armor + 1.0)
 }
 
 /// The visual script of a heal: crc32 of `potionheal` (retail 608 after the potion).
@@ -448,9 +462,33 @@ pub(super) struct MobHitStyle {
     row: Option<RowKey>,
     /// A projectile's hit ([`SimWorld::defend`]).
     ranged: bool,
+    /// A block stops it ([`AttackRow::blockable`]).
+    blockable: bool,
+    /// Its row's damage category: which armor takes it off.
+    category: DamageCategory,
+}
+
+/// What a block does with a mob's hit on a player ([`SimWorld::defend`]).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Blow {
+    /// The stamina its block takes.
+    pub stamina: f32,
+    /// A projectile's hit: only a weapon with `CanBlockRanged` blocks it.
+    pub ranged: bool,
+    /// A block stops it at all.
+    pub blockable: bool,
 }
 
 impl MobHitStyle {
+    /// What a block does with the hit.
+    pub(super) const fn blow(self) -> Blow {
+        Blow {
+            stamina: self.block_stamina,
+            ranged: self.ranged,
+            blockable: self.blockable,
+        }
+    }
+
     /// The style of the same hit by a projectile.
     pub(super) const fn fired(self) -> Self {
         Self {
@@ -695,17 +733,22 @@ impl SimWorld {
                 Some((*data.weapon_of_item(&item)?, data.pvp_damage_factor(&item)))
             })
             .unwrap_or((*self.combat.data.weapon(), PLAIN_DAMAGE_FACTOR));
+        let (crit_chance, crit_multiplier) = self.player_crit(entity, &weapon);
         let attack = PlayerAttack {
             base_damage: weapon.base_damage,
             coefficient: row.coefficient,
             can_crit: row.can_crit,
-            crit_chance: weapon.crit_chance,
-            crit_multiplier: weapon.crit_multiplier,
+            crit_chance,
+            crit_multiplier,
         };
         if let Some(mut vitals) = self.world.get_mut::<Vitals>(entity) {
             vitals.last_attack_ms = Some(now_ms);
         }
-        let armor_share = self.combat.player_armor_share;
+        let armor_share = rent_share(
+            self.combat.player_armor_share,
+            self.player_armor_scale(target_entity, row.category),
+            row.category,
+        );
         let tag = row.damage_type.unwrap_or(HIT_TAG);
         let mut hit = player_hit(&attack, armor_share, &mut self.dice);
         let scale = pvp_factor * self.player_hit_scale(entity, target, tag);
@@ -725,6 +768,8 @@ impl SimWorld {
             block_stamina: 0.0,
             row: Some(RowKey::of(&row.table, &row.damage_id)),
             ranged: false,
+            blockable: row.blockable,
+            category: row.category,
         };
         let outcome = self
             .apply_hit_with(target, number, hit.amount, 0, now_ms, Some(&style))
@@ -876,17 +921,26 @@ impl SimWorld {
             row,
         } = strike;
         let weapon = held.map_or_else(|| *self.combat.data.weapon(), |(weapon, _)| weapon);
-        let armor_share = held
+        let plain_share = held
             .zip(self.combat.data.level(view.level))
             .map_or(self.combat.armor_share, |((_, gear_score), level)| {
                 armor_share(level.physical_armor_rating, gear_score)
             });
+        // The mob's rend effects lower its armor (`PhysicalArmor`, `ElementalArmor`).
+        let rend = self.mob_effects.get(&target).map_or(1.0, |effects| {
+            effects.armor_scale(
+                &self.content.status_effects,
+                row.category != DamageCategory::Elemental,
+            )
+        });
+        let armor_share = rent_share(plain_share, rend, row.category);
+        let (crit_chance, crit_multiplier) = self.player_crit(entity, &weapon);
         let attack = PlayerAttack {
             base_damage: weapon.base_damage,
             coefficient: row.coefficient,
             can_crit: row.can_crit,
-            crit_chance: weapon.crit_chance,
-            crit_multiplier: weapon.crit_multiplier,
+            crit_chance,
+            crit_multiplier,
         };
         if let Some(mut vitals) = self.world.get_mut::<Vitals>(entity) {
             vitals.last_attack_ms = Some(now_ms);
@@ -1171,12 +1225,16 @@ impl SimWorld {
         gear.use_one(slot::QUICK_SLOT_1);
         player.cooldowns_changed = true;
         let connection = player.connection.clone();
+        // The held `HealMod`s and `ConsumableHealMod`s scale the potion (disease: less).
+        let heal_scale = player
+            .status_effects
+            .heal_scale(&self.content.status_effects, true);
         let Some(mut vitals) = self.world.get_mut::<Vitals>(entity) else {
             return;
         };
         let max = f64::from(vitals.health.max());
         // The heal fits a `u32`: it is below the max health and a flat amount.
-        let amount = (heal.health + heal.health_share * max).round() as u32;
+        let amount = ((heal.health + heal.health_share * max) * heal_scale).round() as u32;
         let healed = vitals.health.heal(amount);
         tracing::debug!(player = number, item, amount, healed, "drink");
         self.send_reliable(
@@ -1287,6 +1345,10 @@ impl SimWorld {
             self.stamina_input(entity, number, newest, swimming, now_ms);
         }
         self.ability_presses(entity, records, now_ms);
+        if !self.player_control(entity).may_fight() {
+            tracing::debug!(player = number, "attack keys while stunned");
+            return Vec::new();
+        }
         // The weapon the attack key uses: the one in the hand, else, while the hand holds a
         // spread-shot weapon (which fires through its own request), the melee option.
         let data = Arc::clone(&self.combat.data);
@@ -1614,10 +1676,12 @@ impl SimWorld {
             .and_then(|item| self.content.item_rules.consumable(item))
             .and_then(|consumable| consumable.use_tag.as_deref())
             .and_then(|tag| stance.as_ref()?.use_effect_ms(tag));
+        // A stun keeps the block down and the dodge back; a root or tether only the dodge.
+        let control = self.player_control(entity);
         let Some(mut vitals) = self.world.get_mut::<Vitals>(entity) else {
             return;
         };
-        let block_key = newest.blocking();
+        let block_key = newest.blocking() && control.may_fight();
         let block_released = vitals.block_key && !block_key;
         if block_key != vitals.block_key {
             tracing::debug!(player = number, block_key, "block key");
@@ -1629,7 +1693,7 @@ impl SimWorld {
         let dodge = newest.dodging();
         vitals.dodge_waiting = dodge && (vitals.dodge_waiting || !vitals.dodge_held);
         vitals.dodge_held = dodge;
-        let dodge_pressed = vitals.dodge_waiting && dodge_free;
+        let dodge_pressed = vitals.dodge_waiting && dodge_free && control.may_dodge();
         if dodge_pressed {
             vitals.dodge_waiting = false;
         } else if vitals.dodge_waiting {
@@ -1671,9 +1735,12 @@ impl SimWorld {
 
     /// Runs the stamina of every player one tick at `now_ms`.
     pub(super) fn tick_stamina(&mut self, now_ms: u64) {
+        let rules = &self.content.status_effects;
         let mut query = self.world.query::<&mut Player>();
         for mut player in query.iter_mut(&mut self.world) {
-            player.stamina.tick(now_ms);
+            // A multiple near 1.
+            let regen_scale = player.status_effects.stamina_regen_scale(rules) as f32;
+            player.stamina.tick(now_ms, regen_scale);
         }
     }
 
@@ -1990,7 +2057,7 @@ impl SimWorld {
         attacker: u64,
         amount: u32,
         threat: u64,
-        mob_blow: Option<(f32, bool)>,
+        mob_blow: Option<Blow>,
     ) -> RemoteHit {
         RemoteHit {
             owner,
@@ -2000,8 +2067,9 @@ impl SimWorld {
                 attacker_sim: self.me.id.clone(),
                 amount,
                 threat,
-                block_stamina_milli: mob_blow.map(|(stamina, _)| Hit::milli_of(stamina)),
-                ranged: mob_blow.is_some_and(|(_, ranged)| ranged),
+                block_stamina_milli: mob_blow.map(|blow| Hit::milli_of(blow.stamina)),
+                ranged: mob_blow.is_some_and(|blow| blow.ranged),
+                unblockable: mob_blow.is_some_and(|blow| !blow.blockable),
             },
         }
     }
@@ -2123,10 +2191,15 @@ impl SimWorld {
             vitals.dead_since_ms = Some(now_ms);
         }
         // A hit is combat: it ends the road boost on the frame of the hit
-        // (`Traversal_Road_Sprint_Speed_Boost_CombatRemoval` `IfDamaged`).
+        // (`Traversal_Road_Sprint_Speed_Boost_CombatRemoval` `IfDamaged`). Death's door ends the
+        // effects with `RemoveOnDeathsDoor` (1,573 rows: burns, slows, stuns).
+        let rules = &self.content.status_effects;
         if let Some(mut player) = self.world.get_mut::<Player>(entity) {
             player.tracked.enter_combat();
             player.combat.hit_taken(now_ms);
+            if downs {
+                player.status_effects.deaths_door(rules);
+            }
         }
         // A hit ends a summon and takes mount stamina; a death ends the ride ([`super::mount`]).
         self.mount_hit(
@@ -2342,6 +2415,44 @@ impl SimWorld {
         .touches(body, PLAYER_CAPSULE)
     }
 
+    /// What the held effects of player `entity` keep it from doing (`Stunned`, `NoDodge`,
+    /// `Silenced`).
+    pub(super) fn player_control(&self, entity: Entity) -> Control {
+        self.world
+            .get::<Player>(entity)
+            .map_or_else(Control::default, |player| {
+                player.status_effects.control(&self.content.status_effects)
+            })
+    }
+
+    /// The crit chance and multiplier of player `entity`'s hits with `weapon`: the weapon's, plus
+    /// its held effects' `CritChanceModifier` and `CritDamageModifier`.
+    fn player_crit(&self, entity: Entity, weapon: &WeaponRow) -> (f64, f64) {
+        let (chance, damage) = self
+            .world
+            .get::<Player>(entity)
+            .map_or((0.0, 0.0), |player| {
+                player
+                    .status_effects
+                    .crit_mods(&self.content.status_effects)
+            });
+        (
+            (weapon.crit_chance + chance).clamp(0.0, 1.0),
+            weapon.crit_multiplier + damage,
+        )
+    }
+
+    /// The multiple of player `entity`'s armor against a hit of `category` from its held effects
+    /// (`PhysicalArmor`, `ElementalArmor`).
+    fn player_armor_scale(&self, entity: Entity, category: DamageCategory) -> f64 {
+        self.world.get::<Player>(entity).map_or(1.0, |player| {
+            player.status_effects.armor_scale(
+                &self.content.status_effects,
+                category != DamageCategory::Elemental,
+            )
+        })
+    }
+
     /// How the hit `intent` of a mob, of the move hit `move_hit` when it has one, lands on the
     /// player `defender`, from its damage rows: the row's damage type and affix, its multiple, and
     /// the stamina a block takes ([`AttackRow::block_stamina`], with the weapon's `BlockStability`
@@ -2364,7 +2475,14 @@ impl SimWorld {
             block_stamina: DEFAULT_BLOCK_STAMINA,
             row: None,
             ranged: false,
+            blockable: true,
+            category: DamageCategory::Physical,
         };
+        // The mob's empower buffs raise what a block takes (`StaminaDamageModifier`).
+        // A multiple near 1.
+        let empower = self.mob_effects.get(&intent.mob).map_or(1.0, |effects| {
+            effects.block_stamina_scale(&self.content.status_effects) as f32
+        });
         let stability = defender
             .and_then(|defender| self.held_weapon(defender))
             .map_or(data.weapon().block_stability, |(weapon, _)| {
@@ -2387,9 +2505,11 @@ impl SimWorld {
                 tag: row.damage_type.unwrap_or(DEFAULT_HIT_TAG),
                 affix: row.affix,
                 damage_scale: row.coefficient,
-                block_stamina,
+                block_stamina: block_stamina * empower,
                 row: Some(RowKey::of(&row.table, &row.damage_id)),
                 ranged: false,
+                blockable: row.blockable,
+                category: row.category,
             };
         }
         let mob = intent.mob;
@@ -2415,9 +2535,11 @@ impl SimWorld {
             affix: row.affix,
             damage_scale: row.coefficient / attack_row.coefficient * phase_mult,
             // A few dozen stamina points.
-            block_stamina: row.block_stamina(weapon, stability) as f32,
+            block_stamina: row.block_stamina(weapon, stability) as f32 * empower,
             row: Some(RowKey::of(&row.table, &row.damage_id)),
             ranged: false,
+            blockable: row.blockable,
+            category: row.category,
         }
     }
 
@@ -2446,7 +2568,7 @@ impl SimWorld {
         target: u64,
         mob: u64,
         amount: u32,
-        (block_stamina, ranged): (f32, bool),
+        blow: Blow,
         now_ms: u64,
     ) -> Option<u32> {
         let vitals = *self.world.get::<Vitals>(entity)?;
@@ -2461,14 +2583,14 @@ impl SimWorld {
             return None;
         }
         let tutorial = self.is_tutorial();
-        let ranged_block = ranged.then(|| self.ranged_block_of(entity));
+        let ranged_block = blow.ranged.then(|| self.ranged_block_of(entity));
         let (can_block, block_stamina, passes) = match ranged_block {
-            None => (true, block_stamina, 0.0),
-            Some(None) => (false, block_stamina, 1.0),
+            None => (blow.blockable, blow.stamina, 0.0),
+            Some(None) => (false, blow.stamina, 1.0),
             Some(Some(block)) => (
-                true,
+                blow.blockable,
                 // A few dozen stamina points.
-                block_stamina * block.stamina_scale as f32,
+                blow.stamina * block.stamina_scale as f32,
                 block.health_scale,
             ),
         };
@@ -2519,7 +2641,7 @@ impl SimWorld {
         target: u64,
         attacker: u64,
         amount: u32,
-        blow: (f32, bool),
+        blow: Blow,
         now_ms: u64,
     ) -> Option<AttackOutcome> {
         let entity = self.player_by_number(target)?;
@@ -2534,16 +2656,23 @@ impl SimWorld {
         intents: Vec<(MobAttackIntent, Option<MoveHit>)>,
         now_ms: u64,
     ) -> Vec<AttackOutcome> {
-        let armor_share = self.combat.player_armor_share;
         intents
             .into_iter()
             .filter_map(|(intent, move_hit)| {
-                let mob = self.mobs.get(intent.mob)?;
-                let at = mob.position;
-                let mut hit = mob_hit(&mob.attack, armor_share);
                 let defender = self.player_by_number(intent.target);
                 // The same hit for a player of this sim and one of another (a ghost).
                 let style = self.mob_hit_style(&intent, move_hit, defender);
+                // The player's rend effects lower its armor; a ghost's take theirs at home.
+                let armor_share = rent_share(
+                    self.combat.player_armor_share,
+                    defender.map_or(1.0, |defender| {
+                        self.player_armor_scale(defender, style.category)
+                    }),
+                    style.category,
+                );
+                let mob = self.mobs.get(intent.mob)?;
+                let at = mob.position;
+                let mut hit = mob_hit(&mob.attack, armor_share);
                 let scaled = f64::from(hit.amount)
                     * style.damage_scale
                     * self.mob_hit_scale(intent.mob, style.tag);
@@ -2596,14 +2725,7 @@ impl SimWorld {
         now_ms: u64,
     ) -> Option<AttackOutcome> {
         if let Some(entity) = self.player_by_number(target) {
-            let amount = self.defend(
-                entity,
-                target,
-                mob,
-                amount,
-                (style.block_stamina, style.ranged),
-                now_ms,
-            )?;
+            let amount = self.defend(entity, target, mob, amount, style.blow(), now_ms)?;
             let outcome = self.apply_hit_with(target, mob, amount, 0, now_ms, Some(&style));
             if outcome.is_some() {
                 self.mob_hit_effects(entity, mob, style.row, amount);
@@ -2619,7 +2741,7 @@ impl SimWorld {
                 mob,
                 amount,
                 0,
-                Some((style.block_stamina, style.ranged)),
+                Some(style.blow()),
             ))
         })
     }
@@ -4121,7 +4243,7 @@ mod tests {
         const SWORD_SCALE: f64 = 0.5;
         let blocked = |world: &mut SimWorld, ranged: bool| {
             let entity = world.player_by_number(1).expect("player");
-            world.defend(entity, 1, mob(), AMOUNT, (BLOCK_STAMINA, ranged), NOW)
+            world.defend(entity, 1, mob(), AMOUNT, blow(BLOCK_STAMINA, ranged), NOW)
         };
         let mut world = fight();
         world.attack_input(&connection(1), &[block_held()], NOW);
@@ -4160,6 +4282,55 @@ mod tests {
     }
 
     #[test]
+    fn a_rend_lowers_the_armor_share_and_true_damage_takes_no_armor() {
+        const SHARE: f64 = 0.5;
+        assert!((rent_share(SHARE, 1.0, DamageCategory::Physical) - SHARE).abs() < 1e-12);
+        // Armor 1 against 1 is half; 0.9 of it is 0.9 / 1.9.
+        let rent = rent_share(SHARE, 0.9, DamageCategory::Elemental);
+        assert!((rent - 0.9 / 1.9).abs() < 1e-12);
+        assert_eq!(rent_share(SHARE, 1.0, DamageCategory::True), 0.0);
+        assert_eq!(rent_share(0.0, 0.9, DamageCategory::Physical), 0.0);
+    }
+
+    /// A blockable blow of `stamina`.
+    const fn blow(stamina: f32, ranged: bool) -> Blow {
+        Blow {
+            stamina,
+            ranged,
+            blockable: true,
+        }
+    }
+
+    #[test]
+    fn an_unblockable_hit_passes_a_held_block_and_takes_no_stamina() {
+        const BLOCK_STAMINA: f32 = 16.5;
+        const AMOUNT: u32 = 40;
+        let mut world = fight();
+        world.attack_input(&connection(1), &[block_held()], NOW);
+        let entity = world.player_by_number(1).expect("player");
+        let unblockable = Blow {
+            blockable: false,
+            ..blow(BLOCK_STAMINA, false)
+        };
+        assert_eq!(
+            world.defend(entity, 1, mob(), AMOUNT, unblockable, NOW),
+            Some(AMOUNT),
+            "a boss wipe goes through the block"
+        );
+        assert!((player_stamina(&mut world, 1) - 100.0).abs() < f32::EPSILON);
+        assert!(
+            world
+                .remote_mob_hit(1, mob(), AMOUNT, unblockable, NOW)
+                .is_some(),
+            "also from another sim"
+        );
+        assert_eq!(
+            world.defend(entity, 1, mob(), AMOUNT, blow(BLOCK_STAMINA, false), NOW),
+            None
+        );
+    }
+
+    #[test]
     fn a_mob_hit_from_another_sim_takes_the_block_here() {
         const BLOCK_STAMINA: f32 = 16.5;
         const AMOUNT: u32 = 40;
@@ -4167,7 +4338,7 @@ mod tests {
         world.attack_input(&connection(1), &[block_held()], NOW);
         assert!(
             world
-                .remote_mob_hit(1, mob(), AMOUNT, (BLOCK_STAMINA, false), NOW)
+                .remote_mob_hit(1, mob(), AMOUNT, blow(BLOCK_STAMINA, false), NOW)
                 .is_none(),
             "a blocked hit takes no health"
         );
@@ -4176,7 +4347,7 @@ mod tests {
         world.attack_input(&connection(1), &[InputRecord::default()], NOW + TICK_MS);
         assert!(
             world
-                .remote_mob_hit(1, mob(), AMOUNT, (BLOCK_STAMINA, false), NOW + TICK_MS)
+                .remote_mob_hit(1, mob(), AMOUNT, blow(BLOCK_STAMINA, false), NOW + TICK_MS)
                 .is_some(),
             "an open player takes it"
         );
@@ -4522,6 +4693,79 @@ mod tests {
     }
 
     #[test]
+    fn a_stunned_player_cannot_block_or_dodge_and_a_rooted_one_only_blocks() {
+        use nw_content::status_effects::{EffectSourceRow, StatusEffectRules, StatusEffectSource};
+        const STUN: &str = "AI_Stun_2sec";
+        const ROOT: &str = "AI_Isabella_Solo_Root";
+        let mut world = fight();
+        let mut content = (*world.content).clone();
+        let control = |control: Control, id: &str| EffectSourceRow {
+            status_id: id.to_owned(),
+            control,
+            ..EffectSourceRow::default()
+        };
+        content.status_effects = StatusEffectRules::build(StatusEffectSource {
+            effects: vec![
+                control(
+                    Control {
+                        stunned: true,
+                        ..Control::default()
+                    },
+                    STUN,
+                ),
+                control(
+                    Control {
+                        no_dodge: true,
+                        ..Control::default()
+                    },
+                    ROOT,
+                ),
+            ],
+            damage_types: Vec::new(),
+            hit_effects: Vec::new(),
+        });
+        world.content = Arc::new(content);
+        let rules = world.content.status_effects.clone();
+        let entity = world.player_by_number(1).expect("player");
+        let hold = |world: &mut SimWorld, id: &str, held: bool| {
+            let mut player = world.world.get_mut::<Player>(entity).expect("player");
+            let crc = rules.by_id(id).expect("rule").crc;
+            if held {
+                assert!(player.status_effects.add_by_id(&rules, id, 1.0, 1, NOW));
+            } else {
+                player.status_effects.remove(crc);
+            }
+        };
+        let vitals = |world: &mut SimWorld| *world.world.get::<Vitals>(entity).expect("vitals");
+        hold(&mut world, STUN, true);
+        let full = stamina_of(&mut world);
+        world.attack_input(&connection(1), &[block_held()], NOW);
+        assert!(
+            !vitals(&mut world).blocking(),
+            "a stun keeps the block down"
+        );
+        world.attack_input(&connection(1), &[dodge_record(true)], NOW + TICK_MS);
+        assert!(
+            (stamina_of(&mut world) - full).abs() < f32::EPSILON,
+            "no dodge"
+        );
+        hold(&mut world, STUN, false);
+        hold(&mut world, ROOT, true);
+        world.attack_input(&connection(1), &[InputRecord::default()], NOW + 2 * TICK_MS);
+        world.attack_input(&connection(1), &[block_held()], NOW + 3 * TICK_MS);
+        assert!(vitals(&mut world).blocking(), "a root lets the block up");
+        world.attack_input(&connection(1), &[dodge_record(true)], NOW + 4 * TICK_MS);
+        assert!(
+            (stamina_of(&mut world) - full).abs() < f32::EPSILON,
+            "but no dodge"
+        );
+        hold(&mut world, ROOT, false);
+        world.attack_input(&connection(1), &[dodge_record(false)], NOW + 5 * TICK_MS);
+        world.attack_input(&connection(1), &[dodge_record(true)], NOW + 6 * TICK_MS);
+        assert!(stamina_of(&mut world) < full, "free again: it rolls");
+    }
+
+    #[test]
     fn a_dodge_is_free_in_the_cancel_windows_and_after_the_attack() {
         let playing = sword_light_playing(NOW);
         // Retail: taken at 17, 566 and 1182 ms.
@@ -4640,6 +4884,8 @@ mod tests {
                 damage_type: Some(SLASH),
                 table: BOSS_TABLE.to_owned(),
                 block_stamina_mod: 0.2,
+                blockable: true,
+                category: DamageCategory::Physical,
                 affix,
             });
         }

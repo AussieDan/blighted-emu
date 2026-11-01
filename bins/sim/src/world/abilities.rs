@@ -833,6 +833,10 @@ impl SimWorld {
     /// Reads the ability key presses in the input `records` of player `entity` at `now_ms`: a key
     /// names the mapped ability that the lists of the weapon in its hand start.
     pub(super) fn ability_presses(&mut self, entity: Entity, records: &[InputRecord], now_ms: u64) {
+        // A silence or a stun keeps the ability keys from starting anything.
+        if !self.player_control(entity).may_cast() {
+            return;
+        }
         let data = Arc::clone(&self.combat.data);
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
@@ -898,11 +902,13 @@ impl SimWorld {
                     .filter_map(|(perk, _)| content.perk_effects.ability_of(perk))
             }));
             let attributes = &player.attributes;
-            abilities_on.extend(
-                content.attribute_bonuses.abilities(|attribute| {
-                    attributes.value(&content.progression.points, attribute)
-                }),
-            );
+            let effects = &player.status_effects;
+            // An attribute id is its place in `ATTRIBUTE_NAMES`; food adds its points.
+            abilities_on.extend(content.attribute_bonuses.abilities(|attribute| {
+                attributes
+                    .value(&content.progression.points, attribute)
+                    .saturating_add(effects.attribute_bonus(rules, attribute as usize))
+            }));
             let stats = content
                 .attribute_bonuses
                 .stats_of(abilities_on.iter().copied());
