@@ -4230,11 +4230,11 @@ impl SimWorld {
                         board_version: 0,
                         interacting: false,
                         territories: Vec::new(),
+                        last_zone: None,
                         travel: travel::TravelState::of(arrival.progression.travel.clone()),
                         strikes: quest_objects::Strikes::default(),
                         cooldowns: Vec::new(),
                         cooldowns_changed: false,
-                        last_zone: None,
                         item_effects: item_calls::ItemEffects::default(),
                         status_effects: status_effects::StatusEffects::default(),
                         fall: fall_damage::FallTrack::default(),
@@ -6578,11 +6578,6 @@ mod tests {
     }
 
     #[test]
-    fn a_death_and_a_respawn_go_to_the_own_vitals() {
-        const LETHAL: u32 = 100_000;
-        /// Far beyond the committed `min_respawn_ms`.
-        const RESPAWN_AFTER_MS: u64 = 60_000;
-    #[test]
     fn a_blocked_mob_hit_sends_the_stamina_change_in_the_own_update() {
         // Live 2026-11-01: the server blocked (stamina 100 to 76), the stamina bar did not move.
         const MOB_X: f32 = CELL_M / 2.0;
@@ -6625,6 +6620,11 @@ mod tests {
         assert!(!sent.is_empty(), "no stamina change went to the client");
     }
 
+    #[test]
+    fn a_death_and_a_respawn_go_to_the_own_vitals() {
+        const LETHAL: u32 = 100_000;
+        /// Far beyond the committed `min_respawn_ms`.
+        const RESPAWN_AFTER_MS: u64 = 60_000;
         let mut world = world_with_spawns(Vec::new());
         world.set_table(&table(&["sim-a", "sim-b"])).expect("table");
         world
