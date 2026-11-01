@@ -188,6 +188,21 @@ The tool finds the eight writes by their exact bytes and changes the two
 immediates. Re-make the copy after a change of these values
 (`python3 scripts/patch-client.py "<game>/Bin64"`).
 
+## Typed chat
+
+The client holds typed chat back until a privacy check answers. The check is the
+console variable `javelin.social.enable-vpc-restrictions` (default on); its answer
+comes from a platform service the emulator setup does not have, so the client
+never sends a typed line (live 2026-11-01: no 1291 reached the sim or `social`,
+while `nw-testclient chat` worked). The settings function (build 25810808:
+`FUN_14616d7b0`) creates each variable as `LEA RDX,[name]` / `LEA RCX,[RBP+var]` /
+`CALL` / `MOV R8B,<default>` / `LEA RDX,[RBP+var]`. The tool finds the one
+creation whose `LEA RDX` points at the variable's name and makes the default 0
+(build 25810808: file offset `0x616E0D4`, VA `0x14616EAD4`). The same change, at
+another place, turns typed chat on in another build of the client (Inferred: the
+same check). The account-age chat restriction stays on; the server answers it with
+`accountInProbation`.
+
 ## Fifth change: AWS proxy (Windows only, `--aws-proxy`)
 
 This change is for Windows, where there is no `bwrap` sandbox to give the game

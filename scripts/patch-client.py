@@ -3,8 +3,8 @@
 """Make the patched copy of the New World client that the emulator needs.
 
 This tool writes a patched copy, ``BlightedNewWorld.exe``, next to the official
-``NewWorld.exe`` (which it never modifies). The copy has three changes, and a
-fourth one with ``--aws-proxy``:
+``NewWorld.exe`` (which it never modifies). The copy has four changes, and a
+fifth one with ``--aws-proxy``:
 
 1. Certificate bypass. The real client refuses the emulator's self-signed
    game-server certificate. The tool finds OpenSSL ``SSL_CTX_set_verify`` by a
@@ -28,7 +28,14 @@ fourth one with ``--aws-proxy``:
    (handle 0, result OK, length 0), so the login goes on at once whether Steam is
    online or not. Both functions are found by byte signatures.
 
-4. AWS proxy (``--aws-proxy``, for Windows). The remote-config (S3), analytics
+4. Typed chat. The client holds typed chat back until a privacy check (the
+   console variable ``javelin.social.enable-vpc-restrictions``, default on)
+   gets an answer from a platform service the emulator setup does not have, so
+   nothing typed is ever sent. The settings function creates that variable
+   with ``MOV R8B,1`` as its default; the tool makes the immediate 0. The site
+   is found by the variable's name and the shape of its creation.
+
+5. AWS proxy (``--aws-proxy``, for Windows). The remote-config (S3), analytics
    (Kinesis) and analytics-credentials (STS) clients call fixed Amazon names
    with certificate checks on. Windows has no per-process hosts or trust file,
    so each client is sent through the launcher's loopback proxy instead. After
@@ -159,6 +166,26 @@ MOV_DWORD_RBX = bytes.fromhex("c783")
 MOV_DWORD_RSP8 = bytes.fromhex("c74424")
 LEA_RDX_RSP8 = bytes.fromhex("488d5424")
 MOV_RCX_RBX = bytes.fromhex("488bcb")
+
+# Typed chat patch. The settings function (build 25810808: FUN_14616d7b0) creates each console
+# variable as LEA RDX,[name] / LEA RCX,[RBP+var] / CALL / MOV R8B,<default> / LEA RDX,[RBP+var].
+CHAT_RESTRICTION_VARIABLE = b"javelin.social.enable-vpc-restrictions"
+NUL = b"\x00"
+LEA_RDX_RIP = bytes.fromhex("488d15")
+VARIABLE_CREATION = re.compile(
+    re.escape(LEA_RDX_RIP)
+    + b"(?P<name>.{4})"
+    + re.escape(bytes.fromhex("488d8d"))
+    + b"(?P<variable>.{4})"
+    + b"\xe8.{4}"
+    + re.escape(bytes.fromhex("41b0"))
+    + b"(?P<default>\x01)"
+    + re.escape(bytes.fromhex("488d95"))
+    + b"(?P=variable)",
+    re.DOTALL,
+)
+LEA_RDX_RIP_LEN = 7
+DEFAULT_OFF = b"\x00"
 
 # AWS proxy patch (docs/re/2026-09-20-windows-launcher-network.md). The launcher's loopback proxy
 # listens here; bins/launcher/src/aws_proxy.rs holds the same port.
@@ -380,6 +407,23 @@ def plan_offline_ticket(data: bytes) -> "list[tuple[str, int, bytes]]":
     return [("offline Steam ticket", site, code + bytes([INT3]) * (length - len(code)))]
 
 
+def plan_typed_chat(data: bytes) -> "list[tuple[str, int, bytes]]":
+    """The edit that turns the typed chat privacy check off: the default of
+    ``javelin.social.enable-vpc-restrictions`` becomes 0."""
+    name = virtual_address(
+        data, find_unique(data, NUL + CHAT_RESTRICTION_VARIABLE + NUL, "chat restriction name") + len(NUL)
+    )
+    sites = [
+        match.start("default")
+        for match in VARIABLE_CREATION.finditer(data)
+        if virtual_address(data, match.start()) + LEA_RDX_RIP_LEN
+        + struct.unpack("<i", match.group("name"))[0] == name
+    ]
+    if len(sites) != 1:
+        fail(f"chat restriction site found {len(sites)} times; the client build may have changed")
+    return [("typed chat", sites[0], DEFAULT_OFF)]
+
+
 def plan_patches(data: bytes, aws_proxy: bool) -> "list[tuple[str, int, bytes]]":
     """The (name, file offset, new bytes) edits that make the patched copy from `data`; with
     `aws_proxy`, also the AWS proxy edits."""
@@ -391,6 +435,7 @@ def plan_patches(data: bytes, aws_proxy: bool) -> "list[tuple[str, int, bytes]]"
         ("certificate bypass", verify_site, NOPS),
         ("exit to desktop", slot, struct.pack("<Q", sonic)),
         *plan_offline_ticket(data),
+        *plan_typed_chat(data),
     ]
     return edits + plan_aws_proxy(data) if aws_proxy else edits
 

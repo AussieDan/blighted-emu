@@ -27,6 +27,12 @@ readonly HANDLER_HEX="48895c2410488974241848897c2420554154415541564157488dac2450
 # INT3 to the end of the replaced bytes.
 readonly OFFLINE_TICKET_HEX="c783f002000000000000c744243000000000c744243401000000c744243800000000""488d542430488bcbe8fefeffff4883c4205bc3"
 readonly OFFLINE_TICKET_FILL=53
+# The typed chat site: the name of the chat restriction variable in .rdata, and its creation in
+# .text (LEA RDX,[name] / LEA RCX,[RBP+0x95D8] / CALL / MOV R8B,1 / LEA RDX,[RBP+0x95D8]).
+readonly CHAT_NAME="javelin.social.enable-vpc-restrictions"
+readonly CHAT_NAME_OFFSET=$((0xa40))
+readonly CHAT_SITE_OFFSET=$((0x440))
+readonly CHAT_FLAG_OFFSET=$((CHAT_SITE_OFFSET + 0x15))
 # Fake PE layout: image base, .text at RVA 0x1000 / file 0x200 (0x800 bytes), .rdata at RVA 0x2000
 # / file 0xA00.
 readonly SIG_OFFSET=$((0x200))
@@ -90,10 +96,11 @@ make_bin64() {
   python3 -I - "$dir/NewWorld.exe" "$with_sig" "$with_steam" "$with_proxy" \
     "$with_ticket" "$GET_TICKET_HEX" "$HANDLER_HEX" "$SIGNATURE_HEX" "$SONIC_HEX" "$STEAM_HEX" "$STEAM_VA_HEX" "$CTOR_HEX" "$S3_LEAD_HEX" \
     "$S3_TAIL_HEX" "$KINESIS_LEAD_HEX" "$KINESIS_TAIL_HEX" "$STS_LEAD_HEX" "$STS_TAIL_HEX" \
-    "$S3_VERIFY_HEX" <<'PY'
+    "$S3_VERIFY_HEX" "$CHAT_NAME" "$CHAT_NAME_OFFSET" "$CHAT_SITE_OFFSET" <<'PY'
 import struct, sys
 (path, with_sig, with_steam, with_proxy, with_ticket, get_ticket, handler, sig, sonic, steam, steam_va, ctor,
- s3_lead, s3_tail, kinesis_lead, kinesis_tail, sts_lead, sts_tail, s3_verify) = sys.argv[1:]
+ s3_lead, s3_tail, kinesis_lead, kinesis_tail, sts_lead, sts_tail, s3_verify, chat_name, chat_name_offset,
+ chat_site) = sys.argv[1:]
 image = bytearray(0xB00)
 image[0:2] = b"MZ"
 struct.pack_into("<I", image, 0x3C, 0x40)
@@ -134,6 +141,12 @@ if with_proxy == "yes":
 if with_ticket == "yes":
     put(0x600, handler)
     put(0x6B0, get_ticket)
+chat_name_offset, chat_site = int(chat_name_offset), int(chat_site)
+image[chat_name_offset : chat_name_offset + len(chat_name) + 1] = chat_name.encode() + b"\0"
+# .rdata: RVA 0x2000 at file 0xA00.
+rdata_va = 0x140002000 + chat_name_offset - 0xA00
+name_rel = struct.pack("<i", rdata_va - (va(chat_site) + 7))
+put(chat_site, "488d15" + name_rel.hex() + "488d8dd8950000" "e811111111" "41b001" "488d95d8950000")
 open(path, "wb").write(image)
 PY
 }
@@ -194,6 +207,7 @@ check_bytes "patched GetTicket fills the rest of the request with INT3" \
   $((TICKET_REQUEST_OFFSET + ${#OFFLINE_TICKET_HEX} / 2)) "$(printf 'cc%.0s' $(seq "$OFFLINE_TICKET_FILL"))"
 check_bytes "patched GetTicket keeps the flag write and the log call" "$GET_TICKET_OFFSET" "${GET_TICKET_HEX:0:70}"
 check_bytes "the ticket handler is unchanged" "$HANDLER_OFFSET" "$HANDLER_HEX"
+check_bytes "the chat restriction variable starts off" "$((CHAT_FLAG_OFFSET - 2))" "41b000488d95d8950000"
 
 # 2) --verify passes on the patched copy, and fails after tampering.
 if python3 "$PATCH_SCRIPT" "$bin64" --verify >/dev/null; then
