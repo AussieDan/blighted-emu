@@ -39,7 +39,10 @@ impl Position {
 
     /// Distance in the ground plane.
     pub fn horizontal_distance(self, other: Self) -> f32 {
-        (self.x - other.x).hypot(self.y - other.y)
+        let (east, north) = (self.x - other.x, self.y - other.y);
+        // Not `hypot`: its overflow care is not needed in a level and it is several times
+        // slower (live 2026-11-01: 5 % of the main thread of a sim of 366 players).
+        (east * east + north * north).sqrt()
     }
 }
 
