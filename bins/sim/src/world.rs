@@ -4234,6 +4234,7 @@ impl SimWorld {
                         strikes: quest_objects::Strikes::default(),
                         cooldowns: Vec::new(),
                         cooldowns_changed: false,
+                        last_zone: None,
                         item_effects: item_calls::ItemEffects::default(),
                         status_effects: status_effects::StatusEffects::default(),
                         fall: fall_damage::FallTrack::default(),
