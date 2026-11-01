@@ -2717,6 +2717,7 @@ mod tests {
             quests: PlayerQuests::default(),
             progression: PlayerProgression::default(),
             game_master: false,
+            account_in_probation: false,
         }
     }
 
@@ -3817,6 +3818,7 @@ mod tests {
                 attribute_version: 0,
                 fishing_sequence: 0,
                 game_master: false,
+                account_in_probation: false,
                 quests: PlayerQuests::default(),
                 progression: PlayerProgression::default(),
                 achievement_version: 0,
