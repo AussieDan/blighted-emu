@@ -86,6 +86,11 @@ const MAX_STEP_RISE_M: f32 = 0.6;
 const DETOUR_TURNS_DEG: [f64; 6] = [30.0, -30.0, 60.0, -60.0, 90.0, -90.0];
 /// The longest first leg of a way around a solid (our engineering limit: about a rock's size).
 const DETOUR_LEG_M: f32 = 4.0;
+/// A reach check's answer holds while the mob and its target each stay this near where it ran
+/// (our engineering limit: the check's own floor step). Live 2026-11-01: with a check on every
+/// step, half of the mob time of a sim of 366 players went to the checks (mob part 11.1 ms, 5.5
+/// ms without them).
+const REACH_RECHECK_M: f32 = FLOOR_STEP_M;
 /// The slice config param that gives the engine key `Difficulty_Tier` (Inferred: Janszoon's
 /// slice, `corrupted_sailor_starterbeach_named_00`, sets `DifficultyTier` 1 and no
 /// `Difficulty_Tier`; his great axeman trees attack only at a tier, and tier 1 picks the
@@ -966,6 +971,7 @@ struct MindState {
     manual: Option<Position>,
     last_damage: Option<Position>,
     reachable_ms: Option<u64>,
+    reach: Option<ReachCheck>,
     statuses: Vec<NameId>,
     /// While a hit reaction plays: until when.
     reaction_until_ms: Option<u64>,
@@ -975,6 +981,26 @@ struct MindState {
     picks: Rng48,
     run_speed_mps: Option<f32>,
     sight_m: Option<f32>,
+}
+
+/// The last reach check of a mob: where it and its target stood, and the answer.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct ReachCheck {
+    from: Position,
+    to: Position,
+    reachable: bool,
+}
+
+impl ReachCheck {
+    /// The answer for a mob at `from` and its target at `to`, while both stay within
+    /// [`REACH_RECHECK_M`] of the places of the check.
+    fn answer(self, from: Position, to: Position) -> Option<bool> {
+        let near = |checked: Position, now: Position| {
+            checked.horizontal_distance(now) < REACH_RECHECK_M
+                && (checked.z - now.z).abs() < REACH_RECHECK_M
+        };
+        (near(self.from, from) && near(self.to, to)).then_some(self.reachable)
+    }
 }
 
 /// What a mob perceives in one step.
@@ -1097,7 +1123,18 @@ impl MindState {
             let position = self.manual.unwrap_or(player.position);
             let distance_m = position.horizontal_distance(at);
             let gap = yaw_gap(self.yaw, yaw_toward(at, position));
-            let reachable = reaches(around.ground, at, position, max_slope);
+            let reachable = self
+                .reach
+                .and_then(|check| check.answer(at, position))
+                .unwrap_or_else(|| {
+                    let reachable = reaches(around.ground, at, position, max_slope);
+                    self.reach = Some(ReachCheck {
+                        from: at,
+                        to: position,
+                        reachable,
+                    });
+                    reachable
+                });
             if reachable {
                 self.reachable_ms = Some(around.now_ms);
             }
@@ -1505,6 +1542,7 @@ impl TreeMind {
                 manual: None,
                 last_damage: None,
                 reachable_ms: None,
+                reach: None,
                 statuses: Vec::new(),
                 reaction_until_ms: None,
                 route: spawn_ai
@@ -2642,6 +2680,24 @@ mod tests {
             x: START.x + metres,
             ..START
         }
+    }
+
+    #[test]
+    fn a_reach_answer_holds_until_the_mob_or_its_target_moves_a_floor_step() {
+        let check = ReachCheck {
+            from: START,
+            to: east(20.0),
+            reachable: false,
+        };
+        let short = REACH_RECHECK_M * 0.9;
+        assert_eq!(check.answer(east(short), east(20.0 - short)), Some(false));
+        assert_eq!(check.answer(east(REACH_RECHECK_M), east(20.0)), None);
+        assert_eq!(check.answer(START, east(20.0 + REACH_RECHECK_M)), None);
+        let climbed = Position {
+            z: GROUND_Z + REACH_RECHECK_M,
+            ..START
+        };
+        assert_eq!(check.answer(climbed, east(20.0)), None);
     }
 
     #[test]
