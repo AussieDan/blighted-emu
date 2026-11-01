@@ -45,6 +45,10 @@ expect "a snapshot interval that is not a number is refused" "$EXIT_USAGE" "not 
   env LIVE_STACK_ROOT="$work_dir" NW_GAME_DIR="$work_dir" LIVE_STACK_SNAPSHOT_MS=often \
   "$STACK_SCRIPT"
 
+expect "a thread count that is not a number is refused" "$EXIT_USAGE" "not 'many'" \
+  env LIVE_STACK_ROOT="$work_dir" NW_GAME_DIR="$work_dir" LIVE_STACK_TICK_THREADS=many \
+  "$STACK_SCRIPT"
+
 if [[ -d "$work_dir/local-data/logs" ]]; then
   echo "FAIL: a refused start wrote logs"
   failures=$((failures + 1))
@@ -73,7 +77,7 @@ fake_root="$work_dir/fake"
 mkdir -p "$fake_root/target/release" "$fake_root/local-data/edge-http" "$fake_root/pids"
 touch "$fake_root/local-data/m3-test.env" "$fake_root/local-data/edge-http/edge.toml" \
   "$fake_root/local-data/world-director.toml"
-for program in edge-http world-director sim rep-gateway blighted-admin nw-testclient; do
+for program in edge-http world-director social sim rep-gateway blighted-admin nw-testclient; do
   printf '#!/usr/bin/env bash\necho "$*" > "%s/pids/%s.args"\nenv > "%s/pids/%s.env"\necho $$ > "%s/pids/%s"\necho "started $$"\nexec sleep %s\n' \
     "$fake_root" "$program" "$fake_root" "$program" "$fake_root" "$program" "$FAKE_SLEEP_S" \
     >"$fake_root/target/release/$program"
