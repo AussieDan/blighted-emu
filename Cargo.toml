@@ -43,6 +43,7 @@ proptest = { version = "1.12.0", default-features = false, features = ["std"] }
 quick-xml = { version = "0.42.0", default-features = false, features = ["serialize"] }
 quote = { version = "1.0.47", default-features = false, features = ["proc-macro"] }
 redis = { version = "1.7.1", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
+rustc-hash = { version = "2.1.3", default-features = false, features = ["std"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["json", "form", "rustls-no-provider"] }
 rustls = { version = "0.23.31", default-features = false, features = ["ring", "std", "tls12"] }
 socket2 = { version = "0.6.5", default-features = false, features = ["all"] }

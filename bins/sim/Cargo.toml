@@ -26,6 +26,7 @@ nw-reflect.workspace = true
 nw-sim-core.workspace = true
 nw-social.workspace = true
 nw-world.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

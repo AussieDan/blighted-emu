@@ -18,6 +18,8 @@
 //! ([`release_raw_id`]), so the table holds only the entities in some sim or view now.
 
 use std::collections::HashMap;
+
+use rustc_hash::FxHashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{OnceLock, PoisonError, RwLock};
 
@@ -86,7 +88,8 @@ struct Entry {
 
 #[derive(Debug, Default)]
 struct Registry {
-    by_number: HashMap<u64, Entry>,
+    /// Looked up for every shown entity on every tick, so with a fast hash.
+    by_number: FxHashMap<u64, Entry>,
     by_id: HashMap<[u8; RAW_ID_LEN], u64>,
     by_facet: HashMap<u64, u64>,
     next_seen: u64,

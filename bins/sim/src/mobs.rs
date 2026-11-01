@@ -25,7 +25,7 @@
 //! A GM mob (admin studio spec section 8.2) is spawned by a game master at any point: every player
 //! sees and fights it, it stays awake, and it respawns at its spawn until the GM removes it.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use nw_ai::value::NameId;
@@ -37,6 +37,7 @@ use nw_sim_core::{
     Position, Seen, SpatialGrid, TUTORIAL_FOLDER, mob_max_health, walk_within,
 };
 pub use nw_world::records::VitalsSpawn;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::combat::CombatSettings;
 use crate::mob_ai::{
@@ -382,11 +383,11 @@ struct Personal {
 pub struct Mobs {
     spawns: Arc<[VitalsSpawn]>,
     /// Personal mobs by index; their indexes follow the spawn list.
-    personal: HashMap<u32, Personal>,
+    personal: FxHashMap<u32, Personal>,
     /// GM mobs by index, with their spawns; their indexes follow the spawn list too.
     gm: BTreeMap<u32, VitalsSpawn>,
     /// Mobs a tree spawned (`ExecuteSpawn`) by index; their indexes follow the spawn list too.
-    summoned: HashMap<u32, Summoned>,
+    summoned: FxHashMap<u32, Summoned>,
     /// The design overrides of each spawn of the spawn list (empty: none).
     overrides: Arc<[Option<SpawnAi>]>,
     next_personal: u32,
@@ -395,8 +396,9 @@ pub struct Mobs {
     wake_radius_m: f32,
     sleep_after_ms: u64,
     respawn_ms: u64,
-    live: HashMap<u32, Mob>,
-    owned: HashSet<u32>,
+    /// Looked up many times per awake mob on every tick, so with a fast hash.
+    live: FxHashMap<u32, Mob>,
+    owned: FxHashSet<u32>,
     awake: BTreeSet<u32>,
     spawn_grid: Option<SpatialGrid<u32>>,
     /// The awake mobs by place for the group aggro, and when it was made.
@@ -557,7 +559,7 @@ struct Summoned {
 struct TickView<'a> {
     ai: &'a MobAi,
     players: &'a SpatialGrid<u64>,
-    personal: &'a HashMap<u32, Personal>,
+    personal: &'a FxHashMap<u32, Personal>,
     ground: &'a (dyn Ground + Sync),
     wake_m: f32,
     now_ms: u64,
@@ -645,9 +647,9 @@ impl Mobs {
         let next_personal = u32::try_from(spawns.len()).unwrap_or(u32::MAX);
         Self {
             spawns,
-            personal: HashMap::new(),
+            personal: FxHashMap::default(),
             gm: BTreeMap::new(),
-            summoned: HashMap::new(),
+            summoned: FxHashMap::default(),
             overrides: Arc::from([]),
             next_personal,
             data: Arc::clone(&combat.data),
@@ -655,8 +657,8 @@ impl Mobs {
             wake_radius_m: combat.wake_radius_m,
             sleep_after_ms: combat.sleep_after_ms,
             respawn_ms: combat.mob_respawn_ms,
-            live: HashMap::new(),
-            owned: HashSet::new(),
+            live: FxHashMap::default(),
+            owned: FxHashSet::default(),
             awake: BTreeSet::new(),
             spawn_grid: None,
             aggro_grid: None,
