@@ -117,7 +117,8 @@ pub(super) struct PlayerMount {
     /// The version of the newest persistent list the client has.
     list_version: u64,
     phase: Phase,
-    /// When the next summon may start (sim ms), and its wire time (Unix ns; 0 for none).
+    /// When the next summon may start (sim ms), and its wire time (Unix ns; 0 for none; kept
+    /// over a save and a handoff).
     cooldown_end_ms: u64,
     cooldown_end_ns: u64,
     /// The summon authorization as the client has it.
@@ -158,8 +159,13 @@ pub(super) struct PlayerMount {
 }
 
 impl PlayerMount {
-    /// The mounts a join or a handoff carries: on foot, unless the handoff carries a ride.
-    pub(super) fn of(carried: &PlayerMounts) -> Self {
+    /// The mounts a join or a handoff carries, at `now_ms` (sim ms) and server time `server_ms`:
+    /// on foot, unless the handoff carries a ride; a summon cooldown that runs goes on.
+    pub(super) fn of(carried: &PlayerMounts, now_ms: u64, server_ms: u64) -> Self {
+        let left_ms = carried
+            .summon_cooldown_end_ns
+            .saturating_sub(unix_ns(server_ms))
+            / nw_messages::NS_PER_MS;
         Self {
             selected: carried.selected,
             customized: carried
@@ -175,8 +181,8 @@ impl PlayerMount {
             phase: carried
                 .riding
                 .map_or(Phase::Idle, |mount_id| Phase::Mounted { mount_id }),
-            cooldown_end_ms: 0,
-            cooldown_end_ns: 0,
+            cooldown_end_ms: now_ms.saturating_add(left_ms),
+            cooldown_end_ns: carried.summon_cooldown_end_ns,
             authorization: SummonAuthorization::default(),
             stamina: LOGIN_STAMINA,
             stamina_max: LOGIN_STAMINA,
@@ -220,6 +226,7 @@ impl PlayerMount {
                 })
                 .collect(),
             riding: self.riding(),
+            summon_cooldown_end_ns: self.cooldown_end_ns,
         }
     }
 
@@ -1251,7 +1258,7 @@ mod tests {
     const CLOSE: f32 = 1e-3;
 
     fn rider() -> PlayerMount {
-        let mut mount = PlayerMount::of(&PlayerMounts::default());
+        let mut mount = PlayerMount::of(&PlayerMounts::default(), 0, 0);
         mount.mount_up(LION_BASIC, riding_stamina(), 10.0);
         mount.change = MountState::default();
         mount
@@ -1274,7 +1281,7 @@ mod tests {
             0xc8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00, 0x3f, 0x80, 0x00,
             0x00, 0x3f, 0x80, 0x00, 0x00, 0x3f, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
         ];
-        let mut mount = PlayerMount::of(&PlayerMounts::default());
+        let mut mount = PlayerMount::of(&PlayerMounts::default(), 0, 0);
         assert_eq!(mount.card(), MountState::login_card());
         assert_eq!(mount.card().encode().expect("encode"), retail);
         assert!(mount.take_own_member(true).is_some());
@@ -1283,7 +1290,7 @@ mod tests {
 
     #[test]
     fn the_mount_up_sends_the_rates_and_the_ride_drains_and_regenerates() {
-        let mut mount = PlayerMount::of(&PlayerMounts::default());
+        let mut mount = PlayerMount::of(&PlayerMounts::default(), 0, 0);
         mount.mount_up(LION_BASIC, riding_stamina(), 10.0);
         let up = state_of(&mount.take_own_member(false).expect("change"));
         assert_eq!(
@@ -1372,6 +1379,30 @@ mod tests {
     }
 
     #[test]
+    fn a_summon_cooldown_is_carried_and_goes_on_at_the_next_spawn() {
+        const SERVER_MS: u64 = 1_000_000;
+        const LEFT_MS: u64 = 7_500;
+        const NOW_MS: u64 = 40_000;
+        let mut mount = rider();
+        let end_ns = unix_ns(SERVER_MS + LEFT_MS);
+        mount.get_off(LEFT_MS, end_ns);
+        let carried = mount.carried();
+        assert_eq!(carried.summon_cooldown_end_ns, end_ns, "a save keeps it");
+        let again = PlayerMount::of(&carried, NOW_MS, SERVER_MS);
+        assert_eq!(
+            again.cooldown_end_ms,
+            NOW_MS + LEFT_MS,
+            "the time left goes on"
+        );
+        assert_eq!(
+            again.cooldown_end_ns, end_ns,
+            "the client gets the same end"
+        );
+        let later = PlayerMount::of(&carried, NOW_MS, SERVER_MS + 2 * LEFT_MS);
+        assert_eq!(later.cooldown_end_ms, NOW_MS, "an ended cooldown is over");
+    }
+
+    #[test]
     fn dyes_and_names_go_in_the_persistent_list_and_are_carried() {
         let mut mount = rider();
         mount.customize(LION_BASIC, |customized| customized.dye = [0, 0, 0x33, 0]);
@@ -1386,7 +1417,7 @@ mod tests {
         let carried = mount.carried();
         assert_eq!(carried.selected, Some(LION_BASIC));
         assert_eq!(carried.riding, Some(LION_BASIC));
-        let again = PlayerMount::of(&carried);
+        let again = PlayerMount::of(&carried, 0, 0);
         assert_eq!(again.customized, mount.customized);
         assert_eq!(again.riding(), Some(LION_BASIC), "a handoff keeps the ride");
         assert!(again.card().persistent.is_some());

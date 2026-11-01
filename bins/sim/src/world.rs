@@ -814,6 +814,15 @@ impl Player {
             status_effects: self
                 .status_effects
                 .kept(|status_id| self.item_effects.repeat_of(status_id)),
+            consumable_cooldowns: self
+                .cooldowns
+                .iter()
+                .map(|cooldown| nw_bus::PlayerConsumableCooldown {
+                    group: cooldown.group,
+                    consumable: cooldown.consumable,
+                    end_us: cooldown.end_us,
+                })
+                .collect(),
         }
     }
 
@@ -4302,8 +4311,18 @@ impl SimWorld {
                     last_zone: None,
                     travel: travel::TravelState::of(arrival.progression.travel.clone()),
                     strikes: quest_objects::Strikes::default(),
-                    cooldowns: Vec::new(),
-                    cooldowns_changed: false,
+                    // The client gets the running ones with the first bundles.
+                    cooldowns: arrival
+                        .progression
+                        .consumable_cooldowns
+                        .iter()
+                        .map(|cooldown| ConsumableCooldown {
+                            consumable: cooldown.consumable,
+                            end_us: cooldown.end_us,
+                            group: cooldown.group,
+                        })
+                        .collect(),
+                    cooldowns_changed: !arrival.progression.consumable_cooldowns.is_empty(),
                     item_effects: item_calls::ItemEffects::default(),
                     status_effects: status_effects::StatusEffects::default(),
                     fall: fall_damage::FallTrack::default(),
@@ -4314,7 +4333,12 @@ impl SimWorld {
                     stamina: Stamina::default(),
                     abilities: abilities::AbilityRun::default(),
                     attack_playing: None,
-                    mount: mount::PlayerMount::of(&arrival.progression.mounts),
+                    // The clock of the last tick: a sim ticks before its first admit.
+                    mount: mount::PlayerMount::of(
+                        &arrival.progression.mounts,
+                        self.last_now_ms,
+                        self.server_ms,
+                    ),
                     fishing: fishing::PlayerFishing::continuing(arrival.fishing_sequence),
                     music: music::PlayerMusicState::of(&arrival.progression.music),
                     notifications: notifications::ShownNotifications::of(

@@ -520,6 +520,20 @@ pub struct PlayerProgression {
     /// 0026).
     #[serde(default)]
     pub status_effects: Vec<PlayerStatusEffect>,
+    /// Its running consumable cooldowns, by group (world migration 0029).
+    #[serde(default)]
+    pub consumable_cooldowns: Vec<PlayerConsumableCooldown>,
+}
+
+/// One running consumable cooldown of a player (the item component's ccdmap entry).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlayerConsumableCooldown {
+    /// The CRC-32 of the lowercase `CooldownId`: the consumables that share it.
+    pub group: u32,
+    /// The CRC-32 of the lowercase `ConsumableID` that started it.
+    pub consumable: u32,
+    /// When it ends, microseconds since 2000-01-01.
+    pub end_us: u64,
 }
 
 /// A player's faction (world migration 0025), as a join, a handoff and a save carry it: the
@@ -559,6 +573,9 @@ pub struct PlayerMounts {
     /// (a login starts on foot, as retail's login cards).
     #[serde(default)]
     pub riding: Option<u32>,
+    /// When the next summon may start, Unix ns (0 for none): kept over a save and a handoff.
+    #[serde(default)]
+    pub summon_cooldown_end_ns: u64,
 }
 
 /// One mount with a dye or a name.
@@ -638,6 +655,14 @@ pub struct PlacedCamp {
     pub tier: u8,
     /// When it was placed, Unix ms.
     pub placed_ms: u64,
+    /// Its rotation (x, y, z, w) as `f32` bit patterns; all 0 when not known (a camp saved
+    /// before world migration 0027): it stands unturned.
+    #[serde(default)]
+    pub rotation: [u32; 4],
+    /// The CRC-32 of its blueprint's lowercase id; 0 when not known: the owner's camp skin or
+    /// the default camp of its tier.
+    #[serde(default)]
+    pub blueprint: u32,
 }
 
 /// The housing state of a home beyond its place and furniture (world migration 0020).
@@ -1291,6 +1316,7 @@ mod tests {
                     dye: [u8::MAX; MOUNT_DYE_LEN],
                     name: b"Rex".to_vec(),
                 }],
+                summon_cooldown_end_ns: 1_790_861_002_000_000_000,
                 riding: Some(u32::MAX),
             },
             ability_slots: vec![(
@@ -1316,6 +1342,11 @@ mod tests {
                 changes: u16::MAX,
                 changed_ns: u64::MAX,
             },
+            consumable_cooldowns: vec![PlayerConsumableCooldown {
+                group: u32::MAX,
+                consumable: u32::MAX,
+                end_us: u64::MAX,
+            }],
             status_effects: vec![PlayerStatusEffect {
                 consumable_id: "FoodRecoveryT2".to_owned(),
                 status_id: "FoodRecoveryT2".to_owned(),
@@ -1393,6 +1424,9 @@ mod tests {
                 position: StoredPoint::of(POINT),
                 tier: 2,
                 placed_ms: 1_790_861_000_000,
+                // The retail `Hivecamp` 2236 rotation; any blueprint CRC.
+                rotation: [0, 0, 0x3f5f_dd61, 0xbef8_5bf1],
+                blueprint: 0x5e2a_0c11,
             }),
         }
     }

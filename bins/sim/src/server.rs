@@ -1996,6 +1996,15 @@ fn saved_progression(progression: &PlayerProgression, taken_at_ms: u64) -> Saved
                 saved_ns: taken_at_ms.saturating_mul(NS_PER_MS),
             })
             .collect(),
+        consumable_cooldowns: progression
+            .consumable_cooldowns
+            .iter()
+            .map(|cooldown| nw_db::SavedConsumableCooldown {
+                group: cooldown.group,
+                consumable: cooldown.consumable,
+                end_us: cooldown.end_us,
+            })
+            .collect(),
     }
 }
 
@@ -2040,6 +2049,7 @@ fn saved_mounts(mounts: &nw_bus::PlayerMounts) -> SavedMounts {
                 name: mount.name.clone(),
             })
             .collect(),
+        summon_cooldown_end_ns: mounts.summon_cooldown_end_ns,
     }
 }
 
@@ -2086,6 +2096,8 @@ fn saved_travel(travel: &nw_bus::PlayerTravel) -> SavedTravel {
             position: camp.position.bits(),
             tier: camp.tier,
             placed_ms: camp.placed_ms,
+            rotation: camp.rotation,
+            blueprint: camp.blueprint,
         }),
     }
 }

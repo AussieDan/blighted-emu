@@ -348,8 +348,8 @@ impl SimWorld {
     }
 
     /// The camp of player `entity` comes with it into this sim: a saved camp stands again, of
-    /// the player's camp skin or the default camp of its tier, unturned (the save keeps neither
-    /// the blueprint nor the rotation).
+    /// its saved blueprint and rotation; a camp saved before they were kept (world migration
+    /// 0027) is of the player's camp skin or the default camp of its tier, unturned.
     pub(super) fn camp_arrived(&mut self, entity: Entity) {
         if self.is_tutorial() {
             return;
@@ -362,15 +362,23 @@ impl SimWorld {
         };
         let tier = u32::from(saved.tier);
         let camps = &self.content.camps;
-        let blueprint = skin
-            .and_then(|skin| camps.skin_of_crc(skin))
-            .and_then(|skin| camps.blueprint(&skin.id))
+        let blueprint = camps
+            .blueprint_of_crc(saved.blueprint)
+            .or_else(|| {
+                skin.and_then(|skin| camps.skin_of_crc(skin))
+                    .and_then(|skin| camps.blueprint(&skin.id))
+            })
             .map_or_else(|| default_camp(tier), |blueprint| blueprint.id.clone());
         let nw_bus::Point { x, y, z } = saved.position.point();
+        let rotation = if saved.rotation == [0; 4] {
+            IDENTITY_QUAT
+        } else {
+            saved.rotation.map(f32::from_bits)
+        };
         let placement = CampPlacement {
             blueprint,
             position: Position { x, y, z },
-            rotation: IDENTITY_QUAT,
+            rotation,
             tier,
         };
         let camp = self.spawn_camp(entity, &placement);

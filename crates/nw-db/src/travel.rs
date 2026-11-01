@@ -78,7 +78,14 @@ pub struct SavedCamp {
     pub tier: u8,
     /// Unix milliseconds of its placement.
     pub placed_ms: u64,
+    /// Its rotation quaternion (x, y, z, w) as `f32` bit patterns; all 0 when not saved.
+    pub rotation: [u32; ROTATION_LEN],
+    /// The CRC-32 of its blueprint's lowercase id; 0 when not saved.
+    pub blueprint: u32,
 }
+
+/// What the rotation and blueprint of a camp saved before world migration 0027 read as.
+const NOT_SAVED: u32 = 0;
 
 /// A character's travel and housing state.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -176,11 +183,27 @@ pub(crate) async fn character_travel(
     .await?;
     let (played_ms, inn_recalled_ms, camp_position, camp_tier, camp_placed_ms) =
         times.ok_or(DbError::NoSuchCharacter)?;
+    let shape: Option<(Option<Vec<i32>>, Option<i64>)> = sqlx::query_as(
+        "SELECT camp_rotation_bits, camp_blueprint FROM player_character WHERE character_id = $1",
+    )
+    .bind(character_id)
+    .fetch_optional(world)
+    .await?;
+    let (camp_rotation, camp_blueprint) = shape.ok_or(DbError::NoSuchCharacter)?;
     let placed_camp = match (camp_position, camp_tier, camp_placed_ms) {
         (Some(position), Some(tier), Some(placed_ms)) => Some(SavedCamp {
             position: bits_array(&position, "camp position")?,
             tier: from_column(i64::from(tier), "camp_tier")?,
             placed_ms: from_column(placed_ms, "camp_placed_ms")?,
+            rotation: camp_rotation
+                .as_deref()
+                .map(|bits| bits_array(bits, "camp rotation"))
+                .transpose()?
+                .unwrap_or([NOT_SAVED; ROTATION_LEN]),
+            blueprint: camp_blueprint
+                .map(|crc| from_column(crc, "camp_blueprint"))
+                .transpose()?
+                .unwrap_or(NOT_SAVED),
         }),
         _ => None,
     };
@@ -292,7 +315,8 @@ pub(crate) async fn save_character_travel(
     let camp = travel.placed_camp;
     sqlx::query(
         "UPDATE player_character SET played_ms = $2, inn_recalled_ms = $3, \
-         camp_position_bits = $4, camp_tier = $5, camp_placed_ms = $6 WHERE character_id = $1",
+         camp_position_bits = $4, camp_tier = $5, camp_placed_ms = $6, \
+         camp_rotation_bits = $7, camp_blueprint = $8 WHERE character_id = $1",
     )
     .bind(character_id)
     .bind(to_column(travel.played_ms, "played_ms")?)
@@ -303,6 +327,8 @@ pub(crate) async fn save_character_travel(
         camp.map(|camp| to_column(camp.placed_ms, "camp_placed_ms"))
             .transpose()?,
     )
+    .bind(camp.map(|camp| bits_list(&camp.rotation)))
+    .bind(camp.map(|camp| i64::from(camp.blueprint)))
     .execute(&mut **transaction)
     .await?;
     // The items go with their homes (ON DELETE CASCADE).

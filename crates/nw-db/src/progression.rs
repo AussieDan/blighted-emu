@@ -15,6 +15,9 @@ use sqlx::PgPool;
 use uuid::Uuid;
 
 use crate::arena::{SavedArena, character_arena, save_character_arena};
+use crate::consumable_cooldowns::{
+    SavedConsumableCooldown, character_consumable_cooldowns, save_character_consumable_cooldowns,
+};
 use crate::error::DbError;
 use crate::faction::{SavedFaction, character_faction, save_character_faction};
 use crate::meta_achievements::{SavedMeta, SavedSlot, character_meta, save_character_meta};
@@ -98,6 +101,8 @@ pub struct SavedProgression {
     pub faction: SavedFaction,
     /// The held status effects of used consumables, by effect (world migration 0026).
     pub status_effects: Vec<SavedStatusEffect>,
+    /// The running consumable cooldowns, by group (world migration 0029).
+    pub consumable_cooldowns: Vec<SavedConsumableCooldown>,
 }
 
 type ProgressionRow = (bool, i64, i64, Vec<i32>);
@@ -186,6 +191,7 @@ pub async fn character_progression(
     let recipe_cooldowns = character_recipe_cooldowns(world, character_id).await?;
     let faction = character_faction(world, character_id).await?;
     let status_effects = character_status_effects(world, character_id).await?;
+    let consumable_cooldowns = character_consumable_cooldowns(world, character_id).await?;
     Ok(Some(SavedProgression {
         experience: from_column(experience, "experience")?,
         coins: from_column(coins, "coins")?,
@@ -243,6 +249,7 @@ pub async fn character_progression(
         recipe_cooldowns,
         faction,
         status_effects,
+        consumable_cooldowns,
     }))
 }
 
@@ -414,6 +421,12 @@ pub async fn save_character_progression(
     save_character_faction(&mut transaction, character_id, &progression.faction).await?;
     save_character_status_effects(&mut transaction, character_id, &progression.status_effects)
         .await?;
+    save_character_consumable_cooldowns(
+        &mut transaction,
+        character_id,
+        &progression.consumable_cooldowns,
+    )
+    .await?;
     transaction.commit().await?;
     Ok(SaveOutcome::Saved)
 }
@@ -519,6 +532,12 @@ mod infra_tests {
                 changed_ns: 0x18e1_bb69_e04f_ba64,
             },
             // The retail `target-lock-test` food, 303.5 s left at the save.
+            // A potion cooldown of 20 s.
+            consumable_cooldowns: vec![crate::SavedConsumableCooldown {
+                group: 0x7a1d_2c34,
+                consumable: 0x0b6e_19f2,
+                end_us: 846_118_020_000_000,
+            }],
             status_effects: vec![crate::SavedStatusEffect {
                 status_id: "FoodRecoveryT2".to_owned(),
                 consumable_id: "FoodRecoveryT2".to_owned(),
@@ -576,6 +595,7 @@ mod infra_tests {
                     name: b"Rex".to_vec(),
                 },
             ],
+            summon_cooldown_end_ns: 1_790_861_002_000_000_000,
         }
     }
 
@@ -631,6 +651,9 @@ mod infra_tests {
                 position,
                 tier: 2,
                 placed_ms: 1_790_861_000_000,
+                // The retail `Hivecamp` 2236 rotation; any blueprint CRC.
+                rotation: [0, 0, 0x3f5f_dd61, 0xbef8_5bf1],
+                blueprint: 0x5e2a_0c11,
             }),
         }
     }

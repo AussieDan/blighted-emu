@@ -7,7 +7,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::error::DbError;
-use crate::progression::from_column;
+use crate::progression::{from_column, to_column};
 
 /// Bytes of a dye: one color index per mask channel.
 pub const DYE_LEN: usize = 4;
@@ -30,6 +30,8 @@ pub struct SavedMounts {
     pub selected: Option<u32>,
     /// The mounts with a dye or a name, in the order first customized.
     pub customized: Vec<SavedMount>,
+    /// When the next summon may start, Unix ns; 0 for none.
+    pub summon_cooldown_end_ns: u64,
 }
 
 type MountRow = (i64, Vec<u8>, Vec<u8>);
@@ -39,12 +41,13 @@ pub(crate) async fn character_mounts(
     world: &PgPool,
     character_id: Uuid,
 ) -> Result<SavedMounts, DbError> {
-    let row: Option<(Option<i64>,)> =
-        sqlx::query_as("SELECT mount_id FROM player_character WHERE character_id = $1")
-            .bind(character_id)
-            .fetch_optional(world)
-            .await?;
-    let (selected,) = row.ok_or(DbError::NoSuchCharacter)?;
+    let row: Option<(Option<i64>, i64)> = sqlx::query_as(
+        "SELECT mount_id, mount_cooldown_end_ns FROM player_character WHERE character_id = $1",
+    )
+    .bind(character_id)
+    .fetch_optional(world)
+    .await?;
+    let (selected, cooldown_end_ns) = row.ok_or(DbError::NoSuchCharacter)?;
     let mounts: Vec<MountRow> = sqlx::query_as(
         "SELECT mount_id, dye, name FROM character_mount WHERE character_id = $1 \
          ORDER BY position",
@@ -68,6 +71,7 @@ pub(crate) async fn character_mounts(
                 })
             })
             .collect::<Result<_, DbError>>()?,
+        summon_cooldown_end_ns: from_column(cooldown_end_ns, "mount_cooldown_end_ns")?,
     })
 }
 
@@ -78,11 +82,18 @@ pub(crate) async fn save_character_mounts(
     character_id: Uuid,
     mounts: &SavedMounts,
 ) -> Result<(), DbError> {
-    sqlx::query("UPDATE player_character SET mount_id = $2 WHERE character_id = $1")
-        .bind(character_id)
-        .bind(mounts.selected.map(i64::from))
-        .execute(&mut **transaction)
-        .await?;
+    sqlx::query(
+        "UPDATE player_character SET mount_id = $2, mount_cooldown_end_ns = $3 \
+         WHERE character_id = $1",
+    )
+    .bind(character_id)
+    .bind(mounts.selected.map(i64::from))
+    .bind(to_column(
+        mounts.summon_cooldown_end_ns,
+        "mount_cooldown_end_ns",
+    )?)
+    .execute(&mut **transaction)
+    .await?;
     sqlx::query("DELETE FROM character_mount WHERE character_id = $1")
         .bind(character_id)
         .execute(&mut **transaction)

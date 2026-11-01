@@ -453,6 +453,16 @@ fn player_progression(saved: SavedProgression, now_ns: u64) -> PlayerProgression
             .into_iter()
             .map(|effect| player_status_effect(effect, now_ns))
             .collect(),
+        // Their ends are on the server clock: they need no shift.
+        consumable_cooldowns: saved
+            .consumable_cooldowns
+            .into_iter()
+            .map(|cooldown| nw_bus::PlayerConsumableCooldown {
+                group: cooldown.group,
+                consumable: cooldown.consumable,
+                end_us: cooldown.end_us,
+            })
+            .collect(),
     }
 }
 
@@ -521,6 +531,7 @@ fn player_mounts(saved: SavedMounts) -> PlayerMounts {
             })
             .collect(),
         riding: None,
+        summon_cooldown_end_ns: saved.summon_cooldown_end_ns,
     }
 }
 
@@ -567,6 +578,8 @@ fn player_travel(saved: SavedTravel) -> PlayerTravel {
             position: StoredPoint::from_bits(camp.position),
             tier: camp.tier,
             placed_ms: camp.placed_ms,
+            rotation: camp.rotation,
+            blueprint: camp.blueprint,
         }),
     }
 }
@@ -724,6 +737,7 @@ mod tests {
                     dye: [0x19, 0x25, 0x19, 0x25],
                     name: b"Rex".to_vec(),
                 }],
+                summon_cooldown_end_ns: 1_790_861_002_000_000_000,
             },
             music: nw_db::SavedMusic {
                 next_performance_ms: Some(846_118_000_000),
@@ -741,6 +755,11 @@ mod tests {
                 changes: 1,
                 changed_ns: 0x18e1_bb69_e04f_ba64,
             },
+            consumable_cooldowns: vec![nw_db::SavedConsumableCooldown {
+                group: 0x7a1d_2c34,
+                consumable: 0x0b6e_19f2,
+                end_us: 846_118_020_000_000,
+            }],
             status_effects: vec![
                 saved_food(false),
                 SavedStatusEffect {
@@ -796,6 +815,7 @@ mod tests {
                         name: b"Rex".to_vec(),
                     }],
                     riding: None,
+                    summon_cooldown_end_ns: 1_790_861_002_000_000_000,
                 },
                 music: nw_bus::PlayerMusic {
                     next_performance_ms: Some(846_118_000_000),
@@ -811,6 +831,11 @@ mod tests {
                     changes: 1,
                     changed_ns: 0x18e1_bb69_e04f_ba64,
                 },
+                consumable_cooldowns: vec![nw_bus::PlayerConsumableCooldown {
+                    group: 0x7a1d_2c34,
+                    consumable: 0x0b6e_19f2,
+                    end_us: 846_118_020_000_000,
+                }],
                 status_effects: vec![
                     nw_bus::PlayerStatusEffect {
                         consumable_id: "FoodRecoveryT2".to_owned(),
@@ -838,6 +863,10 @@ mod tests {
 
     /// When the food of [`saved_food`] was saved: unix ns.
     const SAVED_NS: u64 = 1_790_860_000_000_000_000;
+    /// The retail `Hivecamp` 2236 rotation (x, y, z, w bits).
+    const CAMP_ROTATION: [u32; 4] = [0, 0, 0x3f5f_dd61, 0xbef8_5bf1];
+    /// Any blueprint CRC.
+    const CAMP_BLUEPRINT: u32 = 0x5e2a_0c11;
     /// What it had left then (retail `target-lock-test`: 303.5 s).
     const FOOD_LEFT_NS: u64 = 303_500_000_000;
     /// When its next heal came.
@@ -898,6 +927,8 @@ mod tests {
                 position,
                 tier: 2,
                 placed_ms: 1_790_861_000_000,
+                rotation: CAMP_ROTATION,
+                blueprint: CAMP_BLUEPRINT,
             }),
         };
         let travel = player_travel(saved);
@@ -946,6 +977,8 @@ mod tests {
                 position: StoredPoint::from_bits(position),
                 tier: 2,
                 placed_ms: 1_790_861_000_000,
+                rotation: CAMP_ROTATION,
+                blueprint: CAMP_BLUEPRINT,
             })
         );
     }

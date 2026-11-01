@@ -1785,6 +1785,8 @@ impl SimWorld {
                     position: stored(camp.position),
                     tier: u8::try_from(camp.tier).unwrap_or(u8::MAX),
                     placed_ms: unix_ms,
+                    rotation: camp.rotation.map(f32::to_bits),
+                    blueprint: nw_formats::objectstream::lowercase_crc32(&camp.blueprint),
                 });
                 player.travel.due.camping = true;
                 player.travel.due.homes = true;
@@ -3729,7 +3731,13 @@ mod tests {
             let departure = world.leave(&connection(CAMPER)).expect("departure");
             assert!(!shown(&world, &first), "the camp leaves with its owner");
             let travel = departure.progression.expect("saved").travel;
-            assert!(travel.placed_camp.is_some());
+            let saved = travel.placed_camp.expect("a saved camp");
+            assert_eq!(
+                saved.rotation,
+                retail_rotation().map(f32::to_bits),
+                "its rotation"
+            );
+            assert_ne!(saved.blueprint, 0, "its blueprint");
             let mut admit = admit_at(CAMPER, START_X, true);
             admit.backstory = Some(gear::tests::BACKSTORY.to_owned());
             admit.progression.travel = PlayerTravel {
@@ -3740,6 +3748,10 @@ mod tests {
             let entity = world.player_by_number(CAMPER).expect("camper");
             let again = camp_of(&world, entity).expect("the camp again");
             assert!(shown(&world, &again));
+            assert_eq!(
+                again.spawn_point, first.spawn_point,
+                "turned as placed: its respawn point is where it was"
+            );
         }
     }
 }

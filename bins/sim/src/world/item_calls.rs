@@ -1193,6 +1193,62 @@ mod tests {
         }
 
         #[test]
+        fn a_running_consumable_cooldown_comes_back_at_the_next_spawn() {
+            use crate::world::item_calls::{MS_PER_SECOND, US_PER_MS, start_cooldown};
+            use crate::world::tests::admit_at;
+
+            const POTION: &str = "PotionHealthT1";
+            const GROUP: &str = "HealthPotion";
+            const COOLDOWN_S: u32 = 20;
+            const USED_US: u64 = 846_118_000_000_000;
+            let mut before = world_with_spawns(Vec::new());
+            join(&mut before, 1, 0.0);
+            let entity = before.by_connection[&connection(1)];
+            let kept = {
+                let mut player = before.world.get_mut::<Player>(entity).expect("player");
+                assert!(start_cooldown(
+                    &mut player.cooldowns,
+                    POTION,
+                    Some((GROUP, COOLDOWN_S)),
+                    USED_US
+                ));
+                player.progression().consumable_cooldowns
+            };
+            let end_us = USED_US + u64::from(COOLDOWN_S) * MS_PER_SECOND * US_PER_MS;
+            assert_eq!(
+                kept,
+                vec![nw_bus::PlayerConsumableCooldown {
+                    group: lowercase_crc32(GROUP),
+                    consumable: lowercase_crc32(POTION),
+                    end_us,
+                }],
+                "a save keeps it"
+            );
+            let mut after = world_with_spawns(Vec::new());
+            let mut admit = admit_at(1, 0.0, true);
+            admit.progression.consumable_cooldowns = kept;
+            after.admit(&admit, NOW, SERVER_TIME).expect("admit");
+            let entity = after.by_connection[&connection(1)];
+            let mut player = after.world.get_mut::<Player>(entity).expect("player");
+            assert!(player.cooldowns_changed, "the client gets it");
+            assert!(
+                !start_cooldown(
+                    &mut player.cooldowns,
+                    POTION,
+                    Some((GROUP, COOLDOWN_S)),
+                    USED_US + 1
+                ),
+                "no second potion while it runs"
+            );
+            assert!(start_cooldown(
+                &mut player.cooldowns,
+                POTION,
+                Some((GROUP, COOLDOWN_S)),
+                end_us
+            ));
+        }
+
+        #[test]
         fn a_potion_from_the_bag_heals_once_per_cooldown() {
             let mut world = world();
             let entity = world.by_connection[&connection(1)];

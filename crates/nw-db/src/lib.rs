@@ -13,6 +13,7 @@ mod analytics;
 mod arena;
 mod character;
 mod connect;
+mod consumable_cooldowns;
 mod entity;
 mod error;
 mod faction;
@@ -51,6 +52,7 @@ pub use character::{
     insert_character, release_character_name, reserve_character_name,
 };
 pub use connect::{DatabaseConfig, connect, connect_lazy, connect_options};
+pub use consumable_cooldowns::SavedConsumableCooldown;
 pub use entity::{MAX_ENTITY_NUMBER, next_entity_number};
 pub use error::DbError;
 pub use faction::SavedFaction;

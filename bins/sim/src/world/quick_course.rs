@@ -370,11 +370,14 @@ mod tests {
     }
 
     fn mount(world: &mut SimWorld, entity: Entity) {
-        world.world.get_mut::<Player>(entity).expect("player").mount =
-            PlayerMount::of(&PlayerMounts {
+        world.world.get_mut::<Player>(entity).expect("player").mount = PlayerMount::of(
+            &PlayerMounts {
                 riding: Some(MOUNT),
                 ..PlayerMounts::default()
-            });
+            },
+            0,
+            0,
+        );
     }
 
     fn ride_to(world: &mut SimWorld, entity: Entity, [x, y, z]: [f32; 3], now_ms: u64) {
@@ -499,7 +502,7 @@ mod tests {
             "not again while still mounted"
         );
         world.world.get_mut::<Player>(entity).expect("player").mount =
-            PlayerMount::of(&PlayerMounts::default());
+            PlayerMount::of(&PlayerMounts::default(), 0, 0);
         ride_to(
             &mut world,
             entity,
