@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! One player connection in the gateway, with no sockets: DTLS, the carrier, the registration
-//! step, pings, and the time and rate limits (M3 spec sections 3.1, 6, and 10).
+//! step, pings and their round trip, and the time and rate limits (M3 spec sections 3.1, 6, and
+//! 10).
 //!
 //! The server loop passes in datagrams and the time. When a V3 request arrives, [`Peer::receive`]
 //! returns [`PeerEvent::RegistrationRequested`]; the loop checks the ticket (an async store call)
 //! and hands the result to [`Peer::complete_registration`]. Any error closes the connection.
 
+use std::collections::VecDeque;
 use std::time::SystemTime;
 
 use nw_carrier::{
@@ -24,6 +26,12 @@ use crate::registration::{Admission, Refusal, TicketClaims, response};
 
 /// Length of the rate window.
 pub const RATE_WINDOW_MS: u64 = 1000;
+/// Sent pings kept for their echo. Inferred: at one ping a second this is more than a minute of
+/// pings without an echo; an older ping is forgotten, and its echo is then ignored.
+pub const MAX_UNANSWERED_PINGS: usize = 64;
+/// Length of a ping body: the gateway's send time, big-endian milliseconds (Observed: carrier
+/// captures note section 8, an 8-byte body).
+const PING_BODY_LEN: usize = 8;
 
 /// Limits and timers of one connection (config `[limits]`, M3 spec section 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +55,11 @@ pub enum PeerEvent {
     RegistrationRequested(TicketClaims),
     /// A registered client sent a game message; forward its envelope bytes to the world.
     ClientMessage(Vec<u8>),
+    /// The client echoed a ping: the time from sending it to its echo, on the gateway's clock.
+    RoundTrip {
+        /// Milliseconds.
+        ms: u64,
+    },
 }
 
 /// Server messages that wait for the registration response.
@@ -128,6 +141,10 @@ pub struct Peer {
     created_ms: u64,
     last_received_ms: u64,
     last_ping_ms: u64,
+    /// Send times of the pings without an echo yet, oldest first.
+    unanswered_pings: VecDeque<u64>,
+    /// The round trip of the last echoed ping.
+    last_round_trip_ms: Option<u64>,
     window_start_ms: u64,
     window_count: u32,
     held: Vec<HeldMessages>,
@@ -146,6 +163,8 @@ impl Peer {
             created_ms: now_ms,
             last_received_ms: now_ms,
             last_ping_ms: now_ms,
+            unanswered_pings: VecDeque::new(),
+            last_round_trip_ms: None,
             window_start_ms: now_ms,
             window_count: 0,
             held: Vec::new(),
@@ -165,6 +184,18 @@ impl Peer {
     /// The connection id given to [`Peer::new`].
     pub const fn id(&self) -> u64 {
         self.id
+    }
+
+    /// The round trip of this player at `now_ms`: the last echoed ping, raised to the age of the
+    /// oldest ping without an echo, so a client that stops answering shows its delay before the
+    /// silence timer drops it. `None` before the first echo.
+    pub fn round_trip_ms(&self, now_ms: u64) -> Option<u64> {
+        let waiting = self
+            .unanswered_pings
+            .front()
+            .map_or(0, |sent| now_ms.saturating_sub(*sent));
+        self.last_round_trip_ms
+            .map(|measured| measured.max(waiting))
     }
 
     /// Whether the connection is over and its last datagrams are sent.
@@ -193,7 +224,7 @@ impl Peer {
             for event in self.carrier.receive(now_ms, &plaintext)? {
                 match event {
                     Event::Message(message) => {
-                        if let Some(event) = self.message(&message)? {
+                        if let Some(event) = self.message(now_ms, &message)? {
                             events.push(event);
                         }
                     }
@@ -221,7 +252,7 @@ impl Peer {
         Ok(())
     }
 
-    fn message(&mut self, message: &Message) -> Result<Option<PeerEvent>, PeerError> {
+    fn message(&mut self, now_ms: u64, message: &Message) -> Result<Option<PeerEvent>, PeerError> {
         let client = decode_client_message(&message.payload)?;
         let envelope = Envelope::decode(client.envelope)?;
         match (self.phase, envelope.type_index()) {
@@ -232,12 +263,47 @@ impl Peer {
                     TicketClaims::from_token(&request.login_token()),
                 )))
             }
-            (Phase::Registered, Some(PING_MSG_TYPE_INDEX)) => Ok(None),
+            (Phase::Registered, Some(PING_MSG_TYPE_INDEX)) => {
+                Ok(self.ping_echo(now_ms, &envelope.body))
+            }
             (Phase::Registered, Some(index)) if index != REGISTRATION_REQUEST_V3_MSG_TYPE_INDEX => {
                 Ok(Some(PeerEvent::ClientMessage(client.envelope.to_vec())))
             }
             (_, type_index) => Err(PeerError::UnexpectedMessage { type_index }),
         }
+    }
+
+    /// The round trip of an echoed ping. Observed (carrier captures note section 8): the client
+    /// sends a `PingMsg` with the same 8 bytes back. The body only picks the ping this gateway
+    /// sent; the time comes from the gateway's own send record, so a client cannot make up a
+    /// round trip. An echo of no kept ping is ignored. Pings are reliable and in order, so the
+    /// pings sent before the echoed one get no echo of their own any more and are forgotten.
+    fn ping_echo(&mut self, now_ms: u64, body: &[u8]) -> Option<PeerEvent> {
+        let echoed = <[u8; PING_BODY_LEN]>::try_from(body)
+            .ok()
+            .map(u64::from_be_bytes)?;
+        let Some(position) = self
+            .unanswered_pings
+            .iter()
+            .position(|sent| *sent == echoed)
+        else {
+            tracing::debug!(echoed, "echo of no kept ping");
+            return None;
+        };
+        let sent = self.unanswered_pings[position];
+        self.unanswered_pings.drain(..=position);
+        let ms = now_ms.saturating_sub(sent);
+        self.last_round_trip_ms = Some(ms);
+        Some(PeerEvent::RoundTrip { ms })
+    }
+
+    /// Keeps the send time of a ping for its echo, forgetting the oldest beyond
+    /// [`MAX_UNANSWERED_PINGS`].
+    fn remember_ping(&mut self, sent_ms: u64) {
+        if self.unanswered_pings.len() == MAX_UNANSWERED_PINGS {
+            self.unanswered_pings.pop_front();
+        }
+        self.unanswered_pings.push_back(sent_ms);
     }
 
     /// Sends the registration response for the checked ticket. A refused connection sends status
@@ -355,6 +421,7 @@ impl Peer {
             && now_ms.saturating_sub(self.last_ping_ms) >= self.settings.ping_interval_ms
         {
             self.last_ping_ms = now_ms;
+            self.remember_ping(now_ms);
             self.send_message(PING_MSG_TYPE_INDEX, now_ms.to_be_bytes().to_vec())?;
         }
         if self.dtls.is_established() {
@@ -652,14 +719,95 @@ mod tests {
         let (_, peer_events, _) = run(&mut client, &mut peer, now, Ok(entry), |_| false);
         let forwarded: Vec<Option<u64>> = peer_events
             .iter()
-            .map(|event| match event {
+            .filter_map(|event| match event {
                 PeerEvent::ClientMessage(bytes) => {
-                    Envelope::decode(bytes).expect("envelope").type_index()
+                    Some(Envelope::decode(bytes).expect("envelope").type_index())
                 }
-                PeerEvent::RegistrationRequested(_) => None,
+                PeerEvent::RegistrationRequested(_) | PeerEvent::RoundTrip { .. } => None,
             })
             .collect();
         assert_eq!(forwarded, vec![Some(INPUT_TYPE_INDEX)]);
+    }
+
+    fn round_trips(events: &[PeerEvent]) -> Vec<u64> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                PeerEvent::RoundTrip { ms } => Some(*ms),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn an_echoed_ping_gives_its_round_trip_on_the_gateway_clock() {
+        let (mut client, mut peer) = sides(SETTINGS);
+        let entry = record();
+        let (_, _, now) = run(&mut client, &mut peer, START_MS, Ok(entry), |events| {
+            events.contains(&RepEvent::Pinged)
+        });
+        assert_eq!(peer.round_trip_ms(now), None);
+        let (_, peer_events, now) = run(&mut client, &mut peer, now, Ok(entry), |_| false);
+        // The test client echoes at once; the echo arrives with its next poll, one step later.
+        let measured = round_trips(&peer_events);
+        assert!(!measured.is_empty());
+        assert!(measured.iter().all(|ms| *ms == STEP_MS), "{measured:?}");
+        assert!(peer.round_trip_ms(now).is_some_and(|ms| ms >= STEP_MS));
+    }
+
+    #[test]
+    fn a_ping_without_an_echo_raises_the_round_trip() {
+        const LAG_MS: u64 = 2500;
+        let (mut client, mut peer) = sides(SETTINGS);
+        let entry = record();
+        let (_, peer_events, now) = run(&mut client, &mut peer, START_MS, Ok(entry), |_| false);
+        assert!(!round_trips(&peer_events).is_empty());
+        // The next ping goes out but the client never sees it.
+        let sent = now + SETTINGS.ping_interval_ms;
+        peer.poll(sent).expect("ping");
+        assert!(
+            peer.round_trip_ms(sent + LAG_MS)
+                .is_some_and(|ms| ms >= LAG_MS)
+        );
+    }
+
+    #[test]
+    fn only_an_echo_of_a_kept_ping_counts() {
+        const FORGED_SEND_MS: u64 = 1;
+        let (mut client, mut peer) = sides(SETTINGS);
+        let entry = record();
+        let (_, _, now) = run(&mut client, &mut peer, START_MS, Ok(entry), |events| {
+            status(events).is_some()
+        });
+        let sent = now + SETTINGS.ping_interval_ms;
+        peer.poll(sent).expect("ping");
+        let later = sent + STEP_MS;
+        assert_eq!(peer.ping_echo(later, &FORGED_SEND_MS.to_be_bytes()), None);
+        assert_eq!(peer.ping_echo(later, &BODY), None);
+        assert_eq!(peer.round_trip_ms(later), None);
+        assert_eq!(
+            peer.ping_echo(later, &sent.to_be_bytes()),
+            Some(PeerEvent::RoundTrip { ms: STEP_MS })
+        );
+        // A second echo of the same ping finds nothing.
+        assert_eq!(peer.ping_echo(later, &sent.to_be_bytes()), None);
+        assert_eq!(peer.round_trip_ms(later), Some(STEP_MS));
+    }
+
+    #[test]
+    fn at_most_the_last_pings_wait_for_an_echo() {
+        let (_, mut peer) = sides(SETTINGS);
+        let first = START_MS;
+        let mut now = first;
+        peer.remember_ping(now);
+        for _ in 0..MAX_UNANSWERED_PINGS {
+            now += SETTINGS.ping_interval_ms;
+            peer.remember_ping(now);
+        }
+        assert_eq!(peer.unanswered_pings.len(), MAX_UNANSWERED_PINGS);
+        assert_eq!(peer.ping_echo(now, &first.to_be_bytes()), None);
+        assert!(peer.ping_echo(now, &now.to_be_bytes()).is_some());
+        assert!(peer.unanswered_pings.is_empty());
     }
 
     #[test]

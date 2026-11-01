@@ -12,6 +12,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use metrics_exporter_prometheus::{BuildError, Matcher, PrometheusBuilder};
 use nw_common::time::unix_seconds;
 use nw_dtls::{DtlsServerConfig, FirstDatagram};
 use nw_login::queue::{EntryRecord, QueueStore};
@@ -54,6 +55,37 @@ pub const METRIC_DATAGRAMS_OUT: &str = "rep_gateway_datagrams_out_total";
 pub const METRIC_BYTES_IN: &str = "rep_gateway_bytes_in_total";
 /// Metric: UDP payload bytes sent.
 pub const METRIC_BYTES_OUT: &str = "rep_gateway_bytes_out_total";
+/// Metric: histogram of each echoed ping's round trip, in milliseconds.
+pub const METRIC_ROUND_TRIP_MS: &str = "rep_gateway_round_trip_ms";
+/// Metric: the [`ROUND_TRIP_PERCENTILE`] round trip over the players of each `worker` that have
+/// one ([`Peer::round_trip_ms`]), in milliseconds; 0 when none has one.
+pub const METRIC_ROUND_TRIP_P99_MS: &str = "rep_gateway_round_trip_p99_ms";
+/// Metric: players of each `worker` that have a round trip.
+pub const METRIC_ROUND_TRIP_PLAYERS: &str = "rep_gateway_round_trip_players";
+/// Percentile of [`METRIC_ROUND_TRIP_P99_MS`]. Inferred: the canary checks one client's ping
+/// (docs/re/2026-10-02-client-metrics-and-canary.md section 3); over many players the 99th
+/// percentile shows a lag that hits more than one in a hundred, and one bad line does not.
+pub const ROUND_TRIP_PERCENTILE: usize = 99;
+/// Buckets of [`METRIC_ROUND_TRIP_MS`], in milliseconds, around the canary's 2000 ms limit
+/// (docs/re/2026-10-02-client-metrics-and-canary.md section 2).
+pub const ROUND_TRIP_BUCKETS_MS: [f64; 12] = [
+    10.0, 25.0, 50.0, 100.0, 150.0, 250.0, 500.0, 1000.0, 1500.0, 2000.0, 3000.0, 5000.0,
+];
+const PERCENT: usize = 100;
+
+/// `builder` with the buckets of [`METRIC_ROUND_TRIP_MS`].
+///
+/// # Errors
+///
+/// Returns the exporter's error when the buckets are refused.
+pub fn with_round_trip_buckets(
+    builder: PrometheusBuilder,
+) -> Result<PrometheusBuilder, BuildError> {
+    builder.set_buckets_for_metric(
+        Matcher::Full(METRIC_ROUND_TRIP_MS.to_owned()),
+        &ROUND_TRIP_BUCKETS_MS,
+    )
+}
 const RESULT_LABEL: &str = "result";
 const REASON_LABEL: &str = "reason";
 /// Label of the per-worker gauges.
@@ -179,6 +211,9 @@ impl<Q: QueueStore, W: World> Loop<Q, W> {
                         }
                         PeerEvent::ClientMessage(envelope) => {
                             self.gateway.world.client_message(connection, envelope);
+                        }
+                        PeerEvent::RoundTrip { ms } => {
+                            metrics::histogram!(METRIC_ROUND_TRIP_MS).record(ms as f64);
                         }
                     }
                 }
@@ -339,7 +374,7 @@ impl<Q: QueueStore, W: World> Loop<Q, W> {
         for address in addresses {
             self.flush(address, now).await;
         }
-        report_peers(self.worker, &self.peers);
+        report_peers(self.worker, &self.peers, now);
     }
 
     /// Sends what a peer has to send, and removes it when it is over.
@@ -425,12 +460,27 @@ impl<Q: QueueStore, W: World> Loop<Q, W> {
     }
 }
 
-/// Sets the gauges of worker `worker` from its `peers`.
-fn report_peers(worker: u16, peers: &HashMap<SocketAddr, Peer>) {
+/// Sets the gauges of worker `worker` from its `peers` at `now_ms`.
+fn report_peers(worker: u16, peers: &HashMap<SocketAddr, Peer>, now_ms: u64) {
     let handshakes = peers.values().filter(|peer| !peer.is_established()).count();
+    let round_trips: Vec<u64> = peers
+        .values()
+        .filter_map(|peer| peer.round_trip_ms(now_ms))
+        .collect();
     let worker = worker.to_string();
     metrics::gauge!(METRIC_CONNECTIONS, WORKER_LABEL => worker.clone()).set(peers.len() as f64);
-    metrics::gauge!(METRIC_HANDSHAKES, WORKER_LABEL => worker).set(handshakes as f64);
+    metrics::gauge!(METRIC_HANDSHAKES, WORKER_LABEL => worker.clone()).set(handshakes as f64);
+    metrics::gauge!(METRIC_ROUND_TRIP_PLAYERS, WORKER_LABEL => worker.clone())
+        .set(round_trips.len() as f64);
+    metrics::gauge!(METRIC_ROUND_TRIP_P99_MS, WORKER_LABEL => worker)
+        .set(percentile(round_trips, ROUND_TRIP_PERCENTILE).unwrap_or(0) as f64);
+}
+
+/// The nearest-rank `percent` percentile of `values`; `None` when there is none.
+fn percentile(mut values: Vec<u64>, percent: usize) -> Option<u64> {
+    values.sort_unstable();
+    let rank = (values.len() * percent).div_ceil(PERCENT);
+    values.get(rank.checked_sub(1)?).copied()
 }
 
 /// Counts one received datagram and its bytes.
@@ -826,16 +876,51 @@ pub(crate) mod tests {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
-            report_peers(0, &HashMap::new());
-            report_peers(1, &HashMap::new());
+            report_peers(0, &HashMap::new(), 0);
+            report_peers(1, &HashMap::new(), 0);
         });
         let text = handle.render();
         for worker in ["0", "1"] {
-            for metric in [METRIC_CONNECTIONS, METRIC_HANDSHAKES] {
+            for metric in [
+                METRIC_CONNECTIONS,
+                METRIC_HANDSHAKES,
+                METRIC_ROUND_TRIP_PLAYERS,
+                METRIC_ROUND_TRIP_P99_MS,
+            ] {
                 let series = format!("{metric}{{{WORKER_LABEL}=\"{worker}\"}} 0");
                 assert!(text.contains(&series), "{series} in {text}");
             }
         }
+    }
+
+    #[test]
+    fn the_round_trip_percentile_is_the_nearest_rank() {
+        const HUNDRED: u64 = 100;
+        const LAGGING_MS: u64 = 2500;
+        assert_eq!(percentile(Vec::new(), ROUND_TRIP_PERCENTILE), None);
+        assert_eq!(percentile(vec![40], ROUND_TRIP_PERCENTILE), Some(40));
+        // One lagging player of a hundred stays out of the 99th percentile; two do not.
+        let mut values: Vec<u64> = (1..HUNDRED).collect();
+        values.push(LAGGING_MS);
+        assert_eq!(percentile(values.clone(), ROUND_TRIP_PERCENTILE), Some(99));
+        values[0] = LAGGING_MS;
+        assert_eq!(percentile(values, ROUND_TRIP_PERCENTILE), Some(LAGGING_MS));
+    }
+
+    #[test]
+    fn round_trips_go_into_the_configured_buckets() {
+        const ROUND_TRIP: f64 = 120.0;
+        const BUCKET: f64 = 150.0;
+        const MEDIAN: f64 = 0.5;
+        let recorder = with_round_trip_buckets(PrometheusBuilder::new())
+            .expect("buckets")
+            .build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            metrics::histogram!(METRIC_ROUND_TRIP_MS).record(ROUND_TRIP);
+        });
+        let scrape = nw_common::prometheus::Scrape::parse(&handle.render());
+        assert_eq!(scrape.quantile(METRIC_ROUND_TRIP_MS, MEDIAN), Some(BUCKET));
     }
 
     #[test]

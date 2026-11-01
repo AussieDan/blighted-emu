@@ -15,7 +15,7 @@ use nw_login::store::StoreError;
 use nw_login::valkey::Valkey;
 
 use crate::config::{GatewayConfig, GatewayConfigError, load_gateway_config};
-use crate::server::{Gateway, serve as serve_udp};
+use crate::server::{Gateway, serve as serve_udp, with_round_trip_buckets};
 use crate::workers::{ConnectionCount, bind_workers};
 use crate::world::BusWorld;
 
@@ -109,9 +109,8 @@ async fn serve_async(config: GatewayConfig, key: SigningKey) -> Result<(), RunEr
         .map_err(RunError::Valkey)?;
     let bus = Bus::connect(&config.nats_url).await?;
     let (world, events) = BusWorld::start(bus, config.world_link(), config.workers).await?;
-    PrometheusBuilder::new()
-        .with_http_listener(config.metrics_listen)
-        .install()
+    with_round_trip_buckets(PrometheusBuilder::new().with_http_listener(config.metrics_listen))
+        .and_then(PrometheusBuilder::install)
         .map_err(|error| RunError::Metrics(error.to_string()))?;
     tracing::info!(address = %config.metrics_listen, "serving metrics");
     let sockets = bind_workers(config.udp_listen, config.workers, config.udp_buffer_bytes)

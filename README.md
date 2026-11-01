@@ -220,7 +220,7 @@ cargo run -p nw-testclient
 
 `nw-testclient` reads `config/nw-testclient.toml`. Set `login_url` and `game_url` to your domain. The account is made on the first run.
 
-The gateway serves Prometheus metrics on `metrics_listen` (`rep_gateway_*`, among them datagrams and UDP payload bytes in and out). Keep that address internal.
+The gateway serves Prometheus metrics on `metrics_listen` (`rep_gateway_*`, among them datagrams and UDP payload bytes in and out, and the player round trip). Keep that address internal.
 
 ### M3 exit test
 
