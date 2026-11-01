@@ -159,8 +159,10 @@ pub(super) fn gain_experience(player: &mut Player, points: u32, xp: &XpMultiplie
 
 impl SimWorld {
     /// The client of player `entity` says it came into territory `territory` (2297), or left it
-    /// (6416); the quests' go-to and exit tasks read it at the next tick.
+    /// (6416); the quests' go-to and exit tasks read it at the next tick, and the zone it lies in
+    /// is the player's last known zone.
     pub(super) fn territory_changed(&mut self, entity: Entity, territory: u16, inside: bool) {
+        let zone = self.content.charting.territory_of(u32::from(territory));
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
         };
@@ -168,7 +170,16 @@ impl SimWorld {
         if inside {
             player.territories.push(territory);
         }
-        tracing::debug!(player = player.number, territory, inside, "territory");
+        if zone.is_some() {
+            player.last_zone = zone;
+        }
+        tracing::debug!(
+            player = player.number,
+            territory,
+            inside,
+            ?zone,
+            "territory"
+        );
     }
 
     /// Player `number` (`entity`) reads the lore note of interaction `request`, whose title the

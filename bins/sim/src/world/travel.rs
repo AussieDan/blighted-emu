@@ -1675,12 +1675,7 @@ impl SimWorld {
         if tier == 0 {
             return Err(CampRefusal::Rank);
         }
-        let rules = &self.content.travel;
-        if !player
-            .territories
-            .iter()
-            .any(|territory| rules.can_place_camp(u32::from(*territory)))
-        {
+        if !self.camp_allowed_where(player) {
             return Err(CampRefusal::Territory);
         }
         let camps = &self.content.camps;
@@ -1722,6 +1717,32 @@ impl SimWorld {
             rotation: placement.rotation,
             tier,
         })
+    }
+
+    /// Whether `player` stands where a camp may go: in no area that forbids camps (the points of
+    /// interest: `CanPlaceCamp` false), and in an area or a zone that allows them, the zones of
+    /// its areas and its last known zone among them.
+    fn camp_allowed_where(&self, player: &Player) -> bool {
+        let rules = &self.content.travel;
+        let charting = &self.content.charting;
+        let areas: Vec<u32> = player
+            .territories
+            .iter()
+            .map(|area| u32::from(*area))
+            .collect();
+        let in_forbidden_area = areas
+            .iter()
+            .any(|area| !rules.is_territory(*area) && !rules.can_place_camp(*area));
+        let zones = areas
+            .iter()
+            .filter_map(|area| charting.territory_of(*area))
+            .chain(player.last_zone);
+        !in_forbidden_area
+            && areas
+                .iter()
+                .copied()
+                .chain(zones)
+                .any(|territory| rules.can_place_camp(territory))
     }
 
     /// Player `number` places its camp (2236, [`SimWorld::camp_placement`]): the costs leave its
@@ -3053,6 +3074,33 @@ mod tests {
         assert_eq!(
             validated(&answers(&mut world, NOW + TELEPORTER_DELAY_MS + 1)),
             [(kind::TELEPORTER, INTERACTION_REFUSED)]
+        );
+    }
+
+    #[test]
+    fn a_camp_goes_in_the_last_known_zone_but_not_in_a_point_of_interest() {
+        // Live 2026-11-01: the client named only points of interest (La Roussette 30129), never
+        // the zone around them, and both camps were refused.
+        const SHIPWRECK: u16 = 30_129;
+        let mut world = world();
+        let entity = entity(&mut world);
+        let allowed = |world: &mut SimWorld, areas: Vec<u16>, zone: Option<u32>| {
+            let mut player = world.world.get_mut::<Player>(entity).expect("player");
+            player.territories = areas;
+            player.last_zone = zone;
+            let player = world.world.get::<Player>(entity).expect("player");
+            world.camp_allowed_where(player)
+        };
+        assert!(!allowed(&mut world, Vec::new(), None), "no zone known");
+        let zone = Some(u32::from(TERRITORY));
+        assert!(allowed(&mut world, Vec::new(), zone), "the last known zone");
+        assert!(
+            !allowed(&mut world, vec![SHIPWRECK], zone),
+            "inside a point of interest"
+        );
+        assert!(
+            allowed(&mut world, vec![TERRITORY], None),
+            "inside the zone"
         );
     }
 

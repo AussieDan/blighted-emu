@@ -648,6 +648,10 @@ struct Player {
     interacting: bool,
     /// The territory areas its client says it is in (2297 and 6416), for go-to and exit tasks.
     territories: Vec<u16>,
+    /// The zone (`IsTerritory`) of the newest area its client named on entering or leaving, for
+    /// a camp's place: the client names a zone only on crossing into it, and the points of
+    /// interest it passes lie in the zone it is in (Inferred).
+    last_zone: Option<u32>,
     /// Its hits on the level's quest objects.
     strikes: quest_objects::Strikes,
     /// Its running consumable cooldowns, and whether they changed since the last bundle.
@@ -4230,6 +4234,7 @@ impl SimWorld {
                         strikes: quest_objects::Strikes::default(),
                         cooldowns: Vec::new(),
                         cooldowns_changed: false,
+                        last_zone: None,
                         item_effects: item_calls::ItemEffects::default(),
                         status_effects: status_effects::StatusEffects::default(),
                         fall: fall_damage::FallTrack::default(),
