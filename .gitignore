@@ -1,6 +1,11 @@
 # Build output
 /target/
 
+# The public website lives in its own repository (blighted-emu-website), never in this one.
+/bins/blighted-web/
+/config/blighted-web.toml
+/config/blighted-web-news.toml
+
 # Secrets for the infrastructure (copy from deploy/.env.example)
 /deploy/.env
 
