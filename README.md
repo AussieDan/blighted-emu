@@ -482,6 +482,8 @@ Chat commands skip the admin site's audit log. The sim logs each line and its an
 
 ## Rules for contributors
 
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch and commit rules.
+
 - Never commit game files, captures, or `deploy/.env`. Put local game data in `local-data/` (ignored by git).
 - Never connect a changed client to Amazon's servers.
 - Every new copyleft crate must be added to `[licenses] exceptions` in `deny.toml`.
