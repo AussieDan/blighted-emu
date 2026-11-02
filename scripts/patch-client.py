@@ -36,15 +36,17 @@ fifth one with ``--aws-proxy``:
    is found by the variable's name and the shape of its creation.
 
 5. AWS proxy (``--aws-proxy``, for Windows). The remote-config (S3), analytics
-   (Kinesis) and analytics-credentials (STS) clients call fixed Amazon names
-   with certificate checks on. Windows has no per-process hosts or trust file,
+   (Kinesis), analytics-credentials (STS) and news (CMS) clients call fixed
+   Amazon names with certificate checks on, and the region pinger calls fixed
+   Amazon names over plain HTTP. Windows has no per-process hosts or trust file,
    so each client is sent through the launcher's loopback proxy instead. After
    each client's ``Aws::Client::ClientConfiguration`` constructor call, a jump
    to a code cave in ``.text`` padding sets ``proxyHost`` to ``127.0.0.1``,
    ``proxyPort`` to the launcher's port and ``verifySSL`` to false, replays the
-   instruction the jump replaced, and jumps back. The remote-config client
+   instructions the jump replaced, and jumps back. The remote-config client
    sets ``verifySSL`` itself after that point, so the immediate of that write
-   becomes 0 too. The launcher proxy checks the server's mirror certificate.
+   becomes 0 too. The launcher proxy checks the server's mirror certificate, and
+   passes the plain HTTP region pings to the server.
 
 No change alters the file length. See ``docs/client-patch.md`` for the
 procedure, the reasoning, and how to re-derive a signature if a build changes it.
@@ -224,6 +226,15 @@ AWS_CONFIG_SITES = (
     # STS client of the analytics credentials (build 25810808: FUN_1461c5220). LEA RCX,[RBP+0x10] /
     # CALL / NOP / MOV byte ptr [RBP+0x6C],0 / LEA RAX,[RSP+0x30]
     ("analytics credentials proxy", "488d4d10", "c6456c00", "488d442430"),
+    # CMS client of the news, message of the day and their images (build 25810808:
+    # FUN_1430089b0). LEA RCX,[RBP-0x10] / CALL / NOP / MOV byte ptr [RBP+0x4C],0 /
+    # LEA RDX,[RBP-0x10]
+    ("news proxy", "488d4df0", "c6454c00", "488d55f0"),
+    # Plain HTTP client of the region pinger (build 25810808: FUN_146402310, called by the
+    # AwsRegionPinger set-up FUN_14642ce60). LEA RCX,[RSP+0x30] / CALL / NOP / MOV EAX,EBP /
+    # CMP byte ptr [RSI+0x1E8],AL / SETNZ AL. Both short instructions are replayed; a jump keeps
+    # the flags of the CMP.
+    ("region ping proxy", "488d4c2430", "8bc53886e8010000", "0f95c0"),
 )
 # The S3 set-up writes verifySSL = 1 after the constructor (MOV byte ptr [RSP+0x208],1, then
 # MOV dword ptr [RSP+0x70],1). The patch makes the immediate 0.
@@ -356,7 +367,8 @@ def config_cave(cave: int, replayed: bytes, resume: int) -> bytes:
 
 
 def plan_aws_proxy(data: bytes) -> "list[tuple[str, int, bytes]]":
-    """The edits that send the S3, Kinesis and STS clients through the launcher's proxy."""
+    """The edits that send the S3, Kinesis, STS, news and region ping clients through the
+    launcher's proxy."""
     if len(AWS_PROXY_HOST) > INLINE_STRING_CAPACITY:
         fail("the AWS proxy host does not fit the inline string buffer")
     constructor = virtual_address(data, find_unique(data, CONFIG_CONSTRUCTOR, "ClientConfiguration"))
@@ -517,8 +529,8 @@ def main() -> None:
     parser.add_argument(
         "--aws-proxy",
         action="store_true",
-        help="also send the remote-config, Kinesis and STS clients through the launcher's "
-        "loopback proxy (Windows)",
+        help="also send the remote-config, Kinesis, STS, news and region ping clients through "
+        "the launcher's loopback proxy (Windows)",
     )
     arguments = parser.parse_args()
 

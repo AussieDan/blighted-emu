@@ -12,6 +12,9 @@ server_name = "Blighted test server"
 # game routes on https://game.<domain>. The certificate must cover both names.
 domain = "example.org"
 https_listen = "0.0.0.0:443"
+# Plain HTTP listener of the client's region ping (GET /ping on dynamodb.<region>.amazonaws.com,
+# which the launcher maps to this server). The client pings port 80.
+ping_listen = "0.0.0.0:80"
 # Prometheus metrics. Keep this on an internal address.
 metrics_listen = "127.0.0.1:9100"
 request_timeout_seconds = 10
@@ -58,15 +61,28 @@ bucket = "ags-javelin-remote-config"
 # Our own id, sent to the client as -CognitoPool. It names no Amazon pool.
 cognito_pool_id = "b04fbfcd-942c-472d-88c0-c762c4076b2f"
 
+# Our own news: the message of the day, the news stories and the menu tiles the client reads
+# from its news host, and their images. One subfolder per host, named after it; every file in it
+# is served at its path. The news host folder must hold motd/worlds_STEAM_APP_ID.1063730.json,
+# newsstories/STEAM_APP_ID.1063730/metadata.json and marketingtiles/STEAM_APP_ID.1063730/
+# metadata.json; each image URL in them needs its file in the image host folder.
+[cms]
+directory = "config/cms"
+
 # The Amazon names our launcher maps to this server, for the game process only (private hosts
-# file and trust file under bwrap). Only the remote-config bucket host, Kinesis and STS hosts are
-# allowed. Make the certificate once with `edge-http aws-mirror-certificate`; keep both files in
-# local-data/, never in git.
+# file and trust file under bwrap, or the loopback proxy on Windows). Only the remote-config
+# bucket host, Kinesis, STS and DynamoDB (region ping) hosts and the two news hosts are allowed,
+# and the bucket host, the region ping host of us-east-1 and both news hosts are required. Make
+# the certificate with `edge-http aws-mirror-certificate` (again after a change of this list);
+# keep both files in local-data/, never in git.
 [aws_mirror]
 hosts = [
     "ags-javelin-remote-config.s3.amazonaws.com",
     "kinesis.us-east-1.amazonaws.com",
     "sts.us-east-1.amazonaws.com",
+    "dynamodb.us-east-1.amazonaws.com",
+    "d1hkbwzm1bktgo.cloudfront.net",
+    "client.content-service.amazongames.com",
 ]
 certificate_pem_path = "local-data/edge-http/aws-mirror.pem"
 private_key_pem_path = "local-data/edge-http/aws-mirror-key.pem"

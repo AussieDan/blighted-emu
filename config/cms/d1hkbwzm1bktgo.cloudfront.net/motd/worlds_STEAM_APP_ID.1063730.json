@@ -1,0 +1,45 @@
+{
+  "worlds": {
+    "8d0f4c2e-0000-4000-8000-000000000001": {
+      "announcement": "",
+      "es-ES-announcement": "",
+      "es-MX-announcement": "",
+      "fr-FR-announcement": "",
+      "de-DE-announcement": "",
+      "pl-PL-announcement": "",
+      "it-IT-announcement": "",
+      "pt-BR-announcement": "",
+      "warning": "",
+      "es-ES-warning": "",
+      "es-MX-warning": "",
+      "fr-FR-warning": "",
+      "de-DE-warning": "",
+      "pl-PL-warning": "",
+      "it-IT-warning": "",
+      "pt-BR-warning": ""
+    }
+  },
+  "globalAnnouncement": {
+    "title": "Global Announcement",
+    "es-ES-title": "Global Announcement",
+    "es-MX-title": "Global Announcement",
+    "fr-FR-title": "Global Announcement",
+    "de-DE-title": "Global Announcement",
+    "pl-PL-title": "Global Announcement",
+    "it-IT-title": "Global Announcement",
+    "pt-BR-title": "Global Announcement",
+    "description": "",
+    "es-ES-description": "",
+    "es-MX-description": "",
+    "fr-FR-description": "",
+    "de-DE-description": "",
+    "pl-PL-description": "",
+    "it-IT-description": "",
+    "pt-BR-description": ""
+  },
+  "worldSets": {
+    "live": {
+      "setName": "Blighted"
+    }
+  }
+}

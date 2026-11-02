@@ -10,6 +10,7 @@ use axum::extract::connect_info::MockConnectInfo;
 use nw_db::PgPool;
 use uuid::Uuid;
 
+use crate::cms::CmsRouters;
 use crate::config::EdgeConfig;
 use crate::discord::DiscordHttp;
 use crate::game::GameState;
@@ -90,7 +91,14 @@ pub fn edge_app(
     edge_router(
         launcher,
         game,
-        ServiceRouters::on_postgres(global, Router::new()),
+        ServiceRouters::on_postgres(
+            global,
+            Router::new(),
+            CmsRouters {
+                news: Router::new(),
+                images: Router::new(),
+            },
+        ),
     )
     .layer(MockConnectInfo(random_peer()))
 }

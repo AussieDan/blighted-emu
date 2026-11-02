@@ -11,19 +11,21 @@ readonly NOPS_HEX="909090909090"
 # Sonic and Steam EndSession bodies (the Steam one with a stand-in call offset).
 readonly SONIC_HEX="48895c24084889742418488954241057""4883ec20488bfa488bd9488b024c8b4008488d4a0841ffd0c6435801488b074885c0741f488b004885c0741041b802000000488d5708488d4f08ffd048c70700000000488b5c2430488b7424404883c4205fc3"
 readonly STEAM_HEX="48895c2408488954241057""4883ec20488bfa488bd94883c130e812345678488b8b280200004885c97407488b01ff5030"
-# AWS proxy parts: the ClientConfiguration constructor (stand-in call offset), the S3, Kinesis and
-# STS set-ups (lead, NOP, replayed instruction, trail; the call offset is filled in), and the S3
-# verifySSL write.
+# AWS proxy parts: the ClientConfiguration constructor (stand-in call offset), the S3, Kinesis, STS,
+# news and region ping set-ups (lead, NOP, replayed instructions, trail; the call offset is filled
+# in), and the S3 verifySSL write.
 readonly CTOR_HEX="48894c2408535657""4883ec30488bf933f6e81234567890c7472001000000"
 readonly S3_LEAD_HEX="488d4c2450" S3_TAIL_HEX="904488bc24ac000000488b15"
 readonly KINESIS_LEAD_HEX="488d4df0" KINESIS_TAIL_HEX="90c6454c00c7451001000000"
 readonly STS_LEAD_HEX="488d4d10" STS_TAIL_HEX="90c6456c00488d442430"
+readonly NEWS_LEAD_HEX="488d4df0" NEWS_TAIL_HEX="90c6454c00488d55f0"
+readonly PING_LEAD_HEX="488d4c2430" PING_TAIL_HEX="908bc53886e80100000f95c0"
 readonly S3_VERIFY_HEX="c684240802000001c744247001000000"
 # The Steam GetTicket function and the start of its ticket handler (stand-in RIP and call offsets).
 readonly GET_TICKET_HEX="40534883ec20488bd9c681e802000001488d0d11111111488d1511111111e811111111""83bbf002000000743d488d0d11111111ff15111111118b93f0020000488b08488b01ff9088000000""488d8b8c03000033d241b8000a0000e811111111c7838803000000000000488d0d11111111""ff151111111133d2488b08488b01ff50708983f00200004883c4205bc3"
 readonly HANDLER_HEX="48895c2410488974241848897c2420554154415541564157488dac2450faffff4881ecb0060000""488bf2488bd94533ff4489bde0050000448b328b7a044488bde0050000488d0511111111""488944244044897c24480f28442440660f7f4424504c8d0511111111488d542450""488d8de0050000e811111111b8020000004438bde00500000f45f8488d0d11111111""443bb3f00200007411"
 # The patched ticket request (from the CMP after the log call): store handle 0, build the response
-# (handle 0, result OK, length 0) at [RSP+0x30], call the handler at VA 0x140001400, return, and
+# (handle 0, result OK, length 0) at [RSP+0x30], call the handler at VA 0x1400014A0, return, and
 # INT3 to the end of the replaced bytes.
 readonly OFFLINE_TICKET_HEX="c783f002000000000000c744243000000000c744243401000000c744243800000000""488d542430488bcbe8fefeffff4883c4205bc3"
 readonly OFFLINE_TICKET_FILL=53
@@ -44,18 +46,23 @@ readonly S3_OFFSET=$((0x340))
 readonly KINESIS_OFFSET=$((0x380))
 readonly STS_OFFSET=$((0x3c0))
 readonly S3_VERIFY_OFFSET=$((0x400))
+readonly NEWS_OFFSET=$((0x480))
+readonly PING_OFFSET=$((0x4c0))
 # The ticket handler and GetTicket sit past the INT3 run the caves use.
-readonly HANDLER_OFFSET=$((0x600))
-readonly GET_TICKET_OFFSET=$((0x6b0))
+readonly HANDLER_OFFSET=$((0x6a0))
+readonly GET_TICKET_OFFSET=$((0x750))
 readonly TICKET_REQUEST_OFFSET=$((GET_TICKET_OFFSET + 0x23))
-# INT3 padding (0x500..0x800): the first cave is at file 0x500, VA 0x140001300.
+# INT3 padding (0x500..0x6A0, room for five caves): the first cave is at file 0x500, VA
+# 0x140001300.
 readonly CAVE_OFFSET=$((0x500))
 readonly CAVE_SLOT=$((0x50))
 # The jumps that replace the NOP and the next instruction after each constructor call: to the
-# caves at VA 0x140001300, 0x140001350 and 0x1400013A0.
+# caves at VA 0x140001300, 0x140001350, 0x1400013A0, 0x1400013F0 and 0x140001440.
 readonly S3_JUMP_HEX="e9b101000090909090"
 readonly KINESIS_JUMP_HEX="e9c2010000"
 readonly STS_JUMP_HEX="e9d2010000"
+readonly NEWS_JUMP_HEX="e962010000"
+readonly PING_JUMP_HEX="e97101000090909090"
 # The S3 cave: proxyHost "127.0.0.1" (three dwords), its size 9, proxyPort 47443, verifySSL 0,
 # the replayed MOV [RSP+0xAC],R15B, then JMP back to VA 0x140001153.
 readonly S3_CAVE_HEX="c780a00000003132372ec780a4000000302e302ec780a800000031000000""48c780b000000009000000c780c000000053b90000c680b801000000""4488bc24ac000000e90cfeffff"
@@ -96,11 +103,12 @@ make_bin64() {
   python3 -I - "$dir/NewWorld.exe" "$with_sig" "$with_steam" "$with_proxy" \
     "$with_ticket" "$GET_TICKET_HEX" "$HANDLER_HEX" "$SIGNATURE_HEX" "$SONIC_HEX" "$STEAM_HEX" "$STEAM_VA_HEX" "$CTOR_HEX" "$S3_LEAD_HEX" \
     "$S3_TAIL_HEX" "$KINESIS_LEAD_HEX" "$KINESIS_TAIL_HEX" "$STS_LEAD_HEX" "$STS_TAIL_HEX" \
+    "$NEWS_LEAD_HEX" "$NEWS_TAIL_HEX" "$PING_LEAD_HEX" "$PING_TAIL_HEX" \
     "$S3_VERIFY_HEX" "$CHAT_NAME" "$CHAT_NAME_OFFSET" "$CHAT_SITE_OFFSET" <<'PY'
 import struct, sys
 (path, with_sig, with_steam, with_proxy, with_ticket, get_ticket, handler, sig, sonic, steam, steam_va, ctor,
- s3_lead, s3_tail, kinesis_lead, kinesis_tail, sts_lead, sts_tail, s3_verify, chat_name, chat_name_offset,
- chat_site) = sys.argv[1:]
+ s3_lead, s3_tail, kinesis_lead, kinesis_tail, sts_lead, sts_tail, news_lead, news_tail, ping_lead,
+ ping_tail, s3_verify, chat_name, chat_name_offset, chat_site) = sys.argv[1:]
 image = bytearray(0xB00)
 image[0:2] = b"MZ"
 struct.pack_into("<I", image, 0x3C, 0x40)
@@ -132,15 +140,16 @@ put(0xA10, steam_va)
 if with_proxy == "yes":
     put(0x300, ctor)
     for site, lead, tail in ((0x340, s3_lead, s3_tail), (0x380, kinesis_lead, kinesis_tail),
-                             (0x3C0, sts_lead, sts_tail)):
+                             (0x3C0, sts_lead, sts_tail), (0x480, news_lead, news_tail),
+                             (0x4C0, ping_lead, ping_tail)):
         call = site + len(bytes.fromhex(lead))
         offset = struct.pack("<i", va(0x300) - (va(call) + 5))
         put(site, lead + "e8" + offset.hex() + tail)
     put(0x400, s3_verify)
     image[0x500:0x800] = b"\xcc" * 0x300
 if with_ticket == "yes":
-    put(0x600, handler)
-    put(0x6B0, get_ticket)
+    put(0x6A0, handler)
+    put(0x750, get_ticket)
 chat_name_offset, chat_site = int(chat_name_offset), int(chat_site)
 image[chat_name_offset : chat_name_offset + len(chat_name) + 1] = chat_name.encode() + b"\0"
 # .rdata: RVA 0x2000 at file 0xA00.
@@ -277,9 +286,13 @@ python3 "$PATCH_SCRIPT" "$bin64" --aws-proxy >/dev/null
 check_bytes "S3 call returns into a jump to its cave" $((S3_OFFSET + 10)) "$S3_JUMP_HEX"
 check_bytes "Kinesis call returns into a jump to its cave" $((KINESIS_OFFSET + 9)) "$KINESIS_JUMP_HEX"
 check_bytes "STS call returns into a jump to its cave" $((STS_OFFSET + 9)) "$STS_JUMP_HEX"
+check_bytes "news call returns into a jump to its cave" $((NEWS_OFFSET + 9)) "$NEWS_JUMP_HEX"
+check_bytes "region ping call returns into a jump to its cave" $((PING_OFFSET + 10)) "$PING_JUMP_HEX"
 check_bytes "S3 cave sets the proxy and verifySSL, replays, jumps back" "$CAVE_OFFSET" "$S3_CAVE_HEX"
 check_bytes "Kinesis cave replays its instruction" $((CAVE_OFFSET + CAVE_SLOT + 58)) "c6454c00e9"
 check_bytes "STS cave replays its instruction" $((CAVE_OFFSET + 2 * CAVE_SLOT + 58)) "c6456c00e9"
+check_bytes "news cave replays its instruction" $((CAVE_OFFSET + 3 * CAVE_SLOT + 58)) "c6454c00e9"
+check_bytes "region ping cave replays its instructions" $((CAVE_OFFSET + 4 * CAVE_SLOT + 58)) "8bc53886e8010000e9"
 check_bytes "S3 verifySSL write stores 0" "$S3_VERIFY_OFFSET" "c684240802000000c7442470"
 check_bytes "constructor is unchanged" "$CTOR_OFFSET" "${CTOR_HEX:0:40}"
 check_bytes "base patches are kept" "$SIG_OFFSET" "$NOPS_HEX"

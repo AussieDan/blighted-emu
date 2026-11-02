@@ -8,27 +8,17 @@
 //! `[remote_config] directory` holds one file per `versionless` layer, named after its key:
 //! `<application>-<dimension>.json`, and `<application>-WorldId-<world id>.json` for each world
 //! ([`layer_file_name`]). A key with no layer gets the S3 `NoSuchKey` reply (retail answers
-//! every build key that way). This server checks no request signature.
+//! every build key that way; [`crate::s3`]).
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use axum::Router;
-use axum::body::Body;
-use axum::extract::State;
-use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH};
-use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
-use axum::response::{IntoResponse, Response};
-use axum::routing::get;
-use data_encoding::{BASE64, HEXLOWER, HEXUPPER};
-use md5::{Digest, Md5};
 use serde_json::{Map, Value};
 
-use crate::analytics::xml_text;
 use crate::config::EdgeConfig;
-use crate::error::ApiError;
 use crate::game::CLUSTER_ID;
+use crate::s3::{S3Objects, s3_router};
 
 /// The two applications the client reads.
 pub const APPLICATIONS: [&str; 2] = ["public", "publicGameplay"];
@@ -36,13 +26,20 @@ pub const APPLICATIONS: [&str; 2] = ["public", "publicGameplay"];
 pub const PRODUCT_ID: &str = "STEAM_APP_ID.1063730";
 /// The version part of the key that holds the values of every build.
 pub const VERSIONLESS: &str = "versionless";
-/// The application whose `RegionId` layer holds the stats service endpoint.
-pub const LEADERBOARDS_APPLICATION: &str = "publicGameplay";
-/// Path of the stats service object in that layer.
-pub const LEADERBOARDS_PATH: [&str; 2] = ["omni", "leaderboards"];
-/// The stats service host the client queries (leaderboards note). This server fills it with
-/// `game.<domain>`; the tracked files leave it out, because the domain is the server's own.
-pub const CLIENT_ENDPOINT_KEY: &str = "client-endpoint";
+/// The application whose `RegionId` layer holds the service endpoints this server fills.
+pub const ENDPOINTS_APPLICATION: &str = "publicGameplay";
+/// The service endpoints this server fills with `game.<domain>`: the path of their object in
+/// that layer, and their key. The tracked files leave them out, because the domain is the
+/// server's own. The stats service host (leaderboards note), and the shop, entitlement and
+/// purchase service hosts (`omni.fcs.endpoints.*`, read by `FUN_1416190f0`; shop note).
+pub const GAME_HOST_ENDPOINTS: [(&[&str], &str); 4] = [
+    (&["omni", "leaderboards"], "client-endpoint"),
+    (&["omni", "fcs", "endpoints"], "catalog-service"),
+    (&["omni", "fcs", "endpoints"], "entitlement-service"),
+    (&["omni", "fcs", "endpoints"], "transaction-service"),
+];
+/// Between the parts of a key path in an error message.
+const KEY_PATH_SEPARATOR: &str = ".";
 
 /// First part of every key.
 const KEY_ROOT: &str = "applications";
@@ -53,22 +50,6 @@ const KEY_SEPARATOR: char = '/';
 const FILE_NAME_SEPARATOR: &str = "-";
 /// The extension of a layer file.
 const LAYER_FILE_EXTENSION: &str = "json";
-/// Content type of an object (retail reply).
-const OBJECT_CONTENT_TYPE: &str = "binary/octet-stream";
-/// Content type of an S3 error.
-const ERROR_CONTENT_TYPE: &str = "application/xml";
-/// S3 request id headers.
-const REQUEST_ID_HEADER: &str = "x-amz-request-id";
-const HOST_ID_HEADER: &str = "x-amz-id-2";
-/// Random bytes of an S3 request id (16 upper-case hex digits) and host id (base64).
-const REQUEST_ID_BYTES: usize = 8;
-const HOST_ID_BYTES: usize = 56;
-/// `If-None-Match` value that matches every object.
-const ANY_ETAG: &str = "*";
-const ETAG_LIST_SEPARATOR: char = ',';
-const PERCENT: u8 = b'%';
-const HEX_RADIX: u32 = 16;
-const PERCENT_ESCAPE_LEN: usize = 3;
 
 /// The dimensions of a configuration set, in the client's order (`ProductId` lowest).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -168,9 +149,9 @@ pub enum RemoteConfigError {
         /// The file it needs.
         path: PathBuf,
     },
-    /// The leaderboards layer has no `omni.leaderboards` object, or sets the key the server fills.
+    /// The endpoints layer lacks the object of a [`GAME_HOST_ENDPOINTS`] key, or sets that key.
     #[error("remote config {key}: {reason}")]
-    Leaderboards {
+    Endpoint {
         /// The key.
         key: String,
         /// What is wrong.
@@ -178,37 +159,22 @@ pub enum RemoteConfigError {
     },
 }
 
-/// One object: its body and its ETag.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoteConfigObject {
-    body: Vec<u8>,
-    /// `"<MD5 hex>"`, as S3 gives for an object stored in one part.
-    etag: String,
-}
-
-impl RemoteConfigObject {
-    fn new(body: Vec<u8>) -> Self {
-        let etag = format!("\"{}\"", HEXLOWER.encode(&Md5::digest(&body)));
-        Self { body, etag }
-    }
-}
-
 /// The loaded config sets, by key.
 #[derive(Debug, Clone)]
 pub struct RemoteConfigSets {
-    objects: Arc<HashMap<String, RemoteConfigObject>>,
+    objects: S3Objects,
 }
 
 impl RemoteConfigSets {
     /// Loads the `versionless` layer of every application and layer of [`requested_layers`]
     /// from its file in `[remote_config] directory` ([`layer_file_name`]). Each must be a JSON
-    /// object, and the folder may hold no other file. The stats service endpoint of the
-    /// [`LEADERBOARDS_APPLICATION`] `RegionId` layer is set to `game.<domain>`; other layers are
+    /// object, and the folder may hold no other file. The [`GAME_HOST_ENDPOINTS`] of the
+    /// [`ENDPOINTS_APPLICATION`] `RegionId` layer are set to `game.<domain>`; other layers are
     /// served byte for byte.
     pub fn load(config: &EdgeConfig) -> Result<Self, RemoteConfigError> {
         let root = &config.remote_config.directory;
-        let leaderboards_key = object_key(
-            LEADERBOARDS_APPLICATION,
+        let endpoints_key = object_key(
+            ENDPOINTS_APPLICATION,
             Dimension::RegionId,
             CLUSTER_ID,
             VERSIONLESS,
@@ -235,12 +201,12 @@ impl RemoteConfigSets {
                 let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(&bytes) else {
                     return Err(RemoteConfigError::NotObject { key });
                 };
-                let body = if key == leaderboards_key {
-                    with_client_endpoint(object, &config.game_host(), &key)?
+                let body = if key == endpoints_key {
+                    with_game_host_endpoints(object, &config.game_host(), &key)?
                 } else {
                     bytes
                 };
-                objects.insert(key, RemoteConfigObject::new(body));
+                objects.insert(key, body);
                 layer_files.insert(path);
             }
         }
@@ -255,179 +221,70 @@ impl RemoteConfigSets {
             }
         }
         Ok(Self {
-            objects: Arc::new(objects),
+            objects: S3Objects::new(objects),
         })
     }
 
     /// The body of an object, if it exists.
     pub fn body(&self, key: &str) -> Option<&[u8]> {
-        self.objects.get(key).map(|object| object.body.as_slice())
+        self.objects.body(key)
     }
 
     /// Every key, sorted.
     pub fn keys(&self) -> Vec<&str> {
-        let mut keys: Vec<&str> = self.objects.keys().map(String::as_str).collect();
-        keys.sort_unstable();
-        keys
+        self.objects.keys()
     }
 }
 
-/// `object` with [`CLIENT_ENDPOINT_KEY`] set to `game_host`, as JSON text.
-fn with_client_endpoint(
+/// `object` with each [`GAME_HOST_ENDPOINTS`] key set to `game_host`, as JSON text. The object of
+/// each key must exist, and the key must not.
+fn with_game_host_endpoints(
     mut object: Map<String, Value>,
     game_host: &str,
     key: &str,
 ) -> Result<Vec<u8>, RemoteConfigError> {
-    let fail = |reason: String| RemoteConfigError::Leaderboards {
+    let fail = |reason: String| RemoteConfigError::Endpoint {
         key: key.to_owned(),
         reason,
     };
-    let [omni, leaderboards] = LEADERBOARDS_PATH;
-    let section = object
-        .get_mut(omni)
-        .and_then(|value| value.get_mut(leaderboards))
-        .and_then(Value::as_object_mut)
-        .ok_or_else(|| fail(format!("has no {omni}.{leaderboards} object")))?;
-    if section.contains_key(CLIENT_ENDPOINT_KEY) {
-        return Err(fail(format!(
-            "sets {CLIENT_ENDPOINT_KEY}, which the server fills from its domain"
-        )));
+    for (path, endpoint) in GAME_HOST_ENDPOINTS {
+        let name = path.join(KEY_PATH_SEPARATOR);
+        let section = path
+            .iter()
+            .try_fold(&mut object, |parent, part| {
+                parent.get_mut(*part).and_then(Value::as_object_mut)
+            })
+            .ok_or_else(|| fail(format!("has no {name} object")))?;
+        if section.contains_key(endpoint) {
+            return Err(fail(format!(
+                "sets {name}{KEY_PATH_SEPARATOR}{endpoint}, which the server fills from its domain"
+            )));
+        }
+        section.insert(endpoint.to_owned(), Value::String(game_host.to_owned()));
     }
-    section.insert(
-        CLIENT_ENDPOINT_KEY.to_owned(),
-        Value::String(game_host.to_owned()),
-    );
     serde_json::to_vec_pretty(&Value::Object(object)).map_err(|error| fail(error.to_string()))
 }
 
 /// The S3 route: `GET /<key>` (and `HEAD`).
 pub fn remote_config_router(sets: RemoteConfigSets) -> Router {
-    Router::new()
-        .route("/{*key}", get(get_object))
-        .with_state(sets)
-}
-
-async fn get_object(
-    State(sets): State<RemoteConfigSets>,
-    uri: Uri,
-    headers: HeaderMap,
-) -> Response {
-    let Some(ids) = RequestIds::new() else {
-        return ApiError::Unavailable.into_response();
-    };
-    let raw = uri.path().trim_start_matches(KEY_SEPARATOR);
-    let key = percent_decode(raw).unwrap_or_else(|| raw.to_owned());
-    let mut response = match sets.objects.get(&key) {
-        Some(object) => object_reply(object, &headers),
-        None => no_such_key(&key, &ids),
-    };
-    ids.add_headers(&mut response);
-    response
-}
-
-/// `200` with the body, or `304` when `If-None-Match` names its ETag; both carry the ETag.
-fn object_reply(object: &RemoteConfigObject, headers: &HeaderMap) -> Response {
-    let mut response = if etag_matches(headers, &object.etag) {
-        StatusCode::NOT_MODIFIED.into_response()
-    } else {
-        (
-            [(CONTENT_TYPE, HeaderValue::from_static(OBJECT_CONTENT_TYPE))],
-            Body::from(object.body.clone()),
-        )
-            .into_response()
-    };
-    if let Ok(etag) = HeaderValue::from_str(&object.etag) {
-        response.headers_mut().insert(ETAG, etag);
-    }
-    response
-}
-
-/// Whether `If-None-Match` names `etag` (or `*`).
-fn etag_matches(headers: &HeaderMap, etag: &str) -> bool {
-    headers
-        .get_all(IF_NONE_MATCH)
-        .iter()
-        .filter_map(|value| value.to_str().ok())
-        .flat_map(|value| value.split(ETAG_LIST_SEPARATOR))
-        .map(str::trim)
-        .any(|candidate| candidate == etag || candidate == ANY_ETAG)
-}
-
-/// The S3 `NoSuchKey` reply.
-fn no_such_key(key: &str, ids: &RequestIds) -> Response {
-    let body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>NoSuchKey</Code>\
-         <Message>The specified key does not exist.</Message><Key>{}</Key>\
-         <RequestId>{}</RequestId><HostId>{}</HostId></Error>",
-        xml_text(key),
-        ids.request_id,
-        ids.host_id
-    );
-    (
-        StatusCode::NOT_FOUND,
-        [(CONTENT_TYPE, HeaderValue::from_static(ERROR_CONTENT_TYPE))],
-        body,
-    )
-        .into_response()
-}
-
-/// Fresh S3 request ids: 16 upper-case hex digits and a base64 host id.
-struct RequestIds {
-    request_id: String,
-    host_id: String,
-}
-
-impl RequestIds {
-    /// New random ids, or none when the system random source fails.
-    fn new() -> Option<Self> {
-        let mut request_id = [0_u8; REQUEST_ID_BYTES];
-        let mut host_id = [0_u8; HOST_ID_BYTES];
-        getrandom::fill(&mut request_id).ok()?;
-        getrandom::fill(&mut host_id).ok()?;
-        Some(Self {
-            request_id: HEXUPPER.encode(&request_id),
-            host_id: BASE64.encode(&host_id),
-        })
-    }
-
-    fn add_headers(&self, response: &mut Response) {
-        for (name, value) in [
-            (REQUEST_ID_HEADER, &self.request_id),
-            (HOST_ID_HEADER, &self.host_id),
-        ] {
-            if let Ok(value) = HeaderValue::from_str(value) {
-                response.headers_mut().insert(name, value);
-            }
-        }
-    }
-}
-
-/// `%XX` escapes decoded, or none when an escape or the result is not valid.
-fn percent_decode(text: &str) -> Option<String> {
-    let bytes = text.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index] == PERCENT {
-            let escape = text.get(index + 1..index + PERCENT_ESCAPE_LEN)?;
-            out.push(u8::from_str_radix(escape, HEX_RADIX).ok()?);
-            index += PERCENT_ESCAPE_LEN;
-        } else {
-            out.push(bytes[index]);
-            index += 1;
-        }
-    }
-    String::from_utf8(out).ok()
+    s3_router(sets.objects)
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use axum::body::Bytes;
-    use axum::http::Request;
+    use axum::body::{Body, Bytes};
+    use axum::http::header::IF_NONE_MATCH;
+    use axum::http::{HeaderMap, Request, StatusCode};
+    use data_encoding::HEXLOWER;
+    use md5::{Digest, Md5};
     use std::collections::BTreeSet;
 
     use super::*;
     use crate::config::tests::valid;
+    use crate::s3::{
+        ANY_ETAG, ERROR_CONTENT_TYPE, HOST_ID_HEADER, OBJECT_CONTENT_TYPE, REQUEST_ID_BYTES,
+        REQUEST_ID_HEADER,
+    };
     use crate::test_http;
 
     /// The tracked config sets.
@@ -455,7 +312,8 @@ pub(crate) mod tests {
     /// less the four Amazon-only stats keys (`server-endpoint`, `ingestion-endpoint`,
     /// `stats-assume-role`, `ingestion-assume-role`), plus the switches the leaderboards study
     /// asks for (`analytics/enable` and seven `javelin` keys of the publicGameplay `RegionId`
-    /// layer; leaderboards note section 1).
+    /// layer; leaderboards note section 1), plus the shop service keys `omni/fcs/*` that retail
+    /// leaves to the client's defaults (shop note).
     const SERVED_KEY_PATHS: [(&str, Dimension, &[&str]); 8] = [
         (
             "public",
@@ -510,6 +368,10 @@ pub(crate) mod tests {
                 "javelin/use-persona-penalties",
                 "javelin/use-season-end-time-config",
                 "javelin/weekly-leaderboard-reset-hour",
+                "omni/fcs/endpoints/catalog-service",
+                "omni/fcs/endpoints/entitlement-service",
+                "omni/fcs/endpoints/transaction-service",
+                "omni/fcs/region",
                 "omni/leaderboards/client-endpoint",
                 "omni/leaderboards/region",
             ],
@@ -619,17 +481,21 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_stats_endpoint_is_the_servers_game_host() {
+    fn the_service_endpoints_are_the_servers_game_host() {
         let sets = sets();
         let key = object_key(
-            LEADERBOARDS_APPLICATION,
+            ENDPOINTS_APPLICATION,
             Dimension::RegionId,
             CLUSTER_ID,
             VERSIONLESS,
         );
-        let leaderboards = &served_json(&sets, &key)["omni"]["leaderboards"];
-        assert_eq!(leaderboards[CLIENT_ENDPOINT_KEY], "game.example.org");
-        assert_eq!(leaderboards["region"], "us-east-1");
+        let served = served_json(&sets, &key);
+        for (path, endpoint) in GAME_HOST_ENDPOINTS {
+            let section = path.iter().fold(&served, |parent, part| &parent[*part]);
+            assert_eq!(section[endpoint], "game.example.org", "{path:?} {endpoint}");
+        }
+        assert_eq!(served["omni"]["leaderboards"]["region"], "us-east-1");
+        assert_eq!(served["omni"]["fcs"]["region"], "us-east-1");
     }
 
     #[test]
@@ -706,33 +572,50 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn the_files_must_not_set_the_client_endpoint() {
-        let (dir, config) = copied_sets();
+    fn the_files_must_not_set_a_service_endpoint() {
         let key = object_key(
-            LEADERBOARDS_APPLICATION,
+            ENDPOINTS_APPLICATION,
             Dimension::RegionId,
             CLUSTER_ID,
             VERSIONLESS,
         );
-        let path = dir.path().join(layer_file_name(
-            LEADERBOARDS_APPLICATION,
-            Dimension::RegionId,
-            CLUSTER_ID,
-        ));
-        let mut value: Value =
-            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
-        value["omni"]["leaderboards"][CLIENT_ENDPOINT_KEY] = Value::from("elsewhere.example.net");
-        std::fs::write(&path, serde_json::to_vec(&value).expect("json")).expect("write");
-        assert!(matches!(
-            RemoteConfigSets::load(&config),
-            Err(RemoteConfigError::Leaderboards { key: found, .. }) if found == key
-        ));
-        value["omni"] = Value::from("no object");
-        std::fs::write(&path, serde_json::to_vec(&value).expect("json")).expect("write");
-        assert!(matches!(
-            RemoteConfigSets::load(&config),
-            Err(RemoteConfigError::Leaderboards { key: found, .. }) if found == key
-        ));
+        let tracked: Value = serde_json::from_slice(
+            &std::fs::read(committed_directory().join(layer_file_name(
+                ENDPOINTS_APPLICATION,
+                Dimension::RegionId,
+                CLUSTER_ID,
+            )))
+            .expect("read"),
+        )
+        .expect("json");
+        let refused = |value: &Value| {
+            let (dir, config) = copied_sets();
+            let path = dir.path().join(layer_file_name(
+                ENDPOINTS_APPLICATION,
+                Dimension::RegionId,
+                CLUSTER_ID,
+            ));
+            std::fs::write(&path, serde_json::to_vec(value).expect("json")).expect("write");
+            matches!(
+                RemoteConfigSets::load(&config),
+                Err(RemoteConfigError::Endpoint { key: found, .. }) if found == key
+            )
+        };
+        for (path, endpoint) in GAME_HOST_ENDPOINTS {
+            let mut value = tracked.clone();
+            let section = path
+                .iter()
+                .fold(&mut value, |parent, part| &mut parent[*part]);
+            section[endpoint] = Value::from("elsewhere.example.net");
+            assert!(refused(&value), "{path:?} {endpoint} set");
+            let mut value = tracked.clone();
+            let (last, parents) = path.split_last().expect("path");
+            let parent = parents
+                .iter()
+                .fold(&mut value, |parent, part| &mut parent[*part]);
+            parent[*last] = Value::from("no object");
+            assert!(refused(&value), "{path:?} not an object");
+        }
     }
 
     async fn get(path: &str, if_none_match: Option<&str>) -> (StatusCode, HeaderMap, Bytes) {
@@ -841,15 +724,6 @@ pub(crate) mod tests {
         let request = test_http::request("PUT", &format!("/{key}"), "{}");
         let (status, _) = test_http::send(&remote_config_router(sets()), request).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-    }
-
-    #[test]
-    fn percent_escapes_are_decoded() {
-        assert_eq!(percent_decode("a%3Bb%3ab").as_deref(), Some("a;b:b"));
-        assert_eq!(percent_decode("plain").as_deref(), Some("plain"));
-        for bad in ["%", "%3", "%zz", "%FF"] {
-            assert_eq!(percent_decode(bad), None, "{bad}");
-        }
     }
 
     #[test]

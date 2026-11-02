@@ -7,11 +7,15 @@ use std::path::{Path, PathBuf};
 
 use nw_common::config::{ConfigError, load_config};
 pub use nw_db::DatabaseConfig;
-use nw_protocol::aws_mirror::{REMOTE_CONFIG_BUCKETS, is_aws_mirror_host, remote_config_host};
+use nw_protocol::aws_mirror::{
+    CMS_HOST, CMS_IMAGE_HOST, MIRROR_HOST_KINDS, REMOTE_CONFIG_BUCKETS, dynamodb_host,
+    is_aws_mirror_host, remote_config_host,
+};
 use nw_protocol::launcher_api::{AuthMode, SESSION_PLACEHOLDER, is_forbidden_host};
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::game::API_REGION;
 use crate::secrets::SECRET_ENV_PREFIX;
 
 /// Environment variable prefix for overrides of `config/edge.toml`.
@@ -53,6 +57,8 @@ pub struct EdgeConfig {
     pub domain: String,
     /// Public HTTPS listener.
     pub https_listen: SocketAddr,
+    /// Plain HTTP listener of the region ping ([`crate::region_ping`]). The client pings port 80.
+    pub ping_listen: SocketAddr,
     /// Internal Prometheus listener (review finding I1).
     pub metrics_listen: SocketAddr,
     /// Time limit for one HTTP request.
@@ -75,6 +81,8 @@ pub struct EdgeConfig {
     pub valkey: ValkeyConfig,
     /// Our own remote config sets.
     pub remote_config: RemoteConfigConfig,
+    /// Our own news documents and images.
+    pub cms: CmsConfig,
     /// The Amazon names this server answers for its game clients.
     pub aws_mirror: AwsMirrorConfig,
     /// Worlds, one `[[world]]` block each.
@@ -141,13 +149,23 @@ pub struct RemoteConfigConfig {
     pub cognito_pool_id: Uuid,
 }
 
+/// `[cms]`: our own news documents and images, answered as the client's news host and its image
+/// host (study note `docs/re/2026-11-02-cms-news-hosts.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CmsConfig {
+    /// Folder with one subfolder per news host, named after it; each file in it is served at its
+    /// path ([`crate::cms::CmsObjects::load`]).
+    pub directory: PathBuf,
+}
+
 /// `[aws_mirror]`: the Amazon names our launcher maps to this server for the game process, and
 /// the self-signed certificate this server shows for them (`edge-http aws-mirror-certificate`).
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AwsMirrorConfig {
-    /// Host names in lower case; each passes [`is_aws_mirror_host`], and the bucket host is one
-    /// of them.
+    /// Host names in lower case; each passes [`is_aws_mirror_host`], and the bucket host, the
+    /// region ping host of [`API_REGION`] and both news hosts are among them.
     pub hosts: Vec<String>,
     /// Certificate for exactly these names.
     pub certificate_pem_path: PathBuf,
@@ -264,9 +282,7 @@ impl EdgeConfig {
         let mut hosts = HashSet::new();
         for host in &self.aws_mirror.hosts {
             if host.to_ascii_lowercase() != *host || !is_aws_mirror_host(host) {
-                return invalid(&format!(
-                    "{host} is not a lower-case remote-config, Kinesis or STS host"
-                ));
+                return invalid(&format!("{host} is not a lower-case {MIRROR_HOST_KINDS}"));
             }
             if !hosts.insert(host.as_str()) {
                 return invalid(&format!("{host} is listed twice"));
@@ -275,6 +291,15 @@ impl EdgeConfig {
         let bucket_host = remote_config_host(&self.remote_config.bucket);
         if !hosts.contains(bucket_host.as_str()) {
             return invalid(&format!("must contain the bucket host {bucket_host}"));
+        }
+        let ping_host = dynamodb_host(API_REGION);
+        if !hosts.contains(ping_host.as_str()) {
+            return invalid(&format!("must contain the region ping host {ping_host}"));
+        }
+        for news_host in [CMS_HOST, CMS_IMAGE_HOST] {
+            if !hosts.contains(news_host) {
+                return invalid(&format!("must contain the news host {news_host}"));
+            }
         }
         Ok(())
     }
@@ -368,6 +393,7 @@ pub(crate) mod tests {
 server_name = "Test server"
 domain = "example.org"
 https_listen = "0.0.0.0:443"
+ping_listen = "0.0.0.0:80"
 metrics_listen = "127.0.0.1:9100"
 request_timeout_seconds = 10
 max_connections = 4096
@@ -397,11 +423,17 @@ directory = "config/remote-config"
 bucket = "ags-javelin-remote-config"
 cognito_pool_id = "b04fbfcd-942c-472d-88c0-c762c4076b2f"
 
+[cms]
+directory = "config/cms"
+
 [aws_mirror]
 hosts = [
     "ags-javelin-remote-config.s3.amazonaws.com",
     "kinesis.us-east-1.amazonaws.com",
     "sts.us-east-1.amazonaws.com",
+    "dynamodb.us-east-1.amazonaws.com",
+    "d1hkbwzm1bktgo.cloudfront.net",
+    "client.content-service.amazongames.com",
 ]
 certificate_pem_path = "local-data/edge-http/aws-mirror.pem"
 private_key_pem_path = "local-data/edge-http/aws-mirror-key.pem"
@@ -551,6 +583,19 @@ max_connections = 5
             &VALID.replace(
                 "\"ags-javelin-remote-config.s3.amazonaws.com\",",
                 "\"ags-javelin-dev-remote-config.s3.amazonaws.com\",",
+            ),
+            "aws_mirror.hosts",
+        );
+        for required in [CMS_HOST, CMS_IMAGE_HOST, "dynamodb.us-east-1.amazonaws.com"] {
+            refused(
+                &VALID.replace(&format!("    \"{required}\",\n"), ""),
+                "aws_mirror.hosts",
+            );
+        }
+        refused(
+            &VALID.replace(
+                "\"client.content-service.amazongames.com\",",
+                "\"client.catalogservice.amazongames.com\",",
             ),
             "aws_mirror.hosts",
         );

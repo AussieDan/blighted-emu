@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The game process's private network view (study note
-//! `docs/re/2026-09-18-remote-config-layers.md`). The client calls the remote-config bucket, its
-//! analytics stream and STS by fixed Amazon names. The launcher runs Proton inside `bwrap` with
-//! two private files bound over the system ones, for the game process alone:
+//! The game process's private network view (study notes
+//! `docs/re/2026-09-18-remote-config-layers.md`, `docs/re/2026-11-02-cms-news-hosts.md` and
+//! `docs/re/2026-11-02-region-ping.md`). The client calls the remote-config bucket, its analytics
+//! stream, STS, its region ping host and its news hosts by fixed Amazon names. The launcher runs
+//! Proton inside `bwrap` with two private files bound over the system ones, for the game process
+//! alone:
 //!
 //! - `/etc/hosts`: the server's `[aws_mirror]` names lead to the server's own address;
 //! - Wine's first trust file: the system roots plus the server's mirror certificate.
@@ -16,7 +18,7 @@ use std::net::{IpAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nw_protocol::aws_mirror::{AwsMirror, is_aws_mirror_host};
+use nw_protocol::aws_mirror::{AwsMirror, MIRROR_HOST_KINDS, is_aws_mirror_host};
 use rustls::RootCertStore;
 use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::ServerCertVerifier;
@@ -47,8 +49,8 @@ const BWRAP_END_OF_OPTIONS: &str = "--";
 /// The server's mirror cannot be used.
 #[derive(Debug, thiserror::Error)]
 pub enum MirrorError {
-    /// The server asked to map a name that is not a remote-config, Kinesis or STS host.
-    #[error("the server asked to redirect {0}, which is not a remote-config, Kinesis or STS host")]
+    /// The server asked to map a name that is not one of the [`MIRROR_HOST_KINDS`].
+    #[error("the server asked to redirect {0}, which is not a {MIRROR_HOST_KINDS}")]
     BadHost(String),
     /// The server named no host.
     #[error("the server named no host to redirect")]
@@ -255,7 +257,7 @@ mod tests {
 
     use super::*;
 
-    /// A self-signed server certificate (not a CA) for the three hosts of `config/edge.toml`.
+    /// A self-signed server certificate (not a CA) for three mirror hosts.
     const MIRROR_PEM: &str = include_str!("../testdata/aws-mirror.crt");
     /// The same names in a CA certificate.
     const CA_PEM: &str = include_str!("../testdata/aws-mirror-ca.crt");

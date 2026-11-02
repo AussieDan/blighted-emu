@@ -15,6 +15,10 @@
     "omni": {
         "leaderboards": {
             "region": "us-east-1"
+        },
+        "fcs": {
+            "region": "us-east-1",
+            "endpoints": {}
         }
     },
     "javelin-server": {

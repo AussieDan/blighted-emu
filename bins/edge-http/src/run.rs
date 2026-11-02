@@ -14,6 +14,7 @@ use axum_server::tls_rustls::RustlsConfig;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use nw_common::logging::{LoggingError, init_logging};
 use nw_db::{DbError, GLOBAL_MIGRATOR, WORLD_MIGRATOR, check_schema};
+use nw_login::cms::{CmsError, CmsObjects};
 use nw_login::config::{EdgeConfig, EdgeConfigError, load_edge_config};
 use nw_login::discord::{DiscordError, DiscordHttp};
 use nw_login::game::GameState;
@@ -22,6 +23,7 @@ use nw_login::install_crypto_provider;
 use nw_login::launcher::LauncherState;
 use nw_login::password::{PasswordError, PasswordHasher};
 use nw_login::pg::{PgAccounts, PgCharacters};
+use nw_login::region_ping::region_ping_router;
 use nw_login::remote_config::{RemoteConfigError, RemoteConfigSets, remote_config_router};
 use nw_login::secrets::{SecretError, Secrets, load_database_passwords, load_secrets};
 use nw_login::store::StoreError;
@@ -72,6 +74,9 @@ pub enum RunError {
     /// The remote config sets cannot be loaded.
     #[error(transparent)]
     RemoteConfig(#[from] RemoteConfigError),
+    /// The news files cannot be loaded.
+    #[error(transparent)]
+    Cms(#[from] CmsError),
     /// A listener failed.
     #[error("listener failed")]
     Listen(#[source] std::io::Error),
@@ -135,6 +140,7 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
 
 async fn serve_async(config: EdgeConfig, secrets: Secrets) -> Result<(), RunError> {
     let remote_config = RemoteConfigSets::load(&config)?;
+    let cms = CmsObjects::load(&config)?;
     let tls = RustlsConfig::from_config(Arc::new(server_config(&config)?));
     let aws_mirror_certificate_pem = mirror_certificate_pem(&config.aws_mirror)?.into();
     let (global, worlds) = connect_all(&config, &secrets.database_passwords)
@@ -171,7 +177,8 @@ async fn serve_async(config: EdgeConfig, secrets: Secrets) -> Result<(), RunErro
         hasher: PasswordHasher::new(config.auth.argon2_parallel)?,
         aws_mirror_certificate_pem,
     };
-    let services = ServiceRouters::on_postgres(&global, remote_config_router(remote_config));
+    let services =
+        ServiceRouters::on_postgres(&global, remote_config_router(remote_config), cms.routers());
     let game = GameState {
         config: shared_config,
         game_sessions: valkey.clone(),
@@ -186,6 +193,12 @@ async fn serve_async(config: EdgeConfig, secrets: Secrets) -> Result<(), RunErro
         config.max_connections,
     );
     spawn_metrics(config.metrics_listen).await?;
+    spawn_region_ping(
+        config.ping_listen,
+        Duration::from_secs(config.request_timeout_seconds),
+        config.max_connections,
+    )
+    .await?;
     let handle = Handle::new();
     let shutdown = handle.clone();
     tokio::spawn(async move {
@@ -199,6 +212,25 @@ async fn serve_async(config: EdgeConfig, secrets: Secrets) -> Result<(), RunErro
         .serve(app.into_make_service_with_connect_info::<SocketAddr>())
         .await
         .map_err(RunError::Listen)
+}
+
+/// Serves the client's region ping over plain HTTP ([`region_ping_router`]).
+async fn spawn_region_ping(
+    address: SocketAddr,
+    time_limit: Duration,
+    max_in_flight: usize,
+) -> Result<(), RunError> {
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(RunError::Listen)?;
+    let app = with_limits(region_ping_router(), time_limit, max_in_flight);
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(listener, app).await {
+            tracing::error!(%error, "region ping listener stopped");
+        }
+    });
+    tracing::info!(%address, "serving the region ping");
+    Ok(())
 }
 
 /// Installs the Prometheus recorder and serves it on the internal address (review finding I1).
@@ -247,6 +279,15 @@ mod tests {
             .join(&config.remote_config.directory);
         let sets = RemoteConfigSets::load(&config).expect("config/remote-config");
         assert!(!sets.keys().is_empty());
+    }
+
+    #[test]
+    fn committed_news_files_load() {
+        let mut config = load_edge_config(&committed_config()).expect("config/edge.toml");
+        config.cms.directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(&config.cms.directory);
+        CmsObjects::load(&config).expect("config/cms");
     }
 
     #[test]

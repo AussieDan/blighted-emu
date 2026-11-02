@@ -55,8 +55,9 @@ const CHANNEL_ROUTE: &str = "/{file}";
 /// Id of the one cluster in the channel document. The client also names its `RegionId`
 /// remote-config layers after it (`client-connection.authorization.cluster`).
 pub(crate) const CLUSTER_ID: &str = "blighted";
-/// Region text in every `publicApis` element; the client only signs requests with it.
-const API_REGION: &str = "us-east-1";
+/// Region text in every `publicApis` element; the client signs requests with it, and pings
+/// `dynamodb.<region>.amazonaws.com` for it (region ping note).
+pub const API_REGION: &str = "us-east-1";
 /// Value of the three `/steam` credentials; the client signs requests with them and the server
 /// ignores the signatures (JSON note section 7).
 pub(crate) const AUTH_STACK_CREDENTIAL: &str = "blighted";

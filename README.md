@@ -172,7 +172,7 @@ cargo run -p edge-http -- serve
 cargo run -p launcher
 ```
 
-`edge-http aws-mirror-certificate` makes the self-signed certificate of the `[aws_mirror]` hosts in `config/edge.toml` once. It never replaces a file. The launcher maps those Amazon host names to this server for the game process only (see [docs/client-patch.md](docs/client-patch.md)).
+`edge-http aws-mirror-certificate` makes the self-signed certificate of the `[aws_mirror]` hosts in `config/edge.toml`. It never replaces a file. When the host list changes, move the two old files away and make the certificate again. The launcher maps those Amazon host names to this server for the game process only (see [docs/client-patch.md](docs/client-patch.md)). The two news hosts serve the files in `config/cms/` (`[cms]` in `config/edge.toml`): the message of the day, the news stories and the menu tiles, and their images. The tracked files have no news. `ping_listen` (port 80, plain HTTP) answers the client's region ping on `dynamodb.us-east-1.amazonaws.com`; the `setcap` right covers it too.
 
 For a release build, `setcap` takes `target/release/edge-http`. Run `setcap` again after each build, because a new file loses the right.
 

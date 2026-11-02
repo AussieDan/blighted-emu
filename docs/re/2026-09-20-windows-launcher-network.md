@@ -112,6 +112,12 @@ needs no system change.
    retail `NewWorld.exe`. Wiring these into `app.rs::play()` (start the proxy, then the game, stop
    the proxy on exit) is left for the user, because `app.rs` is owned by another session.
 5. **Open.** A live test on Windows (`docs/client-patch.md`, Windows live test).
+6. **Done (2026-11-02).** The news client (`FUN_1430089b0`) is a fourth client of the same kind.
+   `--aws-proxy` gives it a cave too, and the proxy accepts its two hosts
+   (`2026-11-02-cms-news-hosts.md`).
+7. **Done (2026-11-02).** The region pinger's plain HTTP client (`FUN_146402310`) is a fifth
+   client. `--aws-proxy` gives it a cave, and the proxy passes `GET http://<DynamoDB host>/...` to
+   the server's port 80 (`2026-11-02-region-ping.md`).
 
 ## 3. Safety
 

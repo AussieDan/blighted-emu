@@ -157,12 +157,16 @@ The account-age chat restriction stays on. The server answers it with `accountIn
 This change is for Windows. Windows has no `bwrap` sandbox to give the game process a private
 hosts file and trust file. On Linux, do not use it.
 
-The game has three AWS clients that call fixed Amazon names with certificate checks on:
-remote-config (S3), analytics (Kinesis) and analytics credentials (STS). Each one builds an
+The game has four AWS SDK clients that call fixed Amazon names with certificate checks on:
+remote-config (S3), analytics (Kinesis), analytics credentials (STS) and the news client (the
+message of the day, the news stories, the menu tiles and their images;
+`docs/re/2026-11-02-cms-news-hosts.md`). A fifth one, the region pinger, calls
+`dynamodb.<region>.amazonaws.com` over plain HTTP (`docs/re/2026-11-02-region-ping.md`). Each one
+builds an
 `Aws::Client::ClientConfiguration` (constructor `FUN_147467a40`) and uses the WinHTTP client
 (`FUN_147491570`). The factory `FUN_146b73730` picks WinINet only when the configuration byte
 `+0x220` is `2`, and the constructor sets it to `0`. With `--aws-proxy`, the patch sends all
-three clients through the loopback proxy of the launcher
+five clients through the loopback proxy of the launcher
 (`docs/re/2026-09-20-windows-launcher-network.md`).
 
 After the constructor call of each builder, the fresh config is in `RAX`. The patch replaces the
@@ -180,8 +184,9 @@ Then the cave runs the instruction that the jump replaced and jumps back. The re
 builder also writes `verifySSL = 1` itself a little later (`MOV byte ptr [RSP+0x208],1`). The
 patch changes that immediate to `0` too.
 
-The three builders are `FUN_140853a80` (S3), `FUN_1461c3cc0` (Kinesis) and `FUN_1461c5220`
-(STS). The tool finds each one by the bytes around its constructor call. A build change that
+The five builders are `FUN_140853a80` (S3), `FUN_1461c3cc0` (Kinesis), `FUN_1461c5220` (STS),
+`FUN_1430089b0` (news) and `FUN_146402310` (region ping). The tool finds each one by the bytes
+around its constructor call. For the region ping, the cave replays two short instructions. A build change that
 keeps that shape still matches. When a build change breaks the shape, the tool stops and does
 not patch the wrong place.
 
@@ -189,7 +194,15 @@ With `verifySSL` off, the WinHTTP request sets `WINHTTP_OPTION_SECURITY_FLAGS` t
 (ignore an unknown CA and a CN mismatch; the date check stays on). So the weaker check reaches
 only the launcher on loopback. The launcher proxy keeps the real check. It opens its own TLS to
 the server and pins the mirror certificate of the server (`bins/launcher/src/aws_proxy.rs`,
-the same rule as `check_mirror`). It accepts a `CONNECT` only for the three mirror host kinds.
+the same rule as `check_mirror`). It accepts a `CONNECT` only for the mirror host kinds
+(`is_aws_mirror_host`). The region pinger uses plain HTTP, so WinHTTP sends it to the proxy as
+`GET http://<host>/ping`. The proxy accepts that only for a DynamoDB host and passes it unchanged
+to port 80 of the server.
+
+A copy made with `--aws-proxy` before the news and region ping clients were added has fewer
+caves.
+`--verify --aws-proxy` fails on it. Run the tool with `--aws-proxy` again: it writes the copy
+again from `NewWorld.exe`.
 
 Run the tool with `--aws-proxy`:
 
@@ -302,8 +315,10 @@ variable creation changed, update `VARIABLE_CREATION` in `scripts/patch-client.p
 
 For the AWS proxy patch, find the `ClientConfiguration` constructor again (`FUN_147467a40`: it
 writes the two 5,000 ms timeouts and `verifySSL = 1` into a fresh object). Also find the three
-builders that call it with the S3, Kinesis and STS regions. Update `CONFIG_CONSTRUCTOR`, the
-three `AWS_CONFIG_SITES` and `S3_VERIFY_SSL_WRITE` in `scripts/patch-client.py`. If the struct
+builders that call it with the S3, Kinesis and STS regions, the news fetch that logs
+`Loading CMS HTTP Request URL: %s`, and the region pinger's builder (called by the set-up that
+names `AwsRegionPinger`). Update `CONFIG_CONSTRUCTOR`, the five `AWS_CONFIG_SITES` and
+`S3_VERIFY_SSL_WRITE` in `scripts/patch-client.py`. If the struct
 offsets change, read them from the WinHTTP client `FUN_147491570` (it reads `proxyHost +0xA0`
 and `proxyPort +0xC0`). Then update `CONFIG_PROXY_HOST`, `CONFIG_PROXY_HOST_SIZE`,
 `CONFIG_PROXY_PORT` and `CONFIG_VERIFY_SSL`.
@@ -343,7 +358,8 @@ cannot replace the Steam variables that the launcher sets.
 The launcher logs in as usual and starts `BlightedNewWorld.exe` through Proton inside `bwrap`.
 It skips `NewWorldLauncher.exe`, and so it skips Easy Anti-Cheat. `bwrap` binds two private
 files for the game process only. One is a hosts file that sends the `[aws_mirror]` names of the
-server (remote-config bucket, Kinesis, STS) to the server. The other is a trust file with the
+server (remote-config bucket, Kinesis, STS, the region ping host and the two news hosts) to the
+server. The other is a trust file with the
 mirror certificate of the server added (`docs/re/2026-09-18-remote-config-layers.md`). Without
 the Game, Proton and Steam options, the launcher does not start the game. The Steam launch path
 ran the stock client in the retail prefix, where it called the remote-config, analytics and STS
@@ -353,8 +369,8 @@ hosts of Amazon.
 
 Windows has no `bwrap`, so the private hosts file and trust file are not used. Instead, the
 client is patched with `--aws-proxy` (above), and the launcher runs a loopback proxy on
-`127.0.0.1:47443` (`bins/launcher/src/aws_proxy.rs`). The patched client sends its three AWS
-calls there. The proxy checks the mirror certificate of the server and relays the calls to the
+`127.0.0.1:47443` (`bins/launcher/src/aws_proxy.rs`). The patched client sends the calls of its
+five AWS SDK clients there. The proxy checks the mirror certificate of the server and relays the calls to the
 server.
 
 The launcher starts the patched exe directly (no Proton, no `bwrap`). It needs only the Game
@@ -395,7 +411,7 @@ You need a Windows PC with Steam and New World installed, and the project launch
    - The game cannot connect at all. Steam is not running, or the server address or the mirror
      certificate is wrong. The launcher refuses a mirror that is not exactly one certificate,
      that is a CA, that is not valid now for each mirror name, or that has a name that is not
-     a remote-config, Kinesis or STS host.
+     a remote-config, Kinesis, STS, region ping, news or news image host.
    - A TLS error toward the proxy. The `--aws-proxy` patch did not clear `verifySSL`. Run the
      patch and `--verify --aws-proxy` again.
    - The retail `NewWorld.exe` starts, or anti-cheat runs. The Game option does not point at

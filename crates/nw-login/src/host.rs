@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Routing by host name (M2 spec section 14, parent spec 4.2). `login.<domain>` serves the
-//! launcher API and the channel document; `game.<domain>` serves the game routes and the stats
-//! service. The Kinesis and STS host names of the client's analytics get our analytics stream
-//! when they lead here, and the remote-config bucket host gets our own config sets. A request for
-//! any other host gets `421`.
+//! launcher API and the channel document; `game.<domain>` serves the game routes, the stats
+//! service and the shop services. The Kinesis and STS host names of the client's analytics get our analytics stream
+//! when they lead here, the remote-config bucket host gets our own config sets, and the news host
+//! and its image host get our own news. A request for any other host gets `421`.
 
 use std::sync::Arc;
 
@@ -14,15 +14,17 @@ use axum::response::{IntoResponse, Response};
 use tower::ServiceExt;
 
 use nw_db::PgPool;
-use nw_protocol::aws_mirror::remote_config_host;
+use nw_protocol::aws_mirror::{CMS_HOST, CMS_IMAGE_HOST, remote_config_host};
 
 use crate::analytics::{AnalyticsState, is_kinesis_host, is_sts_host, kinesis_router, sts_router};
+use crate::cms::CmsRouters;
 use crate::discord::DiscordApi;
 use crate::error::ApiError;
 use crate::game::{GameState, channel_router, game_router, unknown_route};
 use crate::launcher::{LauncherState, launcher_router};
 use crate::pg::PgStats;
 use crate::queue::QueueStore;
+use crate::shop::shop_router;
 use crate::stats::{StatsState, stats_router};
 use crate::store::{
     AccountStore, CharacterStore, DiscordStateStore, GameSessionStore, RateLimiter,
@@ -42,6 +44,8 @@ struct HostRoutes {
     sts: Router,
     bucket_host: Arc<str>,
     remote_config: Router,
+    cms: Router,
+    cms_images: Router,
 }
 
 /// The routes of the services outside the login logic.
@@ -55,12 +59,14 @@ pub struct ServiceRouters {
     /// Our own remote config sets ([`crate::remote_config::remote_config_router`]), on the
     /// bucket host.
     pub remote_config: Router,
+    /// Our own news ([`crate::cms::CmsObjects::routers`]), on the news host and its image host.
+    pub cms: CmsRouters,
 }
 
 impl ServiceRouters {
-    /// The services over the migrated global database `global`, and the remote config route
-    /// ([`crate::remote_config::remote_config_router`]).
-    pub fn on_postgres(global: &PgPool, remote_config: Router) -> Self {
+    /// The services over the migrated global database `global`, the remote config route
+    /// ([`crate::remote_config::remote_config_router`]) and the news routes.
+    pub fn on_postgres(global: &PgPool, remote_config: Router, cms: CmsRouters) -> Self {
         let store = PgStats::new(global.clone());
         Self {
             stats: stats_router(StatsState {
@@ -69,13 +75,14 @@ impl ServiceRouters {
             kinesis: kinesis_router(AnalyticsState { analytics: store }),
             sts: sts_router(),
             remote_config,
+            cms,
         }
     }
 }
 
 /// The host a request names: the URI authority (HTTP/2) or the `Host` header (HTTP/1.1),
 /// without port and final dot.
-fn request_host(request: &Request) -> Option<&str> {
+pub(crate) fn request_host(request: &Request) -> Option<&str> {
     let host = match request.uri().authority() {
         Some(authority) => authority.host(),
         None => {
@@ -97,6 +104,8 @@ async fn by_host(State(routes): State<HostRoutes>, request: Request) -> Response
         Some(host) if is_kinesis_host(host) => routes.kinesis,
         Some(host) if is_sts_host(host) => routes.sts,
         Some(host) if host == &*routes.bucket_host => routes.remote_config,
+        Some(CMS_HOST) => routes.cms,
+        Some(CMS_IMAGE_HOST) => routes.cms_images,
         _ => return ApiError::UnknownHost.into_response(),
     };
     match target.oneshot(request).await {
@@ -128,10 +137,12 @@ where
             .merge(channel_router(game.clone()))
             .fallback(unknown_route)
             .method_not_allowed_fallback(unknown_route),
-        game: game_router(game).merge(services.stats),
+        game: game_router(game).merge(services.stats).merge(shop_router()),
         kinesis: services.kinesis,
         sts: services.sts,
         remote_config: services.remote_config,
+        cms: services.cms.news,
+        cms_images: services.cms.images,
     };
     Router::new().fallback(by_host).with_state(routes)
 }
@@ -144,6 +155,8 @@ mod tests {
     use nw_protocol::launcher_api::{AuthMode, INFO_PATH, LOGIN_PATH};
 
     use super::*;
+    use crate::cms::CmsDocument;
+    use crate::cms::tests::committed_objects;
     use crate::game::SESSION_PREFIX;
     use crate::game::tests::fixture;
     use crate::launcher::tests::state;
@@ -167,6 +180,7 @@ mod tests {
             }),
             sts: sts_router(),
             remote_config: remote_config_router(committed_sets(&game.state.config)),
+            cms: committed_objects(&game.state.config).routers(),
         };
         (edge_router(launcher, game.state, services), game.session)
     }
@@ -220,6 +234,11 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let (status, _) = get(&app, LOGIN_HOST, board).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+        let catalog = "/players/p/games/new-world/platforms/steam/catalog?type=MTX";
+        let (status, _) = get(&app, GAME_HOST, catalog).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&app, LOGIN_HOST, catalog).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]
@@ -259,6 +278,20 @@ mod tests {
         }
         let (status, _) = get(&app, GAME_HOST, key).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn the_news_hosts_get_our_news() {
+        let (app, _) = app_and_session().await;
+        let key = format!("/{}", CmsDocument::MessageOfTheDay.key());
+        let (status, _) = get(&app, "D1HKBWZM1BKTGO.cloudfront.net.", &key).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = get(&app, CMS_IMAGE_HOST, "/images/none.dds").await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get(&app, GAME_HOST, &key).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let (status, _) = get(&app, "d2c74t4zimux3r.cloudfront.net", &key).await;
+        assert_eq!(status, StatusCode::MISDIRECTED_REQUEST);
     }
 
     #[tokio::test]

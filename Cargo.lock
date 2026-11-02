@@ -3090,6 +3090,7 @@ version = "0.1.0"
 dependencies = [
  "argon2",
  "axum",
+ "crc32fast",
  "data-encoding",
  "flate2",
  "getrandom 0.3.4",
