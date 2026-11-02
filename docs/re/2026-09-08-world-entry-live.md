@@ -378,6 +378,6 @@ client needs edge on 443, so this test used a scratch variant: the setcap'd
 `~/.local/nw-edge/edge-http` with `local-data/edge-http/edge.toml`
 (`https_listen = 0.0.0.0:443`), plus `world-director`, `sim`, `rep-gateway` on
 udp 33435, all with `NW_GAME_DIR` set and the `m3-test.env` secrets.
-`login/game.faqfirebase.com` resolve to 127.0.0.1 in `/etc/hosts`. Launch the
+`login.<domain>` and `game.<domain>` resolve to 127.0.0.1 in `/etc/hosts`. Launch the
 patched client with the launcher's direct-Proton env vars (EAC off). Game.log:
 `<prefix>/drive_c/users/steamuser/AppData/Local/AGS/New World/Game.log`.

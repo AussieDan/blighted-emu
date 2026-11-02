@@ -52,8 +52,6 @@ readonly EDGE_PORT=$((8443 + SHIFT))
 readonly EDGE_LISTEN="0.0.0.0:$EDGE_PORT"
 readonly EDGE_METRICS_LISTEN="127.0.0.1:$((9100 + SHIFT))"
 readonly GATEWAY_PORT=$((33435 + SHIFT))
-readonly LOGIN_URL="https://login.faqfirebase.com:$EDGE_PORT"
-readonly GAME_URL="https://game.faqfirebase.com:$EDGE_PORT"
 readonly ADMIN_LISTEN="127.0.0.1:$((9180 + SHIFT))"
 readonly PANEL_URL="http://$ADMIN_LISTEN/live"
 # The sim metrics ports that local-data/nw-testclient.toml reads (port 9103 is the director's).
@@ -115,6 +113,15 @@ if ((${#missing[@]} > 0)); then
   echo "Run 'cargo build --release', set NW_GAME_DIR, and keep the local-data files." >&2
   exit "$EXIT_MISSING"
 fi
+# The domain is only in the git-ignored edge config, never in this repository.
+DOMAIN="$(sed -n 's/^domain *= *"\(.*\)" *$/\1/p' "$EDGE_CONFIG")"
+if [[ -z "$DOMAIN" ]]; then
+  echo "live stack: $EDGE_CONFIG names no domain (domain = \"<your domain>\")" >&2
+  exit "$EXIT_MISSING"
+fi
+readonly DOMAIN
+readonly LOGIN_URL="https://login.$DOMAIN:$EDGE_PORT"
+readonly GAME_URL="https://game.$DOMAIN:$EDGE_PORT"
 
 mkdir -p "$LOG_DIR"
 pids=()

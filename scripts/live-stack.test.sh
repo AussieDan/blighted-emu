@@ -83,6 +83,10 @@ for program in edge-http world-director social sim rep-gateway blighted-admin nw
     >"$fake_root/target/release/$program"
   chmod +x "$fake_root/target/release/$program"
 done
+expect "an edge config with no domain is refused" "$EXIT_MISSING" "names no domain" \
+  env LIVE_STACK_ROOT="$fake_root" NW_GAME_DIR="$fake_root" "$STACK_SCRIPT" 1
+readonly TEST_DOMAIN="example.org"
+echo "domain = \"$TEST_DOMAIN\"" >"$fake_root/local-data/edge-http/edge.toml"
 control="$fake_root/local-data/logs/live/control"
 control_log="$fake_root/local-data/logs/live/control.log"
 setsid env LIVE_STACK_ROOT="$fake_root" NW_GAME_DIR="$fake_root" "$STACK_SCRIPT" 1 \
@@ -157,7 +161,8 @@ expect "an instance that is not 1 to 9 is refused" "$EXIT_USAGE" "LIVE_STACK_INS
 
 # A second instance: its own ports, world id, logs, edge config copy and bot names.
 rm -f "$fake_root/pids/"*
-echo 'id = "8d0f4c2e-0000-4000-8000-000000000001"' >"$fake_root/local-data/edge-http/edge.toml"
+printf 'domain = "%s"\nid = "8d0f4c2e-0000-4000-8000-000000000001"\n' "$TEST_DOMAIN" \
+  >"$fake_root/local-data/edge-http/edge.toml"
 setsid env LIVE_STACK_ROOT="$fake_root" NW_GAME_DIR="$fake_root" LIVE_STACK_INSTANCE=2 \
   "$STACK_SCRIPT" 1 >"$work_dir/stack2.out" 2>&1 &
 stack_pid=$!
@@ -167,6 +172,7 @@ if wait_for test -s "$fake_root/pids/blighted-admin" &&
   grep -q "NW_SIM_METRICS_LISTEN=127.0.0.1:9202" "$fake_root/pids/sim.env" &&
   grep -q "BLIGHTED_ADMIN_LISTEN=127.0.0.1:9280" "$fake_root/pids/blighted-admin.env" &&
   grep -q "BLIGHTED_ADMIN_LIVE__BOT_CHARACTER_PREFIX=Instbot" "$fake_root/pids/blighted-admin.env" &&
+  grep -q "NW_TESTCLIENT_LOGIN_URL=https://login.$TEST_DOMAIN:8543" "$fake_root/pids/blighted-admin.env" &&
   grep -q "NW_GATEWAY_UDP_LISTEN=0.0.0.0:33535" "$fake_root/pids/rep-gateway.env" &&
   grep -q "local-data/logs/live-2/edge.toml" "$fake_root/pids/edge-http.args" &&
   grep -q "$second_world" "$fake_root/local-data/logs/live-2/edge.toml" &&

@@ -7,8 +7,8 @@ Date: 2026-09-06.
 
 ## Live result: the config route failed; this hook is now the plan
 
-Tested against the live retail client (build 25810808, GE-Proton, world
-`faqfirebase.com`). The client reached character select and started the REP
+Tested against the live retail client (build 25810808, GE-Proton, world on
+the test domain). The client reached character select and started the REP
 connection to `127.0.0.1:33435`, then failed with
 `@mm_csdkerr_transport_security_error (2)`. That is the `gridmate-udp` DTLS cert
 wall. Three attempts to switch it to the no-cert TCP transport all failed,
