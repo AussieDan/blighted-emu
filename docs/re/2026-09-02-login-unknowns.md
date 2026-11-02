@@ -561,7 +561,7 @@ Method: static only, on the existing Ghidra project, read-only, analysis off (`a
 | `nw` | `0` | `0x1484c7fa4` | `0x149f3fd58` |
 | `persona` | `1` | `0x14844b8b0` | `0x149f3fd60` |
 | `omni` | `2` | `0x1484c7fa8` | `0x149f3fd68` |
-| any other command-line text | `3` | — | past the last slot |
+| any other command-line text | `3` | none | past the last slot |
 
 **Observed.** `FUN_1461a9950` passes that index in `R9D` at `0x1461a9a63` and calls `0x140571500` at `0x1461a9a71`. That thunk is `MOV RAX, [RCX]` / `JMP [RAX+0x180]`. `RCX` is again `[RBX+0x28]`.
 

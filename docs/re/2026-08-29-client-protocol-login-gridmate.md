@@ -6,7 +6,7 @@ Method: static analysis of the already-analyzed project, opened read-only with a
 
 Labels: **Observed** = an address, a string, or decompiler output in this build. **Inferred** = a conclusion from that evidence. **Unknown** = not established.
 
-Related notes: [2026-08-29 client install findings](2026-08-29-client-install-findings.md), [2026-08-31 endpoint configuration](2026-08-31-client-endpoint-configuration.md) (RE task 1). This note is RE tasks 2–5 in the architecture spec, section 11.3.
+Related notes: [2026-08-29 client install findings](2026-08-29-client-install-findings.md), [2026-08-31 endpoint configuration](2026-08-31-client-endpoint-configuration.md) (RE task 1). This note is RE tasks 2 to 5 in the architecture spec, section 11.3.
 
 Where this note and `docs/research/02-network-protocol-and-login.md` disagree, the binary wins. Those disagreements are marked below.
 
@@ -260,7 +260,7 @@ A separate string mentions `caPath` and a RETAIL / sandbox certificate choice. I
    - `FUN_140f8ab70` resets the bit-packer at `param_1 + 0x5a0` (vtable `0x147fbe6e8`, slot `+0x08` = `FUN_140f8bfd0`, `0x140f8bfd0`).
    - **Byte 0 (`u8` mode)**: `0x80` when uncompressed, or `0x81` when compressor `param_1[5] != 0`, `*(char *)((longlong)param_1 + 0x252) != 0`, and `*(int *)(conn + 0x68) != 0`. On receive, `FUN_140f898e0` checks `(char)byte0 < 0` and `(byte0 & 0x7e) == 0` (accepting only `0x80` or `0x81`).
    - **Byte 1 (`u8` format)**: `0x01`. On receive, `FUN_140f898e0` rejects the datagram if byte 1 is not `0x01`.
-   - **Bytes 2–3 (`u16` datagram sequence)**: `*(uint16 *)(conn_state + 0x12f0) + 1`, byte-swapped to big-endian when `*(int *)(param_1 + 0x5a4) == 0` (carrier endian setting).
+   - **Bytes 2 and 3 (`u16` datagram sequence)**: `*(uint16 *)(conn_state + 0x12f0) + 1`, byte-swapped to big-endian when `*(int *)(param_1 + 0x5a4) == 0` (carrier endian setting).
 2. **Per-message frame header inside the datagram (`FUN_140f65b20` at `0x140f65b20` on send / `FUN_140f77eb0` at `0x140f77eb0` on receive)**:
    - `u8` flags byte:
      - bit `0x01`: reliable message (`1` = reliable, `0` = unreliable).
@@ -368,11 +368,11 @@ The index integer is a prefix code, not standard LEB128 (research file 02 says L
 
 | First byte | Extra bytes | Value |
 |---|---|---|
-| `0x00`–`0x7F` | 0 | the byte |
-| `0x80`–`0xBF` | 1 | low 6 bits of the first byte, extra byte shifted left 6 |
-| `0xC0`–`0xDF` | 2 | low 5 bits, extra bytes shifted left 5 |
-| `0xE0`–`0xEF` | 3 | low 4 bits, extra bytes shifted left 4 |
-| `0xF0`–`0xFF` | 4 | low 3 bits, extra bytes shifted left 3 |
+| `0x00` to `0x7F` | 0 | the byte |
+| `0x80` to `0xBF` | 1 | low 6 bits of the first byte, extra byte shifted left 6 |
+| `0xC0` to `0xDF` | 2 | low 5 bits, extra bytes shifted left 5 |
+| `0xE0` to `0xEF` | 3 | low 4 bits, extra bytes shifted left 4 |
+| `0xF0` to `0xFF` | 4 | low 3 bits, extra bytes shifted left 3 |
 
 **Observed.** These file indexes match the UUID strings in the binary (hex digits only, case ignored):
 
@@ -507,9 +507,9 @@ All eight open items from the initial static pass are resolved above:
 
 1. **Login-queue `Token` requirements and `Signature` check (resolved in section 1.3)**: `FUN_14643d110` (`0x14643d110`) logs `Received a login ticket: %s, location: %s, %s` on every non-null queue response using outer `TicketId` (`param_3 + 0x00`) and `QueueName` (`param_3 + 0x40`). To exit the queue and advance to REP connection setup, `Token` must be present (`*(char *)(param_3 + 0x278) != 0`) and `Token.Signature` (`param_3 + 0x70`) must be non-empty so `FUN_14114b200` (`0x14114b200`, `operator!=` against the initially empty `GameConnection + 0x10e0`) returns `true`. The client does not verify `Signature` cryptographically; it forwards the `Token` struct inside `RegistrationRequestV3Msg` (`+0xc0`).
 2. **`RepAddress` host/port split (resolved in section 1.3)**: `FUN_140878e80` (`0x140878e80`, called via `FUN_140870880` from `FUN_146b6d600` at `0x146b6d600`) splits `RepAddress` on `':'` (`0x3a`) with `memchr`, classifies the host part as IPv4 or hostname with `WS2_32` ordinal 11 (`inet_addr`), and parses the port with `atoi`. If no port is present in `RepAddress`, `FUN_146b6d600` substitutes `client-connection.transport-options.rep-default-port` (default `33435`).
-3. **Omni platform enum `1` (resolved in section 1.2)**: `FUN_14028fdb0` (`0x14028fdb0`) populates `DAT_14a829178` (read by `FUN_1479c23e0`, `0x1479c23e0`) with `1 = "steam"` (`0x147f48c88`), plus 13 other platform strings (`2`–`13` and `100`).
+3. **Omni platform enum `1` (resolved in section 1.2)**: `FUN_14028fdb0` (`0x14028fdb0`) populates `DAT_14a829178` (read by `FUN_1479c23e0`, `0x1479c23e0`) with `1 = "steam"` (`0x147f48c88`), plus 13 other platform strings (`2` to `13` and `100`).
 4. **Omni JWT verification (resolved in section 1.2)**: `FUN_1479c9f00` (`0x1479c9f00`) and `FUN_1479b6d00` (`0x1479b6d00`) treat `accessToken` as an opaque JSON string and do not decode or verify a JWT signature on the client.
-5. **GridMate Carrier 4-byte datagram header and LZ4 call site (resolved in section 2)**: `FUN_140f8ab70` (`0x140f8ab70`, send) and `FUN_140f898e0` (`0x140f898e0`, receive) write and read byte 0 (`0x80` uncompressed / `0x81` LZ4-compressed), byte 1 (`0x01`), and bytes 2–3 (big-endian `uint16` datagram sequence), and invoke compressor vtable `0x148588db8` slots `+0x28` (`FUN_146ab3bd0`, `LZ4_compress_default`) and `+0x30` (`FUN_146ab6540`, `LZ4_decompress_safe`).
+5. **GridMate Carrier 4-byte datagram header and LZ4 call site (resolved in section 2)**: `FUN_140f8ab70` (`0x140f8ab70`, send) and `FUN_140f898e0` (`0x140f898e0`, receive) write and read byte 0 (`0x80` uncompressed / `0x81` LZ4-compressed), byte 1 (`0x01`), and bytes 2 and 3 (big-endian `uint16` datagram sequence), and invoke compressor vtable `0x148588db8` slots `+0x28` (`FUN_146ab3bd0`, `LZ4_compress_default`) and `+0x30` (`FUN_146ab6540`, `LZ4_decompress_safe`).
 6. **Registration message version and V3 field sources (resolved in section 3)**: `FUN_146b6e190` (`0x146b6e190`) sends `RegistrationRequestV3Msg` (`FUN_146b66820`, `0x146b66820`) in default `gateway` mode when `use-auth-token-msg` (`DAT_149f80d34`) is non-zero, and falls back to `RegistrationRequestV2Msg` (`FUN_146b66a60`, `0x146b66a60`) only when `DAT_149f80d34 == 0` or gateway mode is `stubbed`/`dummy`. V1 is never sent.
 7. **Transitions before `InGame` (resolved in section 5)**: `FUN_146454c00` (`0x146454c00`, `PlayerManagerSelfIdentification`) sets `*(int *)(actor_game + 0xa0) = 2` via `FUN_145a87010` (`0x145a87010`) and sets `*(uint8 *)(actor_game + 0xbc8)` via `FUN_145a9fa30` (`0x145a9fa30`). Once both `PlayerManagerSelfIdentification` and `LevelInfoChanged` (`FUN_146446800`, `0x146446800`) have been received, `FUN_146448cd0` (`0x146448cd0`, `LoadContextAndLevel`) and `FUN_14644b980` (`0x14644b980`) call `FUN_145a95160` (`0x145a95160`), which sets `*(uint8 *)(actor_game + 0x252) = 1` (`FUN_145a923c0`) and flushes pending reliable messages (`FUN_146455e90`, `0x146455e90`). State `0xd` (`WaitingForPlayerSpawn`) then advances to `0xe` (`InGame`) as soon as `FUN_141026080()` (`0x141026080`) virtual slot `+0x30` reports the local player entity is spawned.
 8. **`localIndex` writer (resolved in section 4)**: `FUN_1461673b0` (`0x1461673b0`) writes `localIndex` (`*(int *)(*param_1 + 0x54)`) with `FUN_140877970` (`0x140877970`) and, when `localIndex == 0`, appends the 16 raw UUID bytes from `*param_1 + 0x18`.

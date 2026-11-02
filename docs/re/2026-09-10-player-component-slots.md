@@ -77,7 +77,7 @@ capture decoder `0x17b4110`.
 
 | comp | type | class | ctor (old) | adds | slots | bytes | empty |
 |---:|---:|---|---|---|---:|---:|---|
-| 0 | 10 | GDE spawn card (not a component state class) | — | — | — | — | real body only |
+| 0 | 10 | GDE spawn card (not a component state class) | none | none | none | none | real body only |
 | 1 | 6951 | Javelin::PointsAccumulatorComponentReplicatedState | `0x143bb7090` | 0 | 1 | 1 | `00` |
 | 2 | 5437 | MB::ItemManagementComponentReplicatedState | `0x142d345a0` | 1 | 2 | 1 | `00` |
 | 4 | 2406 | Javelin::PlayerArenaReplicatedState | `0x14276ef30` | 0 | 1 | 1 | `00` |
