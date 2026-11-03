@@ -75,11 +75,9 @@ pub fn track_input(record: &InputRecord, seen: RecordView) -> Option<TrackInput>
             yaw: look.yaw,
             dt_s: seen.frame_s.unwrap_or(DEFAULT_FRAME_S),
         },
-        view: seen.camera.map(|camera| CameraView {
-            camera,
-            yaw: look.yaw,
-            pitch: look.pitch,
-        }),
+        view: seen
+            .camera
+            .map(|camera| CameraView::new(camera, look.yaw, look.pitch)),
         boom_key: record.boom_key_pressed(),
         action_started: record.slayer_input().is_some(),
     })

@@ -51,7 +51,10 @@ use crate::progression::{PROGRESSION_TYPE_INDEX, ProgressionState};
 use crate::progression_points::{
     PROGRESSION_POINT_COMPONENT, PROGRESSION_POINT_TYPE_INDEX, ProgressionPointState,
 };
-use crate::slots::{children_mask, read_children, read_slot_byte, write_known_children};
+use crate::slots::{
+    children_mask, read_children, read_slot_byte, read_wide_children, write_known_children,
+    write_known_wide_children,
+};
 use crate::social::states::{
     CHAT_STATE_COMPONENT, CHAT_STATE_TYPE_INDEX, ChatState, GROUPS_STATE_COMPONENT,
     GROUPS_STATE_TYPE_INDEX, GUILDS_STATE_COMPONENT, GUILDS_STATE_TYPE_INDEX, GroupsState,
@@ -81,10 +84,16 @@ const SLOT_1_CHILDREN: u8 = 22;
 /// hours` 72, `javelin.social.enable-account-age-chat-restriction` 1). Retail sent `02 08 00`
 /// 1.9 to 9.4 s after the spawn in all three captured sessions (general-other-01,
 /// newchar-linux, newchar-retail).
-const CHILD_ACCOUNT_IN_PROBATION: u16 = 1 << 3;
+const CHILD_ACCOUNT_IN_PROBATION: u32 = 1 << 3;
 /// Slot 1 child 12: `onDeathRespawnCooldown`, an `f32`. A change of it to 0 or more opens the
 /// client's death screen (`FUN_14683dba0`, `Hud.LocalPlayer.OnPlayerDeath`).
-const CHILD_ON_DEATH_RESPAWN_COOLDOWN: u16 = 1 << 12;
+const CHILD_ON_DEATH_RESPAWN_COOLDOWN: u32 = 1 << 12;
+/// Slot 1 child 16: `isChangingMount`, one boolean byte. Retail echoes each client 6066 that
+/// changes it, 34 to 100 ms later (`09 9f3d 02 80 80 04 01` at the open of the change mount
+/// screen, `... 00` at its close; Hermit's Rally capture 1790361668323 -> 668363), and sends
+/// nothing for a 6066 that repeats the value (`Hivemountdyes`). Without it the screen spun
+/// (live 2026-11-03; Inferred: its UI follows `OnIsChangingMountChanged`).
+const CHILD_IS_CHANGING_MOUNT: u32 = 1 << 16;
 /// The `onDeathRespawnCooldown` of an open-world death (retail: 0.0 in all three captured
 /// deaths; the meaning of other values is Unknown).
 const OPEN_WORLD_RESPAWN_COOLDOWN: f32 = 0.0;
@@ -348,6 +357,8 @@ pub struct PlayerComponentState {
     pub account_in_probation: Option<bool>,
     /// Slot 1 child 12: the respawn cooldown that opens the death screen, when sent.
     pub on_death_respawn_cooldown: Option<f32>,
+    /// Slot 1 child 16: whether this player has the change mount screen open, when sent.
+    pub is_changing_mount: Option<bool>,
     /// Slot 2 child 0: the 16-byte character id, when sent.
     pub character_id: Option<[u8; RAW_ID_LEN]>,
     /// Slot 2 child 3: whether this player is connected, when sent.
@@ -364,6 +375,7 @@ impl PlayerComponentState {
         Self {
             account_in_probation: None,
             on_death_respawn_cooldown: None,
+            is_changing_mount: None,
             character_id: Some(id),
             player_connected: Some(true),
             looking_through_loadout: None,
@@ -377,6 +389,7 @@ impl PlayerComponentState {
         Self {
             account_in_probation: None,
             on_death_respawn_cooldown: Some(OPEN_WORLD_RESPAWN_COOLDOWN),
+            is_changing_mount: None,
             character_id: None,
             player_connected: None,
             looking_through_loadout: None,
@@ -394,6 +407,7 @@ impl PlayerComponentState {
         Self {
             account_in_probation: None,
             on_death_respawn_cooldown: None,
+            is_changing_mount: None,
             character_id: None,
             player_connected: None,
             looking_through_loadout: Some(looking),
@@ -407,10 +421,24 @@ impl PlayerComponentState {
         Self {
             account_in_probation: None,
             on_death_respawn_cooldown: None,
+            is_changing_mount: None,
             character_id: None,
             player_connected: None,
             looking_through_loadout: None,
             is_in_store: Some(in_store),
+        }
+    }
+
+    /// The change of `isChangingMount` to `changing` ([`CHILD_IS_CHANGING_MOUNT`]).
+    pub const fn changing_mount(changing: bool) -> Self {
+        Self {
+            account_in_probation: None,
+            on_death_respawn_cooldown: None,
+            is_changing_mount: Some(changing),
+            character_id: None,
+            player_connected: None,
+            looking_through_loadout: None,
+            is_in_store: None,
         }
     }
 
@@ -419,6 +447,7 @@ impl PlayerComponentState {
         Self {
             account_in_probation: Some(in_probation),
             on_death_respawn_cooldown: None,
+            is_changing_mount: None,
             character_id: None,
             player_connected: None,
             looking_through_loadout: None,
@@ -446,15 +475,16 @@ impl PlayerComponentState {
             byte: child,
         };
         if slots & SLOT_1_BIT != 0 {
-            read_children(reader, FIELD, SLOT_1_CHILDREN, |reader, child| {
-                // Slot 1 has 22 children: a bit above 15 is no `u16` child.
-                let bit = 1_u32 << child;
-                if bit == u32::from(CHILD_ACCOUNT_IN_PROBATION) {
-                    state.account_in_probation = Some(reader.boolean()?);
-                } else if bit == u32::from(CHILD_ON_DEATH_RESPAWN_COOLDOWN) {
-                    state.on_death_respawn_cooldown = Some(reader.f32()?);
-                } else {
-                    return Err(unsized_child(child));
+            read_wide_children(reader, FIELD, SLOT_1_CHILDREN, |reader, child| {
+                match 1_u32 << child {
+                    CHILD_ACCOUNT_IN_PROBATION => {
+                        state.account_in_probation = Some(reader.boolean()?);
+                    }
+                    CHILD_ON_DEATH_RESPAWN_COOLDOWN => {
+                        state.on_death_respawn_cooldown = Some(reader.f32()?);
+                    }
+                    CHILD_IS_CHANGING_MOUNT => state.is_changing_mount = Some(reader.boolean()?),
+                    _ => return Err(unsized_child(child)),
                 }
                 Ok(())
             })?;
@@ -480,15 +510,15 @@ impl PlayerComponentState {
     pub fn write(&self, writer: &mut Writer) {
         let probation = self.account_in_probation;
         let cooldown = self.on_death_respawn_cooldown;
-        let slot_1_children = if probation.is_some() {
-            CHILD_ACCOUNT_IN_PROBATION
-        } else {
-            0
-        } | if cooldown.is_some() {
-            CHILD_ON_DEATH_RESPAWN_COOLDOWN
-        } else {
-            0
-        };
+        let changing_mount = self.is_changing_mount;
+        let slot_1_children = [
+            (probation.is_some(), CHILD_ACCOUNT_IN_PROBATION),
+            (cooldown.is_some(), CHILD_ON_DEATH_RESPAWN_COOLDOWN),
+            (changing_mount.is_some(), CHILD_IS_CHANGING_MOUNT),
+        ]
+        .into_iter()
+        .filter(|(sent, _)| *sent)
+        .fold(0, |children, (_, child)| children | child);
         let character_id = self.character_id;
         let player_connected = self.player_connected;
         let looking = self.looking_through_loadout;
@@ -513,19 +543,19 @@ impl PlayerComponentState {
         };
         writer.u8(slots);
         if slot_1_children != 0 {
-            write_known_children(
-                writer,
-                slot_1_children,
-                SLOT_1_CHILDREN,
-                |writer, child| match 1 << child {
+            write_known_wide_children(writer, slot_1_children, SLOT_1_CHILDREN, |writer, child| {
+                match 1_u32 << child {
                     CHILD_ACCOUNT_IN_PROBATION => {
                         probation.map(|in_probation| writer.boolean(in_probation));
                     }
-                    _ => {
+                    CHILD_ON_DEATH_RESPAWN_COOLDOWN => {
                         cooldown.map(|cooldown| writer.f32(cooldown));
                     }
-                },
-            );
+                    _ => {
+                        changing_mount.map(|changing| writer.boolean(changing));
+                    }
+                }
+            });
         }
         if slot_2_children != 0 {
             write_known_children(
@@ -989,6 +1019,16 @@ pub fn put_is_in_store(members: &mut Vec<BundleMember>, in_store: bool) {
     put_player_change(members, PlayerComponentState::in_store(in_store), |state| {
         state.is_in_store = Some(in_store);
     });
+}
+
+/// Puts the change of `isChangingMount` to `changing` into the own group `members`, as
+/// [`put_looking_through_loadout`] puts its change.
+pub fn put_is_changing_mount(members: &mut Vec<BundleMember>, changing: bool) {
+    put_player_change(
+        members,
+        PlayerComponentState::changing_mount(changing),
+        |state| state.is_changing_mount = Some(changing),
+    );
 }
 
 /// Applies `apply` to the 3935 state that `members` carries already, else puts `change` as its
@@ -1646,7 +1686,7 @@ mod tests {
     }
 
     #[test]
-    fn a_slot_1_child_above_bit_15_is_refused_not_a_panic() {
+    fn an_unknown_slot_1_child_is_refused_not_a_panic() {
         // Slot 1, child bytes for children 0 to 20 empty, then child 21 (the last of 22).
         const CHILD_21: [u8; 5] = [0x02, 0x80, 0x80, 0x80, 0x01];
         let mut reader = Reader::new(&CHILD_21);
@@ -1694,6 +1734,37 @@ mod tests {
             );
             reader.finish().expect("to the end");
         }
+    }
+
+    #[test]
+    fn the_change_mount_screen_open_and_close_are_the_retail_slot_1_child_16() {
+        // Retail Hermit's Rally capture, 1790361668363 and 1790361685980.
+        for (changing, retail) in [
+            (true, [0x02, 0x80, 0x80, 0x04, 0x01]),
+            (false, [0x02, 0x80, 0x80, 0x04, 0x00]),
+        ] {
+            let state = PlayerComponentState::changing_mount(changing);
+            let mut writer = Writer::new();
+            state.write(&mut writer);
+            assert_eq!(writer.finish(), retail);
+            let mut reader = Reader::new(&retail);
+            assert_eq!(
+                PlayerComponentState::read(&mut reader).expect("read"),
+                state
+            );
+            reader.finish().expect("to the end");
+        }
+        let mut members = Vec::new();
+        put_looking_through_loadout(&mut members, true);
+        put_is_changing_mount(&mut members, true);
+        assert_eq!(members.len(), 1, "one 3935 state");
+        let MemberState::PlayerComponent(state) = &members[0].state else {
+            panic!("a 3935 state");
+        };
+        assert_eq!(
+            (state.looking_through_loadout, state.is_changing_mount),
+            (Some(true), Some(true))
+        );
     }
 
     #[test]

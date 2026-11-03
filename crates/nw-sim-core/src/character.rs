@@ -36,6 +36,8 @@
 
 use nw_world::collision_index::FLOOR_SEARCH_ABOVE_M;
 
+use nw_content::mounts::{MountMovement, MountSurface, SurfaceSpeeds};
+
 use crate::equip_load::EquipLoad;
 use crate::footing::WaterDepth;
 use crate::movement::{Ground, Position};
@@ -526,6 +528,56 @@ pub struct MountPaces {
     pub dash_acceleration_scale: f32,
 }
 
+impl MountPace {
+    /// The speeds of one surface's `speeds`.
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "mount speeds of a few metres per second"
+    )]
+    pub const fn of(speeds: SurfaceSpeeds) -> Self {
+        Self {
+            run_mps: speeds.max_speed as f32,
+            walk_mps: speeds.walk_speed as f32,
+            slow_walk_mps: speeds.slow_walk_speed as f32,
+            acceleration_mps2: speeds.acceleration as f32,
+            deceleration_mps2: speeds.deceleration as f32,
+            walk_acceleration_mps2: speeds.walk_acceleration as f32,
+            walk_deceleration_mps2: speeds.walk_deceleration as f32,
+        }
+    }
+}
+
+impl MountPaces {
+    /// The fastest its rider can go: the fastest surface's run with the dash, m/s.
+    pub fn top_speed_mps(&self) -> f32 {
+        [
+            self.on_road,
+            self.off_road,
+            self.very_shallow_water,
+            self.shallow_water,
+            self.deep_water,
+        ]
+        .iter()
+        .map(|pace| pace.run_mps)
+        .fold(0.0, f32::max)
+            * self.dash_speed_scale.max(1.0)
+    }
+
+    /// The speeds of the movement row `movement`.
+    #[allow(clippy::cast_possible_truncation, reason = "dash scales near 1")]
+    pub fn of(movement: &MountMovement) -> Self {
+        Self {
+            on_road: MountPace::of(movement.on(MountSurface::OnRoad)),
+            off_road: MountPace::of(movement.on(MountSurface::OffRoad)),
+            very_shallow_water: MountPace::of(movement.on(MountSurface::InVeryShallowWater)),
+            shallow_water: MountPace::of(movement.on(MountSurface::InShallowWater)),
+            deep_water: MountPace::of(movement.on(MountSurface::InDeepWater)),
+            dash_speed_scale: movement.dash_speed_scale as f32,
+            dash_acceleration_scale: movement.dash_acceleration_scale as f32,
+        }
+    }
+}
+
 /// A body on a mount: the mount's speeds, the surface under it, and the rider's dash and slow
 /// walk.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -810,6 +862,11 @@ impl Character {
     /// Whether it rides a mount.
     pub const fn is_mounted(&self) -> bool {
         self.mount.is_some()
+    }
+
+    /// The fastest its mount can go ([`MountPaces::top_speed_mps`]); `None` on foot.
+    pub fn mount_top_speed_mps(&self) -> Option<f32> {
+        self.mount.map(|mounted| mounted.paces.top_speed_mps())
     }
 
     /// Its mount dashes, or stops dashing.

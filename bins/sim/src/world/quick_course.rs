@@ -74,7 +74,7 @@ impl SimWorld {
                 Step::Hit { course, section } => {
                     self.course_hit(entity, number, &course, section, now_ms);
                 }
-                Step::Undone => self.end_course(entity, number, None, now_ms),
+                Step::Undone => self.end_course(entity, number, false),
                 Step::Idle => {}
             }
         }
@@ -193,25 +193,26 @@ impl SimWorld {
             Event::QuickCourseSection {
                 course,
                 section: passed,
+                sections: u32::try_from(nodes).unwrap_or(u32::MAX),
             },
             now_ms,
         );
         if last {
-            self.end_course(entity, number, Some(course), now_ms);
+            self.end_course(entity, number, true);
         }
     }
 
-    /// Player `number`'s course ends at `now_ms`: finished (`finished` names it: the client
-    /// gets 6065 and the quests take it) or undone; the client's course list empties.
-    fn end_course(&mut self, entity: Entity, number: u64, finished: Option<&str>, now_ms: u64) {
+    /// Player `number`'s course ends: `finished` (the client gets 6065; the quests took the finish
+    /// as its last section) or undone; the client's course list empties.
+    fn end_course(&mut self, entity: Entity, number: u64, finished: bool) {
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
         };
         let Some(active) = player.course.active.take() else {
             return;
         };
-        player.course.ended_undone = finished.is_none();
-        if finished.is_some() {
+        player.course.ended_undone = !finished;
+        if finished {
             let message = MountServerMsg::QuickCourseEnded {
                 header: FacetHeader::of(PLAYER_QUICK_COURSE_FACET, number),
                 course: lowercase_crc32(&active.course),
@@ -224,10 +225,7 @@ impl SimWorld {
             );
         }
         push_course_state(&mut player);
-        tracing::info!(player = number, course = %active.course, finished = finished.is_some(), "quick course ended");
-        if let Some(course) = finished {
-            self.quest_event(number, Event::QuickCourseFinished(course), now_ms);
-        }
+        tracing::info!(player = number, course = %active.course, finished, "quick course ended");
     }
 }
 
@@ -449,6 +447,21 @@ mod tests {
             at_start,
         );
         assert_eq!(states(&mut world, entity), [Some(1)], "9 m away hits");
+        let ride = |world: &SimWorld| {
+            world
+                .quests_of_player(PLAYER)
+                .iter()
+                .find(|quest| quest.def.id == QUEST)
+                .and_then(|quest| {
+                    quest
+                        .run
+                        .progress()
+                        .into_iter()
+                        .find(|task| task.task == lowercase_crc32("ride"))
+                })
+                .map(|task| task.progress)
+        };
+        assert_eq!(ride(&world), Some(1), "the tracker counts the start gate");
         assert_eq!(
             active(&world, entity).and_then(|course| course.deadline_ms),
             Some(NOW + STARTING_MS + START_MS),
@@ -456,6 +469,7 @@ mod tests {
         );
         ride_to(&mut world, entity, CHECKPOINT, at_start + 10_000);
         assert_eq!(states(&mut world, entity), [Some(2)]);
+        assert_eq!(ride(&world), Some(2), "and the checkpoint");
         ride_to(&mut world, entity, FINISH, at_start + 40_000);
         assert_eq!(
             states(&mut world, entity),

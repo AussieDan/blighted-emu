@@ -61,8 +61,8 @@ use nw_messages::{
     AlcState, BodyCodec, BundleMember, BundlePayload, DEPLETED_GATHERABLE,
     GdeMetadataReplicatedState, InputPosition, LEVEL_INFO_CHANGED_MSG_TYPE_INDEX,
     LOCAL_PLAYER_INTEREST, MemberState, ON_DAMAGE_TYPE_INDEX, OnDamageMsg, PLAYER_SLICE_ASSET,
-    POS_REL_CHILD, REPLICATED_STATE_BUNDLE_TYPE_INDEX, Reader, ReplicatedStateBundle, ScopeEntry,
-    Writer,
+    POS_REL_CHILD, REPLICATED_STATE_BUNDLE_TYPE_INDEX, Reader, RemoteFlags, ReplicatedStateBundle,
+    ScopeEntry, Writer,
 };
 use nw_reflect::decode_type_id;
 use serde::Serialize;
@@ -137,6 +137,8 @@ pub struct AiTrace {
     pub player: Vec<PlayerSample>,
     /// The hits the own player took, in time order.
     pub player_hits: Vec<PlayerHit>,
+    /// The own player's mount states, in time order.
+    pub player_mount: Vec<MountSample>,
     /// Counts of the walk.
     pub stats: TraceStats,
 }
@@ -213,6 +215,19 @@ pub struct FullBodyEntry {
     /// capture check).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub action_name: Option<String>,
+}
+
+/// One own mount state (`MB::MountComponentReplicatedState`): the children it sent.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
+pub struct MountSample {
+    /// Ms from the first ledger record.
+    pub time_ms: u64,
+    /// The player rides (`m_isMounted`), when sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mounted: Option<bool>,
+    /// The mount dashes (`RemoteFlags::DASHING` of what others see), when sent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dashing: Option<bool>,
 }
 
 /// One own player position.
@@ -534,6 +549,8 @@ struct Tracer<'a> {
     own: HashMap<u64, AlcTrack>,
     /// Mob index by facet entity, the newest lifetime.
     facets: HashMap<[u8; FACET_LEN], usize>,
+    /// The interest of the group that carries the own mount state, once a ride was sent.
+    own_mount_interest: Option<u16>,
     trace: AiTrace,
 }
 
@@ -547,6 +564,7 @@ impl<'a> Tracer<'a> {
             live: HashMap::new(),
             own: HashMap::new(),
             facets: HashMap::new(),
+            own_mount_interest: None,
             trace: AiTrace::default(),
         }
     }
@@ -569,6 +587,7 @@ impl<'a> Tracer<'a> {
     }
 
     fn group(&mut self, context: u64, time_ms: u64, group: &ReadGroup) {
+        self.own_mount(time_ms, group);
         if group.interest == LOCAL_PLAYER_INTEREST {
             self.own_states(context, time_ms, group);
             return;
@@ -671,6 +690,34 @@ impl<'a> Tracer<'a> {
                 alc: AlcTrack::default(),
             },
         );
+    }
+
+    /// The own player's mount states in `group`: the ride (`m_isMounted`) and the dash of what
+    /// others see.
+    fn own_mount(&mut self, time_ms: u64, group: &ReadGroup) {
+        for member in &group.members {
+            let MemberState::Mount(mount) = &member.state else {
+                continue;
+            };
+            // The ride goes to the owner only: a state that sends it is the own one, and later
+            // states of the same group's interest are the own rider's.
+            if mount.mounted.is_some() {
+                self.own_mount_interest = Some(group.interest);
+            }
+            if self.own_mount_interest != Some(group.interest) {
+                continue;
+            }
+            let dashing = mount
+                .remote_flags
+                .map(|flags| flags.0 & RemoteFlags::DASHING != 0);
+            if mount.mounted.is_some() || dashing.is_some() {
+                self.trace.player_mount.push(MountSample {
+                    time_ms,
+                    mounted: mount.mounted,
+                    dashing,
+                });
+            }
+        }
     }
 
     /// The own player's ALC states in a group of interest 1.

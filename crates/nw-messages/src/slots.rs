@@ -184,9 +184,19 @@ pub(crate) fn write_known_children(
     writer: &mut Writer,
     children: u16,
     count: u8,
+    write_child: impl FnMut(&mut Writer, u8),
+) {
+    write_known_wide_children(writer, u32::from(children), count, write_child);
+}
+
+/// [`write_wide_children`] with a child writer that cannot fail.
+pub(crate) fn write_known_wide_children(
+    writer: &mut Writer,
+    children: u32,
+    count: u8,
     mut write_child: impl FnMut(&mut Writer, u8),
 ) {
-    write_children::<Infallible>(writer, children, count, |writer, child| {
+    write_wide_children::<Infallible>(writer, children, count, |writer, child| {
         write_child(writer, child);
         Ok(())
     })

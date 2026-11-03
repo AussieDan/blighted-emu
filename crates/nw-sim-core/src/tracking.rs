@@ -82,7 +82,7 @@ use std::sync::Arc;
 
 use nw_content::player_attacks::AttackMotion;
 
-use crate::camera_check::{CameraCheck, CameraView};
+use crate::camera_check::{CameraCheck, CameraView, MOUNTED_CAMERA_LAG_S};
 use crate::character::{
     Character, CharacterInput, MountPaces, SPRINT_SPEED_MPS, key_direction, swim_floor_at,
     wall_between, yaw_axes,
@@ -463,6 +463,12 @@ impl TrackedBody {
         let acting = self.acting_records > 0;
         self.acting_records = self.acting_records.saturating_sub(1);
         let seen = input.view.and_then(|view| {
+            // A rider's camera trails its mount farther than a walker's.
+            let view = if self.character.is_mounted() {
+                view.trailing(MOUNTED_CAMERA_LAG_S)
+            } else {
+                view
+            };
             self.camera.observe(
                 view,
                 position,
@@ -537,11 +543,20 @@ impl TrackedBody {
             // the body the others see, and the step stays inside the sim's speed limit (10.8 m/s
             // against 13 m/s).
             let (dx, dy) = (seen.at.x - before.x, seen.at.y - before.y);
+            // A rider's step is its mount's: the walking step held a horse at 0.36 m a record,
+            // 7.2 m/s at 20 records a second, below its 9.25 m/s road run (replay of retail
+            // Hermit's Rally: the ridden body fell 3 m behind retail's place, median).
+            let step_m = self
+                .character
+                .mount_top_speed_mps()
+                .map_or(FOLLOW_STEP_M, |top_mps| {
+                    FOLLOW_STEP_M.max(top_mps * input.character.dt_s)
+                });
             // A recovery goes the whole way at once.
             let share = if recovering {
                 1.0
             } else {
-                (FOLLOW_STEP_M / dx.hypot(dy)).min(1.0)
+                (step_m / dx.hypot(dy)).min(1.0)
             };
             position.x = before.x + dx * share;
             position.y = before.y + dy * share;
@@ -563,8 +578,16 @@ impl TrackedBody {
             // feet, and a body on a floor the level lacks keeps its own height in an action.
             let held = std::mem::take(&mut self.on_lacking_floor) && acting;
             let height = if held { position.z } else { seen.at.z };
+            // A rider's camera sits on the saddle, about 2 m above a walker's: its height picks
+            // no floor and gives the body none (replay of retail Hermit's Rally: with it the
+            // ridden body stood 2.0 m above retail's place, median).
+            let mounted = self.character.is_mounted();
             let search_at = Position {
-                z: position.z.max(seen.at.z),
+                z: if mounted {
+                    position.z
+                } else {
+                    position.z.max(seen.at.z)
+                },
                 ..position
             };
             match floor_under(ground, search_at, sea_level_m) {
@@ -572,6 +595,7 @@ impl TrackedBody {
                 Some(floor)
                     if !self.dropping
                         && !self.is_swimming()
+                        && !mounted
                         && (held || walking_height)
                         && height - floor > CAMERA_FLOOR_SPREAD_M =>
                 {
@@ -636,17 +660,17 @@ mod tests {
     fn view_of(body: Position, boom: f32, velocity: [f32; 2]) -> CameraView {
         let (forward, right) = yaw_axes(0.0);
         let level = boom * PITCH.cos();
-        CameraView {
-            camera: Position {
+        CameraView::new(
+            Position {
                 x: body.x - level * forward[0] + SHOULDER_RIGHT_M * right[0]
                     - CAMERA_LAG_S * velocity[0],
                 y: body.y - level * forward[1] + SHOULDER_RIGHT_M * right[1]
                     - CAMERA_LAG_S * velocity[1],
                 z: body.z + CAMERA_RISE_M + boom * PITCH.sin(),
             },
-            yaw: 0.0,
-            pitch: PITCH,
-        }
+            0.0,
+            PITCH,
+        )
     }
 
     fn input(forward: i8, view: CameraView) -> TrackInput {
@@ -894,6 +918,59 @@ mod tests {
                 "on the terrain"
             );
         }
+    }
+
+    #[test]
+    fn a_rider_keeps_its_mount_s_speed_and_the_floor_under_a_saddle_camera() {
+        use crate::camera_check::MOUNTED_CAMERA_LAG_S;
+        use crate::character::{MountPace, MountPaces};
+        /// Retail Moonshadow's road run, and retail's 20 input records a second.
+        const RUN_MPS: f32 = 9.25;
+        const RECORD_S: f32 = 0.05;
+        /// A rider's camera above a walker's (retail Hermit's Rally: 3.91 m against 1.685 m).
+        const SADDLE_M: f32 = 2.2;
+        const RECORDS: u32 = 60;
+        let pace = MountPace {
+            run_mps: RUN_MPS,
+            walk_mps: 5.0,
+            slow_walk_mps: 2.0,
+            acceleration_mps2: 1000.0,
+            deceleration_mps2: 9.0,
+            walk_acceleration_mps2: 15.0,
+            walk_deceleration_mps2: 12.0,
+        };
+        let mut body = TrackedBody::new(start());
+        body.mount(MountPaces {
+            on_road: pace,
+            off_road: pace,
+            very_shallow_water: pace,
+            shallow_water: pace,
+            deep_water: pace,
+            dash_speed_scale: 1.0,
+            dash_acceleration_scale: 1.0,
+        });
+        let mut client = start();
+        // `view_of` trails by the walker's lag: scale the motion to the rider's.
+        let trail = [0.0, RUN_MPS * MOUNTED_CAMERA_LAG_S / CAMERA_LAG_S];
+        for _ in 0..RECORDS {
+            client.y += RUN_MPS * RECORD_S;
+            let camera = Position {
+                z: client.z + SADDLE_M,
+                ..client
+            };
+            let mut record = input(1, view_of(camera, BOOM, trail));
+            record.character.dt_s = RECORD_S;
+            body.record(record, &Flat, SEA);
+        }
+        let at = body.position();
+        assert!(
+            (at.z - GROUND_Z).abs() < 1e-3,
+            "on the floor, not the saddle: {at:?}"
+        );
+        assert!(
+            at.horizontal_distance(client) < 0.5,
+            "at the mount's speed, past the walking step of 0.36 m a record: {at:?} {client:?}"
+        );
     }
 
     #[test]
@@ -1687,15 +1764,15 @@ mod tests {
                         yaw: v[1],
                         dt_s: v[0],
                     },
-                    view: Some(CameraView {
-                        camera: Position {
+                    view: Some(CameraView::new(
+                        Position {
                             x: v[3],
                             y: v[4],
                             z: v[5],
                         },
-                        yaw: v[1],
-                        pitch: v[2],
-                    }),
+                        v[1],
+                        v[2],
+                    )),
                     boom_key: flag(keys[6]),
                     action_started: flag(keys[7]),
                 };

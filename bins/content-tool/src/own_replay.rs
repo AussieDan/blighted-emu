@@ -21,14 +21,17 @@ use nw_content::creature_animations::CreatureAnimations;
 use nw_content::mob_prefabs::ASSET_ID_LEN;
 use nw_content::player_attacks::{AttackMotion, Stance};
 use nw_messages::{BodyCodec, ClientInputMsg, InputRecord, RECEIVE_INPUT_FROM_CLIENT_TYPE_INDEX};
-use nw_sim_core::{AmongCharacters, CharacterBody, Ground, LevelGround, Position, TrackedBody};
+use nw_sim_core::{
+    AmongCharacters, CharacterBody, Ground, LevelGround, MountPaces, Position, TrackedBody,
+};
 use nw_world::WorldFile;
 use nw_world::collision::{LevelCollision, collision_file_path};
 use nw_world::collision_index::CollisionIndex;
+use nw_world::roads::{RoadMap, road_file_path};
 use nw_world::water::{WaterMap, water_file_path};
 use nw_world::world_file::world_file_path;
 
-use crate::ai_trace::{MobTrace, PlayerSample, trace_ledger};
+use crate::ai_trace::{MobTrace, MountSample, PlayerSample, trace_ledger};
 use crate::ftue_entities::read_ledger;
 
 /// The client's correction threshold, m (patched client).
@@ -128,13 +131,25 @@ pub fn input_records(bytes: &[u8]) -> Vec<(u64, InputRecord, sim::camera::Record
     out
 }
 
+/// A ride of the replay: retail's own mount states and the mount's speeds. The body gets on and
+/// off as retail's `m_isMounted` says, and dashes as retail's dash flag says.
+#[derive(Debug, Clone, Copy)]
+pub struct Riding<'a> {
+    /// Retail's own mount states, in time order.
+    pub samples: &'a [MountSample],
+    /// The speeds of the mount retail rode.
+    pub paces: MountPaces,
+}
+
 /// Replays `records` over `ground` with the sea at `sea_level_m` against retail's own places
-/// `retail` (in time order); gives every compared place.
+/// `retail` (in time order), on the mount of `riding` when retail rode; gives every compared
+/// place.
 pub fn replay(
     records: &[(u64, InputRecord, sim::camera::RecordView)],
     retail: &[PlayerSample],
     attacks: &[AttackStart],
     mobs: &MobBodies,
+    riding: Option<Riding<'_>>,
     ground: &(impl Ground + ?Sized),
     sea_level_m: f32,
 ) -> (Vec<Compared>, usize) {
@@ -153,7 +168,27 @@ pub fn replay(
     let mut last_retail = place(first);
     let mut compared = Vec::new();
     let mut server_moves = 0;
+    let mut next_mount = 0;
     for ((time_ms, record, view), &record_ms) in records.iter().zip(&times) {
+        if let Some(riding) = riding {
+            while let Some(sample) = riding
+                .samples
+                .get(next_mount)
+                .filter(|sample| sample.time_ms <= *time_ms)
+            {
+                match sample.mounted {
+                    Some(true) if !body.is_mounted() => body.mount(riding.paces),
+                    Some(false) => body.dismount(),
+                    _ => {}
+                }
+                if let Some(dashing) = sample.dashing
+                    && body.is_mounted()
+                {
+                    body.set_mount_dash(dashing);
+                }
+                next_mount += 1;
+            }
+        }
         let characters = mobs.at(*time_ms);
         let ground = &AmongCharacters {
             ground,
@@ -662,6 +697,11 @@ pub fn level_ground(
         Ok(water) => ground.with_water(Arc::new(water)),
         Err(_) => ground,
     };
+    // The sim's ground holds the level's roads: a mount runs at its road speed on them.
+    let ground = match RoadMap::load(&road_file_path(content, &build, level), &build) {
+        Ok(roads) => ground.with_roads(Arc::new(roads)),
+        Err(_) => ground,
+    };
     (ground, sea)
 }
 
@@ -868,6 +908,89 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "needs the local captures, the build 25810808 content and the open world level files"]
+    fn the_mounted_own_movement_replays_against_retail() {
+        use nw_content::ContentBundle;
+        use nw_content::bundle::bundle_path;
+        use nw_content::mounts::MountRules;
+        use nw_content::progression::Progression;
+        use nw_formats::objectstream::lowercase_crc32;
+        /// Retail Hermit's Rally: the first race of the mount quest chain on Moonshadow.
+        const LEDGER: &str = "local-data/captures/open-world/01-Get_Mounts-cd14fc4d0041e80e/\
+            ef_tour_0-Hermit-s-Rally/ledger.bin";
+        const OPEN_WORLD_LEVEL: &str = "newworld_vitaeeterna";
+        const HORSE: &str = "Mount_Horse_1";
+        /// Riding after the mount quest's 500 (its success event).
+        const RIDING_EXPERIENCE: u32 = 500;
+        /// The ride's errors with the rider's camera model: 1.11 m and 0.07 m (median).
+        const RIDDEN_MEDIAN_M: f32 = 1.5;
+        const RIDDEN_HEIGHT_MEDIAN_M: f32 = 0.2;
+        let content = repo().join("local-data/content");
+        let build = load_client_build(&repo().join(CLIENT_BUILD_CONFIG)).expect("client build");
+        let bundle = ContentBundle::load(&bundle_path(&content, &build), &build).expect("bundle");
+        let mounts = MountRules::from_tables(&bundle.tables);
+        let progression = Progression::of_tables(&bundle.tables);
+        let mount_type = mounts
+            .mount(lowercase_crc32(HORSE))
+            .and_then(|mount| mounts.mount_type(mount))
+            .expect("the horse's type");
+        let rank = progression
+            .tradeskill(&mount_type.tradeskill)
+            .map_or(0, |riding| riding.rank_of(RIDING_EXPERIENCE).0);
+        let movement = mounts
+            .movement(mount_type, rank)
+            .expect("the horse's movement");
+        let (ground, sea) = level_ground(
+            &content,
+            &repo().join(CLIENT_BUILD_CONFIG),
+            OPEN_WORLD_LEVEL,
+        );
+        let bytes = read_ledger(&repo().join(LEDGER)).expect("ledger");
+        let trace = trace_ledger(&bytes, &[]);
+        let records = input_records(&bytes);
+        let paces = MountPaces::of(movement);
+        let riding = Riding {
+            samples: &trace.player_mount,
+            paces,
+        };
+        let (compared, moves) = replay(
+            &records,
+            &trace.player,
+            &[],
+            &MobBodies::default(),
+            Some(riding),
+            &ground,
+            sea,
+        );
+        let mounted_at = |time_ms: u64| {
+            trace
+                .player_mount
+                .iter()
+                .take_while(|sample| sample.time_ms <= time_ms)
+                .filter_map(|sample| sample.mounted)
+                .last()
+                .unwrap_or(false)
+        };
+        let (ridden, walked): (Vec<Compared>, Vec<Compared>) =
+            compared.iter().partition(|place| mounted_at(place.time_ms));
+        let ridden_summary = summarize(&ridden, moves);
+        println!("rank {rank}, ridden: {ridden_summary:?}");
+        println!("walked: {:?}", summarize(&walked, 0));
+        assert!(!ridden.is_empty(), "the ride is compared");
+        // The walking camera model held a rider 2.0 m up and 2.69 m behind (median).
+        assert!(
+            ridden_summary.horizontal_m[0] < RIDDEN_MEDIAN_M,
+            "ridden median {} m",
+            ridden_summary.horizontal_m[0]
+        );
+        assert!(
+            ridden_summary.height_m[0] < RIDDEN_HEIGHT_MEDIAN_M,
+            "ridden height median {} m",
+            ridden_summary.height_m[0]
+        );
+    }
+
+    #[test]
     fn the_tutorial_own_movement_replays_against_retail() {
         let (ground, sea) = level_ground(
             &repo().join("local-data/content"),
@@ -880,8 +1003,15 @@ mod tests {
             } = run_of(ledger, sword_until_ms);
             // The sim moves the body by the keys and the camera: not by the attacks' animations,
             // not among the mobs' bodies (the measure of both: the key windows).
-            let (compared, moves) =
-                replay(&records, &retail, &[], &MobBodies::default(), &ground, sea);
+            let (compared, moves) = replay(
+                &records,
+                &retail,
+                &[],
+                &MobBodies::default(),
+                None,
+                &ground,
+                sea,
+            );
             let summary = summarize(&compared, moves);
             println!("{ledger}: {summary:?}");
             for window in compared.chunk_by(|a, b| a.time_ms / WINDOW_MS == b.time_ms / WINDOW_MS) {

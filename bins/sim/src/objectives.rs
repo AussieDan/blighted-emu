@@ -594,9 +594,9 @@ enum TaskKind {
     /// Done when the player finishes an instance of this game mode (`TaskCompleteDungeon`:
     /// `DungeonGreatCleave00`): every encounter of its script done.
     CompleteGameMode(String),
-    /// Done when the player finishes this quick course (`TaskQuickCourse`: its `ItemName` is the
-    /// `QuickCourseId`, `EF_Tour_0`; retail `ef_tour_0-Hermit-s-Rally` ended the course with
-    /// 6065 at the finish node).
+    /// Counts the sections of this quick course the player passes and is done at its finish
+    /// (`TaskQuickCourse`: its `ItemName` is the `QuickCourseId`, `EF_Tour_0`; retail
+    /// `ef_tour_0-Hermit-s-Rally` ended the course with 6065 at the finish node).
     QuickCourse(String),
     /// Done when the player passes section `section` of this quick course
     /// (`TASKQUICKCOURSECHECKPOINT`: hidden, its `MinGearScore` the section, Inferred: 8 and 7
@@ -1468,15 +1468,16 @@ pub enum Event<'a> {
     GameModeCompleted(&'a str),
     /// The player joined or changed to this faction (`nw_content::factions`).
     FactionChosen(u8),
-    /// The player passed section `section` (its index) of this quick course.
+    /// The player passed section `section` (its index) of this quick course of `sections`; the
+    /// last one is its finish.
     QuickCourseSection {
         /// The `QuickCourseId`.
         course: &'a str,
         /// The section's index.
         section: u32,
+        /// The course's sections.
+        sections: u32,
     },
-    /// The player finished this quick course.
-    QuickCourseFinished(&'a str),
     /// The player finished a performance of this song here.
     SongPerformed {
         /// The `SongId`.
@@ -1550,8 +1551,8 @@ pub struct TaskProgress {
     pub index: u8,
     /// CRC-32 of the lowercase id.
     pub task: u32,
-    /// Children done for a container; kills or items so far for a counting task; 1 for another
-    /// task that is done.
+    /// Children done for a container; kills or items so far for a counting task; the sections of
+    /// a ride; 1 for another task that is done.
     pub progress: u32,
     /// Where it stands.
     pub status: TaskStatus,
@@ -1598,6 +1599,8 @@ pub struct ObjectiveRun {
     /// The lowercase `POITag`s the player was in at the last [`ObjectiveRun::sync`]; `None`
     /// before one that knew them.
     places: Option<Vec<String>>,
+    /// The sections of each done `TaskQuickCourse`, its tracker's last progress.
+    course_sections: Vec<(usize, u32)>,
 }
 
 /// Whether `enemy` names a mob of `vitals_id`, `categories` and spawn categories
@@ -1723,6 +1726,7 @@ impl ObjectiveRun {
             states,
             listed: Vec::new(),
             places: None,
+            course_sections: Vec::new(),
         };
         let mut effects = Vec::new();
         if !run.states.is_empty() {
@@ -1785,11 +1789,13 @@ impl ObjectiveRun {
                 QuestTask::Done => TaskState::Done,
             })
             .collect();
+        // A save keeps no ride's sections: a done ride shows 1 after a load.
         Some(Self {
             tree,
             states,
             listed,
             places: None,
+            course_sections: Vec::new(),
         })
     }
 
@@ -1878,6 +1884,11 @@ impl ObjectiveRun {
                         | TaskKind::UseItems { count, .. },
                         TaskState::Done,
                     ) => *count,
+                    (TaskKind::QuickCourse(_), TaskState::Done) => self
+                        .course_sections
+                        .iter()
+                        .find(|(task, _)| task == index)
+                        .map_or(1, |(_, sections)| *sections),
                     (_, TaskState::Active { progress, .. }) => progress,
                     _ => 1,
                 };
@@ -2158,6 +2169,34 @@ impl ObjectiveRun {
             let TaskState::Active { progress, due_ms } = self.states[index] else {
                 continue;
             };
+            // A ride's task counts each section passed, the finish ends it (Observed: retail
+            // Hermit's Rally, `EF_Rally_0` progress 1 at the start gate to 7, then 8 and
+            // Complete at the finish, each within 5 ms of the course state). A new ride counts
+            // from its own start again (Inferred: no failed retail ride was captured).
+            if let (
+                TaskKind::QuickCourse(course),
+                Event::QuickCourseSection {
+                    course: seen,
+                    section,
+                    sections,
+                },
+            ) = (&self.tree.tasks[index].kind, event)
+            {
+                if course.eq_ignore_ascii_case(seen) {
+                    let passed = section.saturating_add(1);
+                    if passed >= sections {
+                        self.course_sections.push((index, passed));
+                        self.complete(index, now_ms, &mut effects);
+                    } else {
+                        self.states[index] = TaskState::Active {
+                            progress: passed,
+                            due_ms,
+                        };
+                        self.list(index);
+                    }
+                }
+                continue;
+            }
             // Whether the event counts, how many it counts and how many the task needs.
             let (matches, step, count) = match (&self.tree.tasks[index].kind, event) {
                 (TaskKind::CinematicStart(id), Event::CinematicStarted(seen))
@@ -2288,14 +2327,12 @@ impl ObjectiveRun {
                     (mode.eq_ignore_ascii_case(seen), 1, 1)
                 }
                 (TaskKind::ChooseFaction, Event::FactionChosen(_)) => (true, 1, 1),
-                (TaskKind::QuickCourse(course), Event::QuickCourseFinished(seen)) => {
-                    (course.eq_ignore_ascii_case(seen), 1, 1)
-                }
                 (
                     TaskKind::QuickCourseSection { course, section },
                     Event::QuickCourseSection {
                         course: seen,
                         section: passed,
+                        ..
                     },
                 ) => (
                     course.eq_ignore_ascii_case(seen) && passed >= *section,
@@ -2554,6 +2591,53 @@ pub(crate) mod tests {
         assert!(!run.is_done("Enter"), "another game mode");
         run.event(Event::GameModeEntered("dungeonamrine"), 0);
         assert!(run.finished(), "entering its game mode ends it");
+    }
+
+    #[test]
+    fn a_ride_task_counts_each_section_and_ends_at_the_finish() {
+        /// Retail Hermit's Rally: `EF_Tour_0`, 8 sections (start, 6 checkpoints, finish).
+        const COURSE: &str = "EF_Tour_0";
+        const SECTIONS: u32 = 8;
+        let rows = vec![
+            container("Root", "ConsecutiveTaskContainer", &["Ride"]),
+            TaskRow {
+                target_qty: Some(1),
+                ..with_item("Ride", "TaskQuickCourse", COURSE)
+            },
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        let (mut run, _) = ObjectiveRun::start(tree, 0);
+        let ride = |run: &ObjectiveRun| {
+            run.progress()
+                .into_iter()
+                .find(|task| task.task == lowercase_crc32("Ride"))
+                .map(|task| (task.progress, task.status))
+        };
+        let pass = |run: &mut ObjectiveRun, course: &str, section| {
+            run.event(
+                Event::QuickCourseSection {
+                    course,
+                    section,
+                    sections: SECTIONS,
+                },
+                0,
+            );
+        };
+        pass(&mut run, "ef_tour_0", 0);
+        assert_eq!(ride(&run), Some((1, TaskStatus::Running)), "the start gate");
+        pass(&mut run, COURSE, 1);
+        assert_eq!(ride(&run), Some((2, TaskStatus::Running)));
+        pass(&mut run, "EF_Tour_1", 2);
+        assert_eq!(ride(&run), Some((2, TaskStatus::Running)), "another course");
+        pass(&mut run, COURSE, 0);
+        assert_eq!(ride(&run), Some((1, TaskStatus::Running)), "a new ride");
+        pass(&mut run, COURSE, SECTIONS - 1);
+        assert_eq!(
+            ride(&run),
+            Some((SECTIONS, TaskStatus::Done)),
+            "retail: 8, Complete"
+        );
+        assert!(run.finished());
     }
 
     #[test]

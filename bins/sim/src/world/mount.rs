@@ -21,9 +21,7 @@
 
 use bevy_ecs::entity::Entity;
 use nw_bus::{CarriedMount, ConnectionRef, GhostMount, MOUNT_DYE_LEN, PlayerMounts};
-use nw_content::mounts::{
-    MountMovement, MountRule, MountStaminaRules, MountSurface, MountTypeRule, SurfaceSpeeds,
-};
+use nw_content::mounts::{MountRule, MountStaminaRules, MountTypeRule};
 use nw_messages::items::{FIRST_VERSION, FullList};
 use nw_messages::mount::{
     LOGIN_STAMINA, LOGIN_STAMINA_RATE, NEUTRAL_MULTIPLIER, name_fits, riding_active_map,
@@ -31,10 +29,10 @@ use nw_messages::mount::{
 use nw_messages::{
     BundleMember, DismountReason, FacetHeader, InputRecord, InteractionRequest, MOUNT_FACET,
     MemberState, MountClientMsg, MountCustomization, MountServerMsg, MountState, PaperdollPublic,
-    PaperdollState, RemoteFlags, SummonAuthorization, SummonCancelReason,
+    PaperdollState, RemoteFlags, SummonAuthorization, SummonCancelReason, put_is_changing_mount,
 };
 use nw_sim_core::character::SPRINT_SPEED_MPS;
-use nw_sim_core::{MountPace, MountPaces, MoveLimits};
+use nw_sim_core::{MountPaces, MoveLimits};
 
 use super::attack::{Vitals, counter_is_newer};
 use super::gear::{Gear, unix_ns};
@@ -480,32 +478,6 @@ impl PlayerMount {
     }
 }
 
-/// The speeds of `speeds` for the body.
-fn pace_of(speeds: SurfaceSpeeds) -> MountPace {
-    MountPace {
-        run_mps: speeds.max_speed as f32,
-        walk_mps: speeds.walk_speed as f32,
-        slow_walk_mps: speeds.slow_walk_speed as f32,
-        acceleration_mps2: speeds.acceleration as f32,
-        deceleration_mps2: speeds.deceleration as f32,
-        walk_acceleration_mps2: speeds.walk_acceleration as f32,
-        walk_deceleration_mps2: speeds.walk_deceleration as f32,
-    }
-}
-
-/// The body's speeds of the movement row `movement`.
-fn paces_of(movement: &MountMovement) -> MountPaces {
-    MountPaces {
-        on_road: pace_of(movement.on(MountSurface::OnRoad)),
-        off_road: pace_of(movement.on(MountSurface::OffRoad)),
-        very_shallow_water: pace_of(movement.on(MountSurface::InVeryShallowWater)),
-        shallow_water: pace_of(movement.on(MountSurface::InShallowWater)),
-        deep_water: pace_of(movement.on(MountSurface::InDeepWater)),
-        dash_speed_scale: movement.dash_speed_scale as f32,
-        dash_acceleration_scale: movement.dash_acceleration_scale as f32,
-    }
-}
-
 /// Puts the change of `player`'s active map at a mount-up or a dismount into its next own
 /// bundle: the map with the mount's slots while it is `riding` ([`riding_active_map`]).
 fn riding_paperdoll(player: &mut Player, riding: bool) {
@@ -561,8 +533,16 @@ impl SimWorld {
                     player.tracked.set_mount_slow_walk(slow_walk);
                 }
             }
+            // The change mount screen follows the echoed `isChangingMount`; a call that repeats
+            // the value gets none (Observed: every retail 6066 that changed it, 34 to 100 ms
+            // later; none for a repeat, `Hivemountdyes`).
             MountClientMsg::ChangingMount { changing, .. } => {
-                self.with_mount(entity, |mount| mount.changing_mount = changing);
+                if let Some(mut player) = self.world.get_mut::<Player>(entity)
+                    && player.mount.changing_mount != changing
+                {
+                    player.mount.changing_mount = changing;
+                    put_is_changing_mount(&mut player.extra_members, changing);
+                }
             }
             // The mount attachment view changes nothing on the server (Observed: no server
             // message within 1 s of the 238 retail calls).
@@ -1102,7 +1082,7 @@ impl SimWorld {
         player
             .mount
             .mount_up(mount_id, movement.stamina, movement.top_speed() as f32);
-        player.tracked.mount(paces_of(movement));
+        player.tracked.mount(MountPaces::of(movement));
         let slow_walk = player.mount.slow_walk;
         player.tracked.set_mount_slow_walk(slow_walk);
         riding_paperdoll(&mut player, true);
@@ -1249,6 +1229,8 @@ pub(super) fn push_mount_message(
 
 #[cfg(test)]
 mod tests {
+    use nw_content::mounts::{MountMovement, SurfaceSpeeds};
+
     use super::*;
 
     /// `Mount_MTX_5_lion_basic`.
@@ -1572,6 +1554,49 @@ mod tests {
                 dash_speed_scale: DASH_SCALE,
                 dash_acceleration_scale: 1.15,
                 stamina: riding_stamina(),
+            }
+        }
+
+        #[test]
+        fn the_change_mount_screen_s_flag_is_echoed_once_per_change() {
+            use nw_messages::player_components::PLAYER_COMPONENT_COMPONENT;
+            let mut world = world_with(Vec::new());
+            let entity = world.player_by_number(PLAYER).expect("player");
+            let echoes = |world: &SimWorld| -> Vec<Option<bool>> {
+                world
+                    .world
+                    .get::<Player>(entity)
+                    .expect("player")
+                    .extra_members
+                    .iter()
+                    .filter(|member| member.component == PLAYER_COMPONENT_COMPONENT)
+                    .filter_map(|member| match &member.state {
+                        MemberState::PlayerComponent(state) => Some(state.is_changing_mount),
+                        _ => None,
+                    })
+                    .collect()
+            };
+            // Open, open again (no echo: the value did not change), close.
+            for (changing, expected) in [
+                (true, vec![Some(true)]),
+                (true, Vec::new()),
+                (false, vec![Some(false)]),
+            ] {
+                world
+                    .world
+                    .get_mut::<Player>(entity)
+                    .expect("player")
+                    .extra_members
+                    .clear();
+                world.mount_call(
+                    &connection(PLAYER),
+                    MountClientMsg::ChangingMount {
+                        header: FacetHeader::of(PLAYER_COMPONENT_COMPONENT, PLAYER),
+                        changing,
+                    },
+                    NOW,
+                );
+                assert_eq!(echoes(&world), expected, "changing {changing}");
             }
         }
 

@@ -45,6 +45,11 @@ pub const CAMERA_RISE_M: f32 = 1.685;
 /// places against the camera with the resting boom: 0.060 s in the open world, 0.064 s in the
 /// tutorial; the camera body then erred by a median 0.10 m instead of 0.22 m).
 pub const CAMERA_LAG_S: f32 = 0.06;
+/// How far behind its body's motion a rider's camera trails, s (Inferred: the fit of the retail
+/// Hermit's Rally ride through the sim's mounted body: with 0.06 s the body stood 2.6 m behind
+/// retail's place along the motion and 2.69 m off (median); 0.40 to 0.45 s gave 1.1 to 1.2 m,
+/// the error of the same capture's walk, and longer or shorter trails more).
+pub const MOUNTED_CAMERA_LAG_S: f32 = 0.45;
 /// The zoom lengths of the boom at rest, m (Observed: the retail resting booms of the newchar
 /// capture gather at 3.00, 4.00, 5.00, 6.00 and 7.00 m, the zoom keys step between them, and
 /// the short-boom key sets 2.75 m).
@@ -92,9 +97,27 @@ pub struct CameraView {
     pub yaw: f32,
     /// The camera pitch (radians; positive looks down).
     pub pitch: f32,
+    /// How far behind its body's motion the camera trails, s ([`CAMERA_LAG_S`] on foot).
+    pub trail_s: f32,
 }
 
 impl CameraView {
+    /// The view of a camera at `camera` with `yaw` and `pitch`, trailing as on foot.
+    pub const fn new(camera: Position, yaw: f32, pitch: f32) -> Self {
+        Self {
+            camera,
+            yaw,
+            pitch,
+            trail_s: CAMERA_LAG_S,
+        }
+    }
+
+    /// This view with the camera trailing by `trail_s`.
+    #[must_use]
+    pub const fn trailing(self, trail_s: f32) -> Self {
+        Self { trail_s, ..self }
+    }
+
     /// The ground-plane step of one metre of boom along the view.
     fn ray(&self) -> [f32; 2] {
         let (forward, _) = yaw_axes(self.yaw);
@@ -107,8 +130,8 @@ impl CameraView {
     fn base(&self, velocity: [f32; 2]) -> [f32; 2] {
         let (_, right) = yaw_axes(self.yaw);
         [
-            self.camera.x - SHOULDER_RIGHT_M * right[0] + CAMERA_LAG_S * velocity[0],
-            self.camera.y - SHOULDER_RIGHT_M * right[1] + CAMERA_LAG_S * velocity[1],
+            self.camera.x - SHOULDER_RIGHT_M * right[0] + self.trail_s * velocity[0],
+            self.camera.y - SHOULDER_RIGHT_M * right[1] + self.trail_s * velocity[1],
         ]
     }
 
@@ -401,11 +424,7 @@ mod tests {
 
     /// The camera of a body at `body` with boom `boom`, yaw `yaw`, trailing `lag`.
     fn camera_of(body: Position, yaw: f32, boom: f32, lag: [f32; 2]) -> CameraView {
-        let mut view = CameraView {
-            camera: body,
-            yaw,
-            pitch: PITCH,
-        };
+        let mut view = CameraView::new(body, yaw, PITCH);
         let ray = view.ray();
         let (_, right) = yaw_axes(yaw);
         view.camera = Position {
@@ -454,15 +473,15 @@ mod tests {
             y: 337.422,
             z: 26.155,
         };
-        let video = CameraView {
-            camera: Position {
+        let video = CameraView::new(
+            Position {
                 x: 478.595,
                 y: 850.321,
                 z: 91.801,
             },
-            yaw: 2.133_29,
-            pitch: 0.172_12,
-        };
+            2.133_29,
+            0.172_12,
+        );
         let mut check = CameraCheck::default();
         assert_eq!(
             check.observe(video, BODY, [0.0; 2], [0.0; 2], true, false),
@@ -494,11 +513,7 @@ mod tests {
         const WITHIN_M: f32 = 0.02;
         let mut check = CameraCheck::default();
         for [x, y, z, yaw, pitch] in CAMERAS {
-            let view = CameraView {
-                camera: Position { x, y, z },
-                yaw,
-                pitch,
-            };
+            let view = CameraView::new(Position { x, y, z }, yaw, pitch);
             let seen = check
                 .observe(view, RETAIL, [0.0; 2], [0.0; 2], true, false)
                 .expect("fits");
