@@ -8,8 +8,10 @@
 //! child, collects (child, utility) of those that plan, and picks the highest (`Top1`) or draws by
 //! utility weight among the top `WeightedRandomN` (`WeightedRandom`); it keeps its executing
 //! choice when `AlwaysPreserveExecutingPlan` is set, and its last choice when
-//! `PreserveExecutingPlanIfNoChange` is set and the candidates and utilities did not change. A
-//! composite's utility is the highest of its own and its planned children's.
+//! `PreserveExecutingPlanIfNoChange` is set, it is in the executing plan and the candidates and
+//! utilities did not change. A selector that is not in the executing plan draws again (the client
+//! checks the executing plan for the selector before both keeps). A composite's utility is the
+//! highest of its own and its planned children's.
 //!
 //! Re-planning (Inferred from the retail capture `newchar-retail-2026-09-18`): the plan is made
 //! again every tick; when it differs from the executing plan and every executing node is
@@ -1025,7 +1027,7 @@ impl<'a, W: World> Ctx<'a, '_, W> {
         {
             child
         } else if let Some(choice) = remembered.filter(|choice| {
-            preserve_if_no_change && choice.signature == signature && has(choice.child)
+            preserve_if_no_change && executing && choice.signature == signature && has(choice.child)
         }) {
             choice.child
         } else {
