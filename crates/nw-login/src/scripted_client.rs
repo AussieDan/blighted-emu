@@ -46,6 +46,9 @@ const STEAM_TICKET: &str = "140000";
 const HTTPS_PREFIX: &str = "https://";
 const ENDPOINT_PATH_START: char = '/';
 const BEARER_PREFIX: &str = "Bearer ";
+/// A public HTTPS port that is not the default, so the walk sends hosts with a port, as players
+/// behind a forwarded port do.
+const WALK_PUBLIC_HTTPS_PORT: u16 = 8443;
 /// The body the client builds by hand for `/steam` (JSON note section 3).
 const STEAM_BODY: &str =
     r#"{"steamAuthTicket":"140000", "steamAppId":"1063730", "branch":"public"}"#;
@@ -107,6 +110,7 @@ async fn walk(global: &PgPool, world_pool: &PgPool) {
     let mut config = valid();
     // A new world id keeps this run's queue apart from other runs in the shared Valkey.
     config.worlds[0].id = Uuid::new_v4();
+    config.public_https_port = WALK_PUBLIC_HTTPS_PORT;
     let world = config.worlds[0].clone();
     let config = Arc::new(config);
     let valkey = Valkey::connect(&test_valkey_url())
@@ -117,7 +121,7 @@ async fn walk(global: &PgPool, world_pool: &PgPool) {
         .await
         .expect("free slots");
     let app = edge_app(Arc::clone(&config), global, world_pool, valkey.clone());
-    let login_host = config.login_host();
+    let login_host = config.login_authority();
 
     // Launcher: sign up, log in again, ask for a game session key.
     let credentials = serde_json::to_string(&PasswordCredentials {
@@ -167,7 +171,7 @@ async fn walk(global: &PgPool, world_pool: &PgPool) {
     };
     assert_eq!(endpoint(AUTH_STACK_TAG), endpoint(LOGIN_GATEWAY_TAG));
     let (game_host, prefix) = split_endpoint(&endpoint(LOGIN_GATEWAY_TAG));
-    assert_eq!(game_host, config.game_host());
+    assert_eq!(game_host, config.game_authority());
 
     let gateway = |operation: &str| format!("{GATEWAY_STAGE}{operation}");
     let world_route = |segment: &str| gateway(&format!("{WORLDS_PATH}/{}{segment}", world.id));

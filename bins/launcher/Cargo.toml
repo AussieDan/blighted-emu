@@ -16,10 +16,7 @@ rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-
-# The Windows loopback proxy (bins/launcher/src/aws_proxy.rs) needs an async runtime and TLS.
-# Linux uses the bwrap path instead, so these stay off the Linux build.
-[target.'cfg(windows)'.dependencies]
+# The loopback proxy (bins/launcher/src/aws_proxy.rs) needs an async runtime and TLS.
 tokio = { workspace = true, features = ["net", "rt-multi-thread", "io-util"] }
 tokio-rustls.workspace = true
 

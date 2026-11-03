@@ -255,6 +255,8 @@ pub fn bwrap_arguments(files: &NetworkFiles) -> Vec<OsString> {
 mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
+    use nw_protocol::aws_mirror::CLIENT_PING_PORT;
+
     use super::*;
 
     /// A self-signed server certificate (not a CA) for three mirror hosts.
@@ -271,6 +273,7 @@ mod tests {
         AwsMirror {
             hosts: hosts.iter().map(|host| (*host).to_owned()).collect(),
             certificate_pem: pem.to_owned(),
+            ping_port: CLIENT_PING_PORT,
         }
     }
 

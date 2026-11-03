@@ -183,6 +183,7 @@ async fn info<A, G, R, D, X>(
         aws_mirror: AwsMirror {
             hosts: config.aws_mirror.hosts.clone(),
             certificate_pem: state.aws_mirror_certificate_pem.to_string(),
+            ping_port: config.public_ping_port,
         },
     })
 }
@@ -321,7 +322,10 @@ where
 }
 
 fn callback_url(config: &EdgeConfig) -> String {
-    format!("https://{}{DISCORD_CALLBACK_PATH}", config.login_host())
+    format!(
+        "https://{}{DISCORD_CALLBACK_PATH}",
+        config.login_authority()
+    )
 }
 
 async fn discord_start<A, G, R, D, X>(

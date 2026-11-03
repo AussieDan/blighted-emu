@@ -143,7 +143,7 @@ The server needs a domain name of your own with two host names that point to the
 - `login.<domain>`: the launcher API and the channel document that the game downloads first.
 - `game.<domain>`: the game routes. Every game request carries the game session key in its path (`/s/<session>/...`).
 
-Get one normal public certificate that covers both names (for example from Let's Encrypt with `certbot` or `lego`). The DNS challenge also works when the names point to a LAN address. Put the PEM files where `[tls]` points. The game always uses port 443, so `https_listen` must use port 443. On Linux, give the program that right once after each build: `sudo setcap 'cap_net_bind_service=+ep' target/debug/edge-http`.
+Get one normal public certificate that covers both names (for example from Let's Encrypt with `certbot` or `lego`). The DNS challenge also works when the names point to a LAN address. Put the PEM files where `[tls]` points. The default ports are 443 (`https_listen`) and 80 (`ping_listen`). On Linux, give the program the right to use them once after each build: `sudo setcap 'cap_net_bind_service=+ep' target/debug/edge-http`. To use other ports, set `public_https_port` and `public_ping_port` in `config/edge.toml` to the ports that players reach. Players then type the HTTPS port after the domain in the launcher (`example.org:8443`), and need a client patched with `--aws-proxy`. See "Servers on other ports" in [docs/client-patch.md](docs/client-patch.md).
 
 Every server reads its file in `config/`, and `--config <file>` picks another. An environment variable can override any key. Its name is the program's prefix, then the key, with nested keys joined by `__` (for example `NW_EDGE_AUTH__LOGIN_FAIL_LIMIT=5000`).
 

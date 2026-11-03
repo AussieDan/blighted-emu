@@ -28,7 +28,8 @@ pub const PRODUCT_ID: &str = "STEAM_APP_ID.1063730";
 pub const VERSIONLESS: &str = "versionless";
 /// The application whose `RegionId` layer holds the service endpoints this server fills.
 pub const ENDPOINTS_APPLICATION: &str = "publicGameplay";
-/// The service endpoints this server fills with `game.<domain>`: the path of their object in
+/// The service endpoints this server fills with `game.<domain>` (and the public HTTPS port when it
+/// is not the default, [`EdgeConfig::game_authority`]): the path of their object in
 /// that layer, and their key. The tracked files leave them out, because the domain is the
 /// server's own. The stats service host (leaderboards note), and the shop, entitlement and
 /// purchase service hosts (`omni.fcs.endpoints.*`, read by `FUN_1416190f0`; shop note).
@@ -202,7 +203,7 @@ impl RemoteConfigSets {
                     return Err(RemoteConfigError::NotObject { key });
                 };
                 let body = if key == endpoints_key {
-                    with_game_host_endpoints(object, &config.game_host(), &key)?
+                    with_game_host_endpoints(object, &config.game_authority(), &key)?
                 } else {
                     bytes
                 };
@@ -236,11 +237,11 @@ impl RemoteConfigSets {
     }
 }
 
-/// `object` with each [`GAME_HOST_ENDPOINTS`] key set to `game_host`, as JSON text. The object of
-/// each key must exist, and the key must not.
+/// `object` with each [`GAME_HOST_ENDPOINTS`] key set to `game_authority`, as JSON text. The
+/// object of each key must exist, and the key must not.
 fn with_game_host_endpoints(
     mut object: Map<String, Value>,
-    game_host: &str,
+    game_authority: &str,
     key: &str,
 ) -> Result<Vec<u8>, RemoteConfigError> {
     let fail = |reason: String| RemoteConfigError::Endpoint {
@@ -260,7 +261,10 @@ fn with_game_host_endpoints(
                 "sets {name}{KEY_PATH_SEPARATOR}{endpoint}, which the server fills from its domain"
             )));
         }
-        section.insert(endpoint.to_owned(), Value::String(game_host.to_owned()));
+        section.insert(
+            endpoint.to_owned(),
+            Value::String(game_authority.to_owned()),
+        );
     }
     serde_json::to_vec_pretty(&Value::Object(object)).map_err(|error| fail(error.to_string()))
 }
@@ -480,22 +484,38 @@ pub(crate) mod tests {
         }
     }
 
-    #[test]
-    fn the_service_endpoints_are_the_servers_game_host() {
-        let sets = sets();
+    fn served_endpoints(sets: &RemoteConfigSets) -> Value {
         let key = object_key(
             ENDPOINTS_APPLICATION,
             Dimension::RegionId,
             CLUSTER_ID,
             VERSIONLESS,
         );
-        let served = served_json(&sets, &key);
+        served_json(sets, &key)
+    }
+
+    fn assert_service_endpoints(served: &Value, authority: &str) {
         for (path, endpoint) in GAME_HOST_ENDPOINTS {
-            let section = path.iter().fold(&served, |parent, part| &parent[*part]);
-            assert_eq!(section[endpoint], "game.example.org", "{path:?} {endpoint}");
+            let section = path.iter().fold(served, |parent, part| &parent[*part]);
+            assert_eq!(section[endpoint], authority, "{path:?} {endpoint}");
         }
+    }
+
+    #[test]
+    fn the_service_endpoints_are_the_servers_game_host() {
+        let served = served_endpoints(&sets());
+        assert_service_endpoints(&served, "game.example.org");
         assert_eq!(served["omni"]["leaderboards"]["region"], "us-east-1");
         assert_eq!(served["omni"]["fcs"]["region"], "us-east-1");
+    }
+
+    #[test]
+    fn the_service_endpoints_name_another_public_port() {
+        const PUBLIC_HTTPS_PORT: u16 = 8443;
+        let mut config = valid();
+        config.public_https_port = PUBLIC_HTTPS_PORT;
+        let served = served_endpoints(&committed_sets(&config));
+        assert_service_endpoints(&served, "game.example.org:8443");
     }
 
     #[test]

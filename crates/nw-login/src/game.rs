@@ -240,9 +240,10 @@ pub fn channel_session_key(channel_key: &str) -> Option<&str> {
         .find(|part| is_game_session_key(part))
 }
 
-/// The channel document for one game session: every endpoint is `game.<domain>/s/<session>`.
+/// The channel document for one game session: every endpoint is `game.<domain>/s/<session>`,
+/// with the public HTTPS port after the host when it is not the default.
 pub fn channel_document(config: &EdgeConfig, session: &str) -> ChannelDocument {
-    let endpoint = format!("{}{SESSION_PREFIX}/{session}", config.game_host());
+    let endpoint = format!("{}{SESSION_PREFIX}/{session}", config.game_authority());
     let api = |tag: &str| PublicApi {
         client_tag: tag.to_owned(),
         api_endpoint: endpoint.clone(),
@@ -883,6 +884,21 @@ pub(crate) mod tests {
         // then calls Amazon's identity host (unknowns note, second pass sections 2 and 8).
         let value = serde_json::to_value(&document).expect("json");
         assert!(value.get("platformMetadata").is_none());
+    }
+
+    #[test]
+    fn channel_document_names_another_public_port() {
+        const PUBLIC_HTTPS_PORT: u16 = 8443;
+        let mut config = valid();
+        config.public_https_port = PUBLIC_HTTPS_PORT;
+        let document = channel_document(&config, OTHER_KEY);
+        let endpoint = format!("game.example.org:8443/s/{OTHER_KEY}");
+        assert!(
+            document.clusters[CLUSTER_ID]
+                .public_apis
+                .iter()
+                .all(|api| api.api_endpoint == endpoint)
+        );
     }
 
     #[test]

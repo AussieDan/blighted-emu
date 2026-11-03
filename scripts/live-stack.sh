@@ -52,7 +52,8 @@ readonly EDGE_PORT=$((8443 + SHIFT))
 readonly EDGE_LISTEN="0.0.0.0:$EDGE_PORT"
 readonly EDGE_METRICS_LISTEN="127.0.0.1:$((9100 + SHIFT))"
 # The bots send no region ping; a high port needs no right to bind.
-readonly EDGE_PING_LISTEN="127.0.0.1:$((8080 + SHIFT))"
+readonly EDGE_PING_PORT=$((8080 + SHIFT))
+readonly EDGE_PING_LISTEN="127.0.0.1:$EDGE_PING_PORT"
 readonly GATEWAY_PORT=$((33435 + SHIFT))
 readonly ADMIN_LISTEN="127.0.0.1:$((9180 + SHIFT))"
 readonly PANEL_URL="http://$ADMIN_LISTEN/live"
@@ -210,6 +211,7 @@ if ((INSTANCE > 1)); then
 fi
 start_server edge env NW_EDGE_HTTPS_LISTEN="$EDGE_LISTEN" \
   NW_EDGE_PING_LISTEN="$EDGE_PING_LISTEN" NW_EDGE_METRICS_LISTEN="$EDGE_METRICS_LISTEN" \
+  NW_EDGE_PUBLIC_HTTPS_PORT="$EDGE_PORT" NW_EDGE_PUBLIC_PING_PORT="$EDGE_PING_PORT" \
   NW_EDGE_AUTH__LOGIN_FAIL_LIMIT="$LOGIN_FAIL_LIMIT" \
   "$BIN/edge-http" --config "$edge_config" serve
 rm -f "$CONTROL_FIFO"

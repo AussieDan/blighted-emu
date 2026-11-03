@@ -13,7 +13,7 @@ use reqwest::Url;
 use reqwest::blocking::{Client, RequestBuilder};
 use serde::de::DeserializeOwned;
 
-use crate::server::api_host;
+use crate::server::{api_host, api_host_name, api_port};
 
 /// Time limit of one call.
 pub const CALL_TIMEOUT: Duration = Duration::from_secs(15);
@@ -77,9 +77,20 @@ impl LauncherApi {
         Ok(Self { base, client })
     }
 
-    /// The API host, for example `login.example.org`.
+    /// The API host and port as typed, for example `login.example.org` or
+    /// `login.example.org:8443`.
     pub fn host(&self) -> &str {
         api_host(&self.base)
+    }
+
+    /// The API host name without the port, for example `login.example.org`.
+    pub fn host_name(&self) -> &str {
+        api_host_name(&self.base)
+    }
+
+    /// The API's HTTPS port. The server answers its Amazon names on it too.
+    pub fn port(&self) -> u16 {
+        api_port(&self.base)
     }
 
     /// Server name, login mode and launch arguments.
@@ -163,7 +174,7 @@ mod tests {
     use axum::response::Redirect;
     use axum::routing::{get, post};
     use axum::{Json, Router};
-    use nw_protocol::aws_mirror::AwsMirror;
+    use nw_protocol::aws_mirror::{AwsMirror, CLIENT_PING_PORT};
     use nw_protocol::launcher_api::{AuthMode, DISCORD_AUTHORIZE_URL};
 
     use super::*;
@@ -190,6 +201,7 @@ mod tests {
             aws_mirror: AwsMirror {
                 hosts: Vec::new(),
                 certificate_pem: String::new(),
+                ping_port: CLIENT_PING_PORT,
             },
         })
     }

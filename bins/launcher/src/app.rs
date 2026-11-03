@@ -13,9 +13,9 @@ use nw_protocol::launcher_api::{AuthMode, DiscordPollReply, LauncherInfo, Passwo
 
 use crate::api::{ApiError, LauncherApi, discord_login_page};
 use crate::game::{PATCHED_EXE_NAME, append_override_config, game_arguments, is_retail_prefix};
-// Linux runs the game under Proton inside `bwrap`; Windows starts the patched exe directly behind
-// the loopback proxy ([`crate::aws_proxy`]). Each path uses only its own helpers.
-#[cfg(windows)]
+// Linux runs the game under Proton inside `bwrap`; Windows starts the patched exe directly. Both
+// run the loopback proxy ([`crate::aws_proxy`]) for a client patched with `--aws-proxy`. Each
+// path uses only its own launch helpers.
 use crate::aws_proxy::AwsProxy;
 #[cfg(not(windows))]
 use crate::game::{checked_direct_launch, start_game};
@@ -182,8 +182,7 @@ pub struct LauncherApp {
     /// What the last scan of this PC found, for the Proton pick list.
     found: Found,
     /// The loopback proxy that carries the game's AWS calls to the server. It must outlive the
-    /// game, so the window keeps it; dropping it stops the proxy. Windows only.
-    #[cfg(windows)]
+    /// game, so the window keeps it; dropping it stops the proxy.
     proxy: Option<AwsProxy>,
 }
 
@@ -360,7 +359,6 @@ impl LauncherApp {
             status_since: Instant::now(),
             job: None,
             found,
-            #[cfg(windows)]
             proxy: None,
         };
         if !app.server_input.is_empty() {
@@ -464,14 +462,25 @@ impl LauncherApp {
         }));
     }
 
-    /// Checks the direct launch and the server's mirror, writes the private network files next to
-    /// the settings, then asks for a game session key and starts the game.
+    /// Starts the loopback proxy, checks the direct launch and the server's mirror, writes the
+    /// private network files next to the settings (Linux), then asks for a game session key and
+    /// starts the game.
     fn play(&mut self, api: LauncherApi, info: LauncherInfo, token: String) {
         self.set_status(Status::new(
             Tone::Busy,
             "starting",
             "Getting a game session and starting the game.",
         ));
+        // Start the loopback proxy before the game and keep it for the window's life, so the
+        // game's AWS calls reach the server for the whole session. A new play replaces it.
+        self.proxy = None;
+        match AwsProxy::start(&info.aws_mirror, api.host_name(), api.port()) {
+            Ok(proxy) => self.proxy = Some(proxy),
+            Err(error) => {
+                self.set_status(Status::error(error.to_string()));
+                return;
+            }
+        }
         let options = self.settings.options.clone();
         #[cfg(not(windows))]
         {
@@ -486,10 +495,11 @@ impl LauncherApp {
                     Ok(environment) => environment,
                     Err(error) => return Event::Failed(error.to_string()),
                 };
-                let files = match write_network_files(&network_dir, &info.aws_mirror, api.host()) {
-                    Ok(files) => files,
-                    Err(error) => return Event::Failed(error.to_string()),
-                };
+                let files =
+                    match write_network_files(&network_dir, &info.aws_mirror, api.host_name()) {
+                        Ok(files) => files,
+                        Err(error) => return Event::Failed(error.to_string()),
+                    };
                 let key = match api.play(&token) {
                     Ok(reply) => reply.game_session_key,
                     Err(error) => return failure(&error),
@@ -509,16 +519,6 @@ impl LauncherApp {
         }
         #[cfg(windows)]
         {
-            // Start the loopback proxy before the game and keep it for the window's life, so the
-            // game's AWS calls reach the server for the whole session. A new play replaces it.
-            self.proxy = None;
-            match AwsProxy::start(&info.aws_mirror, api.host()) {
-                Ok(proxy) => self.proxy = Some(proxy),
-                Err(error) => {
-                    self.set_status(Status::error(error.to_string()));
-                    return;
-                }
-            }
             self.job = Some(run_job(windows_play_job(api, info, token, options)));
         }
     }
@@ -946,7 +946,7 @@ impl eframe::App for LauncherApp {
 
 #[cfg(test)]
 mod tests {
-    use nw_protocol::aws_mirror::AwsMirror;
+    use nw_protocol::aws_mirror::{AwsMirror, CLIENT_PING_PORT};
 
     use super::*;
 
@@ -966,6 +966,7 @@ mod tests {
             aws_mirror: AwsMirror {
                 hosts: Vec::new(),
                 certificate_pem: String::new(),
+                ping_port: CLIENT_PING_PORT,
             },
         }
     }

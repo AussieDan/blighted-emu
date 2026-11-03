@@ -27,6 +27,9 @@ const STS_SERVICE: &str = "sts";
 /// The service the region ping calls: `GET /ping` on `dynamodb.<region>.amazonaws.com`, port 80
 /// (`FUN_1474bafd0` builds the host).
 const DYNAMODB_SERVICE: &str = "dynamodb";
+/// The port the client's region pinger calls. The launcher's proxy sends the ping on to the
+/// server's [`AwsMirror::ping_port`].
+pub const CLIENT_PING_PORT: u16 = 80;
 /// The news service (CMS) host: message of the day, news stories and menu tiles. Fixed in the
 /// client's default-host table (`FUN_14616ae90`).
 pub const CMS_HOST: &str = "d1hkbwzm1bktgo.cloudfront.net";
@@ -102,8 +105,9 @@ pub fn is_aws_mirror_host(host: &str) -> bool {
         || is_cms_host(host)
 }
 
-/// Part of the launcher info: the Amazon names this server answers, and the certificate it
-/// shows for them.
+/// Part of the launcher info: the Amazon names this server answers, the certificate it shows for
+/// them, and the port of its region ping. The names are answered on the launcher API's own HTTPS
+/// port.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AwsMirror {
@@ -111,6 +115,8 @@ pub struct AwsMirror {
     pub hosts: Vec<String>,
     /// The server's self-signed certificate for exactly these names, as PEM. It is not a CA.
     pub certificate_pem: String,
+    /// The server's plain HTTP port of the region ping (`public_ping_port` in `edge.toml`).
+    pub ping_port: u16,
 }
 
 #[cfg(test)]

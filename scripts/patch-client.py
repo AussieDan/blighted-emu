@@ -35,11 +35,13 @@ fifth one with ``--aws-proxy``:
    with ``MOV R8B,1`` as its default; the tool makes the immediate 0. The site
    is found by the variable's name and the shape of its creation.
 
-5. AWS proxy (``--aws-proxy``, for Windows). The remote-config (S3), analytics
+5. AWS proxy (``--aws-proxy``, for Windows, and for Linux when the server uses
+   other ports than 443 and 80). The remote-config (S3), analytics
    (Kinesis), analytics-credentials (STS) and news (CMS) clients call fixed
    Amazon names with certificate checks on, and the region pinger calls fixed
    Amazon names over plain HTTP. Windows has no per-process hosts or trust file,
-   so each client is sent through the launcher's loopback proxy instead. After
+   and a hosts file cannot change a port, so each client is sent through the
+   launcher's loopback proxy instead. After
    each client's ``Aws::Client::ClientConfiguration`` constructor call, a jump
    to a code cave in ``.text`` padding sets ``proxyHost`` to ``127.0.0.1``,
    ``proxyPort`` to the launcher's port and ``verifySSL`` to false, replays the
@@ -530,7 +532,7 @@ def main() -> None:
         "--aws-proxy",
         action="store_true",
         help="also send the remote-config, Kinesis, STS, news and region ping clients through "
-        "the launcher's loopback proxy (Windows)",
+        "the launcher's loopback proxy (Windows, or Linux with other server ports)",
     )
     arguments = parser.parse_args()
 

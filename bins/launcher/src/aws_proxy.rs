@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The game process's private network view on Windows, where there is no `bwrap` sandbox
-//! (study note `docs/re/2026-09-20-windows-launcher-network.md`, option A). On Linux the launcher
-//! uses [`crate::mirror`] instead; this module is built only on Windows (and for tests).
+//! The game process's loopback proxy (study note `docs/re/2026-09-20-windows-launcher-network.md`,
+//! option A). Windows has no `bwrap` sandbox, so there the client must be patched for it. On Linux
+//! the launcher writes the [`crate::mirror`] files too, and runs this proxy beside them: a client
+//! patched with `--aws-proxy` uses the proxy, an unpatched one the private hosts file. Only the
+//! proxy reaches a server whose ports are not 443 and 80, because the hosts file cannot change a
+//! port.
 //!
 //! `scripts/patch-client.py --aws-proxy` points the game's four AWS SDK clients (remote-config
 //! S3, Kinesis, STS and the news client) at `127.0.0.1:47443` with `verifySSL` off. Each client
@@ -20,7 +23,9 @@
 //! The patch points the region pinger's plain HTTP client here too. It sends `GET
 //! http://dynamodb.<region>.amazonaws.com/ping` (study note `docs/re/2026-11-02-region-ping.md`).
 //! The proxy passes such a request, and only for a DynamoDB host, to the server's plain HTTP port
-//! as it is, so the ping still measures the way to the server.
+//! ([`AwsMirror::ping_port`]) as it is, so the ping still measures the way to the server. The
+//! tunnels go to the launcher API's own HTTPS port, where the server also answers its Amazon
+//! names.
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -40,10 +45,6 @@ use crate::mirror::{MirrorError, server_addresses};
 /// The loopback port the proxy listens on. `scripts/patch-client.py` (`AWS_PROXY_PORT`) writes the
 /// same port into the patched client, so the two must stay equal.
 pub const AWS_PROXY_PORT: u16 = 47443;
-/// The HTTPS port of the server, where the mirror answers.
-const MIRROR_HTTPS_PORT: u16 = 443;
-/// The plain HTTP port of the server, where the region ping answers (the client pings port 80).
-const PING_HTTP_PORT: u16 = 80;
 /// Loopback worker threads: one accept loop plus connection relays.
 const PROXY_WORKER_THREADS: usize = 2;
 
@@ -120,13 +121,19 @@ impl Drop for AwsProxy {
 
 impl AwsProxy {
     /// Checks `mirror`, looks up `server_host`, binds [`AWS_PROXY_PORT`] on loopback, and serves
-    /// tunnels to the server in the background.
-    pub fn start(mirror: &AwsMirror, server_host: &str) -> Result<Self, ProxyError> {
-        let server = first_server_address(server_host)?;
+    /// tunnels to the server's `https_port` and region pings to its [`AwsMirror::ping_port`] in
+    /// the background.
+    pub fn start(
+        mirror: &AwsMirror,
+        server_host: &str,
+        https_port: u16,
+    ) -> Result<Self, ProxyError> {
+        let (server, ping_server) =
+            server_targets(first_server_address(server_host)?, https_port, mirror);
         Self::serve(
             mirror,
-            SocketAddr::new(server, MIRROR_HTTPS_PORT),
-            SocketAddr::new(server, PING_HTTP_PORT),
+            server,
+            ping_server,
             (Ipv4Addr::LOCALHOST, AWS_PROXY_PORT).into(),
         )
     }
@@ -167,6 +174,15 @@ impl AwsProxy {
             local_addr,
         })
     }
+}
+
+/// The tunnel and region ping addresses on `server`: its `https_port`, and the ping port the
+/// server named in `mirror`.
+fn server_targets(server: IpAddr, https_port: u16, mirror: &AwsMirror) -> (SocketAddr, SocketAddr) {
+    (
+        SocketAddr::new(server, https_port),
+        SocketAddr::new(server, mirror.ping_port),
+    )
 }
 
 /// The server's first address.
@@ -307,7 +323,8 @@ fn parse_request(head: &[u8]) -> Result<ProxyRequest, &'static [u8]> {
 
 #[cfg(test)]
 mod tests {
-    // Every type the tests need is already imported by the parent module.
+    use nw_protocol::aws_mirror::CLIENT_PING_PORT;
+
     use super::*;
 
     /// A server mirror certificate with its key (stands in for the server's self-signed mirror
@@ -321,7 +338,27 @@ mod tests {
         AwsMirror {
             hosts: vec![MIRROR_HOST.to_owned()],
             certificate_pem: pem.to_owned(),
+            ping_port: CLIENT_PING_PORT,
         }
+    }
+
+    #[test]
+    fn the_server_ports_come_from_the_api_and_the_mirror() {
+        const HTTPS_PORT: u16 = 8443;
+        const PING_PORT: u16 = 8080;
+        const SERVER: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 50);
+        let server = IpAddr::V4(SERVER);
+        let mirror = AwsMirror {
+            ping_port: PING_PORT,
+            ..mirror(MIRROR_CERT)
+        };
+        assert_eq!(
+            server_targets(server, HTTPS_PORT, &mirror),
+            (
+                SocketAddr::new(server, HTTPS_PORT),
+                SocketAddr::new(server, PING_PORT)
+            )
+        );
     }
 
     fn connect_request(authority: &str) -> Vec<u8> {

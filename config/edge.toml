@@ -15,6 +15,14 @@ https_listen = "0.0.0.0:443"
 # Plain HTTP listener of the client's region ping (GET /ping on dynamodb.<region>.amazonaws.com,
 # which the launcher maps to this server). The client pings port 80.
 ping_listen = "0.0.0.0:80"
+# The ports players reach the two listeners on. Set them when a router or proxy forwards other
+# ports to the listeners, or when the listeners use other ports. Links to login.<domain> and
+# game.<domain> name public_https_port when it is not 443, and players type it after the domain
+# in the launcher (example.org:8443). The launcher's proxy sends the region ping to
+# public_ping_port. With other ports than 443 and 80, players need a client patched with
+# --aws-proxy (docs/client-patch.md), also on Linux.
+public_https_port = 443
+public_ping_port = 80
 # Prometheus metrics. Keep this on an internal address.
 metrics_listen = "127.0.0.1:9100"
 request_timeout_seconds = 10

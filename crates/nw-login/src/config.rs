@@ -25,6 +25,12 @@ pub const EDGE_ENV_PREFIX: &str = "NW_EDGE_";
 pub const LOGIN_HOST_LABEL: &str = "login";
 /// Host name label of the game routes: `game.<domain>`.
 pub const GAME_HOST_LABEL: &str = "game";
+/// The HTTPS port a link implies when it names none.
+pub const DEFAULT_HTTPS_PORT: u16 = 443;
+/// The port the client pings when nothing sends its ping elsewhere.
+pub const DEFAULT_PING_PORT: u16 = 80;
+/// Separator between a host and its port in a link.
+const PORT_SEPARATOR: char = ':';
 
 /// Window of `queue_requests_per_minute`, in seconds.
 pub const QUEUE_LIMIT_WINDOW_SECONDS: u64 = 60;
@@ -59,6 +65,15 @@ pub struct EdgeConfig {
     pub https_listen: SocketAddr,
     /// Plain HTTP listener of the region ping ([`crate::region_ping`]). The client pings port 80.
     pub ping_listen: SocketAddr,
+    /// The HTTPS port players reach `https_listen` on. It differs from the listener port when a
+    /// router or proxy forwards another port to it. Links to `login.<domain>` and
+    /// `game.<domain>` name it when it is not [`DEFAULT_HTTPS_PORT`], the default.
+    #[serde(default = "default_public_https_port")]
+    pub public_https_port: u16,
+    /// The plain HTTP port players reach `ping_listen` on. The launcher's proxy sends the region
+    /// ping there. Default [`DEFAULT_PING_PORT`].
+    #[serde(default = "default_public_ping_port")]
+    pub public_ping_port: u16,
     /// Internal Prometheus listener (review finding I1).
     pub metrics_listen: SocketAddr,
     /// Time limit for one HTTP request.
@@ -88,6 +103,14 @@ pub struct EdgeConfig {
     /// Worlds, one `[[world]]` block each.
     #[serde(rename = "world")]
     pub worlds: Vec<WorldConfig>,
+}
+
+const fn default_public_https_port() -> u16 {
+    DEFAULT_HTTPS_PORT
+}
+
+const fn default_public_ping_port() -> u16 {
+    DEFAULT_PING_PORT
 }
 
 /// `[tls]`: PEM files from an ACME tool such as `certbot` or `lego`.
@@ -253,11 +276,30 @@ impl EdgeConfig {
         format!("{GAME_HOST_LABEL}.{}", self.domain)
     }
 
+    /// `host` with [`Self::public_https_port`], left out when it is [`DEFAULT_HTTPS_PORT`].
+    fn public_authority(&self, host: String) -> String {
+        if self.public_https_port == DEFAULT_HTTPS_PORT {
+            host
+        } else {
+            format!("{host}{PORT_SEPARATOR}{}", self.public_https_port)
+        }
+    }
+
+    /// `login.<domain>` as players reach it, with the port when it is not the default.
+    pub fn login_authority(&self) -> String {
+        self.public_authority(self.login_host())
+    }
+
+    /// `game.<domain>` as players reach it, with the port when it is not the default.
+    pub fn game_authority(&self) -> String {
+        self.public_authority(self.game_host())
+    }
+
     /// The launch arguments the launcher passes to the game (M2 spec section 6).
     pub fn launch_arguments(&self) -> Vec<String> {
         vec![
             CHANNEL_SERVICE_ARGUMENT.to_owned(),
-            format!("https://{}", self.login_host()),
+            format!("https://{}", self.login_authority()),
             LOGIN_CHANNEL_OVERRIDE_ARGUMENT.to_owned(),
             SESSION_PLACEHOLDER.to_owned(),
             AUTH_BACKEND_ARGUMENT.to_owned(),
@@ -316,6 +358,12 @@ impl EdgeConfig {
         }
         if is_forbidden_host(&self.domain) {
             return invalid("domain", "must not be an Amazon or CloudFront domain");
+        }
+        if self.public_https_port == 0 {
+            return invalid("public_https_port", "must be above 0");
+        }
+        if self.public_ping_port == 0 {
+            return invalid("public_ping_port", "must be above 0");
         }
         if self.request_timeout_seconds == 0 {
             return invalid("request_timeout_seconds", "must be above 0");
@@ -394,6 +442,8 @@ server_name = "Test server"
 domain = "example.org"
 https_listen = "0.0.0.0:443"
 ping_listen = "0.0.0.0:80"
+public_https_port = 443
+public_ping_port = 80
 metrics_listen = "127.0.0.1:9100"
 request_timeout_seconds = 10
 max_connections = 4096
@@ -501,6 +551,8 @@ max_connections = 5
         let config = valid();
         assert_eq!(config.login_host(), "login.example.org");
         assert_eq!(config.game_host(), "game.example.org");
+        assert_eq!(config.login_authority(), "login.example.org");
+        assert_eq!(config.game_authority(), "game.example.org");
         assert_eq!(config.worlds.len(), 1);
         assert_eq!(config.auth.mode, AuthMode::Password);
         assert_eq!(
@@ -519,7 +571,40 @@ max_connections = 5
     }
 
     #[test]
+    fn the_public_ports_default_to_443_and_80() {
+        let config = load(
+            &VALID
+                .replace("public_https_port = 443\n", "")
+                .replace("public_ping_port = 80\n", ""),
+        )
+        .expect("valid config");
+        assert_eq!(config.public_https_port, DEFAULT_HTTPS_PORT);
+        assert_eq!(config.public_ping_port, DEFAULT_PING_PORT);
+    }
+
+    #[test]
+    fn another_public_port_is_named_in_the_links() {
+        let config = load(&VALID.replace("public_https_port = 443", "public_https_port = 8443"))
+            .expect("valid config");
+        assert_eq!(config.login_host(), "login.example.org");
+        assert_eq!(config.login_authority(), "login.example.org:8443");
+        assert_eq!(config.game_authority(), "game.example.org:8443");
+        assert_eq!(
+            config.launch_arguments()[1],
+            "https://login.example.org:8443"
+        );
+    }
+
+    #[test]
     fn bad_values_are_refused() {
+        refused(
+            &VALID.replace("public_https_port = 443", "public_https_port = 0"),
+            "public_https_port",
+        );
+        refused(
+            &VALID.replace("public_ping_port = 80", "public_ping_port = 0"),
+            "public_ping_port",
+        );
         refused(
             &VALID.replace("domain = \"example.org\"", "domain = \"x.cloudfront.net\""),
             "domain",

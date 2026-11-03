@@ -141,6 +141,8 @@ pub struct ErrorBody {
 
 #[cfg(test)]
 mod tests {
+    use crate::aws_mirror::CLIENT_PING_PORT;
+
     use super::*;
 
     const TOKEN: &str = "launcher-token";
@@ -183,6 +185,7 @@ mod tests {
             aws_mirror: AwsMirror {
                 hosts: vec!["ags-javelin-remote-config.s3.amazonaws.com".to_owned()],
                 certificate_pem: "-----BEGIN CERTIFICATE-----".to_owned(),
+                ping_port: CLIENT_PING_PORT,
             },
         };
         let value = json(&info);
@@ -196,7 +199,10 @@ mod tests {
                 "server_name"
             ]
         );
-        assert_eq!(keys(&value["aws_mirror"]), ["certificate_pem", "hosts"]);
+        assert_eq!(
+            keys(&value["aws_mirror"]),
+            ["certificate_pem", "hosts", "ping_port"]
+        );
         assert_eq!(value["auth_mode"], "discord");
         assert_eq!(
             serde_json::from_value::<LauncherInfo>(value).expect("parse"),

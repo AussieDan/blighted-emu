@@ -152,10 +152,12 @@ client (Inferred: the same check).
 
 The account-age chat restriction stays on. The server answers it with `accountInProbation`.
 
-## Fifth change: AWS proxy (Windows only, `--aws-proxy`)
+## Fifth change: AWS proxy (`--aws-proxy`)
 
-This change is for Windows. Windows has no `bwrap` sandbox to give the game process a private
-hosts file and trust file. On Linux, do not use it.
+This change is for Windows, and for Linux when the server uses other ports than 443 and 80 (see
+"Servers on other ports" below). Windows has no `bwrap` sandbox to give the game process a
+private hosts file and trust file. On Linux, the hosts file cannot change a port, so only the
+proxy reaches a server on other ports.
 
 The game has four AWS SDK clients that call fixed Amazon names with certificate checks on:
 remote-config (S3), analytics (Kinesis), analytics credentials (STS) and the news client (the
@@ -197,7 +199,9 @@ the server and pins the mirror certificate of the server (`bins/launcher/src/aws
 the same rule as `check_mirror`). It accepts a `CONNECT` only for the mirror host kinds
 (`is_aws_mirror_host`). The region pinger uses plain HTTP, so WinHTTP sends it to the proxy as
 `GET http://<host>/ping`. The proxy accepts that only for a DynamoDB host and passes it unchanged
-to port 80 of the server.
+to the ping port of the server (`public_ping_port` in `config/edge.toml`, default 80). The
+tunnels go to the HTTPS port of the launcher API (the port typed after the server domain,
+default 443).
 
 A copy made with `--aws-proxy` before the news and region ping clients were added has fewer
 caves.
@@ -365,6 +369,30 @@ the Game, Proton and Steam options, the launcher does not start the game. The St
 ran the stock client in the retail prefix, where it called the remote-config, analytics and STS
 hosts of Amazon.
 
+## Servers on other ports
+
+`config/edge.toml` sets the ports that players reach the server on: `public_https_port` (default
+443) and `public_ping_port` (default 80). The listeners (`https_listen`, `ping_listen`) can use
+other ports than these when a router or proxy forwards the public ports to them.
+
+When `public_https_port` is not 443:
+
+1. Players type the port after the domain in the launcher, for example `example.org:8443`.
+2. The server puts the port in its links to `login.<domain>` and `game.<domain>` (the
+   `-ChannelService` argument, the channel document, the remote-config service endpoints and the
+   Discord callback). For Discord login, register the callback with the port in the Discord
+   Developer Portal.
+3. The launcher sends the Amazon names of the game to that port through its loopback proxy.
+
+When `public_ping_port` is not 80, the launcher's proxy sends the region ping to it.
+
+The launcher runs the loopback proxy on Windows and on Linux. With other ports, the client must
+be patched with `--aws-proxy` on Linux too. An unpatched client on Linux uses the private hosts
+file, which leads to ports 443 and 80 only.
+
+Unknown: the game client reads a link with a port (`game.example.org:8443/s/<session>`). The
+client already takes a port in `-GatewayAddr`, so it probably does. It is not live-checked yet.
+
 ## Launching the patched client on Windows
 
 Windows has no `bwrap`, so the private hosts file and trust file are not used. Instead, the
@@ -422,7 +450,8 @@ You need a Windows PC with Steam and New World installed, and the project launch
 - `scripts/patch-client.py`: makes, checks and reverts the patched copy (with `--aws-proxy`
   for Windows).
 - `scripts/patch-client.test.sh`: tests the tool on a synthetic exe (`just test-scripts`).
-- `bins/launcher/src/aws_proxy.rs`: the Windows loopback proxy.
+- `bins/launcher/src/aws_proxy.rs`: the loopback proxy (Windows, and Linux with a client patched
+  with `--aws-proxy`).
 - `bins/launcher/testdata/proxy-tls.crt` and `proxy-tls-key.pem`: the proxy's own
   certificate toward the game (the patched client does not check it).
 - `bins/launcher/testdata/proxy-mirror.crt` and `proxy-mirror-key.pem`: a stand-in mirror
