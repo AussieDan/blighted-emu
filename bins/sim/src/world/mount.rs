@@ -76,6 +76,8 @@ const MS_PER_SECOND: f32 = 1_000.0;
 /// `javelin.mount-fall-damage-dismount-threshold-pct`, client default 0.1; the retail remote
 /// config layers do not set it).
 const FALL_DISMOUNT_SHARE: f64 = 0.1;
+/// The summon cooldown end of no cooldown (retail cards before any summon: 0).
+const NO_COOLDOWN_NS: u64 = 0;
 /// The 5816 byte of unknown meaning (all 4 retail calls: 1).
 const SCHEDULED_DISMOUNT_FLAG: u8 = 1;
 
@@ -163,12 +165,18 @@ pub(super) struct PlayerMount {
 
 impl PlayerMount {
     /// The mounts a join or a handoff carries, at `now_ms` (sim ms) and server time `server_ms`:
-    /// on foot, unless the handoff carries a ride; a summon cooldown that runs goes on.
+    /// on foot, unless the handoff carries a ride; a summon cooldown that runs goes on, and one
+    /// that is over is 0 ([`Self::clear_ended_cooldown`]).
     pub(super) fn of(carried: &PlayerMounts, now_ms: u64, server_ms: u64) -> Self {
         let left_ms = carried
             .summon_cooldown_end_ns
             .saturating_sub(unix_ns(server_ms))
             / nw_messages::NS_PER_MS;
+        let cooldown_end_ns = if left_ms == 0 {
+            NO_COOLDOWN_NS
+        } else {
+            carried.summon_cooldown_end_ns
+        };
         Self {
             selected: carried.selected,
             customized: carried
@@ -185,7 +193,7 @@ impl PlayerMount {
                 .riding
                 .map_or(Phase::Idle, |mount_id| Phase::Mounted { mount_id }),
             cooldown_end_ms: now_ms.saturating_add(left_ms),
-            cooldown_end_ns: carried.summon_cooldown_end_ns,
+            cooldown_end_ns,
             authorization: SummonAuthorization::default(),
             stamina: LOGIN_STAMINA,
             stamina_max: LOGIN_STAMINA,
@@ -340,6 +348,17 @@ impl PlayerMount {
         self.cooldown_end_ms = end_ms;
         self.cooldown_end_ns = end_ns;
         self.change.summon_cooldown_end_ns = Some(end_ns);
+    }
+
+    /// A summon cooldown that is over at `now_ms` goes to the client as 0. The client refuses a
+    /// summon while its clock is before `m_summonCooldownEndTime` (`FUN_1438e2270`: reason 14,
+    /// "Summon ready in"), and live (2026-11-03) it refused every summon after the first
+    /// cooldown, minutes after its end; a 0 always passes its check. Retail kept an ended time
+    /// (its clients summoned after it), so the 0 is Inferred, for a client clock that is behind.
+    fn clear_ended_cooldown(&mut self, now_ms: u64) {
+        if self.cooldown_end_ns != NO_COOLDOWN_NS && now_ms >= self.cooldown_end_ms {
+            self.cool_down(self.cooldown_end_ms, NO_COOLDOWN_NS);
+        }
     }
 
     /// The authorization changes to `authorization`.
@@ -640,6 +659,7 @@ impl SimWorld {
                 now_ms.saturating_sub(last) as f32 / MS_PER_SECOND
             });
             player.mount.last_tick_ms = Some(now_ms);
+            player.mount.clear_ended_cooldown(now_ms);
             let [vx, vy] = player.tracked.velocity();
             if player.mount.tick(dt_s, vx.hypot(vy) > 0.0) {
                 player.tracked.set_mount_dash(player.mount.dashing);
@@ -1395,6 +1415,29 @@ mod tests {
         );
         let later = PlayerMount::of(&carried, NOW_MS, SERVER_MS + 2 * LEFT_MS);
         assert_eq!(later.cooldown_end_ms, NOW_MS, "an ended cooldown is over");
+        assert_eq!(
+            later.card().summon_cooldown_end_ns,
+            Some(NO_COOLDOWN_NS),
+            "the client gets no ended time"
+        );
+    }
+
+    #[test]
+    fn an_ended_summon_cooldown_goes_to_the_client_as_0_once() {
+        const END_MS: u64 = 1_000;
+        let mut mount = rider();
+        mount.get_off(END_MS, unix_ns(END_MS));
+        let _ = mount.take_own_member(false);
+        mount.clear_ended_cooldown(END_MS - 1);
+        assert!(mount.take_own_member(false).is_none(), "not yet over");
+        mount.clear_ended_cooldown(END_MS);
+        let member = mount.take_own_member(false).expect("the change");
+        assert_eq!(
+            state_of(&member).summon_cooldown_end_ns,
+            Some(NO_COOLDOWN_NS)
+        );
+        mount.clear_ended_cooldown(END_MS + 1);
+        assert!(mount.take_own_member(false).is_none(), "sent once");
     }
 
     #[test]
