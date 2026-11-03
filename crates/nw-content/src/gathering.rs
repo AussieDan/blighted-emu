@@ -169,6 +169,56 @@ impl GatherRules {
     }
 }
 
+/// The detection spheres of the gatherables whose variant has one (`javelindata_variations`
+/// `DetectionVolumeSphereRadius`, 238 rows in build 25810808, all quest objects), by the CRC-32 of
+/// the lowercase gatherable id. A player who comes into the sphere sets off the gatherable's game
+/// event without a gather (Observed: retail `9401_befriendhorse` capture, the player came within
+/// 8.9 m of a `94_BeastTorch` (radius 9) at 133.69 s and `9401_Torch` was complete in that
+/// record; the client sent no interaction for any torch).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct DetectionSpheres {
+    by_crc: HashMap<u32, f32>,
+}
+
+impl DetectionSpheres {
+    /// The spheres of `tables`: each variant row with a positive radius names its gatherable
+    /// (`GatherableEntryID`, else `GatherableEntryId`).
+    pub fn from_tables(tables: &Tables) -> Self {
+        Self::build(
+            tables
+                .variation_data
+                .iter()
+                .flat_map(|table| &table.rows)
+                .filter_map(|row| {
+                    let gatherable = row
+                        .gatherable_entry_id
+                        .as_deref()
+                        .or(row.gatherable_entry_id_2.as_deref())
+                        .filter(|id| !id.is_empty())?;
+                    let radius_m = row.detection_volume_sphere_radius? as f32;
+                    Some((gatherable.to_owned(), radius_m))
+                }),
+        )
+    }
+
+    /// The spheres of `spheres` (gatherable id, radius in metres); a radius of 0 or less is left
+    /// out and the first row of an id wins.
+    pub fn build(spheres: impl IntoIterator<Item = (String, f32)>) -> Self {
+        let mut by_crc = HashMap::new();
+        for (id, radius_m) in spheres {
+            if radius_m > 0.0 {
+                by_crc.entry(lowercase_crc32(&id)).or_insert(radius_m);
+            }
+        }
+        Self { by_crc }
+    }
+
+    /// The sphere radius of the gatherable whose lowercase id has the CRC-32 `crc`, in metres.
+    pub fn radius_of(&self, crc: u32) -> Option<f32> {
+        self.by_crc.get(&crc).copied()
+    }
+}
+
 /// A state of a cyclic gatherable that a gatherable shows (finding "cyclic gatherables",
 /// 2026-10-03). A `javelindata_variations` row with `NumCyclicStates` shows the variant
 /// `Gatherable_<n>_Variant` in its state n, from 0; a gather of that variant's gatherable turns
@@ -526,6 +576,22 @@ mod tests {
         let flint = gatherables.get(0xa417_137f).cloned().expect("flint");
         assert_eq!(flint.id, "SingleStone");
         assert_eq!(ms_of(0.25), 250);
+    }
+
+    #[test]
+    fn a_detection_sphere_is_found_by_its_gatherable_and_an_empty_one_is_left_out() {
+        /// `94_BeastTorch`'s variant radius in build 25810808.
+        const TORCH_RADIUS_M: f32 = 9.0;
+        let spheres = DetectionSpheres::build([
+            ("94_BeastTorch".to_owned(), TORCH_RADIUS_M),
+            ("94_BeastTorch".to_owned(), 1.0),
+            ("94_BeastMural".to_owned(), 0.0),
+        ]);
+        assert_eq!(
+            spheres.radius_of(lowercase_crc32("94_beasttorch")),
+            Some(TORCH_RADIUS_M)
+        );
+        assert_eq!(spheres.radius_of(lowercase_crc32("94_beastmural")), None);
     }
 
     #[test]

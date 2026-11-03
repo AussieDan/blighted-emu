@@ -327,11 +327,37 @@ pub(super) fn gather_started(facet: u64, gather: u32, run: GatherRun) -> [Bundle
     ]
 }
 
+/// The counter of gather number `gather` (0 for the first) at its end.
+const fn gather_count(gather: u32) -> u32 {
+    gather.saturating_add(1).saturating_mul(STATES_PER_GATHER)
+}
+
+/// The own member when water gather number `gather` ends: a done state that names no
+/// gatherable, amount or efficiency (Observed: retail `Hive_Dye` 74.05 s, status 3, counters 2,
+/// after the 3746; the client ends its gather animation on it, and the 3746 alone left it running
+/// live 2026-11-03).
+pub(super) const fn water_gather_ended(gather: u32) -> BundleMember {
+    let count = gather_count(gather);
+    BundleMember {
+        component: GATHERING_COMPONENT,
+        state: MemberState::Gathering(GatheringState {
+            status: Some(GATHER_DONE),
+            amount_remaining: None,
+            efficiency: None,
+            gatherer_count: None,
+            gather_ref_count: Some(count),
+            is_gathering: Some(false),
+            gatherable: None,
+            sync_ref_count: Some(count),
+        }),
+    }
+}
+
 /// The own member when gather number `gather` of the object with facet entity `facet` ends
 /// (retail chest 239343 and flint, with the 3746), or stops at a cancel (retail `NH-MSQ-1`
 /// 1789560435207: the same done state).
 pub(super) fn chest_gather_ended(facet: u64, gather: u32) -> BundleMember {
-    let count = gather.saturating_add(1).saturating_mul(STATES_PER_GATHER);
+    let count = gather_count(gather);
     BundleMember {
         component: GATHERING_COMPONENT,
         state: MemberState::Gathering(GatheringState {
@@ -352,7 +378,7 @@ pub(super) fn chest_gather_ended(facet: u64, gather: u32) -> BundleMember {
 /// entry, the player's gather state names the nodule and counts on; status, amount, efficiency
 /// and gathering are not sent).
 pub(super) fn object_broken(facet: u64, gather: u32) -> BundleMember {
-    let count = gather.saturating_add(1).saturating_mul(STATES_PER_GATHER);
+    let count = gather_count(gather);
     BundleMember {
         component: GATHERING_COMPONENT,
         state: MemberState::Gathering(GatheringState {

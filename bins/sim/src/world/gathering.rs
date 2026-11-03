@@ -34,7 +34,9 @@ use nw_sim_core::Position;
 
 use super::loot_bag::LimitsSent;
 use super::slots::Slot;
-use super::statics::{GatherRun, chest_gather_ended, gather_started};
+use super::statics::{
+    GatherRun, chest_gather_ended, gather_started, interactor_target, water_gather_ended,
+};
 use super::tradeskill::EventScale;
 use super::{Body, Player, SimWorld, gather_answer, gather_interrupted, send_now};
 use crate::mobs::spawn_index;
@@ -120,9 +122,21 @@ pub(super) struct OpenGather {
     table: Option<String>,
     /// The mob skinned, for a corpse.
     mob: Option<u64>,
-    /// A water gather (kind 15): no node to deplete and no own gather state.
+    /// A water gather (kind 15): no node to deplete, and a done state that names no gatherable.
     water: bool,
     end_ms: u64,
+}
+
+impl OpenGather {
+    /// The own done state of the gather that ends (or stops) as the player's gather number
+    /// `gather`.
+    fn done_state(&self, gather: u32) -> BundleMember {
+        if self.water {
+            water_gather_ended(gather)
+        } else {
+            chest_gather_ended(self.request.target_entity, gather)
+        }
+    }
 }
 
 impl SimWorld {
@@ -234,10 +248,12 @@ impl SimWorld {
     }
 
     /// Player `number` gathers water at `now_ms` (interaction kind 15; craft2 report, retail
-    /// `Hive_Dye`, 2 gathers): the request names no gatherable and retail answers no 3743; the
-    /// gather of the `Water` gatherable ends after its `BaseGatherTime` (retail 3,144 ms for 3 s)
-    /// with the interaction's end (3746) and its loot table's water (`WaterT1` 30). There is no
-    /// node: two retail gathers 3.7 s apart both gave water.
+    /// `Hive_Dye`, 2 gathers): the request names no gatherable and retail answers no 3743, only
+    /// the own interactor's target (the player's own entity, 70.92 s); the gather of the `Water`
+    /// gatherable ends after its `BaseGatherTime` (retail 3,144 ms for 3 s) with the interaction's
+    /// end (3746), a done gather state ([`water_gather_ended`], 74.05 s) and its loot table's
+    /// water (`WaterT1` 30), and the client's cancel that follows gets no 2724. There is no node:
+    /// two retail gathers 3.7 s apart both gave water.
     pub(super) fn gather_water(&mut self, number: u64, request: InteractionRequest, now_ms: u64) {
         let Some(gatherable) = self
             .content
@@ -251,6 +267,13 @@ impl SimWorld {
         let duration_ms =
             gatherable.gather_ms.div_ceil(GATHER_TICK_MS) * GATHER_TICK_MS + GATHER_TICK_MS;
         tracing::debug!(player = number, duration_ms, "water gather");
+        if let Some(entity) = self.player_by_number(number)
+            && let Some(mut player) = self.world.get_mut::<Player>(entity)
+        {
+            player
+                .extra_members
+                .push(interactor_target(request.target_entity));
+        }
         self.open_gathers.push(OpenGather {
             number,
             request,
@@ -525,12 +548,12 @@ impl SimWorld {
             ),
         });
         send_now(&mut self.combat_messages, &player.connection, &[end]);
+        let ended = gather.done_state(player.gathers);
+        player.extra_members.push(ended);
+        player.gathers = player.gathers.saturating_add(1);
         if !gather.water {
-            let ended = chest_gather_ended(gather.request.target_entity, player.gathers);
-            player.extra_members.push(ended);
-            player.gathers = player.gathers.saturating_add(1);
+            player.ended_gather = Some(gather.request);
         }
-        player.ended_gather = Some(gather.request);
         if let Some((reset_ms, at)) = opened {
             player.list_version += 1;
             let version = player.list_version;
@@ -777,7 +800,7 @@ impl SimWorld {
                     self.nodes.release(&gather.request.target);
                 }
                 if let Some(mut player) = self.world.get_mut::<Player>(entity) {
-                    let stopped = chest_gather_ended(gather.request.target_entity, player.gathers);
+                    let stopped = gather.done_state(player.gathers);
                     player.extra_members.push(stopped);
                     player.gathers = player.gathers.saturating_add(1);
                 }
@@ -1074,6 +1097,8 @@ mod tests {
     const MINING_REWARD: f64 = 64.0;
     /// The vein's `BaseGatherTime` and the pick's efficiency.
     const VEIN_MS: u64 = 8_000;
+    /// The client's cancel after a water gather's end (live 2026-11-03: 22 ms; retail 20 ms).
+    const CLIENT_CANCEL_MS: u64 = 22;
     const PICK_EFFICIENCY: f64 = 2.0;
     /// The Mining slot of the paperdoll ([`TOOL_SLOTS`]).
     const MINING_SLOT: u32 = 36;
@@ -1385,7 +1410,7 @@ mod tests {
     }
 
     #[test]
-    fn a_water_gather_ends_without_a_node_or_an_own_gather_state() {
+    fn a_water_gather_targets_the_player_and_ends_with_a_done_state_and_no_2724() {
         let (mut world, entity) = admitted();
         let mut content = (*world.content).clone();
         content.gatherables = Gatherables::build([gatherable(WATER_GATHERABLE, true)]);
@@ -1396,6 +1421,12 @@ mod tests {
             ..request(1, 0x14, WATER_GATHERABLE)
         };
         world.gather_water(NUMBER, water, NOW);
+        let player = world.world.get::<Player>(entity).expect("player");
+        assert_eq!(
+            player.extra_members.last(),
+            Some(&interactor_target(water.target_entity)),
+            "the own interactor's target, no running gather (retail Hive_Dye 70.92 s)"
+        );
         let [gather] = world.open_gathers.as_slice() else {
             panic!("one water gather runs: {:?}", world.open_gathers);
         };
@@ -1409,8 +1440,67 @@ mod tests {
         world.gathers_due(end_ms);
         assert!(world.open_gathers.is_empty());
         let player = world.world.get::<Player>(entity).expect("player");
-        assert_eq!(player.gathers, gathers, "no own gather state");
+        assert_eq!(player.gathers, gathers + 1);
+        assert_eq!(
+            player.extra_members.last(),
+            Some(&water_gather_ended(gathers)),
+            "the done state (retail Hive_Dye 74.05 s: status 3, no gatherable)"
+        );
         assert_eq!(world.nodes.numbers_near(AT, RADIUS_M).count(), 0, "no node");
+        let sent = world.combat_messages.len();
+        world.cancel_gather(entity, water.interaction, end_ms + CLIENT_CANCEL_MS);
+        assert_eq!(
+            world.combat_messages.len(),
+            sent,
+            "the client's cancel after the end gets no 2724"
+        );
+    }
+
+    #[test]
+    fn a_second_water_gather_on_the_same_interaction_id_after_a_pause_runs_again() {
+        /// Retail `Hive_Dye`: the client repeats every 50 ms; the second gather came 0.5 s
+        /// after the first's last request, with the same id.
+        const REPEAT_MS: u64 = 50;
+        const PAUSE_MS: u64 = 500;
+        let (mut world, _) = admitted();
+        let mut content = (*world.content).clone();
+        content.gatherables = Gatherables::build([gatherable(WATER_GATHERABLE, true)]);
+        world.content = Arc::new(content);
+        let water = InteractionRequest {
+            kind: nw_messages::client_input::WATER_GATHER_KIND,
+            gatherable: None,
+            ..request(1, 0x14, WATER_GATHERABLE)
+        };
+        let who = connection(NUMBER);
+        world.interact(&who, water, b"", NOW);
+        let end_ms = world.open_gathers[0].end_ms;
+        let mut at_ms = NOW + REPEAT_MS;
+        while at_ms < end_ms {
+            world.interact(&who, water, b"", at_ms);
+            at_ms += REPEAT_MS;
+        }
+        assert_eq!(
+            world.open_gathers.len(),
+            1,
+            "the repeats are the same press"
+        );
+        world.gathers_due(end_ms);
+        let cancel = nw_messages::ClientFacetMsg::CancelInteraction {
+            header: nw_messages::FacetHeader::of(0, NUMBER),
+            target: water.target,
+            target_entity: water.target_entity,
+            interaction: water.interaction,
+        };
+        world.facet_message(&who, cancel, end_ms).expect("cancel");
+        // Retail: the client still repeats for about 100 ms after its cancel.
+        world.interact(&who, water, b"", at_ms);
+        world.interact(&who, water, b"", at_ms + REPEAT_MS);
+        assert!(
+            world.open_gathers.is_empty(),
+            "the held press ended with the gather"
+        );
+        world.interact(&who, water, b"", at_ms + REPEAT_MS + PAUSE_MS);
+        assert_eq!(world.open_gathers.len(), 1, "after a pause: a new press");
     }
 
     #[test]

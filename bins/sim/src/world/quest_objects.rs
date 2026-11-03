@@ -45,6 +45,8 @@ const LOCALIZED_MARK: char = '@';
 /// Swing hits that break a quest object (Observed: each of Grace's nodules broke on the
 /// greatsword's second 2071, 0.8 s after the first).
 const HITS_TO_BREAK: u32 = 2;
+/// The game events one way into a detection sphere sets off.
+const ONE_DETECTION: u32 = 1;
 /// How far from the player a swing breaks a quest object (Inferred: about a greatsword's reach
 /// plus the object's size; the client's hit shapes are Unknown here).
 const SWING_REACH_M: f32 = 4.0;
@@ -390,5 +392,56 @@ impl SimWorld {
         }
         tracing::info!(player = number, object = index, %event, "quest object broken");
         self.quest_event(number, Event::GameEvent(&event), now_ms);
+    }
+
+    /// Sets off the game event of each quest object whose detection sphere a player with quests
+    /// came into, at `now_ms`: once per way in, and only while one of its quests counts that
+    /// event, so a player already inside when its task starts sets it off then (Observed: retail
+    /// `9401_befriendhorse`, `9401_Torch` complete at 133.69 s in the record where the player came
+    /// within 9 m of a torch, with no interaction from the client).
+    pub(super) fn detect_quest_objects(&mut self, now_ms: u64) {
+        let numbers: Vec<u64> = self.quests.keys().copied().collect();
+        for number in numbers {
+            let Some(entity) = self.player_by_number(number) else {
+                continue;
+            };
+            let Some(position) = self
+                .world
+                .get::<Body>(entity)
+                .map(|body| body.motion.position())
+            else {
+                continue;
+            };
+            let inside = self.content.quest_objects.detected_at(position);
+            let entered: Vec<(usize, String)> = {
+                let Some(mut player) = self.world.get_mut::<Player>(entity) else {
+                    continue;
+                };
+                player.detected.retain(|index| inside.contains(index));
+                let quests = self.quests.get(&number);
+                inside
+                    .iter()
+                    .filter(|index| !player.detected.contains(index))
+                    .filter_map(|index| {
+                        let event = &self.content.quest_objects.get(*index)?.event;
+                        quests
+                            .is_some_and(|quests| {
+                                quests
+                                    .iter()
+                                    .any(|quest| quest.run.counts_game_event(event))
+                            })
+                            .then(|| (*index, event.clone()))
+                    })
+                    .collect()
+            };
+            for (index, event) in entered {
+                if let Some(mut player) = self.world.get_mut::<Player>(entity) {
+                    player.detected.insert(index);
+                }
+                tracing::info!(player = number, object = index, %event, "quest object detected");
+                self.grant_event(number, &event, ONE_DETECTION, now_ms);
+                self.quest_event(number, Event::GameEvent(&event), now_ms);
+            }
+        }
     }
 }

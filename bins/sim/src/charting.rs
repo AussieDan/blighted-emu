@@ -18,9 +18,17 @@
 //! interest they lie in (`[6, 9011]`, `[6, 40142, 9011]`, `[12, 9009]`): that is how the server
 //! knows the territory of an area.
 //!
-//! **Unknown.** What charts a point of interest: retail discovered the shipwreck 40142 at the
-//! same entry (`drowned_shipwreck_2_40142_discovered`) but did not chart it, though it has a
-//! `ChartedAchievement`. Only areas (`IsArea`) are charted here.
+//! **Observed.** A fast travel shrine is charted the same way: retail `Playthrough_Part_01`
+//! 3210.693 s, the client's 2297 for Brysedd Overlook Shrine (30161, `PoiTag`
+//! `spiritshrine_02_30151,fasttravel`, `IsArea` empty) and 68 ms later its `ChartedAchievement`
+//! `spiritshrine_02_30151_charted` with a `Chart_Location` of 75 (Monarch's Bluffs); 152 of 173
+//! first shrine entries over 1,082 ledgers. The world map lists an uncharted shrine as an
+//! "Undiscovered Fast Travel Point" (`fasttravelicon.luac`). A discoverable shrine with a
+//! `DiscoveredAchievement` is discovered at its first entry and charted at a later one.
+//!
+//! **Unknown.** What charts another point of interest: retail discovered the shipwreck 40142 at
+//! the same entry (`drowned_shipwreck_2_40142_discovered`) but did not chart it, though it has a
+//! `ChartedAchievement`. Only areas (`IsArea`) and fast travel points are charted here.
 
 use std::collections::{HashMap, HashSet};
 
@@ -33,6 +41,19 @@ pub const CHART_EVENT: &str = "Chart_Location";
 pub const RANK_UP_EVENT: &str = "CategoricalProgressionRankUp";
 /// The standing experience modifier of a progression that is no territory's standing.
 pub const NEUTRAL_STANDING_MODIFIER: f64 = 1.0;
+/// The `PoiTag` of a fast travel point (all 137 rows that carry it are shrines with a
+/// `ChartedAchievement`, build 25810808).
+const FAST_TRAVEL_POI_TAG: &str = "fasttravel";
+/// Separates the tags of a `PoiTag` cell.
+const POI_TAG_SEPARATOR: char = ',';
+
+/// Whether `poi_tag` (a `PoiTag` cell) names a fast travel point.
+fn is_fast_travel_point(poi_tag: Option<&str>) -> bool {
+    poi_tag.is_some_and(|tags| {
+        tags.split(POI_TAG_SEPARATOR)
+            .any(|tag| tag.trim().eq_ignore_ascii_case(FAST_TRAVEL_POI_TAG))
+    })
+}
 
 /// What a territory's charts and standing give.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -43,10 +64,11 @@ pub struct TerritoryExperience {
     pub standing_modifier: f64,
 }
 
-/// The chartable areas, the territory of each area and what each territory gives.
+/// The chartable areas and fast travel points, the territory of each and what each territory
+/// gives.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ChartRules {
-    /// The `ChartedAchievement` of each chartable area, by `TerritoryID`.
+    /// The `ChartedAchievement` of each chartable area and fast travel point, by `TerritoryID`.
     charted: HashMap<u32, String>,
     /// The territory each area and point of interest of the level lies in.
     area_territories: HashMap<u32, u32>,
@@ -64,7 +86,11 @@ impl ChartRules {
                 .flat_map(|table| &table.rows)
         };
         let charted = rows()
-            .filter(|row| row.is_area.unwrap_or_default() && row.is_chartable.unwrap_or_default())
+            .filter(|row| {
+                row.is_chartable.unwrap_or_default()
+                    && (row.is_area.unwrap_or_default()
+                        || is_fast_travel_point(row.poi_tag.as_deref()))
+            })
             .filter_map(|row| {
                 let area = u32::try_from(row.territory_id).ok()?;
                 let achievement = row.charted_achievement.clone()?;
@@ -158,6 +184,17 @@ mod tests {
         chart_amount: 75,
         standing_modifier: 1.25,
     };
+
+    #[test]
+    fn a_shrine_s_poi_tag_names_a_fast_travel_point_and_a_camp_s_does_not() {
+        // Brysedd Overlook Shrine (30161) and a camp (30143), build 25810808.
+        assert!(is_fast_travel_point(Some(
+            "spiritshrine_02_30151,fasttravel"
+        )));
+        assert!(is_fast_travel_point(Some("FastTravel")));
+        assert!(!is_fast_travel_point(Some("camp_30143")));
+        assert!(!is_fast_travel_point(None));
+    }
 
     #[test]
     fn an_area_lies_in_the_territory_its_records_list_first() {

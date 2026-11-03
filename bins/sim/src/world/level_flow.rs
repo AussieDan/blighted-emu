@@ -457,14 +457,16 @@ impl LevelFlow {
     }
 
     /// The phasing update of an open-world player at (`x`, `y`), when its sectors changed since
-    /// the client's last entries: the start beach's area and the 2 x 2 nearest grid cells
-    /// (open-world note: retail updated them as the player moved; a sector without an entry made
-    /// the client show "You cannot access this area at this time").
-    pub(super) fn phasing_at(&mut self, x: f32, y: f32) -> Option<ServerMessage> {
+    /// the client's last entries: the level's phasing areas `areas` and the 2 x 2 nearest grid
+    /// cells (open-world note: retail updated them as the player moved; a sector without an entry
+    /// made the client show "You cannot access this area at this time"). Retail named only the
+    /// areas near the player; all of them go here (Inferred: an entry for a far area changes
+    /// nothing the player sees).
+    pub(super) fn phasing_at(&mut self, x: f32, y: f32, areas: &[u32]) -> Option<ServerMessage> {
         if self.tutorial {
             return None;
         }
-        let entries = PhasingEntry::open_world(&OPEN_WORLD_LEVEL, x, y, OPEN_WORLD_PHASE_ID);
+        let entries = PhasingEntry::open_world(&OPEN_WORLD_LEVEL, x, y, OPEN_WORLD_PHASE_ID, areas);
         if self.phasing_entries.as_ref()? == &entries {
             return None;
         }
@@ -782,6 +784,8 @@ mod tests {
     fn open_world_phasing_follows_the_player_once_it_took_the_level() {
         const BEACH: (f32, f32) = (7305.0, 3093.0);
         const NEXT_CELL_EAST_M: f32 = 300.0;
+        /// The start beach's and Monarch's Bluffs settlement's phasing areas.
+        const AREAS: [u32; 2] = [9_009, 30_155];
         let mut open_world = LevelFlow::after_level_info(
             ENTITY,
             LevelInfoChangedMsg::of_level(OPEN_WORLD_LEVEL, LOGIN_CLIENT_CONTEXT, NOW, 1),
@@ -794,7 +798,7 @@ mod tests {
             0,
         );
         assert_eq!(
-            open_world.phasing_at(BEACH.0, BEACH.1),
+            open_world.phasing_at(BEACH.0, BEACH.1, &AREAS),
             None,
             "not before the client took the level"
         );
@@ -803,30 +807,41 @@ mod tests {
             client_context: LOGIN_CLIENT_CONTEXT,
         };
         open_world.answer(&ack, LOGIN_CLIENT_CONTEXT);
-        let Some(ServerMessage::UpdatePhasing(update)) = open_world.phasing_at(BEACH.0, BEACH.1)
+        let Some(ServerMessage::UpdatePhasing(update)) =
+            open_world.phasing_at(BEACH.0, BEACH.1, &AREAS)
         else {
             panic!("the cells around the player");
         };
         assert_eq!(
             update.entries,
-            PhasingEntry::open_world(&OPEN_WORLD_LEVEL, BEACH.0, BEACH.1, OPEN_WORLD_PHASE_ID)
+            PhasingEntry::open_world(
+                &OPEN_WORLD_LEVEL,
+                BEACH.0,
+                BEACH.1,
+                OPEN_WORLD_PHASE_ID,
+                &AREAS
+            )
         );
         assert_eq!(update.sequence, 2, "after the ack's update");
-        assert_eq!(open_world.phasing_at(BEACH.0, BEACH.1), None, "no change");
+        assert_eq!(
+            open_world.phasing_at(BEACH.0, BEACH.1, &AREAS),
+            None,
+            "no change"
+        );
         assert!(
             open_world
-                .phasing_at(BEACH.0 + NEXT_CELL_EAST_M, BEACH.1)
+                .phasing_at(BEACH.0 + NEXT_CELL_EAST_M, BEACH.1, &AREAS)
                 .is_some(),
             "new cells"
         );
         assert_eq!(
-            flow().phasing_at(BEACH.0, BEACH.1),
+            flow().phasing_at(BEACH.0, BEACH.1, &AREAS),
             None,
             "not in the tutorial"
         );
         assert!(
             LevelFlow::resumed(ENTITY, 0, &[], 0)
-                .phasing_at(BEACH.0, BEACH.1)
+                .phasing_at(BEACH.0, BEACH.1, &AREAS)
                 .is_some(),
             "a player taken from another sim gets its cells"
         );

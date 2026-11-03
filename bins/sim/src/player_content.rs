@@ -15,7 +15,8 @@ use nw_content::equip_load::EquipLoads;
 use nw_content::fishing::FishingRules;
 use nw_content::gameplay_config::GameplayConfig;
 use nw_content::gathering::{
-    CrateLoot, CrateVariant, CyclicGatherables, GatherRules, Gatherables, ToolEfficiencies,
+    CrateLoot, CrateVariant, CyclicGatherables, DetectionSpheres, GatherRules, Gatherables,
+    ToolEfficiencies,
 };
 use nw_content::instances::InstanceCatalog;
 use nw_content::interact_tags::{InteractTags, variant_tags};
@@ -762,6 +763,8 @@ pub struct PlayerContent {
     /// The chartable areas, the territory of each area and what a chart and a standing rank
     /// give.
     pub charting: ChartRules,
+    /// The level's phasing areas ([`phasing_areas`]).
+    pub phasing_areas: Vec<u32>,
     /// The categorical progression and coins of each game event, for the tradeskill experience
     /// of gathers and crafts and the coins of salvages.
     pub event_grants: EventGrants,
@@ -843,6 +846,36 @@ pub fn dungeon_entrances(level: &WorldFile) -> HashMap<u64, String> {
         .collect()
 }
 
+/// The phasing areas of `tables`: the `TerritoryID` of each row with a `PhasingBoundsMargin` (10
+/// rows in build 25810808: the start beaches 9009 and 9011, the settlements 30155, 40186 and
+/// 20333, 30112, 40102, 9196, 10330 and 30082). Retail's area phasing entries named only these
+/// (40102, 9009, 30112, 40186, 9011 and 30155 over Monarch's Bluffs, Windsward and Everfall).
+pub fn phasing_areas(tables: &Tables) -> Vec<u32> {
+    tables
+        .territory_definition
+        .iter()
+        .flat_map(|table| &table.rows)
+        .filter(|row| {
+            row.phasing_bounds_margin
+                .as_deref()
+                .is_some_and(|margin| !margin.is_empty())
+        })
+        .filter_map(|row| u32::try_from(row.territory_id).ok())
+        .collect()
+}
+
+/// The smallest side of a detection square, in metres.
+const MIN_DETECTION_CELL_M: f32 = 1.0;
+
+/// The detection square of side `cell_m` that holds `at`.
+fn detection_cell(at: Position, cell_m: f32) -> (i32, i32) {
+    // Level places are a few thousand metres: the squares fit an i32.
+    (
+        (at.x / cell_m).floor() as i32,
+        (at.y / cell_m).floor() as i32,
+    )
+}
+
 /// A quest object of the level: a gatherable point whose gather is a game event that a quest's
 /// `TaskGameEvent` counts (Grace's corruption nodules, `MSQ_CorruptedNodule_1_interact`). Retail
 /// 2026-09-18 broke them with weapon hits, with no interaction from the client.
@@ -862,6 +895,9 @@ pub struct QuestObject {
     /// entry in the player's loot tracker (Observed: `io_msq_grace_corruptednodule_1`,
     /// `0x8d40_a880`, on the retail nodules' entries).
     pub loot_tag: Option<u32>,
+    /// The radius of its gatherable's detection sphere ([`DetectionSpheres`]), in metres: a
+    /// player inside it sets off its game event.
+    pub detection_m: Option<f32>,
 }
 
 /// The slices of the zone capital plots (`Darkness/Zone_CapitalPlot_SouthWindsward`), one per
@@ -936,49 +972,95 @@ const SPAWN_MASTER_FOLDER: &str = "CoatGen\\";
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct QuestObjects {
     objects: Vec<QuestObject>,
+    /// The objects with a detection sphere, by their square of [`Self::detection_cell_m`].
+    detecting: HashMap<(i32, i32), Vec<usize>>,
+    /// The side of a detection square: the largest sphere radius, so a sphere reaches no farther
+    /// than the squares next to its own.
+    detection_cell_m: f32,
 }
 
 impl QuestObjects {
     /// The quest objects among the level's gatherable `points`: those of a gatherable in
     /// `gatherables` whose game event is one of `counted` (lowercase ids), each with the GDE id
-    /// of the capital of `capitals` on its point.
+    /// of the capital of `capitals` on its point and its sphere of `spheres`.
     pub fn build(
         points: &[GatherablePoint],
         gatherables: &Gatherables,
+        spheres: &DetectionSpheres,
         counted: &HashSet<String>,
         capitals: &[Capital],
     ) -> Self {
-        Self {
-            objects: points
-                .iter()
-                .filter_map(|point| {
-                    let gatherable = gatherables.get(point.gatherable_id)?;
-                    let event = gatherable.game_event.clone()?;
-                    counted.contains(&event.to_lowercase()).then(|| {
-                        let [x, y, z] = point.position;
-                        let position = Position { x, y, z };
-                        let id = capitals
-                            .iter()
-                            .find(|capital| {
-                                !capital.slice_name.starts_with(SPAWN_MASTER_FOLDER)
-                                    && capital
-                                        .position
-                                        .iter()
-                                        .zip(point.position)
-                                        .all(|(a, b)| (a - b).abs() <= CAPITAL_ON_POINT_M)
-                            })
-                            .and_then(|capital| capital_id(&capital.id));
-                        QuestObject {
-                            event,
-                            position,
-                            respawn_ms: gatherable.respawn_ms.0,
-                            id,
-                            loot_tag: gatherable.loot_table.as_deref().map(lowercase_crc32),
-                        }
-                    })
+        let objects: Vec<QuestObject> = points
+            .iter()
+            .filter_map(|point| {
+                let gatherable = gatherables.get(point.gatherable_id)?;
+                let event = gatherable.game_event.clone()?;
+                counted.contains(&event.to_lowercase()).then(|| {
+                    let [x, y, z] = point.position;
+                    let position = Position { x, y, z };
+                    let id = capitals
+                        .iter()
+                        .find(|capital| {
+                            !capital.slice_name.starts_with(SPAWN_MASTER_FOLDER)
+                                && capital
+                                    .position
+                                    .iter()
+                                    .zip(point.position)
+                                    .all(|(a, b)| (a - b).abs() <= CAPITAL_ON_POINT_M)
+                        })
+                        .and_then(|capital| capital_id(&capital.id));
+                    QuestObject {
+                        event,
+                        position,
+                        respawn_ms: gatherable.respawn_ms.0,
+                        id,
+                        loot_tag: gatherable.loot_table.as_deref().map(lowercase_crc32),
+                        detection_m: spheres.radius_of(point.gatherable_id),
+                    }
                 })
-                .collect(),
+            })
+            .collect();
+        let detection_cell_m = objects
+            .iter()
+            .filter_map(|object| object.detection_m)
+            .fold(MIN_DETECTION_CELL_M, f32::max);
+        let mut detecting: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+        for (index, object) in objects.iter().enumerate() {
+            if object.detection_m.is_some() {
+                detecting
+                    .entry(detection_cell(object.position, detection_cell_m))
+                    .or_default()
+                    .push(index);
+            }
         }
+        Self {
+            objects,
+            detecting,
+            detection_cell_m,
+        }
+    }
+
+    /// The indexes of the objects whose detection sphere holds `at`.
+    pub fn detected_at(&self, at: Position) -> Vec<usize> {
+        if self.detecting.is_empty() {
+            return Vec::new();
+        }
+        let (east, north) = detection_cell(at, self.detection_cell_m);
+        (east - 1..=east + 1)
+            .flat_map(|cell_east| {
+                (north - 1..=north + 1).map(move |cell_north| (cell_east, cell_north))
+            })
+            .filter_map(|cell| self.detecting.get(&cell))
+            .flatten()
+            .copied()
+            .filter(|index| {
+                self.objects[*index].detection_m.is_some_and(|radius_m| {
+                    let object = self.objects[*index].position;
+                    let (east, north, up) = (at.x - object.x, at.y - object.y, at.z - object.z);
+                    east * east + north * north + up * up <= radius_m * radius_m
+                })
+            })
+            .collect()
     }
 
     /// The nearest object within `reach_m` of `at` that `wanted` takes, with its index.
@@ -1045,6 +1127,7 @@ impl PlayerContent {
         let quest_objects = QuestObjects::build(
             level_gatherables,
             &gatherables,
+            &DetectionSpheres::from_tables(tables),
             &counted_game_events(&rows),
             &level.capitals,
         );
@@ -1136,6 +1219,7 @@ impl PlayerContent {
             invites: InviteRules::from_tables(tables),
             travel,
             charting,
+            phasing_areas: phasing_areas(tables),
             event_grants: EventGrants::from_tables(tables),
             tradeskill_curves: TradeskillCurves::from_tables(tables),
             bonus_chances: BonusChances::from_tables(tables),
@@ -1210,6 +1294,23 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "needs the build 25810808 content bundle in NW_CONTENT_DIR"]
+    fn the_real_phasing_areas_are_the_rows_with_a_phasing_margin() {
+        const BUILD: &str = "25810808";
+        let dir = std::env::var("NW_CONTENT_DIR").expect("NW_CONTENT_DIR");
+        let path = nw_content::bundle::bundle_path(std::path::Path::new(&dir), BUILD);
+        let bundle = nw_content::ContentBundle::load(&path, BUILD).expect("bundle");
+        let mut areas = phasing_areas(&bundle.tables);
+        areas.sort_unstable();
+        assert_eq!(
+            areas,
+            [
+                9_009, 9_011, 9_196, 10_330, 20_333, 30_082, 30_112, 30_155, 40_102, 40_186
+            ]
+        );
+    }
+
+    #[test]
     fn a_mission_fills_its_go_to_patrol_timer_and_transport_templates() {
         // Template rows `M_task_goto_POITag`, `M_task_goto_territoryID`, `PVP_task_patrol`,
         // `M_task_give_transport_item` and a timer.
@@ -1282,6 +1383,7 @@ mod tests {
         let objects = QuestObjects::build(
             &[point(0.0), point(10.0)],
             &gatherables,
+            &DetectionSpheres::default(),
             &HashSet::from([EVENT.to_lowercase()]),
             &[
                 capital(PLACED, "slices/IO_Custom_MSQ_CorruptedNodule_A", 0.0),

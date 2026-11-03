@@ -141,19 +141,34 @@ pub struct PhasingEntry {
 impl PhasingEntry {
     /// The start beach's area entry in `phase_id`.
     pub const fn start_beach(phase_id: u64) -> Self {
+        Self::area(START_BEACH_AREA, phase_id)
+    }
+
+    /// The entry of the phasing area `area` (its `TerritoryID`) in `phase_id`.
+    pub const fn area(area: u32, phase_id: u64) -> Self {
         Self {
             key_type: AREA_KEY_TYPE,
-            key_id: START_BEACH_AREA,
+            key_id: area,
             phase_id,
             extra: 0,
         }
     }
 
-    /// The open-world entries of a player at (`x`, `y`) in `phase_id`: the start beach's area and
-    /// the 2 x 2 grid cells nearest the player inside the grid of `level`. A sector around the
-    /// player without an entry makes the client show "You cannot access this area" (client
-    /// `FUN_143f03170`).
-    pub fn open_world(level: &LevelSpec, x: f32, y: f32, phase_id: u64) -> Vec<Self> {
+    /// The open-world entries of a player at (`x`, `y`) in `phase_id`: the level's phasing
+    /// areas `areas` and the 2 x 2 grid cells nearest the player inside the grid of `level`. A
+    /// sector around the player without an entry makes the client show "You cannot access this
+    /// area" (client `FUN_143f03170`), and the level objects in a phasing area without an entry
+    /// carry phase 0 in their ids: the client then names no entry into the areas there (live
+    /// 2026-11-03, Brysedd Overlook Shrine in Monarch's Bluffs settlement's area 30155; retail
+    /// `12a_msq_12_camptutorial` sent 30155 and 30112 entries and the shrine's id carried
+    /// 30155's phase).
+    pub fn open_world(
+        level: &LevelSpec,
+        x: f32,
+        y: f32,
+        phase_id: u64,
+        areas: &[u32],
+    ) -> Vec<Self> {
         let [origin_x, origin_y] = level.phasing_origin;
         let [width, height] = level.phasing_bounds;
         // The cells of one axis: the cell of the point and its neighbour on the nearer side.
@@ -176,7 +191,9 @@ impl PhasingEntry {
         };
         let columns = near(x, origin_x, width);
         let rows = near(y, origin_y, height);
-        std::iter::once(Self::start_beach(phase_id))
+        areas
+            .iter()
+            .map(|area| Self::area(*area, phase_id))
             .chain(rows.iter().flat_map(|row| {
                 columns.iter().map(move |column| Self {
                     key_type: GRID_KEY_TYPE,
@@ -395,10 +412,12 @@ mod tests {
     }
 
     #[test]
-    fn a_player_is_phased_in_the_beach_area_and_its_four_nearest_cells() {
+    fn a_player_is_phased_in_the_level_s_areas_and_its_four_nearest_cells() {
         // The retail beach spot (7305, 3093): cell x 20 (7168-7424, east half: and 21), cell y 12
         // (3088-3344, south half: and 11).
-        let entries = PhasingEntry::open_world(&OPEN_WORLD_LEVEL, 7305.0, 3093.0, 1);
+        /// Two phasing areas of the level: the start beach and Monarch's Bluffs settlement.
+        const AREAS: [u32; 2] = [START_BEACH_AREA, 30_155];
+        let entries = PhasingEntry::open_world(&OPEN_WORLD_LEVEL, 7305.0, 3093.0, 1, &AREAS);
         let keys: Vec<(u8, u32)> = entries
             .iter()
             .map(|entry| (entry.key_type, entry.key_id))
@@ -407,6 +426,7 @@ mod tests {
             keys,
             [
                 (AREA_KEY_TYPE, START_BEACH_AREA),
+                (AREA_KEY_TYPE, 30_155),
                 (GRID_KEY_TYPE, (11 << 16) | 20),
                 (GRID_KEY_TYPE, (11 << 16) | 21),
                 (GRID_KEY_TYPE, (12 << 16) | 20),
@@ -415,8 +435,8 @@ mod tests {
         );
         assert!(entries.iter().all(|entry| entry.phase_id == 1));
         // Outside the grid, only the cells inside it.
-        let corner = PhasingEntry::open_world(&OPEN_WORLD_LEVEL, 2050.0, 20.0, 1);
-        assert_eq!(corner.len(), 2, "the area and cell (0, 0)");
+        let corner = PhasingEntry::open_world(&OPEN_WORLD_LEVEL, 2050.0, 20.0, 1, &AREAS);
+        assert_eq!(corner.len(), 3, "the areas and cell (0, 0)");
     }
 
     #[test]

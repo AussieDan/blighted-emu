@@ -1080,14 +1080,14 @@ impl SimWorld {
     }
 
     /// Player `entity` entered territory `territory`: a discoverable one is discovered (its
-    /// `DiscoveredAchievement`).
-    pub(super) fn discover_territory(&mut self, entity: Entity, territory: u16) {
+    /// `DiscoveredAchievement`); `true` when this entry discovered it.
+    pub(super) fn discover_territory(&mut self, entity: Entity, territory: u16) -> bool {
         let Some(achievement) = self
             .content
             .travel
             .discovered_achievement(u32::from(territory))
         else {
-            return;
+            return false;
         };
         if let Some(mut player) = self.world.get_mut::<Player>(entity)
             && !player
@@ -1098,7 +1098,9 @@ impl SimWorld {
                 .flow
                 .set_achievement(&self.achievement_rules, achievement);
             tracing::info!(player = player.number, territory, achievement, "discovered");
+            return true;
         }
+        false
     }
 
     /// Player `number` (`entity`) came into area `area` at `now_ms`: a chartable one it has not
@@ -2442,6 +2444,49 @@ mod tests {
         assert!(travel_answers(&mut world, NOW + 5).is_empty(), "channels");
         let progression = world.departures()[0].progression.clone().expect("saved");
         assert!(progression.achievements.contains(&DISCOVERED_BIT));
+    }
+
+    #[test]
+    fn a_discoverable_shrine_is_discovered_at_its_first_entry_and_charted_at_a_later_one() {
+        use crate::charting::ChartRules;
+        /// The test level's discoverable territory as a shrine with a chart (retail 40293,
+        /// 40295 and 40183 were charted at an entry after their discovery).
+        const CHARTED: &str = "Charted_40406";
+        const CHARTED_BIT: u32 = 4;
+        let mut world = world();
+        let mut content = (*world.content).clone();
+        content.charting =
+            ChartRules::build([(u32::from(HIDDEN_TERRITORY), CHARTED.to_owned())], [], &[]);
+        world.content = Arc::new(content);
+        world.achievement_rules = AchievementRules::of(
+            &AchievementIndexes::build([
+                (DISCOVERED.to_owned(), DISCOVERED_BIT),
+                (CHARTED.to_owned(), CHARTED_BIT),
+            ]),
+            &[],
+        );
+        let entity = entity(&mut world);
+        let entered = nw_messages::ClientFacetMsg::TerritoryEntered {
+            header: nw_messages::FacetHeader::of(0, PLAYER),
+            area: [0; nw_messages::wire::RAW_ID_LEN],
+            area_entity: 0,
+            extra: 0,
+            territory: HIDDEN_TERRITORY,
+            unknown: 0,
+        };
+        let known = |world: &SimWorld| {
+            let player = world.world.get::<Player>(entity).expect("player");
+            let has = |id| player.flow.has_achievement(&world.achievement_rules, id);
+            (has(DISCOVERED), has(CHARTED))
+        };
+        world
+            .facet_message(&connection(PLAYER), entered.clone(), NOW)
+            .expect("entered");
+        assert_eq!(known(&world), (true, false), "the first entry discovers it");
+        world
+            .facet_message(&connection(PLAYER), entered, NOW + 1)
+            .expect("entered again");
+        assert_eq!(known(&world), (true, true), "a later entry charts it");
     }
 
     #[test]

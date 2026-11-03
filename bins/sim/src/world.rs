@@ -209,6 +209,36 @@ pub(crate) const OWN_CARD_DELAY_MS: u64 = 1_000;
 /// 697 ms, the stream from 797 ms). One send is not enough: the client drops every bundle
 /// that reaches it while its level context is down (live 2026-09-22, the beach switch).
 const OWN_CARD_RESEND_MS: u64 = 350;
+/// The longest pause between two inputs that repeat one interaction request: after the client's
+/// cancel, a longer one starts a new press of it (Observed: retail `Hive_Dye` repeats every 50 ms, then the second water
+/// gather's requests came 0.5 s after the first's with the same interaction id; live clients
+/// repeat every 30 to 40 ms; the value between them is Inferred).
+const INTERACTION_REPEAT_GAP_MS: u64 = 250;
+
+/// The last open-world interaction request of a player: the client repeats it in each input until
+/// it ends the interaction, and retail answers each one once (retail 2026-09-18: one 3743 for a
+/// talk the client held 20 s; ours answered all 667 inputs). One interaction id can carry two
+/// kinds: an inn's open (70) and its check in (18) (retail `12a_msq_02_inntutorial`, 110.8 s and
+/// 112.5 s). The same request is a new press only after the client's cancel of it and a pause
+/// of more than [`INTERACTION_REPEAT_GAP_MS`] (retail `Hive_Dye`: a second water gather on the
+/// same id came 0.5 s after the first's cancel; the client repeated for 100 ms after that cancel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LastInteraction {
+    /// Its (kind, interaction id).
+    asked: (u8, u64),
+    /// When the client last asked, ms.
+    at_ms: u64,
+    /// Whether the client cancelled it since.
+    cancelled: bool,
+}
+
+impl LastInteraction {
+    /// Whether request `asked` at `now_ms` repeats this one.
+    fn repeats(&self, asked: (u8, u64), now_ms: u64) -> bool {
+        self.asked == asked
+            && !(self.cancelled && now_ms.saturating_sub(self.at_ms) > INTERACTION_REPEAT_GAP_MS)
+    }
+}
 /// Time after the client's time-sync (InGame) before other entities go out.
 /// Retail starts the stream about 797 ms after the first own bundle; dumping
 /// every nearby first-card in the same tick as InGame failed the live client's
@@ -674,10 +704,8 @@ struct Player {
     faction: nw_bus::PlayerFaction,
     /// The quick course it rides ([`quick_course`]).
     course: quick_course::PlayerCourse,
-    /// The last open-world interaction its client asked for: the client repeats the request in
-    /// each input until it ends the interaction, and retail answers each one once (retail
-    /// 2026-09-18: one 3743 for a talk the client held 20 s; ours answered all 667 inputs).
-    last_interaction: Option<u64>,
+    /// The last open-world interaction its client asked for ([`LastInteraction`]).
+    last_interaction: Option<LastInteraction>,
     /// The open-world interaction it runs and the interact tags of its object, from its start
     /// to the client's end of it (`TaskInteract`).
     open_interaction: Option<(u64, Vec<String>)>,
@@ -696,6 +724,9 @@ struct Player {
     last_zone: Option<u32>,
     /// Its hits on the level's quest objects.
     strikes: quest_objects::Strikes,
+    /// The level's quest objects whose detection sphere it is in and whose game event it set off
+    /// on the way in (an index of [`crate::player_content::QuestObjects`]).
+    detected: HashSet<usize>,
     /// Its running consumable cooldowns, and whether they changed since the last bundle.
     cooldowns: Vec<ConsumableCooldown>,
     cooldowns_changed: bool,
@@ -2239,6 +2270,7 @@ impl SimWorld {
         let mut player_attacks = self.player_swings_due(now_ms);
         self.tick_tutorials(now_ms);
         self.tick_quests(now_ms);
+        self.detect_quest_objects(now_ms);
         self.tick_events(now_ms);
         self.tick_dungeon_script(now_ms);
         self.tick_scripts(now_ms);
@@ -2940,10 +2972,11 @@ impl SimWorld {
 
     /// Sends each open-world player the phasing of the sectors around it when they changed.
     fn tick_phasing(&mut self) {
+        let content = Arc::clone(&self.content);
         let mut query = self.world.query::<(&mut Player, &Body)>();
         for (mut player, body) in query.iter_mut(&mut self.world) {
             let at = body.motion.position();
-            if let Some(update) = player.flow.phasing_at(at.x, at.y) {
+            if let Some(update) = player.flow.phasing_at(at.x, at.y, &content.phasing_areas) {
                 let connection = player.connection.clone();
                 send_now(&mut self.combat_messages, &connection, &[update]);
             }
@@ -3239,6 +3272,11 @@ impl SimWorld {
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
         };
+        if let Some(last) = player.last_interaction.as_mut()
+            && last.asked.1 == interaction
+        {
+            last.cancelled = true;
+        }
         let number = player.number;
         let Some((open, tags)) = player.open_interaction.take() else {
             return;
@@ -3293,7 +3331,22 @@ impl SimWorld {
             let Some(mut player) = self.world.get_mut::<Player>(entity) else {
                 return;
             };
-            if player.last_interaction.replace(request.interaction) == Some(request.interaction) {
+            let asked = (request.kind, request.interaction);
+            let repeat = player
+                .last_interaction
+                .as_ref()
+                .is_some_and(|last| last.repeats(asked, now_ms));
+            let cancelled = repeat
+                && player
+                    .last_interaction
+                    .as_ref()
+                    .is_some_and(|last| last.cancelled);
+            player.last_interaction = Some(LastInteraction {
+                asked,
+                at_ms: now_ms,
+                cancelled,
+            });
+            if repeat {
                 return;
             }
             let tags = self.content.interact_tags.of(request.target_entity);
@@ -3469,10 +3522,13 @@ impl SimWorld {
                 self.salvage_by_class(entity, number, *class, *rarities, now_ms);
                 return Ok(());
             }
+            // A first entry discovers a discoverable place; a later one charts it (retail: the
+            // shrines 40293, 40295 and 40183 were charted at an entry after their discovery).
             ClientFacetMsg::TerritoryEntered { territory, .. } => {
                 self.territory_changed(entity, *territory, true);
-                self.discover_territory(entity, *territory);
-                self.chart_area(entity, number, *territory, now_ms);
+                if !self.discover_territory(entity, *territory) {
+                    self.chart_area(entity, number, *territory, now_ms);
+                }
                 return Ok(());
             }
             ClientFacetMsg::TerritoryExited { territory, .. } => {
@@ -4331,6 +4387,7 @@ impl SimWorld {
                     last_zone: None,
                     travel: travel::TravelState::of(arrival.progression.travel.clone()),
                     strikes: quest_objects::Strikes::default(),
+                    detected: HashSet::new(),
                     // The client gets the running ones with the first bundles.
                     cooldowns: arrival
                         .progression
@@ -8201,6 +8258,7 @@ mod tests {
         let quest_objects = QuestObjects::build(
             &[nodule],
             &gatherables,
+            &nw_content::gathering::DetectionSpheres::default(),
             &crate::objectives::counted_game_events(&wreck_rows()),
             &[capital],
         );
@@ -10300,6 +10358,105 @@ mod tests {
     }
 
     #[test]
+    fn a_quest_object_s_detection_sphere_sets_off_its_event_for_a_player_on_the_quest() {
+        use crate::objectives::{TaskBook, TaskRow};
+        use crate::player_content::{ObjectiveRow, QuestBook, QuestObjects};
+        use nw_content::gathering::DetectionSpheres;
+        use nw_formats::objectstream::lowercase_crc32;
+        use nw_world::records::GatherablePoint;
+        /// Retail `9401_befriendhorse`: the torch, its game event and its sphere (build 25810808).
+        const TORCH: &str = "94_BeastTorch";
+        const TORCH_EVENT: &str = "94_BeastTorch_interact";
+        const TORCH_RADIUS_M: f32 = 9.0;
+        const TORCH_QUEST: &str = "q_torch";
+        /// The torch stands 20 m east of the player's admit place.
+        const TORCH_X: f32 = CELL_M / 2.0 + 20.0;
+        /// 8.9 m from the torch, as the retail player at 133.69 s.
+        const INSIDE_X: f32 = TORCH_X - 8.9;
+        const TICK_MS: u64 = 33;
+        let task = |id: &str, kind: &str, children: &[&str]| TaskRow {
+            task_id: id.to_owned(),
+            kind: kind.to_owned(),
+            sub_tasks: children.iter().map(|child| (*child).to_owned()).collect(),
+            ..TaskRow::default()
+        };
+        let quests = QuestBook::build(
+            [ObjectiveRow {
+                id: TORCH_QUEST.to_owned(),
+                root: "t_root".to_owned(),
+                ..ObjectiveRow::default()
+            }],
+            TaskBook::new(vec![
+                task("t_root", "ConsecutiveTaskContainer", &["t_torch"]),
+                TaskRow {
+                    kill_enemy_type: Some("94_BeastTorch_Interact".to_owned()),
+                    target_qty: Some(1),
+                    ..task("t_torch", "TaskGameEvent", &[])
+                },
+            ]),
+        );
+        let gatherables = Gatherables::build([Gatherable {
+            id: TORCH.to_owned(),
+            gather_ms: 4_000,
+            respawn_ms: (10_000, 15_000),
+            loot_table: None,
+            loot_container: true,
+            tradeskill: None,
+            tool_required: false,
+            by_hand: true,
+            game_event: Some(TORCH_EVENT.to_owned()),
+        }]);
+        let quest_objects = QuestObjects::build(
+            &[GatherablePoint {
+                gatherable_id: lowercase_crc32(TORCH),
+                position: [TORCH_X, 10.0, 50.0],
+                ..GatherablePoint::default()
+            }],
+            &gatherables,
+            &DetectionSpheres::build([(TORCH.to_owned(), TORCH_RADIUS_M)]),
+            &HashSet::from([TORCH_EVENT.to_lowercase()]),
+            &[],
+        );
+        let mut combat = test_combat();
+        combat.spawns = Vec::new().into();
+        let mut world = SimWorld::new(
+            settings(MANY, MAX_PLAYERS),
+            WorldIds::random(0).expect("ids"),
+            Arc::new(NoGround),
+            slot("sim-a"),
+            combat,
+            Arc::new(PlayerContent {
+                kits: gear::tests::kits(),
+                quests,
+                gatherables,
+                quest_objects,
+                ..PlayerContent::default()
+            }),
+        );
+        world.set_table(&table(&["sim-a"])).expect("table");
+        world
+            .admit(&admit_at(1, CELL_M / 2.0, true), NOW, SERVER_TIME)
+            .expect("admit");
+        tick(&mut world, NOW);
+        world.start_quest(1, TORCH_QUEST, NOW).expect("start");
+        tick(&mut world, NOW + TICK_MS);
+        let torch_done = |world: &SimWorld| world.quests_of_player(1)[0].run.is_done("t_torch");
+        assert!(!torch_done(&world), "20 m away: outside the sphere");
+        let entity = world.by_connection[&connection(1)];
+        let inside = Position {
+            x: INSIDE_X,
+            y: 10.0,
+            z: 50.0,
+        };
+        world.place_player(entity, inside, None, Placement::Stand, NOW + TICK_MS);
+        tick(&mut world, NOW + 2 * TICK_MS);
+        assert!(
+            torch_done(&world),
+            "the way into the sphere set off the torch's event"
+        );
+    }
+
+    #[test]
     fn a_quest_starts_runs_out_gives_its_reward_and_is_done() {
         let mut world = quest_world();
         assert_eq!(
@@ -10406,6 +10563,40 @@ mod tests {
             Ok(()),
             "the next step of a chain starts even with a full journal"
         );
+    }
+
+    #[test]
+    fn an_inn_check_in_on_the_open_s_interaction_id_is_answered_once() {
+        use travel::kind::{OPEN_INN, SET_SPAWN_POINT};
+        /// Retail `12a_msq_02_inntutorial`: the inn's open and its check in carry one id.
+        const INN_INTERACTION: u64 = 16_624_921_653_968_059_714;
+        const INN: [u8; nw_messages::wire::RAW_ID_LEN] = [0x23; nw_messages::wire::RAW_ID_LEN];
+        let mut world = world();
+        let who = connection(1);
+        world
+            .admit(&admit_at(1, CELL_M / 2.0, true), NOW, SERVER_TIME)
+            .expect("admit");
+        let spawn_at = NOW + OWN_CARD_DELAY_MS;
+        tick(&mut world, spawn_at);
+        world.heard_from(&who);
+        let request = |kind| InteractionRequest {
+            target: INN,
+            target_entity: nw_messages::facet_of_raw_id(&INN),
+            interaction: INN_INTERACTION,
+            kind,
+            gatherable: None,
+        };
+        for kind in [OPEN_INN, OPEN_INN, SET_SPAWN_POINT, SET_SPAWN_POINT] {
+            world.interact(&who, request(kind), b"@inn", spawn_at);
+        }
+        let answered: Vec<u8> = messages_to(&tick(&mut world, spawn_at + 1).messages, 1)
+            .into_iter()
+            .filter_map(|message| match message {
+                ServerMessage::InteractionValidated(answer) => Some(answer.kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(answered, [OPEN_INN, SET_SPAWN_POINT]);
     }
 
     #[test]
