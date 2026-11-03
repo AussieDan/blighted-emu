@@ -851,6 +851,11 @@ impl SimWorld {
             if let Some(event) = &craft.event {
                 let scale = EventScale::craft(craft.ingredients);
                 self.grant_scaled_event(craft.number, event, craft.crafts, scale, now_ms);
+                // A quest step can count the recipe's game event, once per craft
+                // (`Quest_03198` on `S8BoxCraftT5`).
+                for _ in 0..craft.crafts {
+                    self.quest_event(craft.number, Event::GameEvent(event), now_ms);
+                }
             }
             self.quest_event(craft.number, Event::Crafted(&craft.recipe), now_ms);
             let families = super::item_families(&self.content, &craft.item);
@@ -1247,6 +1252,54 @@ mod tests {
             experience,
             Some(80),
             "10 per ingredient (4 ore) per craft under a neutral multiplier"
+        );
+    }
+
+    #[test]
+    fn each_craft_fires_its_recipe_s_game_event_for_the_quest() {
+        use crate::objectives::{TaskBook, TaskRow};
+        use crate::player_content::{ObjectiveRow, QuestBook};
+        const CRAFTS: u32 = 2;
+        let (mut world, entity) = at_the_smelter(ORE_PER_CRAFT * CRAFTS, COINS);
+        let task = |id: &str, kind: &str, children: &[&str]| TaskRow {
+            task_id: id.to_owned(),
+            kind: kind.to_owned(),
+            sub_tasks: children.iter().map(|child| (*child).to_owned()).collect(),
+            ..TaskRow::default()
+        };
+        world.content = Arc::new(PlayerContent {
+            quests: QuestBook::build(
+                [ObjectiveRow {
+                    id: "q_smelt".to_owned(),
+                    root: "t_root".to_owned(),
+                    ..ObjectiveRow::default()
+                }],
+                TaskBook::new(vec![
+                    task("t_root", "ConsecutiveTaskContainer", &["t_smelt"]),
+                    TaskRow {
+                        kill_enemy_type: Some(SMELTING_EVENT.to_owned()),
+                        target_qty: Some(i64::from(CRAFTS)),
+                        ..task("t_smelt", "TaskGameEvent", &[])
+                    },
+                ]),
+            ),
+            ..content()
+        });
+        world.start_quest(NUMBER, "q_smelt", NOW).expect("start");
+        world.craft(
+            entity,
+            NUMBER,
+            lowercase_crc32(INGOT),
+            CRAFTS,
+            FEE_PER_CRAFT * CRAFTS,
+            &[],
+            &CraftChoice::default(),
+            NOW,
+        );
+        world.crafts_due(NOW + CRAFT_MS);
+        assert!(
+            world.quests_of_player(NUMBER)[0].run.is_done("t_smelt"),
+            "two crafts, two events"
         );
     }
 

@@ -2706,7 +2706,8 @@ impl SimWorld {
                 }
             }
         }
-        if let Some(event) = quest.def.success_event.as_deref() {
+        let success_event = quest.def.success_event.clone();
+        if let Some(event) = success_event.as_deref() {
             self.grant_event_standing(number, event);
             self.grant_event_progression(number, event, self.last_now_ms);
         }
@@ -2717,6 +2718,11 @@ impl SimWorld {
             Event::ObjectiveDone(&quest.def.id),
             self.last_now_ms,
         );
+        // Another quest's step can wait for this success event (`09A_S5_SavePrivateer` on
+        // `09A_S5_Success`, `Mission_Success_Procurer_T1`).
+        if let Some(event) = success_event.as_deref() {
+            self.quest_event(number, Event::GameEvent(event), self.last_now_ms);
+        }
     }
 
     /// Feeds game event `event` to the quests of player `number`.
@@ -2875,7 +2881,9 @@ impl SimWorld {
                             .saturating_add(1),
                     ),
                     Some(id) => {
-                        let mastery = content.progression.mastery(id)?;
+                        // Any categorical progression: a faction's (`9804_M_0001_RankUp` names
+                        // `Marauder`), not only a mastery or a tradeskill.
+                        let mastery = content.progression.categorical(id)?;
                         let experience = player.masteries.experience(mastery);
                         Some(if points {
                             experience
@@ -3349,7 +3357,10 @@ impl SimWorld {
             if repeat {
                 return;
             }
-            let tags = self.content.interact_tags.of(request.target_entity);
+            let tags = self
+                .content
+                .interact_tags
+                .of_interaction(request.target_entity, request.gatherable);
             player.open_interaction =
                 (!tags.is_empty()).then(|| (request.interaction, tags.to_vec()));
             self.mount_interaction(entity, now_ms);
@@ -10453,6 +10464,148 @@ mod tests {
         assert!(
             torch_done(&world),
             "the way into the sphere set off the torch's event"
+        );
+    }
+
+    #[test]
+    fn a_quest_s_success_event_counts_for_another_quest() {
+        use crate::objectives::{TaskBook, TaskRow};
+        use crate::player_content::{ObjectiveRow, QuestBook};
+        /// Retail `09A_S5_SavePrivateer` waits for the success event of the quest before it.
+        const SUCCESS: &str = "09A_S5_Success";
+        let task = |id: &str, kind: &str, children: &[&str]| TaskRow {
+            task_id: id.to_owned(),
+            kind: kind.to_owned(),
+            sub_tasks: children.iter().map(|child| (*child).to_owned()).collect(),
+            ..TaskRow::default()
+        };
+        let quests = QuestBook::build(
+            [
+                ObjectiveRow {
+                    id: "q_first".to_owned(),
+                    root: "t_first".to_owned(),
+                    success_event: Some(SUCCESS.to_owned()),
+                    ..ObjectiveRow::default()
+                },
+                ObjectiveRow {
+                    id: "q_after".to_owned(),
+                    root: "t_after".to_owned(),
+                    ..ObjectiveRow::default()
+                },
+            ],
+            TaskBook::new(vec![
+                task("t_first", "ConsecutiveTaskContainer", &[]),
+                task("t_after", "ConsecutiveTaskContainer", &["t_wait"]),
+                TaskRow {
+                    kill_enemy_type: Some(SUCCESS.to_owned()),
+                    target_qty: Some(1),
+                    ..task("t_wait", "TaskGameEvent", &[])
+                },
+            ]),
+        );
+        let mut world = SimWorld::new(
+            settings(MANY, MAX_PLAYERS),
+            WorldIds::random(0).expect("ids"),
+            Arc::new(NoGround),
+            slot("sim-a"),
+            test_combat(),
+            Arc::new(PlayerContent {
+                kits: gear::tests::kits(),
+                quests,
+                ..PlayerContent::default()
+            }),
+        );
+        world.set_table(&table(&["sim-a"])).expect("table");
+        world
+            .admit(&admit_at(1, CELL_M / 2.0, true), NOW, SERVER_TIME)
+            .expect("admit");
+        tick(&mut world, NOW);
+        world.start_quest(1, "q_after", NOW).expect("start");
+        world.start_quest(1, "q_first", NOW).expect("start");
+        world.complete_quest(1, "q_first");
+        let after = world
+            .quests_of_player(1)
+            .iter()
+            .find(|quest| quest.def.id == "q_after")
+            .expect("the quest after");
+        assert!(after.run.is_done("t_wait"), "the success event counted");
+    }
+
+    #[test]
+    fn a_food_s_status_effect_fires_its_game_event_for_the_quest() {
+        use crate::objectives::{TaskBook, TaskRow};
+        use crate::player_content::{ObjectiveRow, QuestBook};
+        use nw_content::item_rules::Consumable;
+        use nw_content::status_effects::{EffectSourceRow, StatusEffectRules, StatusEffectSource};
+        use nw_formats::objectstream::lowercase_crc32;
+        /// Retail mount food (build 25810808): `MountConsum_GruelT0` adds this effect, whose
+        /// `GameEventID` the step `9401_TutorialFood` counts.
+        const FOOD_EFFECT: &str = "Status_Mount_GrantRidingXP_Small";
+        const FOOD_EVENT: &str = "Mount_GrantRidingXP_Small";
+        const FOOD_QUEST: &str = "q_feed";
+        let task = |id: &str, kind: &str, children: &[&str]| TaskRow {
+            task_id: id.to_owned(),
+            kind: kind.to_owned(),
+            sub_tasks: children.iter().map(|child| (*child).to_owned()).collect(),
+            ..TaskRow::default()
+        };
+        let quests = QuestBook::build(
+            [ObjectiveRow {
+                id: FOOD_QUEST.to_owned(),
+                root: "t_root".to_owned(),
+                ..ObjectiveRow::default()
+            }],
+            TaskBook::new(vec![
+                task("t_root", "ConsecutiveTaskContainer", &["t_feed"]),
+                TaskRow {
+                    kill_enemy_type: Some(FOOD_EVENT.to_owned()),
+                    target_qty: Some(1),
+                    ..task("t_feed", "TaskGameEvent", &[])
+                },
+            ]),
+        );
+        let status_effects = StatusEffectRules::build(StatusEffectSource {
+            effects: vec![EffectSourceRow {
+                status_id: FOOD_EFFECT.to_owned(),
+                game_event: Some(FOOD_EVENT.to_owned()),
+                ..EffectSourceRow::default()
+            }],
+            ..StatusEffectSource::default()
+        });
+        let mut world = SimWorld::new(
+            settings(MANY, MAX_PLAYERS),
+            WorldIds::random(0).expect("ids"),
+            Arc::new(NoGround),
+            slot("sim-a"),
+            test_combat(),
+            Arc::new(PlayerContent {
+                kits: gear::tests::kits(),
+                quests,
+                status_effects,
+                ..PlayerContent::default()
+            }),
+        );
+        world.set_table(&table(&["sim-a"])).expect("table");
+        world
+            .admit(&admit_at(1, CELL_M / 2.0, true), NOW, SERVER_TIME)
+            .expect("admit");
+        tick(&mut world, NOW);
+        world.start_quest(1, FOOD_QUEST, NOW).expect("start");
+        let entity = world.by_connection[&connection(1)];
+        let food = Consumable {
+            id: "MountConsum_GruelT0".to_owned(),
+            cooldown: None,
+            effects: Vec::new(),
+            disabled_in_combat: false,
+            status_effects: vec![lowercase_crc32(FOOD_EFFECT)],
+            potency: 1.0,
+            duration_override_ms: None,
+            use_tag: None,
+        };
+        world.add_consumable_effects(entity, &food, NOW);
+        assert!(
+            world.quests_of_player(1)[0].run.is_done("t_feed"),
+            "the food's effect fired its game event"
         );
     }
 

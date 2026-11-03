@@ -2,10 +2,14 @@
 //! The interact tags of the level objects a player can interact with (finding "task
 //! interact"), by the facet entity an interaction request names. An object's tags come from its
 //! slice (`m_interactTagString`, the world file's interact tags) and from its gatherable variant
-//! (`VariationData` `InteractTag`, the quest objects `IO_*`). A `TaskInteract` task counts an
+//! (`VariationData` `InteractTag`, the quest objects `IO_*`). A gather of a region gatherable
+//! point, which has no slice, has the tags of its gatherable's variants (the Gawain crown
+//! `MB_MSQ2_DefeatGawain_Crown` of `12A_MSQ_24_DefeatGawain`). A `TaskInteract` task counts an
 //! interact whose tag matches its `InteractTag`.
 
 use std::collections::HashMap;
+
+use nw_formats::objectstream::lowercase_crc32;
 
 use crate::Tables;
 use crate::gathering::{FACET_FREE_BITS, capital_key};
@@ -14,6 +18,27 @@ use crate::gathering::{FACET_FREE_BITS, capital_key};
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct InteractTags {
     by_key: HashMap<u64, Vec<String>>,
+    /// The tags of the variants of each gatherable, by the CRC-32 of its lowercase
+    /// `GatherableEntryID`.
+    by_gatherable: HashMap<u32, Vec<String>>,
+}
+
+/// The `InteractTag` of each `VariationData` row that has one and a `GatherableEntryID`: the
+/// CRC-32 of the lowercase entry id and the tag.
+pub fn gatherable_tags(tables: &Tables) -> Vec<(u32, String)> {
+    tables
+        .variation_data
+        .iter()
+        .flat_map(|table| &table.rows)
+        .filter_map(|row| {
+            let tag = row.interact_tag.clone().filter(|tag| !tag.is_empty())?;
+            let entry = row
+                .gatherable_entry_id
+                .as_deref()
+                .filter(|id| !id.is_empty())?;
+            Some((lowercase_crc32(entry), tag))
+        })
+        .collect()
 }
 
 /// The `InteractTag` of each `VariationData` row that has one, by lowercase `VariantID`.
@@ -59,7 +84,38 @@ impl InteractTags {
                 by_key.insert(key, tags);
             }
         }
-        Self { by_key }
+        Self {
+            by_key,
+            by_gatherable: HashMap::new(),
+        }
+    }
+
+    /// The same tags, and `gatherables` (the CRC-32 of a lowercase `GatherableEntryID` and a
+    /// variant's tag, [`gatherable_tags`]) for the gathers of objects without tags of their own.
+    #[must_use]
+    pub fn with_gatherables(
+        mut self,
+        gatherables: impl IntoIterator<Item = (u32, String)>,
+    ) -> Self {
+        for (gatherable, tag) in gatherables {
+            let tags = self.by_gatherable.entry(gatherable).or_default();
+            if !tags.contains(&tag) {
+                tags.push(tag);
+            }
+        }
+        self
+    }
+
+    /// The interact tags of an interaction with the object of facet entity `facet`: its own,
+    /// else those of the gatherable it gathers, if any.
+    pub fn of_interaction(&self, facet: u64, gatherable: Option<u32>) -> &[String] {
+        let own = self.of(facet);
+        if !own.is_empty() {
+            return own;
+        }
+        gatherable
+            .and_then(|gatherable| self.by_gatherable.get(&gatherable))
+            .map_or(&[], Vec::as_slice)
     }
 
     /// The interact tags of the object with facet entity `facet`; empty for an object with none.
@@ -95,5 +151,30 @@ mod tests {
         assert_eq!(tags.of(SETTLEMENT_FACET), ["SettlementStorage"]);
         assert_eq!(tags.of(JOURNAL_ID), ["IO_99B_MSQ_02_GalahadJournal"]);
         assert!(tags.of(1).is_empty());
+    }
+
+    #[test]
+    fn a_region_gatherable_s_gather_has_its_variant_tag() {
+        const CROWN: &str = "MB_MSQ2_DefeatGawain_Crown";
+        const CROWN_TAG: &str = "IO_MB_MSQ2_DefeatGawain_Crown";
+        const REGION_POINT_FACET: u64 = 0x5555_0000_0000_0001;
+        let tags = InteractTags::build(
+            &HashMap::new(),
+            [(
+                SETTLEMENT_GUID,
+                None,
+                ["SettlementStorage".to_owned()].as_slice(),
+            )],
+            [],
+        )
+        .with_gatherables([(lowercase_crc32(CROWN), CROWN_TAG.to_owned())]);
+        let crown = Some(lowercase_crc32(CROWN));
+        assert_eq!(tags.of_interaction(REGION_POINT_FACET, crown), [CROWN_TAG]);
+        assert!(tags.of_interaction(REGION_POINT_FACET, None).is_empty());
+        assert_eq!(
+            tags.of_interaction(SETTLEMENT_FACET, crown),
+            ["SettlementStorage"],
+            "an object's own tags come first"
+        );
     }
 }

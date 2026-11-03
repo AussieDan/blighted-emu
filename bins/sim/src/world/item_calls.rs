@@ -487,7 +487,7 @@ impl SimWorld {
         self.change_vitals(entity, &instant);
         // Every effect it adds goes in the player's status effects (4236): attributes,
         // absorption, food and potion buffs, immunities ([`super::status_effects`]).
-        self.add_consumable_effects(entity, consumable);
+        self.add_consumable_effects(entity, consumable, now_ms);
         let scripts: Vec<ServerMessage> = consumable
             .effects
             .iter()

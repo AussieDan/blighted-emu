@@ -19,7 +19,7 @@ use nw_content::gathering::{
     ToolEfficiencies,
 };
 use nw_content::instances::InstanceCatalog;
-use nw_content::interact_tags::{InteractTags, variant_tags};
+use nw_content::interact_tags::{InteractTags, gatherable_tags, variant_tags};
 use nw_content::item_repair::GearScoreUpgrades;
 use nw_content::item_rolls::ItemRolls;
 use nw_content::item_rules::ItemRules;
@@ -922,7 +922,8 @@ fn zone_plots(level: &WorldFile) -> Vec<([f32; 3], [u8; MISSION_BOARD_ID_LEN])> 
 }
 
 /// The interact tags of `level`'s capitals and spawned slices: their slices' tags and their
-/// gatherable variants' `InteractTag` (`tables`).
+/// gatherable variants' `InteractTag` (`tables`), and those of each gatherable's variants for the
+/// gathers of region points.
 fn level_interact_tags(tables: &Tables, level: &WorldFile) -> InteractTags {
     let mut capital_tags = HashMap::new();
     let mut spawned_tags = HashMap::new();
@@ -956,6 +957,7 @@ fn level_interact_tags(tables: &Tables, level: &WorldFile) -> InteractTags {
             )
         }),
     )
+    .with_gatherables(gatherable_tags(tables))
 }
 
 /// The largest difference on each axis between a quest object's point and the capital on it, m

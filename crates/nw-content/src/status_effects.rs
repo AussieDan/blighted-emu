@@ -178,6 +178,9 @@ pub struct StatusEffectRule {
     pub on_death: Vec<u32>,
     /// `InitialStackSize`: the stacks of its first application, when more than one.
     pub initial_stacks: Option<u8>,
+    /// `GameEventID`: the game event its application fires (the mount foods'
+    /// `Mount_GrantRidingXP_*`: riding experience, and the quest step `9401_TutorialFood`).
+    pub game_event: Option<String>,
 }
 
 /// What a status effect keeps its holder from doing (the flag columns of `StatusEffectData`).
@@ -343,6 +346,8 @@ pub struct EffectSourceRow {
     pub on_death: Option<String>,
     /// `InitialStackSize`.
     pub initial_stacks: Option<i64>,
+    /// `GameEventID`.
+    pub game_event: Option<String>,
 }
 
 impl EffectSourceRow {
@@ -495,6 +500,7 @@ impl EffectSourceRow {
             remove_on_deaths_door: set(row.remove_on_deaths_door),
             on_death: row.on_death_status_effect.clone(),
             initial_stacks: row.initial_stack_size,
+            game_event: row.game_event_id.clone().filter(|event| !event.is_empty()),
         }
     }
 }
@@ -737,6 +743,7 @@ fn rule(
             .initial_stacks
             .and_then(|stacks| u8::try_from(stacks).ok())
             .filter(|stacks| *stacks > 1),
+        game_event: row.game_event.clone(),
     }
 }
 
@@ -856,6 +863,7 @@ mod tests {
             remove_on_deaths_door: true,
             on_death: Some("AI_Bleed_9".to_owned()),
             initial_stacks: Some(5),
+            game_event: Some("Mount_GrantRidingXP_Small".to_owned()),
             ..EffectSourceRow::default()
         });
         let rules = StatusEffectRules::build(source);
@@ -873,6 +881,10 @@ mod tests {
         assert!(rule.remove_on_deaths_door);
         assert_eq!(rule.on_death, vec![lowercase_crc32("ai_bleed_9")]);
         assert_eq!(rule.initial_stacks, Some(5));
+        assert_eq!(
+            rule.game_event.as_deref(),
+            Some("Mount_GrantRidingXP_Small")
+        );
         let bleed = rules.by_id("AI_Bleed_9").expect("bleed");
         assert!(!bleed.control.any() && bleed.initial_stacks.is_none());
     }

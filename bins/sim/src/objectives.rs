@@ -19,6 +19,10 @@ use nw_content::Tables;
 use nw_formats::objectstream::lowercase_crc32;
 use nw_sim_core::Position;
 
+use crate::player_content::requirement_met;
+
+/// The separator of the `POITag`s of one `TaskGoToPOITag` cell.
+const POI_TAG_SEPARATOR: char = ',';
 /// How near a player must come to a trigger area's `OverrideLocation` when [`TRIGGER_VOLUMES`]
 /// holds no volume of its `TP_TargetTag` (Unknown: the open-world quest volumes, such as the
 /// beach's `TriggerVol_12_Spawn_A`, were not found in the region capitals, the beach region's
@@ -415,7 +419,9 @@ enum TaskKind {
     /// locks it when the task is removed (progress begins completed, nothing progresses this
     /// task)").
     TemporaryUnlock(String),
-    /// Done when the player has the achievement.
+    /// Done when the player's achievements meet the `ItemName` expression: one name, or names
+    /// joined by `&&` and `||` with `!` (90 retail tasks, `95_s01_05_CROW_CanonAndCoin`,
+    /// `Objective_Artifact_*`; [`crate::player_content::requirement_met`]).
     HasAchievement(String),
     /// Removes `TargetQty` of an item from the player and is done (all 104 `TaskRemoveItem`
     /// rows of build 25810808 carry a `TargetQty` of 1 to 7; the four
@@ -495,8 +501,10 @@ enum TaskKind {
     /// client's 5397 for `12_demonstorm_02_TalkTo_Grace` named `0308314e`, the CRC-32 of its tag
     /// `01_Grace_Goodbye_MB` (login-world-entry-01).
     ConversationTopic(u32),
-    /// Done while the player is in a point of interest of this `POITag` (`TaskGoToPOITag`).
-    GoToPoi(String),
+    /// Done while the player is in a point of interest of one of these `POITag`s
+    /// (`TaskGoToPOITag`; the cell can list several, `,`-separated: `95A_S02_VoicesoftheDesert`
+    /// names six crow's nests).
+    GoToPoi(Vec<String>),
     /// Done while the player is out of every point of interest of this `POITag`
     /// (`TaskExitPOITag`).
     ExitPoi(String),
@@ -1091,7 +1099,13 @@ fn kind_of(row: &TaskRow) -> TaskKind {
             filled(&row.poi_tag),
             row.override_location.as_deref().and_then(location_of),
         ) {
-            (Some(poi), _) => TaskKind::GoToPoi(poi),
+            (Some(poi), _) => TaskKind::GoToPoi(
+                poi.split(POI_TAG_SEPARATOR)
+                    .map(str::trim)
+                    .filter(|tag| !tag.is_empty())
+                    .map(str::to_owned)
+                    .collect(),
+            ),
             (None, Some(location)) => TaskKind::TriggerArea {
                 area: Some(TriggerArea::Around(location)),
                 leave: false,
@@ -1968,7 +1982,7 @@ impl ObjectiveRun {
                     .held
                     .iter()
                     .any(|(id, _, worn)| *worn && id.eq_ignore_ascii_case(item)),
-                TaskKind::GoToPoi(tag) => inside(tag) == Some(true),
+                TaskKind::GoToPoi(tags) => tags.iter().any(|tag| inside(tag) == Some(true)),
                 TaskKind::GoToTerritory { territory, poi } => {
                     facts
                         .territories
@@ -1981,9 +1995,9 @@ impl ObjectiveRun {
                     ..
                 } => inside(tag) == Some(!*leave),
                 TaskKind::ExitPoi(tag) => inside(tag) == Some(false),
-                TaskKind::HasAchievement(achievement) => {
-                    facts.achieved.is_some_and(|achieved| achieved(achievement))
-                }
+                TaskKind::HasAchievement(expression) => facts
+                    .achieved
+                    .is_some_and(|achieved| requirement_met(expression, achieved)),
                 TaskKind::OwnHouses(count) => facts.houses.is_some_and(|houses| houses >= *count),
                 TaskKind::HaveLevel {
                     progression,
@@ -2591,6 +2605,67 @@ pub(crate) mod tests {
         assert!(!run.is_done("Enter"), "another game mode");
         run.event(Event::GameModeEntered("dungeonamrine"), 0);
         assert!(run.finished(), "entering its game mode ends it");
+    }
+
+    #[test]
+    fn an_achievement_task_reads_its_expression() {
+        /// The retail form of `95_s01_05_CROW_CanonAndCoin` (build 25810808): either of two.
+        const EITHER: &str = "95_CROW_Cannon || 95_CROW_Coin";
+        let rows = vec![
+            container("Root", "ConsecutiveTaskContainer", &["Either"]),
+            with_item("Either", "TaskAchievement", EITHER),
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        let synced = |achieved: &dyn Fn(&str) -> bool| {
+            let (mut run, _) = ObjectiveRun::start(Arc::clone(&tree), 0);
+            run.sync(
+                &Facts {
+                    held: &[],
+                    places: None,
+                    achieved: Some(achieved),
+                    level: None,
+                    territories: None,
+                    of_family: None,
+                    houses: None,
+                },
+                0,
+            );
+            run.is_done("Either")
+        };
+        assert!(!synced(&|_| false), "neither");
+        assert!(synced(&|id| id == "95_CROW_Coin"), "the second one");
+    }
+
+    #[test]
+    fn a_poi_task_with_a_tag_list_is_done_in_any_of_them() {
+        /// Retail `95A_S02_VoicesoftheDesert` (build 25810808), the first two of its six.
+        const NESTS: &str = "CrowsNest_50426,CrowsNest_30334";
+        let rows = vec![
+            container("Root", "ConsecutiveTaskContainer", &["Nest"]),
+            TaskRow {
+                poi_tag: Some(NESTS.to_owned()),
+                ..container("Nest", "TaskGoToPOITag", &[])
+            },
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        let synced = |places: &[&str]| {
+            let (mut run, _) = ObjectiveRun::start(Arc::clone(&tree), 0);
+            run.sync(
+                &Facts {
+                    held: &[],
+                    places: Some(places),
+                    achieved: None,
+                    level: None,
+                    territories: None,
+                    of_family: None,
+                    houses: None,
+                },
+                0,
+            );
+            run.is_done("Nest")
+        };
+        assert!(!synced(&["CrowsNest_99999"]), "another nest");
+        assert!(synced(&["crowsnest_30334"]), "the second of the list");
     }
 
     #[test]

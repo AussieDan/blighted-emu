@@ -289,7 +289,7 @@ impl SimWorld {
 }
 
 /// One firing.
-const ONE_FIRING: u32 = 1;
+pub(super) const ONE_FIRING: u32 = 1;
 
 /// The masteries a player arrives with: `saved` (id to total experience), or for a character
 /// that has none yet (a new one) the ranks its archetype pick `backstory` starts with
@@ -490,5 +490,70 @@ mod tests {
         let player = world.world.get::<Player>(entity).expect("player");
         assert_eq!(player.masteries.experience(&riding), 500);
         assert!(player.flow.has_achievement(&world.achievement_rules, MARK));
+    }
+
+    #[test]
+    fn a_faction_rank_task_reads_the_faction_s_progression() {
+        use crate::objectives::{TaskBook, TaskRow};
+        use crate::player_content::{ObjectiveRow, QuestBook};
+        // Content bundle 25810808: `9804_M_0001_d_02_Reach_MarauderRank_1` checks 3,000 points
+        // of the categorical progression `Marauder`.
+        const MARAUDER: &str = "Marauder";
+        const RANK_POINTS: i64 = 3_000;
+        const MISSION_EVENT: &str = "Test_Marauder_Mission";
+        let task = |id: &str, kind: &str, children: &[&str]| TaskRow {
+            task_id: id.to_owned(),
+            kind: kind.to_owned(),
+            sub_tasks: children.iter().map(|child| (*child).to_owned()).collect(),
+            ..TaskRow::default()
+        };
+        let mut world = world_with_spawns(Vec::new());
+        world.content = Arc::new(PlayerContent {
+            progression: Progression::default().with_progressions([ProgressionSource {
+                id: MARAUDER.to_owned(),
+                max_level: 10,
+                auto_rank_up: true,
+                ranks: vec![(0, 3_000), (1, 6_000)],
+            }]),
+            event_grants: EventGrants::build([(
+                MISSION_EVENT.to_owned(),
+                EventGrant {
+                    progression: Some((MARAUDER.to_owned(), 3_000.0)),
+                    ..EventGrant::default()
+                },
+            )]),
+            quests: QuestBook::build(
+                [ObjectiveRow {
+                    id: "q_rank".to_owned(),
+                    root: "t_root".to_owned(),
+                    ..ObjectiveRow::default()
+                }],
+                TaskBook::new(vec![
+                    task("t_root", "ConsecutiveTaskContainer", &["t_rank", "t_after"]),
+                    TaskRow {
+                        kill_enemy_type: Some("Test_Never".to_owned()),
+                        target_qty: Some(1),
+                        ..task("t_after", "TaskGameEvent", &[])
+                    },
+                    TaskRow {
+                        item_name: Some(MARAUDER.to_owned()),
+                        target_qty: Some(RANK_POINTS),
+                        should_check_points: true,
+                        ..task("t_rank", "TaskHaveLevel", &[])
+                    },
+                ]),
+            ),
+            ..PlayerContent::default()
+        });
+        world
+            .admit(&admit_at(PLAYER, 0.0, true), NOW, SERVER_TIME)
+            .expect("admit");
+        world.start_quest(PLAYER, "q_rank", NOW).expect("start");
+        let rank_done = |world: &SimWorld| world.quests_of_player(PLAYER)[0].run.is_done("t_rank");
+        world.tick(NOW, SERVER_TIME).expect("tick");
+        assert!(!rank_done(&world), "no points yet");
+        world.grant_event_progression(PLAYER, MISSION_EVENT, NOW);
+        world.tick(NOW + 50, SERVER_TIME + 50).expect("tick");
+        assert!(rank_done(&world), "3,000 Marauder points");
     }
 }

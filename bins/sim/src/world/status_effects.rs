@@ -15,6 +15,8 @@
 //! it has no base, and it reads one at any time; the retail writer sends one when the delta
 //! would be empty or too long).
 
+use std::sync::Arc;
+
 use bevy_ecs::entity::Entity;
 use nw_bus::{EffectRepeat, PlayerStatusEffect};
 use nw_content::item_rules::Consumable;
@@ -29,8 +31,10 @@ use nw_sim_core::EquipLoad;
 
 use super::attack::Vitals;
 use super::gear::{server_ms_of, unix_ns};
+use super::tradeskill::ONE_FIRING;
 use super::{EQUIP_LOAD_SLOTS, Player, SimWorld, send_now};
 use crate::combat::AttackOutcome;
+use crate::objectives::Event;
 
 /// The effect of a hurt player out of combat (`BaseDuration` 180, `Health` 40 a second; retail
 /// removed it at the first hit taken). It starts out of combat below the max health (retail
@@ -903,14 +907,23 @@ fn equip_load_effects(rules: &StatusEffectRules, load: EquipLoad) -> Vec<u32> {
 }
 
 impl SimWorld {
-    /// Player `entity` used `consumable` at server time `now_ms`: it holds the effects the
-    /// consumable adds, of its potency and duration override.
-    pub(super) fn add_consumable_effects(&mut self, entity: Entity, consumable: &Consumable) {
-        let now_ms = self.server_ms;
-        let rules = &self.content.status_effects;
+    /// Player `entity` used `consumable` at `now_ms` (sim ms): it holds the effects the
+    /// consumable adds, of its potency and duration override, from the server time now. Each
+    /// added effect with a game event fires it: its grant (a mount food's riding experience) and
+    /// the quest steps that count it (`9401_TutorialFood`).
+    pub(super) fn add_consumable_effects(
+        &mut self,
+        entity: Entity,
+        consumable: &Consumable,
+        now_ms: u64,
+    ) {
+        let server_ms = self.server_ms;
+        let content = Arc::clone(&self.content);
+        let rules = &content.status_effects;
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
         };
+        let mut fired = Vec::new();
         let application = Application {
             source: player.number,
             origin: Origin::Consumable,
@@ -920,9 +933,12 @@ impl SimWorld {
         };
         let number = player.number;
         for crc in &consumable.status_effects {
-            let added = player.status_effects.add(rules, *crc, application, now_ms);
+            let added = player
+                .status_effects
+                .add(rules, *crc, application, server_ms);
             if let Some(rule) = rules.get(*crc).filter(|_| added) {
                 player.status_effects.keep(rule, &consumable.id);
+                fired.extend(rule.game_event.as_deref());
             }
             let ends_ms = player.status_effects.ends_ms(*crc);
             tracing::debug!(
@@ -930,10 +946,14 @@ impl SimWorld {
                 consumable = %consumable.id,
                 effect = rules.get(*crc).map_or("", |rule| rule.id.as_str()),
                 added,
-                now_ms,
+                server_ms,
                 ?ends_ms,
                 "consumable effect"
             );
+        }
+        for event in fired {
+            self.grant_event(number, event, ONE_FIRING, now_ms);
+            self.quest_event(number, Event::GameEvent(event), now_ms);
         }
     }
 
