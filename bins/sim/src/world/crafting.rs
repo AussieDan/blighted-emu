@@ -850,7 +850,7 @@ impl SimWorld {
             }
             if let Some(event) = &craft.event {
                 let scale = EventScale::craft(craft.ingredients);
-                self.grant_scaled_event(craft.number, event, craft.crafts, scale);
+                self.grant_scaled_event(craft.number, event, craft.crafts, scale, now_ms);
             }
             self.quest_event(craft.number, Event::Crafted(&craft.recipe), now_ms);
             let families = super::item_families(&self.content, &craft.item);
@@ -1169,6 +1169,7 @@ mod tests {
                     progression: Some(("Smelting".to_owned(), SMELTING_REWARD)),
                     coins: (0, 0),
                     territory_standing: 0.0,
+                    achievement: None,
                 },
             )]),
             ..PlayerContent::default()

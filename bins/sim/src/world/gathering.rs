@@ -576,7 +576,7 @@ impl SimWorld {
         self.wear_tool(entity, &gather.gatherable);
         if let Some(event) = &gather.gatherable.game_event {
             let scale = self.gather_scale(gather);
-            self.grant_scaled_event(gather.number, event, ONE_GATHER, scale);
+            self.grant_scaled_event(gather.number, event, ONE_GATHER, scale, now_ms);
             self.quest_event(gather.number, Event::GameEvent(event), now_ms);
         }
         if let Some(tradeskill) = &gather.gatherable.tradeskill {
@@ -1146,6 +1146,7 @@ mod tests {
                     progression: Some(("Mining".to_owned(), MINING_REWARD)),
                     coins: (0, 0),
                     territory_standing: 0.0,
+                    achievement: None,
                 },
             )]),
             ..PlayerContent::default()

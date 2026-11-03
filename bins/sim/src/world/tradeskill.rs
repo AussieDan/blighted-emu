@@ -118,20 +118,22 @@ pub(super) fn event_gain(per_firing: f64, times: u32, multiplier: f64) -> u32 {
 impl SimWorld {
     /// Player `number` fires game event `event` `times` times by salvaging or fishing: as
     /// [`Self::grant_scaled_event`] with each firing counted once.
-    pub(super) fn grant_event(&mut self, number: u64, event: &str, times: u32) {
-        self.grant_scaled_event(number, event, times, EventScale::PLAIN);
+    pub(super) fn grant_event(&mut self, number: u64, event: &str, times: u32, now_ms: u64) {
+        self.grant_scaled_event(number, event, times, EventScale::PLAIN, now_ms);
     }
 
     /// Player `number` fires game event `event` `times` times, each scaled by `scale`: the
     /// categorical progression it names gains its experience, the territory the player is in
-    /// its standing, and its coins (each firing rolled) go to the wallet. An event without a
-    /// grant, or a progression the content does not know, gives nothing of it (logged).
+    /// its standing, its coins (each firing rolled) go to the wallet, and the player earns its
+    /// achievement. An event without a grant, or a progression the content does not know, gives
+    /// nothing of it (logged).
     pub(super) fn grant_scaled_event(
         &mut self,
         number: u64,
         event: &str,
         times: u32,
         scale: EventScale,
+        now_ms: u64,
     ) {
         let content = Arc::clone(&self.content);
         let Some(event_grant) = content.event_grants.get(event) else {
@@ -166,6 +168,9 @@ impl SimWorld {
             };
             grant(&mut player, &reward, &content.gameplay);
         }
+        if let Some(achievement) = &event_grant.achievement {
+            self.earn_achievement(number, achievement, now_ms);
+        }
     }
 
     /// Player `number` gets the territory standing of game event `event` once (a quest's turn-in
@@ -182,6 +187,23 @@ impl SimWorld {
         };
         if let Some(territory) = self.current_territory(number) {
             self.gain_categorical(number, event, &territory, standing, ONE_FIRING);
+        }
+    }
+
+    /// Player `number` gets the categorical progression and the achievement of game event
+    /// `event` once: the part of a quest's success event that its reward does not hold (Observed,
+    /// content bundle 25810808: `9401_BefriendHorse_Success`, the mount quest's success event,
+    /// gives `Riding` 500).
+    pub(super) fn grant_event_progression(&mut self, number: u64, event: &str, now_ms: u64) {
+        let content = Arc::clone(&self.content);
+        let Some(event_grant) = content.event_grants.get(event) else {
+            return;
+        };
+        if let Some((id, reward)) = &event_grant.progression {
+            self.gain_categorical(number, event, id, *reward, ONE_FIRING);
+        }
+        if let Some(achievement) = &event_grant.achievement {
+            self.earn_achievement(number, achievement, now_ms);
         }
     }
 
@@ -389,6 +411,7 @@ mod tests {
                     progression: None,
                     coins: (0, 0),
                     territory_standing: 1.0,
+                    achievement: None,
                 },
             )]),
             ..PlayerContent::default()
@@ -411,14 +434,61 @@ mod tests {
                 .get::<Player>(entity)
                 .map(|player| player.masteries.experience(&mastery))
         };
-        world.grant_scaled_event(PLAYER, RATION_EVENT, 2, EventScale::craft(1));
+        world.grant_scaled_event(PLAYER, RATION_EVENT, 2, EventScale::craft(1), NOW);
         assert_eq!(standing(&world), Some(0), "outside every territory");
         world.territory_changed(entity, WINDSWARD, true);
         world.territory_changed(entity, POI, true);
         // Retail newchar: two Light Rations (one pork each) gave territory 6 standing 6.
-        world.grant_scaled_event(PLAYER, RATION_EVENT, 2, EventScale::craft(1));
+        world.grant_scaled_event(PLAYER, RATION_EVENT, 2, EventScale::craft(1), NOW);
         assert_eq!(standing(&world), Some(6));
         world.grant_event_standing(PLAYER, RATION_EVENT);
         assert_eq!(standing(&world), Some(9));
+    }
+
+    #[test]
+    fn a_quest_s_success_event_gives_its_progression_and_achievement() {
+        // Content bundle 25810808: `9401_BefriendHorse_Success`, the mount quest's success
+        // event, gives `Riding` 500; its reward holds no progression.
+        const SUCCESS_EVENT: &str = "9401_BefriendHorse_Success";
+        const RIDING: &str = "Riding";
+        const RIDING_REWARD: f64 = 500.0;
+        const MARK: &str = "Test_Event_Achievement";
+        const MARK_BIT: u32 = 77;
+        let mut world = world_with_spawns(Vec::new());
+        let indexes =
+            nw_content::achievements::AchievementIndexes::build([(MARK.to_owned(), MARK_BIT)]);
+        world.achievement_rules = crate::world::level_flow::AchievementRules::of(&indexes, &[]);
+        world.content = Arc::new(PlayerContent {
+            progression: Progression::default().with_progressions([ProgressionSource {
+                id: RIDING.to_owned(),
+                max_level: 200,
+                auto_rank_up: true,
+                ranks: vec![(0, 1_000), (1, 2_000)],
+            }]),
+            event_grants: EventGrants::build([(
+                SUCCESS_EVENT.to_owned(),
+                EventGrant {
+                    progression: Some((RIDING.to_owned(), RIDING_REWARD)),
+                    achievement: Some(MARK.to_owned()),
+                    ..EventGrant::default()
+                },
+            )]),
+            achievements: indexes,
+            ..PlayerContent::default()
+        });
+        world
+            .admit(&admit_at(PLAYER, 0.0, true), NOW, SERVER_TIME)
+            .expect("admit");
+        let entity = world.player_by_number(PLAYER).expect("player");
+        world.grant_event_progression(PLAYER, SUCCESS_EVENT, NOW);
+        let riding = world
+            .content
+            .progression
+            .categorical(RIDING)
+            .expect("riding")
+            .clone();
+        let player = world.world.get::<Player>(entity).expect("player");
+        assert_eq!(player.masteries.experience(&riding), 500);
+        assert!(player.flow.has_achievement(&world.achievement_rules, MARK));
     }
 }

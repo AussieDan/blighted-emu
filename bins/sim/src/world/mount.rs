@@ -49,6 +49,9 @@ const SUMMON_AUTHORIZATION_MS: u64 = 8_000;
 /// The dash starts only with this much mount stamina (`playeractions_mount.actionlist`
 /// `MountDash`: `IfMountStamina GreaterThanOrEqual 15`).
 const DASH_MIN_STAMINA: f32 = 15.0;
+/// The regen delay of a jump on a mount (`playeractions_mount.actionlist` `MountJump`:
+/// `PayMountStaminaCost Cost=0 RegenDelay=1`).
+const JUMP_REGEN_DELAY_S: f32 = 1.0;
 /// The 5752 byte of a refusal at the summon key and of a player's own cancel, and of a cancel of
 /// a running summon by the server (summon survey of 2026-10-31, 398 retail 5752: 0 in all 213
 /// refusals at the key and 103 player cancels; 1 in all 47 server cancels: `Combat` 13,
@@ -139,6 +142,8 @@ pub(super) struct PlayerMount {
     auto_dash: bool,
     /// The dash key in the newest record.
     dash_held: bool,
+    /// The jump key in the newest record.
+    jump_held: bool,
     dashing: bool,
     /// The body moved in the last tick.
     moving: bool,
@@ -194,6 +199,7 @@ impl PlayerMount {
             dash_toggle: false,
             auto_dash: false,
             dash_held: false,
+            jump_held: false,
             dashing: false,
             moving: false,
             slow_walk: false,
@@ -374,9 +380,10 @@ impl PlayerMount {
         self.authorize(SummonAuthorization::default());
     }
 
-    /// Reads the dash key of `record` when it is newer than the records read before: a press
-    /// toggles the dash in toggle mode, else the key holds it. Gives the phase the record finds;
-    /// `None` for a record read before.
+    /// Reads the dash and jump keys of `record` when it is newer than the records read before: a
+    /// dash press toggles the dash in toggle mode, else the key holds it; a jump press on the
+    /// mount sets the jump's regen delay. Gives the phase the record finds; `None` for a record
+    /// read before.
     fn read_keys(&mut self, record: &InputRecord) -> Option<Phase> {
         let counter = record.u16_after_mask;
         if self
@@ -391,6 +398,12 @@ impl PlayerMount {
             self.auto_dash = !self.auto_dash;
         }
         self.dash_held = held;
+        let jumping = record.move_keys().jump;
+        if jumping && !self.jump_held && self.riding().is_some() {
+            self.regen_delay_s = self.regen_delay_s.max(JUMP_REGEN_DELAY_S);
+            self.change.regen_delay = Some(self.regen_delay_s);
+        }
+        self.jump_held = jumping;
         Some(self.phase)
     }
 
@@ -1455,6 +1468,8 @@ mod tests {
     const SUMMON_KEY: u64 = 1 << 26;
     /// Input 67, the dodge key (value 1): the mount's dash.
     const DASH_KEY: u64 = 1 << 3;
+    /// Input 41, the jump key (value 1).
+    const JUMP_KEY: u64 = 1 << 9;
 
     fn record(counter: u16, values: Vec<u64>) -> InputRecord {
         InputRecord {
@@ -1466,6 +1481,25 @@ mod tests {
             },
             ..InputRecord::default()
         }
+    }
+
+    #[test]
+    fn a_jump_on_the_mount_sets_the_regen_delay_once_per_press() {
+        let mut mount = rider();
+        mount.regen_delay_s = 0.0;
+        mount.read_keys(&record(1, vec![0, JUMP_KEY]));
+        assert_eq!(mount.regen_delay_s, JUMP_REGEN_DELAY_S);
+        assert_eq!(mount.change.regen_delay, Some(JUMP_REGEN_DELAY_S));
+        mount.tick(0.5, true);
+        let waited = mount.regen_delay_s;
+        mount.read_keys(&record(2, vec![0, JUMP_KEY]));
+        assert_eq!(mount.regen_delay_s, waited, "a held key is one jump");
+        mount.read_keys(&record(3, vec![0, 0]));
+        mount.read_keys(&record(4, vec![0, JUMP_KEY]));
+        assert_eq!(mount.regen_delay_s, JUMP_REGEN_DELAY_S, "a new press");
+        let mut walker = PlayerMount::of(&PlayerMounts::default(), 0, 0);
+        walker.read_keys(&record(1, vec![0, JUMP_KEY]));
+        assert_eq!(walker.regen_delay_s, 0.0, "only a rider");
     }
 
     #[test]
@@ -1542,6 +1576,12 @@ mod tests {
         }
 
         fn world_with(achievements: Vec<u32>) -> SimWorld {
+            world_admitted(achievements, false)
+        }
+
+        /// The sim of [`world_with`], with a player admitted at a login (`login`): a login's
+        /// level flow holds the achievement bits, so achievements set later reach it.
+        fn world_admitted(achievements: Vec<u32>, login: bool) -> SimWorld {
             let mounts = MountRules::build(
                 [MountRule {
                     id: HORSE.to_owned(),
@@ -1578,7 +1618,7 @@ mod tests {
                 achievements: indexes,
                 ..PlayerContent::default()
             });
-            let mut admit = admit_at(PLAYER, 0.0, false);
+            let mut admit = admit_at(PLAYER, 0.0, login);
             admit.progression.achievements = achievements;
             world.admit(&admit, NOW, SERVER_TIME).expect("admit");
             world
@@ -1702,6 +1742,48 @@ mod tests {
             );
             let again = press(&mut world, 4, off_ms + COOLDOWN_MS + TICK_MS);
             assert!(matches!(again[..], [MountServerMsg::SummonPending { .. }]));
+        }
+
+        #[test]
+        fn the_mount_quest_s_reward_box_gives_the_horse_it_summons() {
+            // Content bundle 25810808: salvaging `MountItem_MountReward_Box_1` fires
+            // `Reward_MountReward_Box_1`, whose `AchievementId` owns the horse. Retail (mount
+            // quest capture, 283.210 s): the box opened (1733), then the first summon (5747).
+            const BOX_EVENT: &str = "Reward_MountReward_Box_1";
+            let mut world = world_admitted(vec![UNLOCK_BIT], true);
+            let mut content = (*world.content).clone();
+            content.event_grants = nw_content::rewards::EventGrants::build([(
+                BOX_EVENT.to_owned(),
+                nw_content::rewards::EventGrant {
+                    achievement: Some(HORSE_GIFT.to_owned()),
+                    ..nw_content::rewards::EventGrant::default()
+                },
+            )]);
+            world.content = Arc::new(content);
+            ticked(&mut world, NOW);
+            ticked(&mut world, NOW + TICK_MS);
+            let before = press(&mut world, 1, NOW + 2 * TICK_MS);
+            assert!(
+                before.iter().any(|message| matches!(
+                    message,
+                    MountServerMsg::SummonCancelled {
+                        reason: SummonCancelReason::NoMountEquipped,
+                        ..
+                    }
+                )),
+                "no horse before the box: {before:?}"
+            );
+            let opened = NOW + 3 * TICK_MS;
+            world.grant_event(PLAYER, BOX_EVENT, 1, opened);
+            ticked(&mut world, opened);
+            let summoned = press(&mut world, 2, opened + TICK_MS);
+            assert!(
+                summoned
+                    .iter()
+                    .any(|message| matches!(message, MountServerMsg::SummonPending { .. })),
+                "{summoned:?}"
+            );
+            assert_eq!(mount_of(&mut world).selected, Some(lowercase_crc32(HORSE)));
         }
 
         #[test]

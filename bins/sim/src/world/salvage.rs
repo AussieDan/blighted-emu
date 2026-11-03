@@ -196,7 +196,7 @@ impl SimWorld {
         tracing::debug!(player = number, item = %item_id, quantity, ?items, "salvaged");
         self.give_loot_as(number, items, gained_reason, now_ms);
         if let Some(event) = &rule.event {
-            self.grant_event(number, event, quantity);
+            self.grant_event(number, event, quantity, now_ms);
         }
         if let Some(achievement) = &rule.achievement {
             self.earn_achievement(number, achievement, now_ms);
@@ -264,6 +264,7 @@ mod tests {
                     progression: None,
                     coins: (COINS, COINS),
                     territory_standing: 0.0,
+                    achievement: None,
                 },
             )]),
             ..PlayerContent::default()

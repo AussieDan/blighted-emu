@@ -107,6 +107,10 @@ pub struct EventGrant {
     /// 2026-09-18: two Light Ration crafts of `Craft_CookingT1`, standing 1, gave territory 6
     /// standing 6 under multiplier 3). 0 for an event without one.
     pub territory_standing: f64,
+    /// `AchievementId`: the achievement one firing earns (Observed, content bundle 25810808:
+    /// `Reward_MountReward_Box_1`, the salvage event of the mount quest's reward box, earns
+    /// `AwardAchievement_Mount_Horse_1`, the achievement that owns the horse `Mount_Horse_1`).
+    pub achievement: Option<String>,
 }
 
 impl EventGrant {
@@ -162,6 +166,10 @@ impl EventGrants {
                             progression,
                             coins: coin_range(row.currency_reward.as_deref()),
                             territory_standing: number_of(row.territory_standing.as_deref()),
+                            achievement: row
+                                .achievement_id
+                                .clone()
+                                .filter(|id| !id.trim().is_empty()),
                         },
                     )
                 }),
@@ -257,6 +265,7 @@ mod tests {
                     progression: Some(("Mining".to_owned(), 64.0)),
                     coins: (0, 0),
                     territory_standing: 0.0,
+                    achievement: None,
                 },
             ),
             (
@@ -265,6 +274,7 @@ mod tests {
                     progression: None,
                     coins: coin_range(Some("2000-5000")),
                     territory_standing: number_of(Some("1")),
+                    achievement: None,
                 },
             ),
         ]);

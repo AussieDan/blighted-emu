@@ -1304,7 +1304,7 @@ impl SimWorld {
     fn fishing_event(&mut self, number: u64, event: &str, now_ms: u64) {
         let content = Arc::clone(&self.content);
         if event.eq_ignore_ascii_case(FISHING_DATA.hook_event) {
-            self.grant_event(number, event, ONCE);
+            self.grant_event(number, event, ONCE, now_ms);
         }
         if let Some(reward) = content.rewards.get(event) {
             if let Some(mut player) = self

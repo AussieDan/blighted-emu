@@ -4132,6 +4132,89 @@ pub(crate) mod tests {
 
     #[test]
     #[ignore = "needs the build 25810808 content bundle in NW_CONTENT_DIR"]
+    fn the_real_mount_quest_runs_to_its_end() {
+        // `9401_BefriendHorse` ("My Kingdom for a Horse", Jochi Khan in Everfall): the cave
+        // trigger, the torch, the mural and its whisper, the azoth oats, then the talk with the
+        // horse (`javelindata_c94_objectivetasks`).
+        const BUILD: &str = "25810808";
+        const ROOT: &str = "9401_Befriend_Container";
+        const STEP_MS: usize = 30_000;
+        /// The `9401_Goto_Cave` trigger's place.
+        const CAVE: Position = Position {
+            x: 9103.09,
+            y: 5147.67,
+            z: 144.10,
+        };
+        let dir = std::env::var("NW_CONTENT_DIR").expect("NW_CONTENT_DIR");
+        let path = nw_content::bundle::bundle_path(std::path::Path::new(&dir), BUILD);
+        let bundle = nw_content::ContentBundle::load(&path, BUILD).expect("bundle");
+        let book = TaskBook::new(task_rows(&bundle.tables));
+        let tree = Arc::new(book.tree(ROOT).expect("the mount quest"));
+        let (mut run, mut effects) = ObjectiveRun::start(tree, NOW);
+        let steps = [
+            Event::Moved(CAVE),
+            Event::GameEvent("94_BeastTorch_Interact"),
+            Event::GameEvent("94_BeastMural_Interact"),
+            Event::GameEvent("94_AzothOats_Interact"),
+            Event::TopicFinished(lowercase_crc32("9401_HorseTalk")),
+        ];
+        for (event, now) in steps.into_iter().zip((NOW..).step_by(STEP_MS)) {
+            effects.extend(run.tick(now));
+            effects.extend(run.event(event, now));
+        }
+        assert!(run.finished(), "{:?}", run.progress());
+        for wanted in [
+            Effect::Achievement("Vector_Mounts_PushQuest".to_owned()),
+            Effect::Achievement("9401_Befriend_Started".to_owned()),
+            Effect::GameEvent("94_BeastMural_Whisper".to_owned()),
+            Effect::Achievement("9401_HorseWalkAway".to_owned()),
+            Effect::LockAchievement("9401_HorseWalkAway".to_owned()),
+        ] {
+            assert!(effects.contains(&wanted), "{wanted:?} in {effects:?}");
+        }
+        // Its success event gives the reward box and Riding 500; salvaging the box fires the
+        // event whose achievement owns the horse.
+        const SUCCESS_EVENT: &str = "9401_BefriendHorse_Success";
+        const BOX: &str = "MountItem_MountReward_Box_1";
+        const BOX_EVENT: &str = "Reward_MountReward_Box_1";
+        const HORSE: &str = "Mount_Horse_1";
+        const HORSE_GIFT: &str = "AwardAchievement_Mount_Horse_1";
+        let rewards = nw_content::rewards::Rewards::from_tables(&bundle.tables);
+        assert_eq!(
+            rewards
+                .get(SUCCESS_EVENT)
+                .and_then(|reward| reward.item.clone()),
+            Some((BOX.to_owned(), 1))
+        );
+        let grants = nw_content::rewards::EventGrants::from_tables(&bundle.tables);
+        assert_eq!(
+            grants
+                .get(SUCCESS_EVENT)
+                .and_then(|grant| grant.progression.clone()),
+            Some(("Riding".to_owned(), 500.0))
+        );
+        let salvage = nw_content::salvage::Salvage::from_tables(&bundle.tables);
+        assert_eq!(
+            salvage.of(BOX).and_then(|rule| rule.event.as_deref()),
+            Some(BOX_EVENT)
+        );
+        assert_eq!(
+            grants
+                .get(BOX_EVENT)
+                .and_then(|grant| grant.achievement.as_deref()),
+            Some(HORSE_GIFT)
+        );
+        let mounts = nw_content::mounts::MountRules::from_tables(&bundle.tables);
+        assert_eq!(
+            mounts
+                .mount(lowercase_crc32(HORSE))
+                .and_then(|mount| mount.required_achievement.as_deref()),
+            Some(HORSE_GIFT)
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the build 25810808 content bundle in NW_CONTENT_DIR"]
     fn the_real_wreck_quests_run_to_their_end_on_the_retail_steps() {
         const BUILD: &str = "25810808";
         /// The corrupted mariners of the second wreck (17 of the 21 spawns within 60 m of the

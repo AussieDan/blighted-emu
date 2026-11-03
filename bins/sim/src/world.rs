@@ -2616,8 +2616,9 @@ impl SimWorld {
 
     /// Ends the finished quest `objective` of player `number`: it joins the done list, its
     /// achievement is set, the achievements of its temporary unlocks are cleared, its rewards go
-    /// to the player (the coins and experience of its success game event, and its items into the
-    /// bag), and the quests that track it hear of its end.
+    /// to the player (the coins and experience of its success game event, its items into the bag,
+    /// and the event's standing, categorical progression and achievement), and the quests that
+    /// track it hear of its end.
     fn complete_quest(&mut self, number: u64, objective: &str) {
         let Some(quests) = self.quests.get_mut(&number) else {
             return;
@@ -2675,6 +2676,7 @@ impl SimWorld {
         }
         if let Some(event) = quest.def.success_event.as_deref() {
             self.grant_event_standing(number, event);
+            self.grant_event_progression(number, event, self.last_now_ms);
         }
         let items: Vec<(String, u32)> = quest.def.reward.into_iter().chain(reward.item).collect();
         self.give_loot(number, items, self.last_now_ms);
