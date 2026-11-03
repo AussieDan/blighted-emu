@@ -276,8 +276,29 @@ impl LevelFlow {
             .map_or(0, |achievements| achievements.version)
     }
 
-    /// The flow of a player that a sim took without a level change: nothing is pending.
-    pub(super) const fn resumed(entity: u64, phasing_sequence: u8) -> Self {
+    /// The flow of a player that a sim took without a level change: nothing is pending. A
+    /// handoff's `carried` bits at `carried_version`, the newest state its client has, stay the
+    /// flow's bits, and later changes go on above that version; without a version (an admit
+    /// without a login) the flow holds no bits.
+    pub(super) fn resumed(
+        entity: u64,
+        phasing_sequence: u8,
+        carried: &[u32],
+        carried_version: u64,
+    ) -> Self {
+        let achievements = (carried_version > 0).then(|| {
+            let mut achievements = Achievements {
+                bits: vec![0; BITSET_BYTES],
+                version: carried_version,
+                changes: Vec::new(),
+            };
+            for bit in carried {
+                achievements.set(*bit);
+            }
+            // The client has these bits already.
+            achievements.changes.clear();
+            achievements
+        });
         Self {
             entity,
             level_info: None,
@@ -290,7 +311,7 @@ impl LevelFlow {
             cutscene: None,
             queued_cutscene: None,
             cinematic: None,
-            achievements: None,
+            achievements,
         }
     }
 
@@ -642,8 +663,40 @@ mod tests {
             "the full state holds them"
         );
         assert_eq!(flow.achievement_version(), CARRIED_VERSION + 1);
-        assert_eq!(LevelFlow::resumed(ENTITY, 0).achievement_bits(), None);
-        assert_eq!(LevelFlow::resumed(ENTITY, 0).achievement_version(), 0);
+        assert_eq!(
+            LevelFlow::resumed(ENTITY, 0, &[], 0).achievement_bits(),
+            None
+        );
+        assert_eq!(
+            LevelFlow::resumed(ENTITY, 0, &[], 0).achievement_version(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_handoff_keeps_the_bits_and_sets_new_ones_above_the_carried_version() {
+        // A player taken from the sim before keeps its achievements: a quest or a reward box
+        // that sets one after the handoff must reach the client as a change above the version
+        // the client has.
+        const CARRIED: [u32; 2] = [14_809, 15_317];
+        const CARRIED_VERSION: u64 = 25;
+        const NEW_BIT: u32 = 1_001;
+        let mut flow = LevelFlow::resumed(ENTITY, 0, &CARRIED, CARRIED_VERSION);
+        assert_eq!(flow.achievement_bits(), Some(CARRIED.to_vec()));
+        assert_eq!(flow.take_achievement_changes(), None, "the client has them");
+        flow.achievements
+            .as_mut()
+            .expect("the carried bits")
+            .set(NEW_BIT);
+        let Some(AchievementBits::Changes(changes)) =
+            flow.take_achievement_changes().and_then(|state| state.bits)
+        else {
+            panic!("a change");
+        };
+        assert_eq!(changes[0].version, CARRIED_VERSION + 1);
+        let mut expected = vec![CARRIED[0], CARRIED[1], NEW_BIT];
+        expected.sort_unstable();
+        assert_eq!(flow.achievement_bits(), Some(expected));
     }
 
     #[test]
@@ -772,7 +825,7 @@ mod tests {
             "not in the tutorial"
         );
         assert!(
-            LevelFlow::resumed(ENTITY, 0)
+            LevelFlow::resumed(ENTITY, 0, &[], 0)
                 .phasing_at(BEACH.0, BEACH.1)
                 .is_some(),
             "a player taken from another sim gets its cells"
@@ -876,7 +929,7 @@ mod tests {
         flow.ack_phasing(empty.sequence);
         assert!(flow.phasing_acknowledged());
         assert!(
-            LevelFlow::resumed(ENTITY, empty.sequence).phasing_acknowledged(),
+            LevelFlow::resumed(ENTITY, empty.sequence, &[], 0).phasing_acknowledged(),
             "a handoff has nothing pending"
         );
     }

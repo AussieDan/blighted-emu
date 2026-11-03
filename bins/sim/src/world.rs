@@ -1241,7 +1241,7 @@ impl SimWorld {
                 &admit.progression.achievements,
                 0,
             ),
-            None => LevelFlow::resumed(admit.entity, 0),
+            None => LevelFlow::resumed(admit.entity, 0, &admit.progression.achievements, 0),
         };
         let arrival = Arrival {
             connection: admit.connection.clone(),
@@ -1391,7 +1391,12 @@ impl SimWorld {
                 &offer.progression.achievements,
                 offer.achievement_version,
             ),
-            None => LevelFlow::resumed(offer.entity, offer.phasing_sequence),
+            None => LevelFlow::resumed(
+                offer.entity,
+                offer.phasing_sequence,
+                &offer.progression.achievements,
+                offer.achievement_version,
+            ),
         };
         let arrival = Arrival {
             connection: offer.connection.clone(),
