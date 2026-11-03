@@ -14,7 +14,12 @@
 //!   cooldown), the only toss of the held trees whose range holds the retail 8.7 m. The branch's
 //!   other choices (the officer's ocean shield, anchor dash and run attack) are left out: the
 //!   retail Janszoon showed none of them. The officer throws only at difficulty tier 2 or more;
-//!   Janszoon's slice sets tier 1 and he threw in retail, so that one condition is left out too.
+//!   Janszoon's slice sets tier 1 and he threw in retail, so that one condition is left out too;
+//! - with, first in the close range selector, the officer's close `SpellCDCheck` branch: the
+//!   anchor slam behind its `SpellCD` cooldown (10 to 14 s at his tier). A second retail fight
+//!   (the Linux main quest playthrough, part 1, 819480 ms) shows `Officer_AnchorSlam` right after
+//!   `Attack_Combo_GreatAxeman_3`. The branch's ocean shield is left out (no retail fight shows
+//!   it). Its place in the selector is Inferred.
 
 use nw_ai::classes::{Class, class_of};
 use nw_formats::objectstream::{Element, lowercase_crc32, parse_object_stream};
@@ -40,10 +45,21 @@ const TOSS_SELECTOR: &str = "FarSelector";
 const TIER_CHECK: &str = "MediumDifficultyCheck";
 /// The key of the tier condition.
 const TIER_KEY: &str = "Difficulty_Tier";
+/// The officer's close range branch that slams behind `SpellCD`.
+const SLAM_BRANCH: &str = "SpellCDCheck";
+/// The selector of [`SLAM_BRANCH`] that picks the shield or the slam.
+const SLAM_SELECTOR: &str = "SpellSelector";
+/// The slam's CAGE task.
+const SLAM_TASK: &str = "Officer_AnchorSlam_CAGE_Task";
+/// The great axeman's close range branch of its combat selector.
+const CLOSE_RANGE: &str = "CloseMeleeRange";
+/// The selector of [`CLOSE_RANGE`].
+const CLOSE_SELECTOR: &str = "CloseAttackSel";
 
 const NAME: &str = "Name";
 const ROOT: &str = "Root";
 const CHILDREN: &str = "Children";
+const CHILD: &str = "Child";
 const ENTRY_CONDITIONS: &str = "EntryConditions";
 const CONDITIONS: &str = "Conditions";
 const BASE_CLASS: &str = "BaseClass1";
@@ -98,32 +114,20 @@ fn janszoon_tree(entries: &[(String, Vec<u8>)]) -> Result<Element, StandInError>
     };
     let mut root = source(entries, GREAT_AXEMAN_TREE)?;
     let officer = source(entries, OFFICER_COMBAT_TREE)?;
-    let mut toss = find(&officer, &|element| {
-        class_of(&element.type_id) == Some(Class::NodePtr)
-            && element
-                .children
-                .first()
-                .is_some_and(|node| node_name(node) == Some(TOSS_BRANCH))
-    })
-    .cloned()
-    .ok_or_else(|| shape(TOSS_BRANCH))?;
-    let mut kept = 0;
-    for_each_mut(&mut toss, &mut |element| {
-        if node_name(element) != Some(TOSS_SELECTOR) {
-            return;
-        }
-        if let Some(list) = field_mut(element, CHILDREN) {
-            list.children.retain(|pointer| {
-                pointer
-                    .children
-                    .first()
-                    .is_some_and(|node| node_name(node) == Some(TIER_CHECK))
-            });
-            kept += list.children.len();
-        }
-    });
-    if kept != 1 {
+    let mut toss = branch(&officer, TOSS_BRANCH, None).ok_or_else(|| shape(TOSS_BRANCH))?;
+    if keep_one_choice(&mut toss, TOSS_SELECTOR, &|node| {
+        node_name(node) == Some(TIER_CHECK)
+    }) != 1
+    {
         return Err(shape(TOSS_SELECTOR));
+    }
+    let mut slam =
+        branch(&officer, SLAM_BRANCH, Some(SLAM_TASK)).ok_or_else(|| shape(SLAM_BRANCH))?;
+    if keep_one_choice(&mut slam, SLAM_SELECTOR, &|node| {
+        holds_text(node, SLAM_TASK)
+    }) != 1
+    {
+        return Err(shape(SLAM_SELECTOR));
     }
     let mut tier_conditions = 0;
     for_each_mut(&mut toss, &mut |element| {
@@ -144,6 +148,7 @@ fn janszoon_tree(entries: &[(String, Vec<u8>)]) -> Result<Element, StandInError>
         return Err(shape(TIER_KEY));
     }
     let mut grafts = 0;
+    let mut slams = 0;
     for_each_mut(&mut root, &mut |element| {
         let is_combat_tree = class_of(&element.type_id) == Some(Class::Tree)
             && field(element, NAME)
@@ -161,11 +166,56 @@ fn janszoon_tree(entries: &[(String, Vec<u8>)]) -> Result<Element, StandInError>
         };
         list.children.insert(0, toss.clone());
         grafts += 1;
+        let close_choices = list
+            .children
+            .iter_mut()
+            .filter_map(|pointer| pointer.children.first_mut())
+            .filter(|node| node_name(node) == Some(CLOSE_RANGE))
+            .filter_map(|node| field_mut(node, CHILD))
+            .filter_map(|pointer| pointer.children.first_mut())
+            .filter(|node| node_name(node) == Some(CLOSE_SELECTOR))
+            .filter_map(|selector| field_mut(selector, CHILDREN));
+        for choices in close_choices {
+            choices.children.insert(0, slam.clone());
+            slams += 1;
+        }
     });
     if grafts == 0 {
         return Err(shape(GREAT_AXEMAN_COMBAT));
     }
+    if slams != grafts {
+        return Err(shape(CLOSE_SELECTOR));
+    }
     Ok(root)
+}
+
+/// A copy of the first node pointer under `tree` whose node is named `name` and, with `task`,
+/// holds that CAGE task.
+fn branch(tree: &Element, name: &str, task: Option<&str>) -> Option<Element> {
+    find(tree, &|element| {
+        class_of(&element.type_id) == Some(Class::NodePtr)
+            && element.children.first().is_some_and(|node| {
+                node_name(node) == Some(name) && task.is_none_or(|task| holds_text(node, task))
+            })
+    })
+    .cloned()
+}
+
+/// Keeps, in every selector named `selector` under `branch`, only the choices whose node `keep`
+/// accepts; the number of choices kept.
+fn keep_one_choice(branch: &mut Element, selector: &str, keep: &dyn Fn(&Element) -> bool) -> usize {
+    let mut kept = 0;
+    for_each_mut(branch, &mut |element| {
+        if node_name(element) != Some(selector) {
+            return;
+        }
+        if let Some(list) = field_mut(element, CHILDREN) {
+            list.children
+                .retain(|pointer| pointer.children.first().is_some_and(keep));
+            kept += list.children.len();
+        }
+    });
+    kept
 }
 
 /// The parsed `Tree` root of the Server.pak tree `path`.
@@ -271,7 +321,7 @@ mod tests {
     }
 
     #[test]
-    fn janszoon_s_tree_is_the_great_axeman_s_with_the_officer_s_toss() {
+    fn janszoon_s_tree_is_the_great_axeman_s_with_the_officer_s_toss_and_slam() {
         const TOSS_TASK: &str = "Officer_AnchorToss_CAGE_Task";
         let entries = entries();
         let trees = stand_in_trees(&entries).expect("stand-in trees");
@@ -299,6 +349,21 @@ mod tests {
             field(selector, CHILDREN).expect("children").children.len(),
             1
         );
+        let close = find(root, &|element| {
+            node_name(element) == Some(CLOSE_SELECTOR)
+                && field(element, CHILDREN).is_some_and(|list| {
+                    list.children
+                        .first()
+                        .and_then(|pointer| pointer.children.first())
+                        .and_then(node_name)
+                        == Some(SLAM_BRANCH)
+                })
+        })
+        .expect("the slam first in the close range selector");
+        let slam = &field(close, CHILDREN).expect("children").children[0];
+        assert!(holds_text(slam, SLAM_TASK));
+        assert!(!holds_text(slam, "Officer_OceanShield_CAGE_Task"));
+        assert!(!holds_text(slam, "Officer_OceanShield_Easy_CAGE_Task"));
         let mut decoder = nw_ai::decode::TreeDecoder::default();
         decoder
             .add_tree(path, root)

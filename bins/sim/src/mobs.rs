@@ -3225,9 +3225,10 @@ mod retail_tests {
                 ..player_at(SPAWN_X).position
             },
         };
-        // His damage table's rows of the great axe attacks
+        // His damage table's rows of the great axe attacks and of the anchor slam
         // (`javelindata_damagetable_damned_firstmate`).
         const AXE_ROW_PREFIX: &str = "Damned_2H_GreatAxe_Melee_";
+        const SLAM_ROW_SUFFIX: &str = "_FirstMate_AnchorSlam";
         let mut rows = Vec::new();
         let mut fragments = Vec::new();
         let mut serial = None;
@@ -3244,9 +3245,55 @@ mod retail_tests {
         assert!(
             rows.iter()
                 .all(|(table, row)| table == "DamnedFirstMateDamageTable"
-                    && row.starts_with(AXE_ROW_PREFIX)),
+                    && (row.starts_with(AXE_ROW_PREFIX) || row.ends_with(SLAM_ROW_SUFFIX))),
             "{rows:?}"
         );
+    }
+
+    #[test]
+    fn janszoon_slams_and_mixes_his_attacks_on_a_player_next_to_him() {
+        // Retail (Linux main quest playthrough, part 1): `Attack_Combo_GreatAxeman_3` at
+        // 813217 ms, `Officer_AnchorSlam` at 819480 ms. Before the client's keep rule (a
+        // UtilitySelector keeps its last pick only while it is in the executing plan), one
+        // random pick of `Attack_Close_2H_Axe_04` came back for minutes.
+        const JANSZOON_ID: &str = "Corrupted_Sailor_StarterBeach_Named_00";
+        const JANSZOON: &str = "7214ec6831b058f2a3b60f9b5c285e6c";
+        const FIGHT_MS: u64 = 180_000;
+        const SLAM: &str = "Officer_AnchorSlam";
+        const HEAVY: &str = "Attack_Close_2H_Axe_02";
+        const ATTACK_PREFIX: &str = "Attack_";
+        const MIN_ATTACK_KINDS: usize = 4;
+        let mut mobs = retail_mobs(
+            vec![spawn_at(SPAWN_X, JANSZOON_ID, TEST_LEVEL)],
+            &[(JANSZOON_ID, asset(JANSZOON))],
+        );
+        let player = Seen {
+            entity: PLAYER,
+            position: Position {
+                y: super::tests::ROW_Y + 2.0,
+                ..player_at(SPAWN_X).position
+            },
+        };
+        let mut fragments = Vec::new();
+        let mut serial = None;
+        for now in (0..FIGHT_MS).step_by(TICK_MS as usize) {
+            mobs.tick(&[player], now, &Flat, 1);
+            played(&mobs, mob_entity(0), &mut serial, &mut fragments);
+        }
+        assert!(
+            fragments.iter().any(|fragment| fragment == SLAM),
+            "{fragments:?}"
+        );
+        let heavies = fragments
+            .iter()
+            .filter(|fragment| *fragment == HEAVY)
+            .count();
+        assert!(heavies > 1, "the heavy attack comes back: {fragments:?}");
+        let kinds: std::collections::HashSet<&String> = fragments
+            .iter()
+            .filter(|fragment| fragment.starts_with(ATTACK_PREFIX))
+            .collect();
+        assert!(kinds.len() >= MIN_ATTACK_KINDS, "{fragments:?}");
     }
 
     #[test]
