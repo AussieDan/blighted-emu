@@ -98,7 +98,7 @@
 <body>
 <main>
   <h1>Blighted New World Emulator: Progress</h1>
-  <p class="sub">Status on 2026-11-02. Client build 25810808. Last commit <code>56c43afb</code>.</p>
+  <p class="sub">Status on 2026-11-03. Client build 25810808. Last commit <code>56c43afb</code>.</p>
 
   <div class="cards" id="summary"></div>
 
@@ -147,6 +147,8 @@
       <div class="why">Every new player goes through both. The tutorial is the <code>ftue_v2</code> level (ship, quick time event, sailors, legionnaires, corruption, Damned Commander). The starting beach is open world. Found on the beach (play test 2026-10-01, 18 issues): player hits that miss (boars, Janszoon, mariners), bosses whose melee does no damage, mobs that swing from 3 to 4.5 m, mobs sunk in the ground or stuck in walls (Janszoon, the cave), a mob back to full health, debuffs shown as 10,957 days, no food buff, no fall damage, the watchtower crate gives nothing, growths with no break effect, deck boars not asleep. Fixed since, live check needed: the food buff, the watchtower crate, the growths' break state (<code>ba675453</code>), the ground at La Roussette (<code>4c1a219f</code>). The others: not checked again. Level not yet checked: temple door wall.</div></li>
     <li><strong>Make own movement match retail (to-do <code>t1</code>).</strong>
       <div class="why">The server body is still off from the client: median 0.156 m in the open world, 0.219 m in the tutorial. Small drifts cause missed hits and bad walls.</div></li>
+    <li><strong>Close the collision gaps: attack motion, camera, physics.</strong>
+      <div class="why">The server already has the slayer state, its own movement checks, and a collision file of the whole open world from the client's paks (<code>collision-25810808-newworld_vitaeeterna.bin</code>, floor and ray queries). Still open: (1) the client moves the body by an attack's root motion (<code>AnimationDrivenMotion</code>); our body stops it at walls (<code>SetHaltMotionOnCollision</code>), but not yet at an enemy's capsule, and the live server body does not use it yet (only the replay tool). Wired before the capsule halt and the camera boom, it made the camera-follow parts worse (2026-09-26). (2) Camera collision and the fight camera boom (0.9 to 5 m) are not built; ship fights are 0.94 m median off. (3) The server checks rules against the collision mesh; it runs no full physics engine. Whether the retail servers run one: Unknown. Notes: <code>local-data/findings/2026-11-01-movement-review.md</code>.</div></li>
     <li><strong>Make the first open world hours work.</strong>
       <div class="why">After the beach: main story quests, gathering, crafting, shops, fast travel. The code exists, but nobody played it live.</div></li>
     <li><strong>Finish combat: ranged, magic, block, status effects.</strong>
