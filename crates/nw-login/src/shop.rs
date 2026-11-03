@@ -4,17 +4,18 @@
 //! keys `omni.fcs.endpoints.*`, which this server fills with `game.<domain>`
 //! ([`crate::remote_config::GAME_HOST_ENDPOINTS`]). Without the keys the client calls Amazon.
 //!
-//! This server sells nothing and grants no entitlement: the catalog and every store are empty,
-//! the entitlement list is empty, and a sync is accepted. The shapes, the `ETag` and the `304`
-//! follow the retail replies.
+//! This server sells nothing and grants no entitlement: the catalog is empty, every store has no
+//! slot, the entitlement list is empty, and a sync is accepted. The shapes, the `ETag` and the
+//! `304` follow the retail replies.
 
 use axum::Router;
+use axum::extract::Path;
 use axum::http::header::{CONTENT_TYPE, ETAG, IF_NONE_MATCH};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use data_encoding::BASE64;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// The route prefix: the player's persona, the game alias and the platform.
@@ -38,16 +39,34 @@ struct Catalog {
     etag: String,
 }
 
-/// `GET .../stores/<alias>`: the stores with this alias. Retail sends one with its slots;
-/// this server has none.
+/// `GET .../stores/<alias>`: the stores with this alias. Retail always sends one, with that
+/// alias (`leaving_a_company` capture: `Featured`, `Seasonal`, `Special1`, `Special2`). An empty
+/// list left the client's catalog unfinished: it sent no `store_on_catalog_ready` and the change
+/// mount screen, which waits for that (`selectionpanel.luac` `SetupMountsList`), spun (live
+/// 2026-11-03).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Stores {
     currency_code: &'static str,
-    stores: [(); 0],
+    stores: [Store; 1],
     country_code: &'static str,
     etag: String,
 }
+
+/// One store: hidden, with no slot. Retail's hidden stores have the metadata
+/// `{"visible":"false"}` (`Special1`); a store with no slot is Inferred (every retail store had
+/// one or more).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Store {
+    metadata: &'static str,
+    slots: [(); 0],
+    next_schedule_start_date: Option<&'static str>,
+    alias: String,
+}
+
+/// The metadata of a hidden store (retail `Special1`).
+const HIDDEN_STORE_METADATA: &str = r#"{"visible":"false"}"#;
 
 /// `GET .../entitlements`: one page of the player's entitlements. Inferred: the last page leaves
 /// out `paginationToken` (no retail last page was captured).
@@ -128,13 +147,24 @@ async fn catalog(headers: HeaderMap) -> Response {
     })
 }
 
-async fn stores(headers: HeaderMap) -> Response {
+async fn stores(Path(path): Path<StorePath>, headers: HeaderMap) -> Response {
     tagged_reply(&headers, |etag| Stores {
         currency_code: CURRENCY_CODE,
-        stores: [],
+        stores: [Store {
+            metadata: HIDDEN_STORE_METADATA,
+            slots: [],
+            next_schedule_start_date: None,
+            alias: path.alias.clone(),
+        }],
         country_code: COUNTRY_CODE,
         etag,
     })
+}
+
+/// The path of a store call.
+#[derive(Deserialize)]
+struct StorePath {
+    alias: String,
 }
 
 async fn entitlements() -> Response {
@@ -186,7 +216,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_catalog_and_stores_are_empty_with_a_working_etag() {
+    async fn the_catalog_is_empty_and_each_store_is_one_hidden_store_with_a_working_etag() {
         for (path, list) in [
             (format!("{PLAYER}/catalog?type=MTX"), "offers"),
             (format!("{PLAYER}/stores/Featured"), "stores"),
@@ -195,7 +225,22 @@ mod tests {
             let (status, headers, body) = send("GET", &path, None).await;
             assert_eq!(status, StatusCode::OK, "{path}");
             let value: Value = serde_json::from_slice(&body).expect("json");
-            assert_eq!(value[list], Value::Array(Vec::new()), "{path}");
+            match list {
+                "offers" => assert_eq!(value[list], Value::Array(Vec::new()), "{path}"),
+                _ => {
+                    let alias = path.rsplit('/').next().expect("alias");
+                    assert_eq!(
+                        value[list],
+                        serde_json::json!([{
+                            "metadata": HIDDEN_STORE_METADATA,
+                            "slots": [],
+                            "nextScheduleStartDate": null,
+                            "alias": alias,
+                        }]),
+                        "{path}"
+                    );
+                }
+            }
             assert_eq!(value["currencyCode"], CURRENCY_CODE);
             assert_eq!(value["countryCode"], COUNTRY_CODE);
             let etag = headers[ETAG].to_str().expect("etag").to_owned();
