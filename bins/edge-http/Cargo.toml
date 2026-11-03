@@ -23,6 +23,7 @@ thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "net", "rt-multi-thread", "signal", "time"] }
 tower = { workspace = true, features = ["limit"] }
 tracing.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true

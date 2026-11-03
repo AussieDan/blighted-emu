@@ -8,4 +8,4 @@ mod layers;
 mod run;
 mod tls;
 
-pub use run::{RunError, make_mirror_certificate, migrate, serve};
+pub use run::{RunError, link_discord, make_mirror_certificate, migrate, serve};

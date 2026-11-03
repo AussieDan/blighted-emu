@@ -36,8 +36,13 @@ certificate_pem_path = "local-data/edge-http/fullchain.pem"
 private_key_pem_path = "local-data/edge-http/privkey.pem"
 
 [auth]
-# "password" (accounts made in the launcher) or "discord" (Discord login).
+# Login type, one per server:
+#   "password"  players make an account with a username and password in the launcher.
+#   "discord"   players log in with Discord (needs [discord] below and the
+#               NW_SECRET_DISCORD_CLIENT_SECRET secret).
 mode = "password"
+# Password mode only: true lets players make new accounts in the launcher; false: only
+# accounts that exist can log in. (In Discord mode, use [discord] allow_list instead.)
 allow_registration = true
 # Parallel Argon2id hashes; 0 = number of CPUs.
 argon2_parallel = 0
@@ -46,11 +51,23 @@ login_fail_window_seconds = 600
 game_session_ttl_seconds = 7200
 
 [discord]
-# Discord application id (Discord Developer Portal). Used when mode = "discord".
+# Used only when [auth] mode = "discord". Every new account is a normal player; staff ranks
+# are given on the admin site.
+#
+# Discord application id (Discord Developer Portal, your app, OAuth2, Client ID).
 client_id = ""
-# Discord server id a player must be in to log in (Discord: Developer Mode, right-click the
-# server, Copy Server ID). Empty: no server check.
+# Discord server check. A Discord server id (Discord: Developer Mode on, right-click the
+# server, Copy Server ID): only members of that server can log in.
+# Off: "" (empty).
 guild_id = ""
+# Allow list. true: only the Discord user ids in allowed_user_ids can log in and make
+# accounts; a user taken off the list can no longer press Play, even with an old login.
+# false (the default): every Discord user can (still limited by guild_id).
+# Both checks can be on together. Restart edge-http after a change.
+allow_list = false
+# Discord user ids (Discord: Developer Mode on, right-click a name, Copy User ID), for
+# example ["80351110224678912", "175928847299117063"].
+allowed_user_ids = []
 
 [global_database]
 url = "postgres://nw@127.0.0.1:5432/nw_global"

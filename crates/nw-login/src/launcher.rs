@@ -48,6 +48,8 @@ const CALLBACK_FAILED: &str = "Discord login failed. Start again in the launcher
 const CALLBACK_BANNED: &str = "This account is banned.";
 const CALLBACK_NOT_MEMBER: &str =
     "Join this server's Discord first, then start again in the launcher.";
+const CALLBACK_NOT_ALLOWED: &str =
+    "This Discord account may not log in to this server. Ask the server staff to add it.";
 
 /// Everything the launcher routes need.
 #[derive(Clone)]
@@ -274,8 +276,11 @@ where
     }
 }
 
+/// The account of the request's launcher session. Like a ban, a Discord user off the allow list
+/// (`discord.allow_list`) is refused here, though its session was made before.
 async fn session_account<A: AccountStore>(
     accounts: &A,
+    config: &EdgeConfig,
     headers: &HeaderMap,
 ) -> Result<Account, ApiError> {
     let token = bearer_token(headers)?;
@@ -285,6 +290,12 @@ async fn session_account<A: AccountStore>(
         .ok_or(ApiError::NoSession)?;
     if account.banned {
         return Err(ApiError::Banned);
+    }
+    if config.auth.mode == AuthMode::Discord && config.discord.allow_list {
+        let user_id = accounts.discord_user_id(account.id).await?;
+        if !user_id.is_some_and(|user_id| config.discord.allows(&user_id)) {
+            return Err(ApiError::NotAllowed);
+        }
     }
     Ok(account)
 }
@@ -297,7 +308,7 @@ where
     A: AccountStore,
     G: GameSessionStore,
 {
-    let account = session_account(&state.accounts, &headers).await?;
+    let account = session_account(&state.accounts, &state.config, &headers).await?;
     let key = new_game_session_key().map_err(|_| ApiError::Unavailable)?;
     state
         .game_sessions
@@ -388,6 +399,7 @@ where
         Ok(()) => (StatusCode::OK, CALLBACK_DONE),
         Err(ApiError::Banned) => (StatusCode::FORBIDDEN, CALLBACK_BANNED),
         Err(ApiError::NotGuildMember) => (StatusCode::FORBIDDEN, CALLBACK_NOT_MEMBER),
+        Err(ApiError::NotAllowed) => (StatusCode::FORBIDDEN, CALLBACK_NOT_ALLOWED),
         Err(ApiError::UnknownLogin | ApiError::WrongMode) => {
             (StatusCode::NOT_FOUND, CALLBACK_EXPIRED)
         }
@@ -429,6 +441,9 @@ where
     if user.guild_member == Some(false) {
         return Err(ApiError::NotGuildMember);
     }
+    if !state.config.discord.allows(&user.profile.user_id) {
+        return Err(ApiError::NotAllowed);
+    }
     let account = state.accounts.discord_account(&user.profile).await?;
     let session = new_launcher_session(&state.accounts, &account).await?;
     state
@@ -460,6 +475,7 @@ pub(crate) mod tests {
     use axum::http::HeaderValue;
 
     use super::*;
+    use crate::config::DiscordConfig;
     use crate::config::tests::valid;
     use crate::discord::tests::{
         FAKE_EMAIL, FAKE_GUILD_ID, FAKE_USER_ID, FAKE_USERNAME, FakeDiscord, GOOD_CODE,
@@ -476,6 +492,8 @@ pub(crate) mod tests {
     const ONE_HASH_AT_A_TIME: usize = 1;
     /// Wrong-password logins sent at the same time.
     const PARALLEL_LOGINS: usize = 40;
+    /// A Discord user id other than [`FAKE_USER_ID`].
+    const OTHER_DISCORD_USER_ID: &str = "175928847299117063";
 
     pub(crate) type TestState = LauncherState<
         MemoryAccounts,
@@ -909,24 +927,36 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::FORBIDDEN);
     }
 
-    /// Logs in through the callback with a server that `guild_id` names; returns the callback
-    /// status and page.
-    async fn guild_login(guild_id: &str) -> (StatusCode, Vec<u8>, MemoryAccounts) {
+    /// A Discord mode state whose `[discord]` is changed by `change`.
+    fn discord_state(change: impl FnOnce(&mut DiscordConfig)) -> TestState {
         let mut state = state(AuthMode::Discord);
         let mut config = (*state.config).clone();
-        config.discord.guild_id = guild_id.to_owned();
+        change(&mut config.discord);
         state.config = Arc::new(config);
-        let accounts = state.accounts.clone();
-        let app = app(state);
-        let (_, body) = send(&app, "POST", DISCORD_START_PATH, None, "").await;
+        state
+    }
+
+    /// Starts a Discord login and calls back with the good code; returns the start, the
+    /// callback status and the callback page.
+    async fn callback_login(app: &Router) -> (DiscordStart, StatusCode, Vec<u8>) {
+        let (_, body) = send(app, "POST", DISCORD_START_PATH, None, "").await;
         let start: DiscordStart = serde_json::from_slice(&body).expect("start");
-        assert!(start.authorize_url.contains("guilds.members.read"));
         let callback = format!(
             "{DISCORD_CALLBACK_PATH}?code={GOOD_CODE}&state={}",
             start.state
         );
-        let (status, body) = send(&app, "GET", &callback, None, "").await;
-        (status, body.to_vec(), accounts)
+        let (status, body) = send(app, "GET", &callback, None, "").await;
+        (start, status, body.to_vec())
+    }
+
+    /// Logs in through the callback with a server that `guild_id` names; returns the callback
+    /// status and page.
+    async fn guild_login(guild_id: &str) -> (StatusCode, Vec<u8>, MemoryAccounts) {
+        let state = discord_state(|discord| discord.guild_id = guild_id.to_owned());
+        let accounts = state.accounts.clone();
+        let (start, status, body) = callback_login(&app(state)).await;
+        assert!(start.authorize_url.contains("guilds.members.read"));
+        (status, body, accounts)
     }
 
     #[tokio::test]
@@ -947,5 +977,53 @@ pub(crate) mod tests {
             (StatusCode::OK, CALLBACK_DONE.as_bytes())
         );
         assert!(accounts.discord_profile(FAKE_USER_ID).is_some());
+    }
+
+    #[tokio::test]
+    async fn an_allow_list_refuses_other_discord_users_at_login_and_at_play() {
+        let allow_only = |user_id: &str| {
+            let user_id = user_id.to_owned();
+            move |discord: &mut DiscordConfig| {
+                discord.allow_list = true;
+                discord.allowed_user_ids = vec![user_id];
+            }
+        };
+        let listed = discord_state(allow_only(FAKE_USER_ID));
+        let accounts = listed.accounts.clone();
+        let unlisted = TestState {
+            config: discord_state(allow_only(OTHER_DISCORD_USER_ID)).config,
+            ..listed.clone()
+        };
+        let unlisted_app = app(unlisted);
+        let (_, status, body) = callback_login(&unlisted_app).await;
+        assert_eq!(
+            (status, &body[..]),
+            (StatusCode::FORBIDDEN, CALLBACK_NOT_ALLOWED.as_bytes())
+        );
+        assert_eq!(
+            accounts.discord_profile(FAKE_USER_ID),
+            None,
+            "no account for a user off the list"
+        );
+        let listed_app = app(listed);
+        let (start, status, body) = callback_login(&listed_app).await;
+        assert_eq!(
+            (status, &body[..]),
+            (StatusCode::OK, CALLBACK_DONE.as_bytes())
+        );
+        let poll = serde_json::to_string(&DiscordPoll { state: start.state }).expect("poll");
+        let (_, body) = send(&listed_app, "POST", DISCORD_POLL_PATH, None, &poll).await;
+        let DiscordPollReply::Ready(session) = serde_json::from_slice(&body).expect("ready") else {
+            panic!("expected a finished login");
+        };
+        let token = session.launcher_token.as_str();
+        let (status, _) = send(&listed_app, "POST", PLAY_PATH, Some(token), "").await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, body) = send(&unlisted_app, "POST", PLAY_PATH, Some(token), "").await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (StatusCode::FORBIDDEN, "not_allowed"),
+            "a user taken off the list cannot play on its older session"
+        );
     }
 }

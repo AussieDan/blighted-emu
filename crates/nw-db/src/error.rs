@@ -7,6 +7,9 @@ pub enum DbError {
     /// That username is already registered.
     #[error("username is already registered")]
     DuplicateUsername,
+    /// The account already has a Discord login of another Discord user.
+    #[error("account already has a Discord login")]
+    AccountHasDiscordLogin,
     /// That character name is already used in some world.
     #[error("character name is already used")]
     DuplicateCharacterName,

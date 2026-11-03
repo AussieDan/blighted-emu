@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use edge_http::{make_mirror_certificate, migrate, serve};
+use edge_http::{link_discord, make_mirror_certificate, migrate, serve};
 
 /// The committed example configuration.
 const DEFAULT_CONFIG: &str = "config/edge.toml";
@@ -31,6 +31,15 @@ enum Command {
     Migrate,
     /// Makes the self-signed certificate of the `[aws_mirror]` hosts. Never replaces a file.
     AwsMirrorCertificate,
+    /// Points a Discord user at a password account, so Discord login opens its characters.
+    LinkDiscord {
+        /// Username of the password account.
+        #[arg(long)]
+        username: String,
+        /// Discord user id (Discord: Developer Mode on, right-click your name, Copy User ID).
+        #[arg(long)]
+        discord_user_id: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -39,6 +48,10 @@ fn main() -> ExitCode {
         Command::Serve => serve(&cli.config),
         Command::Migrate => migrate(&cli.config),
         Command::AwsMirrorCertificate => make_mirror_certificate(&cli.config),
+        Command::LinkDiscord {
+            username,
+            discord_user_id,
+        } => link_discord(&cli.config, &username, &discord_user_id),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

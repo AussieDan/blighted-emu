@@ -15,6 +15,7 @@ use nw_protocol::launcher_api::{AuthMode, SESSION_PLACEHOLDER, is_forbidden_host
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::discord::is_discord_user_id;
 use crate::game::API_REGION;
 use crate::secrets::SECRET_ENV_PREFIX;
 
@@ -150,12 +151,25 @@ pub struct DiscordConfig {
     /// Id of the Discord server a player must be in to log in; empty: no server check.
     #[serde(default)]
     pub guild_id: String,
+    /// When true, only the Discord users of [`Self::allowed_user_ids`] may log in and make
+    /// accounts. Off by default: every Discord user may.
+    #[serde(default)]
+    pub allow_list: bool,
+    /// The Discord user ids that may log in while [`Self::allow_list`] is on.
+    #[serde(default)]
+    pub allowed_user_ids: Vec<String>,
 }
 
 impl DiscordConfig {
     /// The Discord server a login needs, if any.
     pub fn required_guild_id(&self) -> Option<&str> {
         (!self.guild_id.is_empty()).then_some(self.guild_id.as_str())
+    }
+
+    /// True when the Discord user `user_id` may log in: [`Self::allow_list`] is off or
+    /// [`Self::allowed_user_ids`] names it.
+    pub fn allows(&self, user_id: &str) -> bool {
+        !self.allow_list || self.allowed_user_ids.iter().any(|id| id == user_id)
     }
 }
 
@@ -394,6 +408,23 @@ impl EdgeConfig {
             return invalid(
                 "discord.guild_id",
                 "must be a Discord server id (digits only)",
+            );
+        }
+        if !self
+            .discord
+            .allowed_user_ids
+            .iter()
+            .all(|id| is_discord_user_id(id))
+        {
+            return invalid(
+                "discord.allowed_user_ids",
+                "must be Discord user ids (17 to 20 digits)",
+            );
+        }
+        if self.discord.allow_list && self.discord.allowed_user_ids.is_empty() {
+            return invalid(
+                "discord.allowed_user_ids",
+                "needs at least one Discord user id while discord.allow_list is on",
             );
         }
         if !REMOTE_CONFIG_BUCKETS.contains(&self.remote_config.bucket.as_str()) {
@@ -642,6 +673,14 @@ max_connections = 5
             "discord.guild_id",
         );
         refused(
+            &format!("{VALID}\n[discord]\nclient_id = \"123\"\nallowed_user_ids = [\"nelly\"]\n"),
+            "discord.allowed_user_ids",
+        );
+        refused(
+            &format!("{VALID}\n[discord]\nclient_id = \"123\"\nallow_list = true\n"),
+            "discord.allowed_user_ids",
+        );
+        refused(
             &VALID.replace("capacity = 100", "capacity = 0"),
             "world.capacity",
         );
@@ -767,5 +806,19 @@ max_connections = 5
             load(&format!("{VALID}\n[extra]\nkey = 1\n")),
             Err(EdgeConfigError::Load(_))
         ));
+    }
+
+    #[test]
+    fn the_allow_list_is_off_by_default_and_names_who_may_log_in_when_on() {
+        let mut discord = DiscordConfig::default();
+        assert!(!discord.allow_list);
+        assert!(
+            discord.allows("80351110224678912"),
+            "off: every Discord user"
+        );
+        discord.allow_list = true;
+        discord.allowed_user_ids = vec!["80351110224678912".to_owned()];
+        assert!(discord.allows("80351110224678912"));
+        assert!(!discord.allows("175928847299117063"));
     }
 }

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! `serve` and `migrate`.
+//! `serve`, `migrate` and `link-discord`.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -13,14 +13,18 @@ use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use nw_common::logging::{LoggingError, init_logging};
-use nw_db::{DbError, GLOBAL_MIGRATOR, WORLD_MIGRATOR, check_schema};
+use nw_db::{
+    DbError, GLOBAL_MIGRATOR, WORLD_MIGRATOR, account_by_discord, characters_for_account,
+    check_schema, link_discord_login, password_login,
+};
 use nw_login::cms::{CmsError, CmsObjects};
 use nw_login::config::{EdgeConfig, EdgeConfigError, load_edge_config};
-use nw_login::discord::{DiscordError, DiscordHttp};
+use nw_login::discord::{DiscordError, DiscordHttp, is_discord_user_id};
 use nw_login::game::GameState;
 use nw_login::host::{ServiceRouters, edge_router};
 use nw_login::install_crypto_provider;
 use nw_login::launcher::LauncherState;
+use nw_login::names::{NameError, normalize_username};
 use nw_login::password::{PasswordError, PasswordHasher};
 use nw_login::pg::{PgAccounts, PgCharacters};
 use nw_login::region_ping::region_ping_router;
@@ -28,6 +32,7 @@ use nw_login::remote_config::{RemoteConfigError, RemoteConfigSets, remote_config
 use nw_login::secrets::{SecretError, Secrets, load_database_passwords, load_secrets};
 use nw_login::store::StoreError;
 use nw_login::valkey::Valkey;
+use uuid::Uuid;
 
 use crate::database::{EnsureDatabaseError, connect_all, ensure_database};
 use crate::layers::with_limits;
@@ -86,6 +91,28 @@ pub enum RunError {
     /// The Prometheus recorder could not be installed.
     #[error("metrics recorder failed: {0}")]
     Metrics(String),
+    /// The username of `link-discord` breaks the username rules.
+    #[error(transparent)]
+    Username(#[from] NameError),
+    /// No password login has the username of `link-discord`.
+    #[error("no account has the username {0}")]
+    NoSuchUsername(String),
+    /// The Discord user id of `link-discord` is not a Discord user id.
+    #[error("{0} is not a Discord user id (17 to 20 digits: Discord, Copy User ID)")]
+    DiscordUserId(String),
+    /// The Discord user already opens another account that has characters.
+    #[error(
+        "Discord user {discord_user_id} already opens account {account_id} with {characters} \
+         characters; it is not moved"
+    )]
+    DiscordAccountPlayed {
+        /// The Discord user.
+        discord_user_id: String,
+        /// The account it opens now.
+        account_id: Uuid,
+        /// Characters of that account over all worlds.
+        characters: usize,
+    },
 }
 
 fn env_lookup(name: &str) -> Option<String> {
@@ -120,6 +147,62 @@ pub fn migrate(config_path: &Path) -> Result<(), RunError> {
         tracing::info!(worlds = worlds.len(), "migrations applied");
         Ok(())
     })
+}
+
+/// Points a Discord user at the account of a password login (`link-discord`), so that Discord
+/// login opens that account with its characters, ranks and account items; nothing is copied.
+/// The password login stays (the admin site uses it). A Discord login that already opens a new
+/// account without characters moves over; one whose account has characters is refused.
+pub fn link_discord(
+    config_path: &Path,
+    username: &str,
+    discord_user_id: &str,
+) -> Result<(), RunError> {
+    let username = normalize_username(username)?;
+    check_discord_user_id(discord_user_id)?;
+    let config = load_edge_config(config_path)?;
+    let passwords = load_database_passwords(&config, env_lookup)?;
+    init_logging(&config.log_filter)?;
+    runtime()?.block_on(async {
+        let (global, worlds) = connect_all(&config, &passwords)
+            .await
+            .map_err(RunError::Database)?;
+        check_schema(&global, &GLOBAL_MIGRATOR).await?;
+        for world in &worlds {
+            check_schema(world, &WORLD_MIGRATOR).await?;
+        }
+        let (account, _) = password_login(&global, &username)
+            .await?
+            .ok_or_else(|| RunError::NoSuchUsername(username.clone()))?;
+        if let Some(current) = account_by_discord(&global, discord_user_id).await? {
+            if current.id == account.id {
+                tracing::info!(%username, account = %account.id, "Discord user already linked");
+                return Ok(());
+            }
+            let mut characters = 0;
+            for world in &worlds {
+                characters += characters_for_account(world, current.id).await?.len();
+            }
+            if characters > 0 {
+                return Err(RunError::DiscordAccountPlayed {
+                    discord_user_id: discord_user_id.to_owned(),
+                    account_id: current.id,
+                    characters,
+                });
+            }
+        }
+        link_discord_login(&global, discord_user_id, account.id).await?;
+        tracing::info!(%username, account = %account.id, "Discord user linked");
+        Ok(())
+    })
+}
+
+fn check_discord_user_id(discord_user_id: &str) -> Result<(), RunError> {
+    if is_discord_user_id(discord_user_id) {
+        Ok(())
+    } else {
+        Err(RunError::DiscordUserId(discord_user_id.to_owned()))
+    }
 }
 
 /// Makes the self-signed certificate of the `[aws_mirror]` hosts (`aws-mirror-certificate`).
@@ -288,6 +371,15 @@ mod tests {
             .join("../..")
             .join(&config.cms.directory);
         CmsObjects::load(&config).expect("config/cms");
+    }
+
+    #[test]
+    fn link_discord_refuses_a_bad_discord_user_id_before_connecting() {
+        assert!(check_discord_user_id("80351110224678912").is_ok());
+        assert!(matches!(
+            check_discord_user_id("nelly"),
+            Err(RunError::DiscordUserId(id)) if id == "nelly"
+        ));
     }
 
     #[test]

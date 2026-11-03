@@ -10,6 +10,8 @@ use crate::{Account, DiscordProfile};
 
 const PASSWORD_LOGIN_PKEY: &str = "password_login_pkey";
 const DISCORD_LOGIN_PKEY: &str = "discord_login_pkey";
+/// One Discord login per account (`discord_login.account_id UNIQUE`).
+const DISCORD_LOGIN_ACCOUNT_KEY: &str = "discord_login_account_id_key";
 
 /// Columns of [`Account`], in this order, for `query_as`.
 const ACCOUNT_COLUMNS: &str = "account.account_id, account.display_name, \
@@ -130,6 +132,32 @@ async fn update_discord_contact(pool: &PgPool, profile: &DiscordProfile) -> Resu
     Ok(())
 }
 
+/// Points the Discord user `discord_user_id` at `account_id`, so its next Discord login opens
+/// that account and its characters. A Discord login of another account moves over; the caller
+/// checks first that the other account has nothing to lose. The Discord username and email are
+/// written at the next login.
+pub async fn link_discord_login(
+    pool: &PgPool,
+    discord_user_id: &str,
+    account_id: Uuid,
+) -> Result<(), DbError> {
+    let linked = sqlx::query(
+        "INSERT INTO discord_login (discord_user_id, account_id) VALUES ($1, $2) \
+         ON CONFLICT (discord_user_id) DO UPDATE SET account_id = EXCLUDED.account_id",
+    )
+    .bind(discord_user_id)
+    .bind(account_id)
+    .execute(pool)
+    .await;
+    match linked {
+        Ok(_) => Ok(()),
+        Err(error) if is_unique_violation(&error, DISCORD_LOGIN_ACCOUNT_KEY) => {
+            Err(DbError::AccountHasDiscordLogin)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Loads one account.
 pub async fn account_by_id(pool: &PgPool, account_id: Uuid) -> Result<Option<Account>, DbError> {
     let row: Option<AccountRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
@@ -151,7 +179,17 @@ pub async fn set_banned(pool: &PgPool, account_id: Uuid, banned: bool) -> Result
     Ok(result.rows_affected() > 0)
 }
 
-async fn account_by_discord(
+/// The Discord user id of an account's Discord login, if it has one.
+pub async fn discord_user_id(pool: &PgPool, account_id: Uuid) -> Result<Option<String>, DbError> {
+    let id = sqlx::query_scalar("SELECT discord_user_id FROM discord_login WHERE account_id = $1")
+        .bind(account_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(id)
+}
+
+/// The account of a Discord user.
+pub async fn account_by_discord(
     pool: &PgPool,
     discord_user_id: &str,
 ) -> Result<Option<Account>, DbError> {
@@ -231,10 +269,12 @@ mod tests {
             email_verified: true,
             ..first_login.clone()
         };
-        let (first, second, contact) = with_test_schema(async |pool| {
+        let (first, second, contact, rank, user_id) = with_test_schema(async |pool| {
             GLOBAL_MIGRATOR.run(pool).await.expect("migrate");
             let first = discord_account(pool, &first_login).await.expect("first");
             let second = discord_account(pool, &second_login).await.expect("second");
+            let rank = crate::admin_rank(pool, first.id).await.expect("rank");
+            let user_id = discord_user_id(pool, first.id).await.expect("user id");
             let contact: (String, Option<String>, bool, bool) = sqlx::query_as(
                 "SELECT discord_username, email, email_verified, last_login_at IS NOT NULL \
                  FROM discord_login WHERE discord_user_id = $1",
@@ -243,10 +283,12 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("contact");
-            (first, second, contact)
+            (first, second, contact, rank, user_id)
         })
         .await;
         assert_eq!(first, second);
+        assert_eq!(rank, None, "a new Discord account is a normal player");
+        assert_eq!(user_id.as_deref(), Some(DISCORD_ID));
         assert_eq!(first.display_name, DISCORD_NAME);
         assert_eq!(
             contact,
@@ -257,6 +299,36 @@ mod tests {
                 true
             )
         );
+    }
+
+    #[tokio::test]
+    async fn a_linked_discord_login_opens_the_old_account_and_moves_from_a_new_one() {
+        let profile = DiscordProfile {
+            user_id: DISCORD_ID.to_owned(),
+            username: DISCORD_USERNAME.to_owned(),
+            display_name: DISCORD_NAME.to_owned(),
+            email: Some(DISCORD_EMAIL.to_owned()),
+            email_verified: true,
+        };
+        let (local, first_discord, linked, login, other_user) = with_test_schema(async |pool| {
+            GLOBAL_MIGRATOR.run(pool).await.expect("migrate");
+            let local = create_password_account(pool, USERNAME, HASH)
+                .await
+                .expect("create");
+            let first_discord = discord_account(pool, &profile).await.expect("new account");
+            link_discord_login(pool, DISCORD_ID, local.id)
+                .await
+                .expect("link");
+            let linked = account_by_discord(pool, DISCORD_ID).await.expect("linked");
+            let login = discord_account(pool, &profile).await.expect("login");
+            let other_user = link_discord_login(pool, "175928847299117063", local.id).await;
+            (local, first_discord, linked, login, other_user)
+        })
+        .await;
+        assert_ne!(first_discord.id, local.id);
+        assert_eq!(linked.as_ref(), Some(&local));
+        assert_eq!(login, local);
+        assert!(matches!(other_user, Err(DbError::AccountHasDiscordLogin)));
     }
 
     #[tokio::test]

@@ -57,6 +57,12 @@ pub trait AccountStore: Clone + Send + Sync + 'static {
         profile: &DiscordProfile,
     ) -> impl Future<Output = Result<Account, StoreError>> + Send;
 
+    /// The Discord user id of an account's Discord login, if it has one.
+    fn discord_user_id(
+        &self,
+        account_id: Uuid,
+    ) -> impl Future<Output = Result<Option<String>, StoreError>> + Send;
+
     /// Stores a launcher session by token hash.
     fn create_launcher_session(
         &self,

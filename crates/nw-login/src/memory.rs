@@ -117,6 +117,14 @@ impl AccountStore for MemoryAccounts {
         Ok(account)
     }
 
+    async fn discord_user_id(&self, account_id: Uuid) -> Result<Option<String>, StoreError> {
+        Ok(lock(&self.0)
+            .discord
+            .iter()
+            .find(|(_, (id, _))| *id == account_id)
+            .map(|(user_id, _)| user_id.clone()))
+    }
+
     async fn create_launcher_session(
         &self,
         token_hash: [u8; 32],

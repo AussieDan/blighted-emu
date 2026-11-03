@@ -39,7 +39,8 @@ mod travel;
 pub mod test_db;
 
 pub use account::{
-    account_by_id, create_password_account, discord_account, password_login, set_banned,
+    account_by_discord, account_by_id, create_password_account, discord_account, discord_user_id,
+    link_discord_login, password_login, set_banned,
 };
 pub use admin::{
     AdminRank, AuditEntry, AuditRow, RankRow, admin_rank, admin_ranks, audit_rows, insert_audit,

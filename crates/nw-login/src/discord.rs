@@ -24,6 +24,13 @@ pub const DISCORD_SCOPE: &str = "identify email";
 pub const DISCORD_GUILD_SCOPE: &str = "identify email guilds.members.read";
 /// Callback path on `login.<domain>`.
 pub const DISCORD_CALLBACK_PATH: &str = "/launcher/discord/callback";
+/// Digits of a Discord user id (a snowflake: 17 digits in 2015, at most 20 for a u64).
+pub const DISCORD_USER_ID_DIGITS: std::ops::RangeInclusive<usize> = 17..=20;
+
+/// True when `id` has the form of a Discord user id ([`DISCORD_USER_ID_DIGITS`] digits).
+pub fn is_discord_user_id(id: &str) -> bool {
+    DISCORD_USER_ID_DIGITS.contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_digit())
+}
 
 /// The Discord user behind a login.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -295,5 +302,19 @@ pub(crate) mod tests {
         )
         .expect("url");
         assert!(url.contains("scope=identify+email+guilds.members.read&"));
+    }
+
+    #[test]
+    fn a_discord_user_id_is_17_to_20_digits() {
+        assert!(is_discord_user_id("80351110224678912"));
+        assert!(is_discord_user_id("18446744073709551615"));
+        for bad in [
+            "8035111022467891",
+            "184467440737095516150",
+            "nelly",
+            "8035111022467891x",
+        ] {
+            assert!(!is_discord_user_id(bad), "{bad}");
+        }
     }
 }

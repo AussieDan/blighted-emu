@@ -178,6 +178,10 @@ For a release build, `setcap` takes `target/release/edge-http`. Run `setcap` aga
 
 In Discord mode, add `https://login.<domain>/launcher/discord/callback` as a redirect URL of your Discord application. The server asks Discord for the scopes `identify email`, and saves the Discord username and email of each Discord login (written again at every login) so staff can help a player get an account back. To let in only the members of one Discord server, set `[discord] guild_id` to its server id; the login then also asks for `guilds.members.read` and refuses users outside that server.
 
+To let in only chosen people, set `[discord] allow_list = true` and put their Discord user ids in `allowed_user_ids` (Discord: Developer Mode on, right-click a name, Copy User ID). The list is off by default. While it is on, only those users can log in and make accounts, and a user taken off the list can no longer press Play, even with an older launcher login (like a ban, a game session that is already open runs on until it ends). The server check and the list can be on together. Restart `edge-http` after a change. Every new account is a normal player; staff ranks are given on the admin site.
+
+To keep the characters of a password account when a server moves to Discord mode, run `edge-http link-discord --username <name> --discord-user-id <id>` before the first Discord login (Discord: Settings, Advanced, Developer Mode on; then right-click your name, Copy User ID). Discord login then opens that account with its characters, ranks and account items; nothing is copied. The password login stays, and the admin site still uses it. When that Discord user already made a new account without characters, the login moves over; when that account has characters, the command refuses.
+
 `edge-http` logs every request that no route serves (`request for an unknown route`, with the session key masked). These lines show what the client asks for that the server does not answer yet.
 
 ### M2 exit test (manual)
