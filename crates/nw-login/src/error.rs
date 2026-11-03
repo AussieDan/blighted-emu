@@ -58,6 +58,9 @@ pub enum ApiError {
     /// Discord refused or failed.
     #[error("Discord login failed")]
     Discord,
+    /// The Discord user is not in the Discord server that logins need.
+    #[error("join the server's Discord first")]
+    NotGuildMember,
     /// No character of this account with that id in that world.
     #[error("unknown character")]
     UnknownCharacter,
@@ -81,7 +84,7 @@ impl ApiError {
         match self {
             Self::BadRequest | Self::InvalidName(_) => StatusCode::BAD_REQUEST,
             Self::InvalidCredentials | Self::NoSession => StatusCode::UNAUTHORIZED,
-            Self::Banned | Self::RegistrationClosed => StatusCode::FORBIDDEN,
+            Self::Banned | Self::RegistrationClosed | Self::NotGuildMember => StatusCode::FORBIDDEN,
             Self::WrongMode
             | Self::UnknownLogin
             | Self::UnknownWorld
@@ -121,6 +124,7 @@ impl ApiError {
             Self::RateLimited => "rate_limited",
             Self::UnknownLogin => "unknown_login",
             Self::Discord => "discord_failed",
+            Self::NotGuildMember => "not_guild_member",
             Self::Unavailable => "unavailable",
         }
     }
@@ -180,6 +184,7 @@ mod tests {
             ApiError::RateLimited,
             ApiError::UnknownLogin,
             ApiError::Discord,
+            ApiError::NotGuildMember,
             ApiError::Unavailable,
         ];
         let codes: std::collections::HashSet<&str> = errors.iter().map(ApiError::code).collect();

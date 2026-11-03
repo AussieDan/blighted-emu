@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Discord OAuth2 with PKCE (M2 spec section 5.3). Only the server talks to Discord; it holds the
-//! client secret. Scope: `identify`.
+//! client secret. Scopes: `identify email`, plus `guilds.members.read` when logins need a
+//! Discord server (`discord.guild_id`).
 
 use std::future::Future;
 
 use data_encoding::BASE64URL_NOPAD;
+use nw_db::DiscordProfile;
 use nw_protocol::launcher_api::DISCORD_AUTHORIZE_URL;
-use reqwest::Url;
+use reqwest::{StatusCode, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -14,18 +16,30 @@ use sha2::{Digest, Sha256};
 pub const DISCORD_TOKEN_URL: &str = "https://discord.com/api/v10/oauth2/token";
 /// Discord current-user endpoint.
 pub const DISCORD_ME_URL: &str = "https://discord.com/api/v10/users/@me";
-/// The only scope the server asks for.
-pub const DISCORD_SCOPE: &str = "identify";
+/// Base of the current user's server endpoints: `<base>/<guild id>/member`.
+pub const DISCORD_MY_GUILDS_URL: &str = "https://discord.com/api/v10/users/@me/guilds";
+/// Scopes when no Discord server is needed: user id, names and email.
+pub const DISCORD_SCOPE: &str = "identify email";
+/// Scopes when logins need a Discord server: [`DISCORD_SCOPE`] plus the member check.
+pub const DISCORD_GUILD_SCOPE: &str = "identify email guilds.members.read";
 /// Callback path on `login.<domain>`.
 pub const DISCORD_CALLBACK_PATH: &str = "/launcher/discord/callback";
 
 /// The Discord user behind a login.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscordUser {
-    /// Discord user id (snowflake text).
-    pub id: String,
-    /// Global display name, or the username when none is set.
-    pub display_name: String,
+    /// Ids, names and email.
+    pub profile: DiscordProfile,
+    /// The user is in the required Discord server; `None` when no server was asked for.
+    pub guild_member: Option<bool>,
+}
+
+/// The scopes of a login: [`DISCORD_GUILD_SCOPE`] when it needs a Discord server.
+pub fn login_scope(required_guild_id: Option<&str>) -> &'static str {
+    match required_guild_id {
+        Some(_) => DISCORD_GUILD_SCOPE,
+        None => DISCORD_SCOPE,
+    }
 }
 
 /// Discord refused the code or could not be reached.
@@ -35,12 +49,14 @@ pub struct DiscordError(#[source] Box<dyn std::error::Error + Send + Sync>);
 
 /// Exchanges a login code for the Discord user.
 pub trait DiscordApi: Clone + Send + Sync + 'static {
-    /// The user of an authorization `code` from the callback.
+    /// The user of an authorization `code` from the callback, and whether the user is in the
+    /// server `required_guild_id`.
     fn user_for_code(
         &self,
         code: &str,
         verifier: &str,
         redirect_uri: &str,
+        required_guild_id: Option<&str>,
     ) -> impl Future<Output = Result<DiscordUser, DiscordError>> + Send;
 }
 
@@ -55,6 +71,7 @@ pub fn authorize_url(
     redirect_uri: &str,
     state: &str,
     verifier: &str,
+    scope: &str,
 ) -> Result<String, DiscordError> {
     let challenge = pkce_challenge(verifier);
     Url::parse_with_params(
@@ -62,7 +79,7 @@ pub fn authorize_url(
         [
             ("response_type", "code"),
             ("client_id", client_id),
-            ("scope", DISCORD_SCOPE),
+            ("scope", scope),
             ("redirect_uri", redirect_uri),
             ("state", state),
             ("code_challenge", challenge.as_str()),
@@ -91,6 +108,8 @@ struct MeReply {
     id: String,
     username: String,
     global_name: Option<String>,
+    email: Option<String>,
+    verified: Option<bool>,
 }
 
 impl DiscordHttp {
@@ -106,6 +125,27 @@ impl DiscordHttp {
             client_secret,
         })
     }
+
+    /// True when the owner of `access_token` is in the server `guild_id`. Discord answers 404
+    /// for a server the user is not in.
+    async fn is_guild_member(
+        &self,
+        access_token: &str,
+        guild_id: &str,
+    ) -> Result<bool, DiscordError> {
+        let reply = self
+            .client
+            .get(format!("{DISCORD_MY_GUILDS_URL}/{guild_id}/member"))
+            .bearer_auth(access_token)
+            .send()
+            .await
+            .map_err(failed)?;
+        if reply.status() == StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        reply.error_for_status().map_err(failed)?;
+        Ok(true)
+    }
 }
 
 fn failed(error: reqwest::Error) -> DiscordError {
@@ -118,6 +158,7 @@ impl DiscordApi for DiscordHttp {
         code: &str,
         verifier: &str,
         redirect_uri: &str,
+        required_guild_id: Option<&str>,
     ) -> Result<DiscordUser, DiscordError> {
         let token: TokenReply = self
             .client
@@ -140,7 +181,7 @@ impl DiscordApi for DiscordHttp {
         let me: MeReply = self
             .client
             .get(DISCORD_ME_URL)
-            .bearer_auth(token.access_token)
+            .bearer_auth(&token.access_token)
             .send()
             .await
             .and_then(reqwest::Response::error_for_status)
@@ -148,9 +189,19 @@ impl DiscordApi for DiscordHttp {
             .json()
             .await
             .map_err(failed)?;
+        let guild_member = match required_guild_id {
+            Some(guild_id) => Some(self.is_guild_member(&token.access_token, guild_id).await?),
+            None => None,
+        };
         Ok(DiscordUser {
-            id: me.id,
-            display_name: me.global_name.unwrap_or(me.username),
+            profile: DiscordProfile {
+                user_id: me.id,
+                display_name: me.global_name.unwrap_or_else(|| me.username.clone()),
+                username: me.username,
+                email: me.email,
+                email_verified: me.verified.unwrap_or(false),
+            },
+            guild_member,
         })
     }
 }
@@ -159,7 +210,8 @@ impl DiscordApi for DiscordHttp {
 pub(crate) mod tests {
     use super::*;
 
-    /// A Discord stand-in: the code `good` belongs to one fixed user.
+    /// A Discord stand-in: the code `good` belongs to one fixed user, who is only in the
+    /// server [`FAKE_GUILD_ID`].
     #[derive(Debug, Clone)]
     pub(crate) struct FakeDiscord;
 
@@ -167,6 +219,12 @@ pub(crate) mod tests {
     pub(crate) const GOOD_CODE: &str = "good";
     /// The user of [`GOOD_CODE`].
     pub(crate) const FAKE_USER_ID: &str = "80351110224678912";
+    /// The Discord username of [`FAKE_USER_ID`].
+    pub(crate) const FAKE_USERNAME: &str = "nelly";
+    /// The email of [`FAKE_USER_ID`].
+    pub(crate) const FAKE_EMAIL: &str = "nelly@example.org";
+    /// The only server [`FAKE_USER_ID`] is in.
+    pub(crate) const FAKE_GUILD_ID: &str = "1234567890123456789";
 
     impl DiscordApi for FakeDiscord {
         async fn user_for_code(
@@ -174,11 +232,18 @@ pub(crate) mod tests {
             code: &str,
             _verifier: &str,
             _redirect_uri: &str,
+            required_guild_id: Option<&str>,
         ) -> Result<DiscordUser, DiscordError> {
             if code == GOOD_CODE {
                 Ok(DiscordUser {
-                    id: FAKE_USER_ID.to_owned(),
-                    display_name: "Nelly".to_owned(),
+                    profile: DiscordProfile {
+                        user_id: FAKE_USER_ID.to_owned(),
+                        username: FAKE_USERNAME.to_owned(),
+                        display_name: "Nelly".to_owned(),
+                        email: Some(FAKE_EMAIL.to_owned()),
+                        email_verified: true,
+                    },
+                    guild_member: required_guild_id.map(|guild_id| guild_id == FAKE_GUILD_ID),
                 })
             } else {
                 Err(DiscordError(Box::new(std::io::Error::other("bad code"))))
@@ -201,6 +266,7 @@ pub(crate) mod tests {
             "https://login.example.org/launcher/discord/callback",
             "st",
             "ver",
+            login_scope(None),
         )
         .expect("url");
         assert!(
@@ -208,11 +274,26 @@ pub(crate) mod tests {
                 "https://discord.com/oauth2/authorize?response_type=code&client_id=123"
             )
         );
-        assert!(url.contains("scope=identify"));
+        assert!(url.contains("scope=identify+email&"));
         assert!(url.contains(
             "redirect_uri=https%3A%2F%2Flogin.example.org%2Flauncher%2Fdiscord%2Fcallback"
         ));
         assert!(url.contains("state=st"));
         assert!(url.contains("code_challenge_method=S256"));
+    }
+
+    #[test]
+    fn a_required_server_adds_the_member_scope() {
+        assert_eq!(login_scope(None), DISCORD_SCOPE);
+        assert_eq!(login_scope(Some(FAKE_GUILD_ID)), DISCORD_GUILD_SCOPE);
+        let url = authorize_url(
+            "123",
+            "https://login.example.org/launcher/discord/callback",
+            "st",
+            "ver",
+            login_scope(Some(FAKE_GUILD_ID)),
+        )
+        .expect("url");
+        assert!(url.contains("scope=identify+email+guilds.members.read&"));
     }
 }

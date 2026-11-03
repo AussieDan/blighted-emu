@@ -5,8 +5,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use nw_db::{
-    Account, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character, DbError, NewCharacter,
-    PgPool, StatValues,
+    Account, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character, DbError,
+    DiscordProfile, NewCharacter, PgPool, StatValues,
 };
 use uuid::Uuid;
 
@@ -169,12 +169,8 @@ impl AccountStore for PgAccounts {
             .map_err(store_error)
     }
 
-    async fn discord_account(
-        &self,
-        discord_user_id: &str,
-        display_name: &str,
-    ) -> Result<Account, StoreError> {
-        nw_db::discord_account(&self.pool, discord_user_id, display_name)
+    async fn discord_account(&self, profile: &DiscordProfile) -> Result<Account, StoreError> {
+        nw_db::discord_account(&self.pool, profile)
             .await
             .map_err(store_error)
     }

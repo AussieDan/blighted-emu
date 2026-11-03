@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use nw_db::{
-    Account, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character, NewCharacter,
-    StatValues,
+    Account, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character, DiscordProfile,
+    NewCharacter, StatValues,
 };
 use nw_protocol::launcher_api::LauncherSession;
 use uuid::Uuid;
@@ -37,7 +37,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 struct Accounts {
     accounts: HashMap<Uuid, Account>,
     passwords: HashMap<String, (Uuid, String)>,
-    discord: HashMap<String, Uuid>,
+    discord: HashMap<String, (Uuid, DiscordProfile)>,
     sessions: HashMap<[u8; 32], (Uuid, i64)>,
 }
 
@@ -51,6 +51,14 @@ impl MemoryAccounts {
         if let Some(account) = lock(&self.0).accounts.get_mut(&account_id) {
             account.banned = banned;
         }
+    }
+
+    /// The newest Discord profile stored for a Discord user id.
+    pub(crate) fn discord_profile(&self, discord_user_id: &str) -> Option<DiscordProfile> {
+        lock(&self.0)
+            .discord
+            .get(discord_user_id)
+            .map(|(_, profile)| profile.clone())
     }
 }
 
@@ -95,23 +103,17 @@ impl AccountStore for MemoryAccounts {
         }))
     }
 
-    async fn discord_account(
-        &self,
-        discord_user_id: &str,
-        display_name: &str,
-    ) -> Result<Account, StoreError> {
+    async fn discord_account(&self, profile: &DiscordProfile) -> Result<Account, StoreError> {
         let mut accounts = lock(&self.0);
-        if let Some(account) = accounts
+        let known = accounts
             .discord
-            .get(discord_user_id)
-            .and_then(|id| accounts.accounts.get(id))
-        {
-            return Ok(account.clone());
-        }
-        let account = new_account(&mut accounts, display_name);
+            .get(&profile.user_id)
+            .and_then(|(id, _)| accounts.accounts.get(id))
+            .cloned();
+        let account = known.unwrap_or_else(|| new_account(&mut accounts, &profile.display_name));
         accounts
             .discord
-            .insert(discord_user_id.to_owned(), account.id);
+            .insert(profile.user_id.clone(), (account.id, profile.clone()));
         Ok(account)
     }
 
@@ -725,15 +727,19 @@ pub(crate) mod contract {
             None
         );
 
-        let discord_id = unique("d");
-        let first = store
-            .discord_account(&discord_id, "Nelly")
-            .await
-            .expect("discord");
-        let again = store
-            .discord_account(&discord_id, "Renamed")
-            .await
-            .expect("again");
+        let profile = DiscordProfile {
+            user_id: unique("d"),
+            username: "nelly".to_owned(),
+            display_name: "Nelly".to_owned(),
+            email: Some("nelly@example.org".to_owned()),
+            email_verified: true,
+        };
+        let first = store.discord_account(&profile).await.expect("discord");
+        let renamed = DiscordProfile {
+            display_name: "Renamed".to_owned(),
+            ..profile
+        };
+        let again = store.discord_account(&renamed).await.expect("again");
         assert_eq!(first, again);
 
         let live = crate::keys::token_hash(&unique("t"));

@@ -102,6 +102,21 @@ pub use travel::{
 };
 pub use uuid::Uuid;
 
+/// What Discord says about a user at one login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordProfile {
+    /// Discord user id (snowflake text).
+    pub user_id: String,
+    /// Unique Discord username.
+    pub username: String,
+    /// Global display name, or the username when none is set.
+    pub display_name: String,
+    /// Email of the Discord account; `None` when Discord has none.
+    pub email: Option<String>,
+    /// Discord has verified the email.
+    pub email_verified: bool,
+}
+
 /// An account row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {

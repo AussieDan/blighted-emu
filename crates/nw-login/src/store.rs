@@ -5,8 +5,8 @@
 use std::future::Future;
 
 use nw_db::{
-    Account, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character, NewCharacter,
-    StatValues,
+    Account, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character, DiscordProfile,
+    NewCharacter, StatValues,
 };
 use nw_protocol::launcher_api::LauncherSession;
 use uuid::Uuid;
@@ -50,11 +50,11 @@ pub trait AccountStore: Clone + Send + Sync + 'static {
         username: &str,
     ) -> impl Future<Output = Result<Option<(Account, String)>, StoreError>> + Send;
 
-    /// Finds or creates the account of a Discord user.
+    /// Finds or creates the account of a Discord user and stores the user's newest Discord
+    /// username and email.
     fn discord_account(
         &self,
-        discord_user_id: &str,
-        display_name: &str,
+        profile: &DiscordProfile,
     ) -> impl Future<Output = Result<Account, StoreError>> + Send;
 
     /// Stores a launcher session by token hash.

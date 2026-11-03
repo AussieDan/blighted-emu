@@ -5,8 +5,8 @@
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::Account;
 use crate::error::{DbError, is_unique_violation};
+use crate::{Account, DiscordProfile};
 
 const PASSWORD_LOGIN_PKEY: &str = "password_login_pkey";
 const DISCORD_LOGIN_PKEY: &str = "discord_login_pkey";
@@ -77,23 +77,27 @@ pub async fn password_login(
     )
 }
 
-/// Finds the account of a Discord user, or creates it with `display_name`.
-pub async fn discord_account(
-    pool: &PgPool,
-    discord_user_id: &str,
-    display_name: &str,
-) -> Result<Account, DbError> {
-    if let Some(account) = account_by_discord(pool, discord_user_id).await? {
+/// Finds the account of a Discord user, or creates it with the display name of `profile`. Each
+/// login writes the Discord username and email of `profile` again, so staff see the newest ones.
+pub async fn discord_account(pool: &PgPool, profile: &DiscordProfile) -> Result<Account, DbError> {
+    if let Some(account) = account_by_discord(pool, &profile.user_id).await? {
+        update_discord_contact(pool, profile).await?;
         return Ok(account);
     }
     let mut transaction = pool.begin().await?;
-    let account = insert_account(&mut transaction, display_name).await?;
-    let inserted =
-        sqlx::query("INSERT INTO discord_login (discord_user_id, account_id) VALUES ($1, $2)")
-            .bind(discord_user_id)
-            .bind(account.id)
-            .execute(&mut *transaction)
-            .await;
+    let account = insert_account(&mut transaction, &profile.display_name).await?;
+    let inserted = sqlx::query(
+        "INSERT INTO discord_login \
+         (discord_user_id, account_id, discord_username, email, email_verified, last_login_at) \
+         VALUES ($1, $2, $3, $4, $5, now())",
+    )
+    .bind(&profile.user_id)
+    .bind(account.id)
+    .bind(&profile.username)
+    .bind(&profile.email)
+    .bind(profile.email_verified)
+    .execute(&mut *transaction)
+    .await;
     match inserted {
         Ok(_) => {
             transaction.commit().await?;
@@ -102,12 +106,28 @@ pub async fn discord_account(
         // Another request created the account first; use that one.
         Err(error) if is_unique_violation(&error, DISCORD_LOGIN_PKEY) => {
             drop(transaction);
-            account_by_discord(pool, discord_user_id)
+            let account = account_by_discord(pool, &profile.user_id)
                 .await?
-                .ok_or(DbError::Database(Box::new(error)))
+                .ok_or(DbError::Database(Box::new(error)))?;
+            update_discord_contact(pool, profile).await?;
+            Ok(account)
         }
         Err(error) => Err(error.into()),
     }
+}
+
+async fn update_discord_contact(pool: &PgPool, profile: &DiscordProfile) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE discord_login SET discord_username = $2, email = $3, email_verified = $4, \
+         last_login_at = now() WHERE discord_user_id = $1",
+    )
+    .bind(&profile.user_id)
+    .bind(&profile.username)
+    .bind(&profile.email)
+    .bind(profile.email_verified)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Loads one account.
@@ -171,6 +191,8 @@ mod tests {
     const HASH: &str = "$argon2id$stored";
     const DISCORD_ID: &str = "80351110224678912";
     const DISCORD_NAME: &str = "Nelly";
+    const DISCORD_USERNAME: &str = "nelly";
+    const DISCORD_EMAIL: &str = "nelly@example.org";
 
     #[tokio::test]
     async fn password_accounts_are_unique_and_found_by_username() {
@@ -194,20 +216,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discord_account_is_created_once() {
-        let (first, second) = with_test_schema(async |pool| {
+    async fn discord_account_is_created_once_and_keeps_the_newest_contact() {
+        let first_login = DiscordProfile {
+            user_id: DISCORD_ID.to_owned(),
+            username: DISCORD_USERNAME.to_owned(),
+            display_name: DISCORD_NAME.to_owned(),
+            email: None,
+            email_verified: false,
+        };
+        let second_login = DiscordProfile {
+            username: "nelly_new".to_owned(),
+            display_name: "renamed".to_owned(),
+            email: Some(DISCORD_EMAIL.to_owned()),
+            email_verified: true,
+            ..first_login.clone()
+        };
+        let (first, second, contact) = with_test_schema(async |pool| {
             GLOBAL_MIGRATOR.run(pool).await.expect("migrate");
-            let first = discord_account(pool, DISCORD_ID, DISCORD_NAME)
-                .await
-                .expect("first");
-            let second = discord_account(pool, DISCORD_ID, "renamed")
-                .await
-                .expect("second");
-            (first, second)
+            let first = discord_account(pool, &first_login).await.expect("first");
+            let second = discord_account(pool, &second_login).await.expect("second");
+            let contact: (String, Option<String>, bool, bool) = sqlx::query_as(
+                "SELECT discord_username, email, email_verified, last_login_at IS NOT NULL \
+                 FROM discord_login WHERE discord_user_id = $1",
+            )
+            .bind(DISCORD_ID)
+            .fetch_one(pool)
+            .await
+            .expect("contact");
+            (first, second, contact)
         })
         .await;
         assert_eq!(first, second);
         assert_eq!(first.display_name, DISCORD_NAME);
+        assert_eq!(
+            contact,
+            (
+                "nelly_new".to_owned(),
+                Some(DISCORD_EMAIL.to_owned()),
+                true,
+                true
+            )
+        );
     }
 
     #[tokio::test]

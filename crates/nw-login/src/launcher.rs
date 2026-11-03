@@ -20,7 +20,7 @@ use nw_protocol::launcher_api::{
 use serde::Deserialize;
 
 use crate::config::{AuthConfig, EdgeConfig};
-use crate::discord::{DISCORD_CALLBACK_PATH, DiscordApi, authorize_url};
+use crate::discord::{DISCORD_CALLBACK_PATH, DiscordApi, authorize_url, login_scope};
 use crate::error::{ApiError, parse_json};
 use crate::keys::{is_launcher_token, new_game_session_key, new_random_token, token_hash};
 use crate::names::{check_password, normalize_username};
@@ -46,6 +46,8 @@ const CALLBACK_DONE: &str = "Login finished. Return to the launcher.";
 const CALLBACK_EXPIRED: &str = "This login expired. Start again in the launcher.";
 const CALLBACK_FAILED: &str = "Discord login failed. Start again in the launcher.";
 const CALLBACK_BANNED: &str = "This account is banned.";
+const CALLBACK_NOT_MEMBER: &str =
+    "Join this server's Discord first, then start again in the launcher.";
 
 /// Everything the launcher routes need.
 #[derive(Clone)]
@@ -353,6 +355,7 @@ where
         &callback_url(&state.config),
         &login_state,
         &verifier,
+        login_scope(state.config.discord.required_guild_id()),
     )
     .map_err(|_| ApiError::Unavailable)?;
     state
@@ -384,6 +387,7 @@ where
     match finish_discord_login(&state, query).await {
         Ok(()) => (StatusCode::OK, CALLBACK_DONE),
         Err(ApiError::Banned) => (StatusCode::FORBIDDEN, CALLBACK_BANNED),
+        Err(ApiError::NotGuildMember) => (StatusCode::FORBIDDEN, CALLBACK_NOT_MEMBER),
         Err(ApiError::UnknownLogin | ApiError::WrongMode) => {
             (StatusCode::NOT_FOUND, CALLBACK_EXPIRED)
         }
@@ -411,16 +415,21 @@ where
         .await?
         .ok_or(ApiError::UnknownLogin)?;
     let user = discord
-        .user_for_code(&code, &verifier, &callback_url(&state.config))
+        .user_for_code(
+            &code,
+            &verifier,
+            &callback_url(&state.config),
+            state.config.discord.required_guild_id(),
+        )
         .await
         .map_err(|error| {
             tracing::warn!(error = %error, "Discord login failed");
             ApiError::Discord
         })?;
-    let account = state
-        .accounts
-        .discord_account(&user.id, &user.display_name)
-        .await?;
+    if user.guild_member == Some(false) {
+        return Err(ApiError::NotGuildMember);
+    }
+    let account = state.accounts.discord_account(&user.profile).await?;
     let session = new_launcher_session(&state.accounts, &account).await?;
     state
         .discord_states
@@ -452,7 +461,9 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::config::tests::valid;
-    use crate::discord::tests::{FAKE_USER_ID, FakeDiscord, GOOD_CODE};
+    use crate::discord::tests::{
+        FAKE_EMAIL, FAKE_GUILD_ID, FAKE_USER_ID, FAKE_USERNAME, FakeDiscord, GOOD_CODE,
+    };
     use crate::memory::{
         MemoryAccounts, MemoryDiscordStates, MemoryGameSessions, MemoryRateLimiter,
     };
@@ -790,7 +801,9 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn discord_login_finishes_through_the_callback() {
-        let app = app(state(AuthMode::Discord));
+        let state = state(AuthMode::Discord);
+        let accounts = state.accounts.clone();
+        let app = app(state);
         let (status, body) = send(&app, "POST", DISCORD_START_PATH, None, "").await;
         assert_eq!(status, StatusCode::OK);
         let start: DiscordStart = serde_json::from_slice(&body).expect("start");
@@ -830,6 +843,17 @@ pub(crate) mod tests {
         };
         let (status, _) = send(&app, "POST", PLAY_PATH, Some(&session.launcher_token), "").await;
         assert_eq!(status, StatusCode::OK);
+        let stored = accounts
+            .discord_profile(FAKE_USER_ID)
+            .expect("stored profile");
+        assert_eq!(
+            (
+                stored.username.as_str(),
+                stored.email.as_deref(),
+                stored.email_verified
+            ),
+            (FAKE_USERNAME, Some(FAKE_EMAIL), true)
+        );
         let (status, body) = send(&app, "POST", DISCORD_POLL_PATH, None, &poll).await;
         assert_eq!(
             (status, error_code(&body).as_str()),
@@ -864,7 +888,13 @@ pub(crate) mod tests {
             (StatusCode::NOT_FOUND, CALLBACK_EXPIRED.as_bytes())
         );
         let account = accounts
-            .discord_account(FAKE_USER_ID, "Nelly")
+            .discord_account(&nw_db::DiscordProfile {
+                user_id: FAKE_USER_ID.to_owned(),
+                username: FAKE_USERNAME.to_owned(),
+                display_name: "Nelly".to_owned(),
+                email: None,
+                email_verified: false,
+            })
             .await
             .expect("account");
         accounts.set_banned(account.id, true);
@@ -877,5 +907,45 @@ pub(crate) mod tests {
         );
         let (status, _) = send(&app, "GET", &banned, None, "").await;
         assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    /// Logs in through the callback with a server that `guild_id` names; returns the callback
+    /// status and page.
+    async fn guild_login(guild_id: &str) -> (StatusCode, Vec<u8>, MemoryAccounts) {
+        let mut state = state(AuthMode::Discord);
+        let mut config = (*state.config).clone();
+        config.discord.guild_id = guild_id.to_owned();
+        state.config = Arc::new(config);
+        let accounts = state.accounts.clone();
+        let app = app(state);
+        let (_, body) = send(&app, "POST", DISCORD_START_PATH, None, "").await;
+        let start: DiscordStart = serde_json::from_slice(&body).expect("start");
+        assert!(start.authorize_url.contains("guilds.members.read"));
+        let callback = format!(
+            "{DISCORD_CALLBACK_PATH}?code={GOOD_CODE}&state={}",
+            start.state
+        );
+        let (status, body) = send(&app, "GET", &callback, None, "").await;
+        (status, body.to_vec(), accounts)
+    }
+
+    #[tokio::test]
+    async fn a_required_discord_server_refuses_users_outside_it() {
+        let (status, body, accounts) = guild_login("999").await;
+        assert_eq!(
+            (status, &body[..]),
+            (StatusCode::FORBIDDEN, CALLBACK_NOT_MEMBER.as_bytes())
+        );
+        assert_eq!(
+            accounts.discord_profile(FAKE_USER_ID),
+            None,
+            "no account for a user outside the server"
+        );
+        let (status, body, accounts) = guild_login(FAKE_GUILD_ID).await;
+        assert_eq!(
+            (status, &body[..]),
+            (StatusCode::OK, CALLBACK_DONE.as_bytes())
+        );
+        assert!(accounts.discord_profile(FAKE_USER_ID).is_some());
     }
 }

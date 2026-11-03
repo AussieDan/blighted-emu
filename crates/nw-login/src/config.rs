@@ -147,6 +147,16 @@ pub struct AuthConfig {
 pub struct DiscordConfig {
     /// Discord application (client) id.
     pub client_id: String,
+    /// Id of the Discord server a player must be in to log in; empty: no server check.
+    #[serde(default)]
+    pub guild_id: String,
+}
+
+impl DiscordConfig {
+    /// The Discord server a login needs, if any.
+    pub fn required_guild_id(&self) -> Option<&str> {
+        (!self.guild_id.is_empty()).then_some(self.guild_id.as_str())
+    }
 }
 
 /// `[valkey]`.
@@ -379,6 +389,12 @@ impl EdgeConfig {
         }
         if self.auth.mode == AuthMode::Discord && self.discord.client_id.is_empty() {
             return invalid("discord.client_id", "is required in Discord mode");
+        }
+        if !self.discord.guild_id.chars().all(|c| c.is_ascii_digit()) {
+            return invalid(
+                "discord.guild_id",
+                "must be a Discord server id (digits only)",
+            );
         }
         if !REMOTE_CONFIG_BUCKETS.contains(&self.remote_config.bucket.as_str()) {
             return invalid(
@@ -620,6 +636,10 @@ max_connections = 5
         refused(
             &VALID.replace("mode = \"password\"", "mode = \"discord\""),
             "discord.client_id",
+        );
+        refused(
+            &format!("{VALID}\n[discord]\nclient_id = \"123\"\nguild_id = \"blighted\"\n"),
+            "discord.guild_id",
         );
         refused(
             &VALID.replace("capacity = 100", "capacity = 0"),

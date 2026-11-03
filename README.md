@@ -176,7 +176,7 @@ cargo run -p launcher
 
 For a release build, `setcap` takes `target/release/edge-http`. Run `setcap` again after each build, because a new file loses the right.
 
-In Discord mode, add `https://login.<domain>/launcher/discord/callback` as a redirect URL of your Discord application.
+In Discord mode, add `https://login.<domain>/launcher/discord/callback` as a redirect URL of your Discord application. The server asks Discord for the scopes `identify email`, and saves the Discord username and email of each Discord login (written again at every login) so staff can help a player get an account back. To let in only the members of one Discord server, set `[discord] guild_id` to its server id; the login then also asks for `guilds.members.read` and refuses users outside that server.
 
 `edge-http` logs every request that no route serves (`request for an unknown route`, with the session key masked). These lines show what the client asks for that the server does not answer yet.
 

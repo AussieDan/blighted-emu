@@ -48,6 +48,9 @@ game_session_ttl_seconds = 7200
 [discord]
 # Discord application id (Discord Developer Portal). Used when mode = "discord".
 client_id = ""
+# Discord server id a player must be in to log in (Discord: Developer Mode, right-click the
+# server, Copy Server ID). Empty: no server check.
+guild_id = ""
 
 [global_database]
 url = "postgres://nw@127.0.0.1:5432/nw_global"
