@@ -305,11 +305,11 @@ mod tests {
         let state = AppState::new(
             test_layer(CAP),
             std::env::temp_dir(),
-            listen,
+            AdminOrigin::of(listen),
             Captures::default(),
             None,
         )
-        .with_access(access, AdminOrigin::of(listen));
+        .with_access(access);
         Fixture { memory, state }
     }
 

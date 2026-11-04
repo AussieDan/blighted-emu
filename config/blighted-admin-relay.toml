@@ -1,0 +1,21 @@
+# blighted-admin relay configuration (admin relay spec, 2026-11-04-admin-relay-design.md, kept
+# locally). This file holds no secret.
+# The relay runs on another machine than the game servers. It takes the browser connections and
+# sends them to the admin site on the game machine, which connects to it (`agent_listen`).
+# Any key below can be overridden with BLIGHTED_ADMIN_RELAY_<KEY>, nested keys joined by "__".
+
+# The browser address. Without [tls] the relay serves plain HTTP: put a TLS proxy in front, and
+# reach the site only by HTTPS (the session cookie is Secure).
+listen = "127.0.0.1:9190"
+log_filter = "info"
+# HTTPS for the browsers (optional):
+#   tls = { certificate_pem_path = "...", private_key_pem_path = "..." }
+
+# The admin site on the game machine connects here. Open this port to the game machine only.
+agent_listen = "0.0.0.0:9191"
+
+# The files of `blighted-admin relay-keys --relay-name <relay DNS name>`.
+[agent_tls]
+certificate_pem_path = "local-data/admin-relay/relay.pem"
+private_key_pem_path = "local-data/admin-relay/relay-key.pem"
+agent_certificate_pem_path = "local-data/admin-relay/agent.pem"

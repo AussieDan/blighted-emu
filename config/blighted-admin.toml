@@ -66,6 +66,15 @@ restart_timeout_s = 600
 #   global_database = { url = "postgres://nw@127.0.0.1:5432/nw_global", max_connections = 5 }
 #   global_database_password_env = "NW_SECRET_GLOBAL_DATABASE_PASSWORD"
 #   tls = { certificate_pem_path = "...", private_key_pem_path = "..." }
+# Relay (optional, server mode only): remove listen and tls, and this site connects to a relay
+# on another machine (`blighted-admin relay`), which serves the browsers (README "Admin site on
+# another machine"):
+#   [access.relay]
+#   address = "admin-relay.example.org:9191"
+#   server_name = "admin-relay.example.org"
+#   relay_certificate_pem_path = "local-data/admin-relay/relay.pem"
+#   certificate_pem_path = "local-data/admin-relay/agent.pem"
+#   private_key_pem_path = "local-data/admin-relay/agent-key.pem"
 # Discord login (optional, server mode only), with the Discord app of the game login:
 #   [access.discord]
 #   client_id = "<Discord application id>"

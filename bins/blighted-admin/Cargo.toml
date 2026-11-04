@@ -23,12 +23,16 @@ nw-bus.workspace = true
 nw-login.workspace = true
 nw-sim-core.workspace = true
 futures-util.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 rep-gateway.workspace = true
 reqwest.workspace = true
+rustls.workspace = true
 sim.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+tokio-rustls.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing.workspace = true

@@ -580,6 +580,7 @@ async fn compare(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use crate::guard::AdminOrigin;
     use std::time::Duration;
 
     use axum::body::Body;
@@ -672,7 +673,7 @@ mod tests {
         let app = router(AppState::new(
             test_layer(CAP),
             dir.path().to_path_buf(),
-            LISTEN.parse().expect("address"),
+            AdminOrigin::of(LISTEN.parse().expect("address")),
             captures,
             None,
         ));

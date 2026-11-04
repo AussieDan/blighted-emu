@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The HTTP routes of `blighted-admin` (admin tools spec sections 3 and 7).
 
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -73,19 +72,19 @@ pub struct AppState {
 }
 
 impl AppState {
-    /// The state of a server on `listen` with `world`, the map tiles in `map_dir`, the capture
-    /// sessions, and the live panel when configured.
+    /// The state of a server with the request checks of `origin`, `world`, the map tiles in
+    /// `map_dir`, the capture sessions, and the live panel when configured.
     pub fn new(
         world: WorldLayer,
         map_dir: PathBuf,
-        listen: SocketAddr,
+        origin: AdminOrigin,
         captures: Captures,
         live: Option<Live>,
     ) -> Self {
         Self {
             world: WorldSlot::new(world),
             map_dir: Arc::new(map_dir),
-            origin: AdminOrigin::of(listen),
+            origin,
             captures: Arc::new(captures),
             live,
             studio: None,
@@ -102,14 +101,9 @@ impl AppState {
         }
     }
 
-    /// The same state with `access` (server mode: logins and ranks) and the request checks of
-    /// `origin`.
-    pub fn with_access(self, access: Access, origin: AdminOrigin) -> Self {
-        Self {
-            access,
-            origin,
-            ..self
-        }
+    /// The same state with `access` (server mode: logins and ranks).
+    pub fn with_access(self, access: Access) -> Self {
+        Self { access, ..self }
     }
 
     /// The same state with the studio routes served by `studio`.
@@ -390,7 +384,7 @@ mod tests {
         router(AppState::new(
             test_layer(CAP),
             map_dir.to_path_buf(),
-            LISTEN.parse().expect("address"),
+            AdminOrigin::of(LISTEN.parse().expect("address")),
             captures,
             None,
         ))

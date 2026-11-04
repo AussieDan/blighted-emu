@@ -1184,14 +1184,15 @@ mod tests {
         let state = AppState::new(
             test_layer(CAP),
             std::env::temp_dir(),
-            listen,
+            AdminOrigin::of(listen),
             Captures::default(),
             Some(live),
         )
-        .with_access(
-            Access::new(AccessMode::Local, Some(Store::Memory(store.clone())), None),
-            AdminOrigin::of(listen),
-        )
+        .with_access(Access::new(
+            AccessMode::Local,
+            Some(Store::Memory(store.clone())),
+            None,
+        ))
         .with_commands(commands(&sims));
         Fixture { sims, store, state }
     }

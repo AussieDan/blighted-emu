@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `serve`: reads the configuration, the world file and the content bundle names, starts the
-//! live readers when `[live]` is set, and serves the admin pages until Ctrl-C.
+//! live readers when `[live]` is set, and serves the admin pages until Ctrl-C (on `listen`, or
+//! through a relay with `[access.relay]`). `relay`: runs the admin relay. `relay_keys`: makes
+//! its certificates.
 
 use std::net::SocketAddr;
 use std::path::Path;
@@ -10,24 +12,30 @@ use std::time::Duration;
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use nw_db::{AdminRank, PgPool};
-use uuid::Uuid;
 use nw_login::config::TlsConfig;
 use nw_login::discord::DiscordHttp;
 use nw_login::install_crypto_provider;
 use nw_login::password::PasswordHasher;
+use uuid::Uuid;
 
 use nw_common::logging::{LoggingError, init_logging};
 use nw_content::client_build::load_client_build;
 use tokio::sync::watch;
+use tokio_rustls::TlsAcceptor;
 
 use crate::access::discord::{AdminDiscord, DiscordClient};
 use crate::access::store::Store;
 use crate::access::{Access, AccessMode};
 use crate::captures::Captures;
-use crate::config::{AccessConfig, AdminConfig, AdminConfigError, load_admin_config};
+use crate::config::{AccessConfig, AdminConfig, AdminConfigError, Front, load_admin_config};
 use crate::gm::Commands;
 use crate::guard::AdminOrigin;
 use crate::live;
+use crate::relay::RelayError;
+use crate::relay::agent::serve_agent;
+use crate::relay::config::load_relay_config;
+use crate::relay::front::{AgentLink, accept_agents, relay_agent_tls, relay_router};
+use crate::relay::keys::write_relay_keys;
 use crate::server::{AppState, router};
 use crate::studio::{LoadWorld, Studio};
 use crate::world::{WorldLayer, WorldLayerError, map_dir};
@@ -74,10 +82,13 @@ pub enum RunError {
     /// The TLS certificate or key cannot be read (server mode).
     #[error("TLS certificate or key")]
     Tls(#[source] std::io::Error),
+    /// The relay, its connection or its certificates failed.
+    #[error(transparent)]
+    Relay(#[from] RelayError),
 }
 
-/// Time the HTTPS server gives open requests after Ctrl-C.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// Time open requests get after Ctrl-C.
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Parallel password hashes in server mode (0: one per CPU).
 const HASH_PARALLEL: usize = 0;
 
@@ -88,10 +99,16 @@ const HASH_PARALLEL: usize = 0;
 /// Returns [`RunError`] when the configuration or the data cannot be read, or the server fails.
 pub fn serve(config_path: &Path) -> Result<(), RunError> {
     let config = load_admin_config(config_path)?;
+    let front = config.front()?;
     init_logging(&config.log_filter)?;
     let world = WorldLayer::load(&config)?;
     let game_dir = std::env::var_os(GAME_DIR_ENV).map(std::path::PathBuf::from);
-    let captures = Captures::load(&config.captures, game_dir.as_deref());
+    // Captures never leave their machine: a site behind a relay serves none.
+    let captures = match front {
+        Front::Relay(..) => Captures::default(),
+        Front::Local(_) | Front::Https(..) => Captures::load(&config.captures, game_dir.as_deref()),
+    };
+    let origin = origin_of(front);
     let map = map_dir(&config);
     let client_build =
         load_client_build(&config.client_build_config).map_err(RunError::ClientBuild)?;
@@ -104,7 +121,7 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
             let (close, closing) = watch::channel(false);
             let live = config.live.as_ref().map(|live| live::start(live, closing));
             let live_state = live.as_ref().map(|live| live.state().clone());
-            let state = AppState::new(world, map, config.listen, captures, live);
+            let state = AppState::new(world, map, origin, captures, live);
             let reload_config = Arc::new(config.clone());
             let load_world: LoadWorld = Arc::new(move || {
                 WorldLayer::load(&reload_config).map_err(|error| error.to_string())
@@ -123,34 +140,96 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
                 Some(studio) => state.with_studio(studio),
                 None => state,
             };
-            let state = state.with_access(access, origin_of(&config));
+            let state = state.with_access(access);
             let state = match &config.live {
                 Some(live) => {
                     state.with_commands(Commands::over_bus(&live.nats_url, live.world_id))
                 }
                 None => state,
             };
-            if let Some(tls) = config
-                .access
-                .as_ref()
-                .and_then(|access| access.tls.as_ref())
-            {
-                return serve_https(config.listen, tls, router(state), close).await;
+            match front {
+                Front::Local(listen) => serve_http(listen, router(state), close).await,
+                Front::Https(listen, tls, _) => {
+                    serve_https(listen, tls, router(state), close).await
+                }
+                Front::Relay(link, _) => {
+                    let closing = close.subscribe();
+                    tokio::spawn(close_on_ctrl_c(close));
+                    tracing::info!(relay = %link.address, "serving through the relay");
+                    Ok(serve_agent(link, router(state), closing).await?)
+                }
             }
-            let listener = tokio::net::TcpListener::bind(config.listen)
+        })
+}
+
+/// Runs the admin relay of `config_path` until Ctrl-C: the agent connection on `agent_listen`,
+/// the browsers on `listen` (admin relay spec section 5.1).
+///
+/// # Errors
+///
+/// Returns [`RunError`] when the configuration or the certificates cannot be used, or a listener
+/// fails.
+pub fn relay(config_path: &Path) -> Result<(), RunError> {
+    let config = load_relay_config(config_path).map_err(AdminConfigError::from)?;
+    init_logging(&config.log_filter)?;
+    let acceptor = TlsAcceptor::from(Arc::new(
+        relay_agent_tls(&config.agent_tls).map_err(RelayError::from)?,
+    ));
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(RunError::Io)?
+        .block_on(async {
+            let agents = tokio::net::TcpListener::bind(config.agent_listen)
                 .await
                 .map_err(RunError::Io)?;
-            tracing::info!(listen = %config.listen, "serving");
-            axum::serve(listener, router(state))
-                .with_graceful_shutdown(async move {
-                    // A failed signal handler means the server runs until killed.
-                    let _ = tokio::signal::ctrl_c().await;
-                    // The live streams never end by themselves; the server waits for them.
-                    let _ = close.send(true);
-                })
-                .await
-                .map_err(RunError::Io)
+            tracing::info!(agent_listen = %config.agent_listen, "waiting for the agent");
+            let link = AgentLink::default();
+            tokio::spawn(accept_agents(agents, acceptor, link.clone()));
+            let (close, _) = watch::channel(false);
+            match &config.tls {
+                Some(tls) => serve_https(config.listen, tls, relay_router(link), close).await,
+                None => serve_http(config.listen, relay_router(link), close).await,
+            }
         })
+}
+
+/// Writes the relay and agent certificates for `relay_name` into `out` (`relay-keys`).
+///
+/// # Errors
+///
+/// Returns [`RunError::Relay`] when a file exists or cannot be written.
+pub fn relay_keys(relay_name: &str, out: &Path) -> Result<(), RunError> {
+    write_relay_keys(relay_name, out).map_err(RelayError::from)?;
+    Ok(())
+}
+
+/// Turns `close` true at Ctrl-C. With a failed signal handler it never returns: the server runs
+/// until killed.
+async fn close_on_ctrl_c(close: watch::Sender<bool>) {
+    if tokio::signal::ctrl_c().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+    let _ = close.send(true);
+}
+
+/// Serves `app` over plain HTTP on `listen` until Ctrl-C.
+async fn serve_http(
+    listen: SocketAddr,
+    app: axum::Router,
+    close: watch::Sender<bool>,
+) -> Result<(), RunError> {
+    let listener = tokio::net::TcpListener::bind(listen)
+        .await
+        .map_err(RunError::Io)?;
+    tracing::info!(%listen, "serving");
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            // The live streams never end by themselves; the server waits for them.
+            close_on_ctrl_c(close).await;
+        })
+        .await
+        .map_err(RunError::Io)
 }
 
 /// An account command (a rank change, Marks of Fortune) could not be made.
@@ -292,12 +371,12 @@ async fn access_of(config: &AdminConfig) -> Result<Access, RunError> {
     }
 }
 
-/// The request checks of `config`: the `[access] hosts` over HTTPS in server mode, else the
+/// The request checks of `front`: the `[access] hosts` over HTTPS in server mode, else the
 /// listen address.
-fn origin_of(config: &AdminConfig) -> AdminOrigin {
-    match config.access.as_ref() {
-        Some(access) if access.mode == AccessMode::Server => AdminOrigin::server(&access.hosts),
-        _ => AdminOrigin::of(config.listen),
+fn origin_of(front: Front<'_>) -> AdminOrigin {
+    match front {
+        Front::Local(listen) => AdminOrigin::of(listen),
+        Front::Https(_, _, hosts) | Front::Relay(_, hosts) => AdminOrigin::server(hosts),
     }
 }
 
@@ -320,10 +399,8 @@ async fn serve_https(
     let handle = Handle::new();
     let shutdown = handle.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = close.send(true);
-            shutdown.graceful_shutdown(Some(SHUTDOWN_GRACE));
-        }
+        close_on_ctrl_c(close).await;
+        shutdown.graceful_shutdown(Some(SHUTDOWN_GRACE));
     });
     tracing::info!(%listen, "serving HTTPS");
     axum_server::bind_rustls(listen, tls)

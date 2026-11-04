@@ -581,6 +581,7 @@ async fn stop_all(State(state): State<AppState>) -> Response {
 
 #[cfg(all(test, unix))]
 mod tests {
+    use crate::guard::AdminOrigin;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -885,7 +886,7 @@ echo "input closed"
         router(AppState::new(
             test_layer(CAP),
             std::env::temp_dir(),
-            LISTEN.parse().expect("address"),
+            AdminOrigin::of(LISTEN.parse().expect("address")),
             Captures::default(),
             Some(Live::new(
                 fixture.state.clone(),

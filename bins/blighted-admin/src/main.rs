@@ -9,11 +9,15 @@ use nw_db::AdminRank;
 
 /// The committed example configuration.
 const DEFAULT_CONFIG: &str = "config/blighted-admin.toml";
+/// The committed example relay configuration.
+const DEFAULT_RELAY_CONFIG: &str = "config/blighted-admin-relay.toml";
+/// Where `relay-keys` writes by default.
+const DEFAULT_RELAY_KEYS_DIR: &str = "local-data/admin-relay";
 
 #[derive(Parser)]
 #[command(
     name = "blighted-admin",
-    about = "Local admin web tools of the Blighted New World emulator."
+    about = "Admin web tools of the Blighted New World emulator."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -22,7 +26,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Serves the admin pages until Ctrl-C (local mode: loopback; server mode: HTTPS).
+    /// Serves the admin pages until Ctrl-C (local mode: loopback; server mode: HTTPS, or through
+    /// the relay of `[access.relay]`).
     Serve {
         /// Configuration file.
         #[arg(long, default_value = DEFAULT_CONFIG)]
@@ -38,6 +43,23 @@ enum Command {
         /// The rank.
         #[arg(value_parser = parse_rank)]
         rank: AdminRank,
+    },
+    /// Runs the admin relay until Ctrl-C, on a machine other than the game servers: it takes the
+    /// browsers and the connection of the admin site on the game machine.
+    Relay {
+        /// Relay configuration file.
+        #[arg(long, default_value = DEFAULT_RELAY_CONFIG)]
+        config: PathBuf,
+    },
+    /// Makes the relay and agent certificates (relay.pem, relay-key.pem, agent.pem,
+    /// agent-key.pem). Existing files are never replaced.
+    RelayKeys {
+        /// The DNS name the admin site uses to reach the relay (`[access.relay] server_name`).
+        #[arg(long)]
+        relay_name: String,
+        /// Folder for the four files.
+        #[arg(long, default_value = DEFAULT_RELAY_KEYS_DIR)]
+        out: PathBuf,
     },
     /// Removes the admin rank of a game account.
     RevokeRank {
@@ -81,6 +103,22 @@ fn main() -> ExitCode {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => report(&error),
         },
+        Command::Relay { config } => match blighted_admin::run::relay(&config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => report(&error),
+        },
+        Command::RelayKeys { relay_name, out } => {
+            match blighted_admin::run::relay_keys(&relay_name, &out) {
+                Ok(()) => {
+                    println!(
+                        "wrote the relay and agent certificates to {}",
+                        out.display()
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(error) => report(&error),
+            }
+        }
         Command::GrantRank {
             config,
             username,

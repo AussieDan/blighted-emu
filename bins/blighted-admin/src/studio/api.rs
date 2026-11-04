@@ -366,6 +366,7 @@ async fn start_apply(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use crate::guard::AdminOrigin;
     use std::io::{BufRead, BufReader};
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -419,7 +420,7 @@ mod tests {
                 AppState::new(
                     test_layer(CAP),
                     std::env::temp_dir(),
-                    LISTEN.parse().expect("address"),
+                    AdminOrigin::of(LISTEN.parse().expect("address")),
                     Captures::default(),
                     None,
                 )

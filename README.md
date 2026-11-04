@@ -450,6 +450,31 @@ A server in Discord mode adds `[access.discord]` with the `client_id` of the gam
 
 Five wrong passwords in 10 minutes lock a name for 15 minutes. The session cookie is `HttpOnly`, `Secure` and `SameSite=Strict`, and lasts 12 hours. In server mode, the site refuses the design routes (Check, Apply), the bot batches and the to-do routes. Design work happens on the PC of a team member and reaches the server through git.
 
+#### Admin site on another machine (relay)
+
+The admin site reads the files, the bus and the processes of the game machine, so it runs there. With a relay, the browsers reach it through another machine, and no port opens into the game machine. The site connects out to the relay over TLS, and each side checks the other's certificate. The relay keeps no game data and no password. A site behind a relay serves no capture data. The admin relay spec (`2026-11-04-admin-relay-design.md`) is kept locally.
+
+1. Make the certificates once. Use the name by which the game machine reaches the relay:
+
+   ```bash
+   blighted-admin relay-keys --relay-name admin-relay.example.org
+   ```
+
+   This writes `relay.pem`, `relay-key.pem`, `agent.pem` and `agent-key.pem` into `local-data/admin-relay/`. It never replaces a file.
+2. On the relay machine, put `relay.pem`, `relay-key.pem` and `agent.pem` in `local-data/admin-relay/` and run `blighted-admin relay` (`config/blighted-admin-relay.toml`). `listen` takes the browsers. Without `tls` it serves plain HTTP, so put a TLS proxy in front (the session cookie is `Secure`). `agent_listen` takes the game machine; open it to the game machine only.
+3. On the game machine, put `agent.pem`, `agent-key.pem` and `relay.pem` in `local-data/admin-relay/`. In a copy of `config/blighted-admin.toml`, set server mode with `hosts` (the public admin name) and the global database, remove `listen`, and add:
+
+   ```toml
+   [access.relay]
+   address = "admin-relay.example.org:9191"
+   server_name = "admin-relay.example.org"
+   relay_certificate_pem_path = "local-data/admin-relay/relay.pem"
+   certificate_pem_path = "local-data/admin-relay/agent.pem"
+   private_key_pem_path = "local-data/admin-relay/agent-key.pem"
+   ```
+
+   Then run `blighted-admin serve --config <that file>`. It connects again 5 s after a lost connection. While it is not connected, the relay answers 503.
+
 GM commands go to the sim that owns the target, which the site finds from the sim snapshots and the cell table. A command waits up to 5 s for the answer of the sim. Every command and every login writes a row to the audit log. On the live page, select a player or a bot for these commands:
 
 - Teleport to a point or to another player.

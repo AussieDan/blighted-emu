@@ -97,6 +97,7 @@ async fn stream_views(
 
 #[cfg(test)]
 mod tests {
+    use crate::guard::AdminOrigin;
     use std::time::Duration;
 
     use axum::body::Body;
@@ -123,7 +124,7 @@ mod tests {
         router(AppState::new(
             test_layer(CAP),
             dir,
-            LISTEN.parse().expect("address"),
+            AdminOrigin::of(LISTEN.parse().expect("address")),
             Captures::default(),
             live,
         ))

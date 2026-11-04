@@ -23,8 +23,9 @@ const NOT_LETTERS: &str = "must be one or more letters a to z or A to Z";
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminConfig {
-    /// HTTP address; loopback only.
-    pub listen: SocketAddr,
+    /// HTTP address: loopback in local mode, the HTTPS address in server mode, absent with
+    /// `[access.relay]` (the relay serves the browsers).
+    pub listen: Option<SocketAddr>,
     /// `tracing` filter.
     pub log_filter: String,
     /// File with the pinned client build.
@@ -63,6 +64,87 @@ pub struct AccessConfig {
     pub tls: Option<TlsConfig>,
     /// Server mode: log in with Discord, for accounts made by a Discord login in the game.
     pub discord: Option<AdminDiscordConfig>,
+    /// Server mode: no listener; this site connects to an admin relay on another machine
+    /// (`blighted-admin relay`), which serves the browsers.
+    pub relay: Option<RelayLinkConfig>,
+}
+
+/// `[access.relay]`: the relay this site connects to (admin relay spec section 5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayLinkConfig {
+    /// The relay's agent address, `host:port`.
+    pub address: String,
+    /// The DNS name of the relay certificate.
+    pub server_name: String,
+    /// The relay certificate (`relay.pem` of `relay-keys`); the relay must show exactly it.
+    pub relay_certificate_pem_path: PathBuf,
+    /// This site's certificate (`agent.pem`), which the relay trusts.
+    pub certificate_pem_path: PathBuf,
+    /// Its private key (`agent-key.pem`).
+    pub private_key_pem_path: PathBuf,
+}
+
+/// How the browsers reach the site.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Front<'a> {
+    /// Local mode: plain HTTP on a loopback address.
+    Local(SocketAddr),
+    /// Server mode: HTTPS on `listen` for the `[access] hosts`.
+    Https(SocketAddr, &'a TlsConfig, &'a [String]),
+    /// Server mode through a relay, for the `[access] hosts`.
+    Relay(&'a RelayLinkConfig, &'a [String]),
+}
+
+impl AdminConfig {
+    /// How the browsers reach the site, from `listen` and `[access]`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AdminConfigError`] when `listen` and `[access]` do not fit together.
+    pub fn front(&self) -> Result<Front<'_>, AdminConfigError> {
+        let server = |access: &AccessConfig| {
+            access.global_database.is_some()
+                && access.global_database_password_env.is_some()
+                && !access.hosts.is_empty()
+        };
+        match self.access.as_ref() {
+            Some(access) if access.mode == AccessMode::Server => {
+                match (&access.relay, &access.tls, self.listen) {
+                    (Some(relay), None, None) if server(access) => {
+                        Ok(Front::Relay(relay, &access.hosts))
+                    }
+                    (Some(_), ..) => Err(AdminConfigError::Invalid {
+                        key: "access.relay",
+                        reason: "relay mode needs global_database, global_database_password_env and hosts, and takes no tls and no listen",
+                    }),
+                    (None, Some(tls), Some(listen)) if server(access) => {
+                        Ok(Front::Https(listen, tls, &access.hosts))
+                    }
+                    (None, ..) => Err(AdminConfigError::Invalid {
+                        key: "access",
+                        reason: "server mode needs listen, tls, global_database, global_database_password_env and hosts",
+                    }),
+                }
+            }
+            Some(access) if access.discord.is_some() => Err(AdminConfigError::Invalid {
+                key: "access.discord",
+                reason: "Discord login needs server mode",
+            }),
+            Some(access) if access.relay.is_some() => Err(AdminConfigError::Invalid {
+                key: "access.relay",
+                reason: "a relay needs server mode",
+            }),
+            _ => match self.listen {
+                Some(listen) if listen.ip().is_loopback() => Ok(Front::Local(listen)),
+                Some(listen) => Err(AdminConfigError::NotLoopback(listen)),
+                None => Err(AdminConfigError::Invalid {
+                    key: "listen",
+                    reason: "local mode needs a loopback listen address",
+                }),
+            },
+        }
+    }
 }
 
 /// `[access.discord]`: the Discord app of the game login (the same client id and secret).
@@ -193,30 +275,7 @@ pub enum AdminConfigError {
 /// Returns [`AdminConfigError`] when the file cannot be read or a value is not allowed.
 pub fn load_admin_config(path: &Path) -> Result<AdminConfig, AdminConfigError> {
     let config: AdminConfig = load_config(path, ADMIN_ENV_PREFIX)?;
-    match config.access.as_ref() {
-        Some(access) if access.mode == AccessMode::Server => {
-            let complete = access.tls.is_some()
-                && access.global_database.is_some()
-                && access.global_database_password_env.is_some()
-                && !access.hosts.is_empty();
-            if !complete {
-                return Err(AdminConfigError::Invalid {
-                    key: "access",
-                    reason: "server mode needs tls, global_database, global_database_password_env and hosts",
-                });
-            }
-        }
-        Some(access) if access.discord.is_some() => {
-            return Err(AdminConfigError::Invalid {
-                key: "access.discord",
-                reason: "Discord login needs server mode",
-            });
-        }
-        _ if !config.listen.ip().is_loopback() => {
-            return Err(AdminConfigError::NotLoopback(config.listen));
-        }
-        _ => {}
-    }
+    config.front()?;
     if config.max_spawns_per_request == 0 {
         return Err(AdminConfigError::Invalid {
             key: "max_spawns_per_request",
@@ -276,7 +335,7 @@ mod tests {
     fn the_committed_config_loads() {
         let config =
             load_admin_config(&repo_root().join("config/blighted-admin.toml")).expect("load");
-        assert!(config.listen.ip().is_loopback());
+        assert!(matches!(config.front(), Ok(Front::Local(listen)) if listen.ip().is_loopback()));
         assert!(config.max_spawns_per_request > 0);
     }
 
@@ -450,6 +509,78 @@ mod tests {
         assert!(matches!(
             load_changed("listen = \"127.0.0.1:", "listen = \"0.0.0.0:"),
             Err(AdminConfigError::NotLoopback(_))
+        ));
+    }
+    /// Server mode without tls, and the `[access.relay]` of the tests.
+    const RELAY_ACCESS: &str = "mode = \"server\"\nhosts = [\"admin.example.test\"]\nglobal_database_password_env = \"NW_SECRET_GLOBAL_DATABASE_PASSWORD\"\nglobal_database = { url = \"postgres://nw@127.0.0.1:5432/nw_global\", max_connections = 2 }\n[access.relay]\naddress = \"relay.example.test:9191\"\nserver_name = \"relay.example.test\"\nrelay_certificate_pem_path = \"relay.pem\"\ncertificate_pem_path = \"agent.pem\"\nprivate_key_pem_path = \"agent-key.pem\"\n";
+    const COMMITTED_LISTEN: &str = "listen = \"127.0.0.1:9180\"\n";
+
+    fn load_text(text: &str) -> Result<AdminConfig, AdminConfigError> {
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("blighted-admin.toml");
+        std::fs::write(&path, text).expect("write");
+        load_admin_config(&path)
+    }
+
+    fn committed() -> String {
+        std::fs::read_to_string(repo_root().join("config/blighted-admin.toml")).expect("read")
+    }
+
+    #[test]
+    fn relay_mode_has_no_listener_and_names_the_hosts() {
+        let text = committed()
+            .replace("mode = \"local\"\n", RELAY_ACCESS)
+            .replace(COMMITTED_LISTEN, "");
+        let config = load_text(&text).expect("relay config");
+        let Ok(Front::Relay(relay, hosts)) = config.front() else {
+            panic!("not relay mode");
+        };
+        assert_eq!(relay.address, "relay.example.test:9191");
+        assert_eq!(relay.server_name, "relay.example.test");
+        assert_eq!(hosts, ["admin.example.test"]);
+    }
+
+    #[test]
+    fn relay_mode_with_a_listener_or_tls_is_refused() {
+        let with_listen = committed().replace("mode = \"local\"\n", RELAY_ACCESS);
+        let relay_access_with_tls = RELAY_ACCESS.replace(
+            "[access.relay]",
+            "tls = { certificate_pem_path = \"cert.pem\", private_key_pem_path = \"key.pem\" }\n[access.relay]",
+        );
+        let with_tls = committed()
+            .replace("mode = \"local\"\n", &relay_access_with_tls)
+            .replace(COMMITTED_LISTEN, "");
+        for text in [with_listen, with_tls] {
+            assert!(matches!(
+                load_text(&text),
+                Err(AdminConfigError::Invalid {
+                    key: "access.relay",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn a_relay_in_local_mode_is_refused() {
+        let text = committed().replace(
+            "mode = \"local\"\n",
+            &RELAY_ACCESS.replace("mode = \"server\"", "mode = \"local\""),
+        );
+        assert!(matches!(
+            load_text(&text),
+            Err(AdminConfigError::Invalid {
+                key: "access.relay",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn local_mode_needs_a_listen_address() {
+        assert!(matches!(
+            load_text(&committed().replace(COMMITTED_LISTEN, "")),
+            Err(AdminConfigError::Invalid { key: "listen", .. })
         ));
     }
 }

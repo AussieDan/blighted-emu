@@ -363,6 +363,7 @@ async fn changed(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use crate::guard::AdminOrigin;
     use axum::body::Body;
     use axum::http::{Method, Request, header};
     use http_body_util::BodyExt;
@@ -438,7 +439,7 @@ mod tests {
                 AppState::new(
                     test_layer(CAP),
                     std::env::temp_dir(),
-                    LISTEN.parse().expect("address"),
+                    AdminOrigin::of(LISTEN.parse().expect("address")),
                     Captures::default(),
                     None,
                 )
