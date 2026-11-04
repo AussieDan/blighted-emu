@@ -44,7 +44,6 @@ use nw_messages::{
 use nw_sim_core::Position;
 use uuid::Uuid;
 
-use super::meta_achievements::has_achievement;
 use super::slots::Slot;
 use super::tradeskill::progression_gain;
 use super::{Body, Player, SimWorld, send_now};
@@ -793,7 +792,7 @@ impl SimWorld {
         };
         let mut bits: Vec<u16> = pages
             .iter()
-            .filter(|page| has_achievement(&self.achievement_rules, player, page))
+            .filter(|page| player.flow.has_achievement(&self.achievement_rules, page))
             .filter_map(|page| u16::try_from(self.achievement_rules.bit(page)?).ok())
             .collect();
         bits.sort_unstable();

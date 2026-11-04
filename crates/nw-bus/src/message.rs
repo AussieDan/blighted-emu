@@ -441,6 +441,18 @@ pub struct HandoffOffer {
     /// 12065 in the tutorial and 13586 on the beach, live 2026-09-18).
     #[serde(default)]
     pub achievement_version: u64,
+    /// Whether the player toggled its PvP flag on: the client sends no new toggle at a handoff.
+    #[serde(default)]
+    pub pvp_flagged: bool,
+    /// Whether the client still auto-pins a new quest: the client sends its setting at login
+    /// only.
+    #[serde(default = "auto_pin_on")]
+    pub auto_pin: bool,
+}
+
+/// The auto-pin setting of a login: on until the client turns it off.
+const fn auto_pin_on() -> bool {
+    true
 }
 
 /// A player's quests (admin studio spec section 6.3), as a join or a handoff carries them.
@@ -1553,6 +1565,8 @@ mod tests {
             account_in_probation: true,
             entitlements: vec!["Ent_Mount_MTX_1_wolf".to_owned()],
             achievement_version: 25,
+            pvp_flagged: true,
+            auto_pin: false,
             items: Some(vec![CarriedItem {
                 item_id: "PotionHealthT1".to_owned(),
                 quantity: 2,

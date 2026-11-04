@@ -337,6 +337,12 @@ impl Gear {
         worn.chain(bag).collect()
     }
 
+    /// Marks the items unsaved, so the next save round writes them: the items of a handoff,
+    /// which the sender did not save.
+    pub(super) const fn mark_unsaved(&mut self) {
+        self.unsaved = true;
+    }
+
     /// The items to save when they changed since the last call; `None` when they did not.
     pub(super) fn take_unsaved(&mut self) -> Option<Vec<CarriedItem>> {
         if !self.unsaved {

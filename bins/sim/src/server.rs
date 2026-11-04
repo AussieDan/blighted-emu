@@ -3903,6 +3903,8 @@ mod tests {
                 quests: PlayerQuests::default(),
                 progression: PlayerProgression::default(),
                 achievement_version: 0,
+                pvp_flagged: false,
+                auto_pin: true,
             };
             let subject = subject::sim_handoff(world_id, &id);
             let mut reply: Result<HandoffReply, BusError> = Err(BusError::NoReplySubject);

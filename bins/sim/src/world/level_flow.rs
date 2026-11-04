@@ -199,8 +199,8 @@ pub(super) struct LevelFlow {
     queued_cutscene: Option<u32>,
     /// The cinematic video the client plays, from its start (6606) to its end (6542).
     cinematic: Option<u32>,
-    /// `None` for a player taken without a level change (its client has them).
-    achievements: Option<Achievements>,
+    /// The achievement bits: the saved ones and every one set since.
+    achievements: Achievements,
 }
 
 impl LevelFlow {
@@ -248,57 +248,54 @@ impl LevelFlow {
             cutscene: None,
             queued_cutscene: None,
             cinematic: None,
-            achievements: Some(achievements),
+            achievements,
         }
     }
 
-    /// The set achievement bits, ascending, for a handoff or a save; `None` for a player taken
-    /// without a level change, whose bits this flow does not hold.
-    pub(super) fn achievement_bits(&self) -> Option<Vec<u32>> {
-        let achievements = self.achievements.as_ref()?;
-        Some(
-            (0..)
-                .zip(&achievements.bits)
-                .flat_map(|(byte, value): (u32, &u8)| {
-                    (0..u8::BITS)
-                        .filter(move |bit| value & (1 << bit) != 0)
-                        .map(move |bit| byte * u8::BITS + bit)
-                })
-                .collect(),
-        )
+    /// The set achievement bits, ascending, for a handoff or a save.
+    pub(super) fn achievement_bits(&self) -> Vec<u32> {
+        (0..)
+            .zip(&self.achievements.bits)
+            .flat_map(|(byte, value): (u32, &u8)| {
+                (0..u8::BITS)
+                    .filter(move |bit| value & (1 << bit) != 0)
+                    .map(move |bit| byte * u8::BITS + bit)
+            })
+            .collect()
     }
 
-    /// The version of the newest achievement state, for a handoff; 0 for a player taken without
-    /// a level change.
+    /// The version of the newest achievement state, for a handoff.
     pub(super) fn achievement_version(&self) -> u64 {
-        self.achievements
-            .as_ref()
-            .map_or(0, |achievements| achievements.version)
+        self.achievements.version
     }
 
     /// The flow of a player that a sim took without a level change: nothing is pending. A
     /// handoff's `carried` bits at `carried_version`, the newest state its client has, stay the
-    /// flow's bits, and later changes go on above that version; without a version (an admit
-    /// without a login) the flow holds no bits.
+    /// flow's bits, and later changes go on above that version. Without a version (a resume after
+    /// its sim was lost, with the saved bits) the bits start at the first full state's version,
+    /// as at a login, and the resumed player's own card sends them whole (Inferred: its client
+    /// takes the whole own card again, gear and all). A flow without the bits would set no
+    /// achievement, and its saves would write the old bits over every new one.
     pub(super) fn resumed(
         entity: u64,
         phasing_sequence: u8,
         carried: &[u32],
         carried_version: u64,
     ) -> Self {
-        let achievements = (carried_version > 0).then(|| {
-            let mut achievements = Achievements {
-                bits: vec![0; BITSET_BYTES],
-                version: carried_version,
-                changes: Vec::new(),
-            };
-            for bit in carried {
-                achievements.set(*bit);
-            }
-            // The client has these bits already.
-            achievements.changes.clear();
-            achievements
-        });
+        let mut achievements = Achievements {
+            bits: vec![0; BITSET_BYTES],
+            version: if carried_version > 0 {
+                carried_version
+            } else {
+                FIRST_ACHIEVEMENT_VERSION
+            },
+            changes: Vec::new(),
+        };
+        for bit in carried {
+            achievements.set(*bit);
+        }
+        // The client has these bits already, or gets them with the own card.
+        achievements.changes.clear();
         Self {
             entity,
             level_info: None,
@@ -490,22 +487,20 @@ impl LevelFlow {
         self.phasing(Vec::new(), EMPTY_PHASING_MODE)
     }
 
-    /// The whole achievement state for the spawn card; `None` for a player taken without a level
-    /// change. Changes made so far are in it.
-    pub(super) fn first_achievements(&mut self) -> Option<AchievementState> {
-        let achievements = self.achievements.as_mut()?;
-        achievements.changes.clear();
-        Some(AchievementState {
+    /// The whole achievement state for the spawn card. Changes made so far are in it.
+    pub(super) fn first_achievements(&mut self) -> AchievementState {
+        self.achievements.changes.clear();
+        AchievementState {
             bits: Some(AchievementBits::Full(FullList {
-                version: Some(achievements.version),
-                elements: achievements.bits.clone(),
+                version: Some(self.achievements.version),
+                elements: self.achievements.bits.clone(),
             })),
-        })
+        }
     }
 
     /// The achievement changes not sent yet, as one state; `None` without changes.
     pub(super) fn take_achievement_changes(&mut self) -> Option<AchievementState> {
-        let changes = self.achievements.as_mut()?.take_changes()?;
+        let changes = self.achievements.take_changes()?;
         Some(AchievementState {
             bits: Some(AchievementBits::Changes(changes)),
         })
@@ -513,21 +508,18 @@ impl LevelFlow {
 
     /// Sets achievement `id` of `rules`; an id the content does not have changes nothing.
     pub(super) fn set_achievement(&mut self, rules: &AchievementRules, id: &str) {
-        if let (Some(achievements), Some(bit)) =
-            (self.achievements.as_mut(), rules.indexes.index(id))
-        {
-            achievements.set(bit);
+        if let Some(bit) = rules.indexes.index(id) {
+            self.achievements.set(bit);
         }
     }
 
     /// Whether the player has achievement `id` of `rules`; an id the content does not have is
     /// one it has not.
     pub(super) fn has_achievement(&self, rules: &AchievementRules, id: &str) -> bool {
-        let (Some(achievements), Some(bit)) = (self.achievements.as_ref(), rules.indexes.index(id))
-        else {
+        let Some(bit) = rules.indexes.index(id) else {
             return false;
         };
-        achievements
+        self.achievements
             .bits
             .get((bit / u8::BITS) as usize)
             .is_some_and(|value| value & (1 << (bit % u8::BITS)) != 0)
@@ -535,10 +527,8 @@ impl LevelFlow {
 
     /// Clears achievement `id` (a quest's `TaskLockAchievement`).
     pub(super) fn clear_achievement(&mut self, rules: &AchievementRules, id: &str) {
-        if let (Some(achievements), Some(bit)) =
-            (self.achievements.as_mut(), rules.indexes.index(id))
-        {
-            achievements.clear(bit);
+        if let Some(bit) = rules.indexes.index(id) {
+            self.achievements.clear(bit);
         }
     }
 
@@ -616,7 +606,7 @@ mod tests {
     #[test]
     fn a_player_starts_with_the_expansion_and_its_archetype() {
         let mut flow = flow();
-        let first = flow.first_achievements().expect("achievements");
+        let first = flow.first_achievements();
         let Some(AchievementBits::Full(list)) = &first.bits else {
             panic!("a full bitset");
         };
@@ -648,10 +638,8 @@ mod tests {
         );
         let mut expected = vec![EXPANSION_BIT, WARMONGER_BIT, CARRIED[0], CARRIED[1]];
         expected.sort_unstable();
-        assert_eq!(flow.achievement_bits(), Some(expected));
-        let Some(AchievementBits::Full(first)) =
-            flow.first_achievements().and_then(|state| state.bits)
-        else {
+        assert_eq!(flow.achievement_bits(), expected);
+        let Some(AchievementBits::Full(first)) = flow.first_achievements().bits else {
             panic!("a full state");
         };
         assert_eq!(
@@ -665,14 +653,36 @@ mod tests {
             "the full state holds them"
         );
         assert_eq!(flow.achievement_version(), CARRIED_VERSION + 1);
-        assert_eq!(
-            LevelFlow::resumed(ENTITY, 0, &[], 0).achievement_bits(),
-            None
-        );
-        assert_eq!(
-            LevelFlow::resumed(ENTITY, 0, &[], 0).achievement_version(),
-            0
-        );
+    }
+
+    #[test]
+    fn a_resume_holds_the_saved_bits_and_keeps_a_new_one_for_the_save() {
+        // A player resumed on another sim after its sim was lost comes with its saved bits and
+        // no version. A shrine charted after the resume must be in the bits a save writes; a
+        // flow without the bits set nothing, and the save wrote the old bits over it.
+        const SAVED: [u32; 2] = [832, 5_242];
+        const CHARTED: &str = "spiritshrine_02_30151_charted";
+        const CHARTED_BIT: u32 = 14_554;
+        let rules = AchievementRules {
+            indexes: AchievementIndexes::build([(CHARTED.to_owned(), CHARTED_BIT)]),
+            ..AchievementRules::default()
+        };
+        let mut flow = LevelFlow::resumed(ENTITY, 0, &SAVED, 0);
+        assert_eq!(flow.achievement_bits(), SAVED.to_vec());
+        let Some(AchievementBits::Full(first)) = flow.first_achievements().bits else {
+            panic!("a full state with the own card");
+        };
+        assert_eq!(first.version, Some(FIRST_ACHIEVEMENT_VERSION));
+        assert!(!flow.has_achievement(&rules, CHARTED));
+        flow.set_achievement(&rules, CHARTED);
+        assert!(flow.has_achievement(&rules, CHARTED));
+        let Some(AchievementBits::Changes(changes)) =
+            flow.take_achievement_changes().and_then(|state| state.bits)
+        else {
+            panic!("the new bit goes to the client");
+        };
+        assert_eq!(changes[0].version, FIRST_ACHIEVEMENT_VERSION + 1);
+        assert_eq!(flow.achievement_bits(), [SAVED[0], SAVED[1], CHARTED_BIT]);
     }
 
     #[test]
@@ -684,12 +694,9 @@ mod tests {
         const CARRIED_VERSION: u64 = 25;
         const NEW_BIT: u32 = 1_001;
         let mut flow = LevelFlow::resumed(ENTITY, 0, &CARRIED, CARRIED_VERSION);
-        assert_eq!(flow.achievement_bits(), Some(CARRIED.to_vec()));
+        assert_eq!(flow.achievement_bits(), CARRIED.to_vec());
         assert_eq!(flow.take_achievement_changes(), None, "the client has them");
-        flow.achievements
-            .as_mut()
-            .expect("the carried bits")
-            .set(NEW_BIT);
+        flow.achievements.set(NEW_BIT);
         let Some(AchievementBits::Changes(changes)) =
             flow.take_achievement_changes().and_then(|state| state.bits)
         else {
@@ -698,7 +705,7 @@ mod tests {
         assert_eq!(changes[0].version, CARRIED_VERSION + 1);
         let mut expected = vec![CARRIED[0], CARRIED[1], NEW_BIT];
         expected.sort_unstable();
-        assert_eq!(flow.achievement_bits(), Some(expected));
+        assert_eq!(flow.achievement_bits(), expected);
     }
 
     #[test]

@@ -673,9 +673,6 @@ struct Player {
     /// Its coins, and whether they changed since the last bundle.
     coins: u64,
     coins_changed: bool,
-    /// The achievement bits it arrived with: its bits while its flow holds none (a player taken
-    /// without a level change).
-    arrived_achievements: Vec<u32>,
     /// Its progression as last taken for a save, or as loaded at its join; `None` after a
     /// handoff (the sender may not have saved it), so the next save round saves it.
     progression_saved: Option<PlayerProgression>,
@@ -818,10 +815,7 @@ impl Player {
         PlayerProgression {
             experience: self.experience,
             coins: self.coins,
-            achievements: self
-                .flow
-                .achievement_bits()
-                .unwrap_or_else(|| self.arrived_achievements.clone()),
+            achievements: self.flow.achievement_bits(),
             loot_limits: self.loot.limit_counts(),
             masteries: self.masteries.carried(),
             attributes: self.attributes.carried(),
@@ -1113,9 +1107,10 @@ struct Arrival {
     active_weapon: Option<u32>,
     /// Its saved or carried progression.
     progression: PlayerProgression,
-    /// Whether `progression` is what the database holds or a save of this sim waits with (a
-    /// join); a handoff's may not be saved yet.
-    progression_saved: bool,
+    /// Whether its items, quests and progression are what the database holds or a save of this
+    /// sim waits with (a join). A handoff's may not be saved yet: the sender saves nothing at a
+    /// handoff, so this sim saves them at its next save round.
+    saved: bool,
     /// The versions of the newest 911 and 3681 lists its client has (0 for none).
     mastery_versions: (u64, u64),
     /// The version of the newest 129 lists its client has (0 for none).
@@ -1132,6 +1127,10 @@ struct Arrival {
     entitlements: BTreeSet<String>,
     /// Its saved or carried quests.
     quests: PlayerQuests,
+    /// Its PvP flag: off at a login, carried by a handoff.
+    pvp_flagged: bool,
+    /// Whether its client auto-pins a new quest: on at a login, carried by a handoff.
+    auto_pin: bool,
 }
 
 impl SimWorld {
@@ -1315,7 +1314,7 @@ impl SimWorld {
             drawn_weapon: None,
             active_weapon: None,
             progression: admit.progression.clone(),
-            progression_saved: true,
+            saved: true,
             mastery_versions: (0, 0),
             attribute_version: 0,
             fishing_sequence: 0,
@@ -1324,6 +1323,8 @@ impl SimWorld {
             account: admit.account,
             entitlements: admit.entitlements.iter().cloned().collect(),
             quests: admit.quests.clone(),
+            pvp_flagged: false,
+            auto_pin: true,
         };
         self.check(&arrival)?;
         let login = if let Some(level_info) = &level_info {
@@ -1472,7 +1473,7 @@ impl SimWorld {
             drawn_weapon: offer.drawn_weapon,
             active_weapon: offer.active_weapon,
             progression: offer.progression.clone(),
-            progression_saved: false,
+            saved: false,
             mastery_versions: offer.mastery_versions,
             attribute_version: offer.attribute_version,
             fishing_sequence: offer.fishing_sequence,
@@ -1481,6 +1482,8 @@ impl SimWorld {
             account: offer.account,
             entitlements: offer.entitlements.iter().cloned().collect(),
             quests: offer.quests.clone(),
+            pvp_flagged: offer.pvp_flagged,
+            auto_pin: offer.auto_pin,
         };
         self.check(&arrival)?;
         let level_change = if let Some(level_info) = &level_info {
@@ -4293,6 +4296,9 @@ impl SimWorld {
                                 arrival.active_weapon,
                             );
                             gear.restore_inventory(&self.content.kits, &arrival.inventory);
+                            if !arrival.saved {
+                                gear.mark_unsaved();
+                            }
                             Some(gear)
                         }
                         None => Gear::starter(
@@ -4334,8 +4340,8 @@ impl SimWorld {
                     remote_plan: replica::RemotePlan::default(),
                     throttle_cleared: false,
                     defer_throttle_clear: false,
-                    auto_pin: true,
-                    pvp_flagged: false,
+                    auto_pin: arrival.auto_pin,
+                    pvp_flagged: arrival.pvp_flagged,
                     own_places: OwnPlaces::default(),
                     footing: Footing::SPAWN,
                     footing_sent: Footing::SPAWN,
@@ -4349,17 +4355,14 @@ impl SimWorld {
                     teleports: 0,
                     quest: None,
                     done_quests: arrival.quests.done.clone(),
-                    quests_unsaved: false,
+                    quests_unsaved: !arrival.saved,
                     tracker_floor: arrival.quests.tracker_version,
                     experience: arrival.progression.experience,
                     experience_changed: false,
                     coins: arrival.progression.coins,
                     coins_changed: false,
                     loot: loot_bag::PlayerLoot::with_limits(&arrival.progression.loot_limits),
-                    progression_saved: arrival
-                        .progression_saved
-                        .then(|| arrival.progression.clone()),
-                    arrived_achievements: arrival.progression.achievements,
+                    progression_saved: arrival.saved.then(|| arrival.progression.clone()),
                     masteries: progression::Masteries::of(
                         &arrival_masteries,
                         &self.content.progression,
@@ -4932,7 +4935,7 @@ impl Neighbourhood<'_> {
                 // change.
                 let first = own_card == OwnCard::Spawn;
                 let achievements = if first {
-                    player.flow.first_achievements()
+                    Some(player.flow.first_achievements())
                 } else {
                     player.flow.take_achievement_changes()
                 };
@@ -5489,6 +5492,8 @@ fn handoff_offer(
         quests,
         progression: player.progression(),
         achievement_version: player.flow.achievement_version(),
+        pvp_flagged: player.pvp_flagged,
+        auto_pin: player.auto_pin,
     }
 }
 
@@ -9956,6 +9961,49 @@ mod tests {
             "the sender may not have saved it: the taker's first round does"
         );
         assert_eq!(new.positions()[0].progression, None);
+    }
+
+    #[test]
+    fn a_handoff_s_items_and_quests_are_saved_by_the_taker_and_its_flags_stay() {
+        // The sender saves nothing at a handoff: a change of the last seconds before it (the
+        // tutorial's whole kit, which the tutorial never saves) is in the database only when the
+        // taker's first round saves it. The client sends its PvP toggle and auto-pin setting
+        // once; the taker keeps them.
+        let mut old = world();
+        old.set_table(&table(&["sim-a", "sim-b"])).expect("table");
+        old.admit(&admit_at(1, BORDER_X + 50.0, true), NOW, SERVER_TIME)
+            .expect("admit");
+        let entity = old.player_by_number(1).expect("player");
+        {
+            let mut player = old.world.get_mut::<Player>(entity).expect("player");
+            player.pvp_flagged = true;
+            player.auto_pin = false;
+        }
+        tick(&mut old, NOW);
+        let offer = tick_offer(&mut old);
+        assert!(
+            offer.pvp_flagged && !offer.auto_pin,
+            "the offer carries both"
+        );
+        let mut new = world_of("sim-b", settings(MANY, MAX_PLAYERS));
+        new.set_table(&table(&["sim-a", "sim-b"])).expect("table");
+        new.take(&offer, NOW, SERVER_TIME).expect("take");
+        let taken = new.player_by_number(1).expect("player");
+        let player = new.world.get::<Player>(taken).expect("player");
+        assert!(player.pvp_flagged, "still flagged");
+        assert!(!player.auto_pin, "still no auto-pin");
+        let first = new.positions().remove(0);
+        assert_eq!(
+            first.items, offer.items,
+            "the taker's first round saves the items"
+        );
+        assert_eq!(first.quests, Some(offer.quests.clone()), "and the quests");
+        let second = new.positions().remove(0);
+        assert_eq!(
+            (second.items, second.quests),
+            (None, None),
+            "once, until they change"
+        );
     }
 
     #[test]

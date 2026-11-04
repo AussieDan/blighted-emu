@@ -36,7 +36,6 @@ use nw_sim_core::{MountPaces, MoveLimits};
 
 use super::attack::{Vitals, counter_is_newer};
 use super::gear::{Gear, unix_ns};
-use super::meta_achievements::has_achievement;
 use super::replica::PAPERDOLL_COMPONENT;
 use super::{MESSAGE_CHANNEL, Outgoing, Player, SimWorld, gather_answer};
 
@@ -641,7 +640,9 @@ impl SimWorld {
             if player.own_card_sent
                 && std::mem::take(&mut player.mount.unlock_due)
                 && mounts.types().any(|mount_type| {
-                    has_achievement(rules, &*player, &mount_type.required_achievement)
+                    player
+                        .flow
+                        .has_achievement(rules, &mount_type.required_achievement)
                 })
             {
                 player.mount.enabled_sent = true;
@@ -920,7 +921,7 @@ impl SimWorld {
         let by_achievement = mount
             .required_achievement
             .as_deref()
-            .is_some_and(|id| has_achievement(rules, player, id));
+            .is_some_and(|id| player.flow.has_achievement(rules, id));
         let bought = mount.entitlement
             && self
                 .content
@@ -929,8 +930,11 @@ impl SimWorld {
                 .is_some_and(|store| player.entitlements.contains(&store.unlock.entitlement));
         let owned = by_achievement || bought;
         let mount_type = self.content.mounts.mount_type(mount)?;
-        (owned && has_achievement(rules, player, &mount_type.required_achievement))
-            .then_some((mount, mount_type))
+        (owned
+            && player
+                .flow
+                .has_achievement(rules, &mount_type.required_achievement))
+        .then_some((mount, mount_type))
     }
 
     /// The summon key of player `entity` at `now_ms` (retail Mount-quest capture: 5747 40 ms
@@ -960,10 +964,11 @@ impl SimWorld {
             Err(SummonCancelReason::Combat)
         } else if player.tracked.is_swimming() {
             Err(SummonCancelReason::Swimming)
-        } else if !mounts
-            .types()
-            .any(|mount_type| has_achievement(rules, player, &mount_type.required_achievement))
-        {
+        } else if !mounts.types().any(|mount_type| {
+            player
+                .flow
+                .has_achievement(rules, &mount_type.required_achievement)
+        }) {
             Err(SummonCancelReason::RequirementsNotMet)
         } else {
             let chosen = player

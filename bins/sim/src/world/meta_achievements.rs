@@ -323,7 +323,7 @@ fn progress_of(
     rule: &MetaRule,
 ) -> u64 {
     let progression = &content.progression;
-    let has = |id: &str| has_achievement(achievements, player, id);
+    let has = |id: &str| player.flow.has_achievement(achievements, id);
     match &rule.kind {
         MetaKind::Kills { .. } | MetaKind::Gathering(_) | MetaKind::Deaths => player
             .meta
@@ -378,7 +378,7 @@ fn title_count(
 ) -> u64 {
     let progression = &content.progression;
     let rank = |id: &str| u32::from(player.masteries.rank(progression, id));
-    let achievement = |id: &str| has_achievement(achievements, player, id);
+    let achievement = |id: &str| player.flow.has_achievement(achievements, id);
     let completed = |id: &str| player.meta.is_completed(id);
     let progress = TitleProgress {
         level: progression.level_of(player.experience),
@@ -387,21 +387,6 @@ fn title_count(
         meta_achievement: &completed,
     };
     count(content.titles.earned(&progress).count())
-}
-
-/// Whether `player` has achievement `id`: in its level flow's bits, else in the bits it
-/// arrived with.
-pub(super) fn has_achievement(
-    rules: &super::level_flow::AchievementRules,
-    player: &Player,
-    id: &str,
-) -> bool {
-    if player.flow.achievement_version() > 0 {
-        return player.flow.has_achievement(rules, id);
-    }
-    rules
-        .bit(id)
-        .is_some_and(|bit| player.arrived_achievements.contains(&bit))
 }
 
 /// The summary (1679) of `player` on `header`.
