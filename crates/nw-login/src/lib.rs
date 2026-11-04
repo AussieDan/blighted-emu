@@ -5,6 +5,7 @@
 //! `edge-http` runs it.
 
 pub mod analytics;
+pub mod certificate;
 pub mod cms;
 pub mod config;
 pub mod discord;

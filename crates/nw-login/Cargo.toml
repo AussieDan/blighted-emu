@@ -24,6 +24,7 @@ nw-db.workspace = true
 nw-formats.workspace = true
 nw-messages.workspace = true
 nw-protocol.workspace = true
+openssl.workspace = true
 redis.workspace = true
 reqwest.workspace = true
 rustls.workspace = true

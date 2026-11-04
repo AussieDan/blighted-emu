@@ -3109,6 +3109,7 @@ dependencies = [
  "nw-formats",
  "nw-messages",
  "nw-protocol",
+ "openssl",
  "redis",
  "reqwest",
  "rustls",

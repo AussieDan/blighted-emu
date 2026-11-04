@@ -5,76 +5,28 @@
 //! `docs/re/2026-09-18-remote-config-layers.md`). The choice is made by the TLS server name.
 
 use std::collections::HashSet;
-use std::fs::OpenOptions;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use nw_login::config::{AwsMirrorConfig, EdgeConfig};
-use openssl::asn1::Asn1Time;
-use openssl::bn::{BigNum, MsbOption};
-use openssl::error::ErrorStack;
-use openssl::hash::MessageDigest;
-use openssl::pkey::PKey;
-use openssl::rsa::Rsa;
-use openssl::x509::extension::{
-    BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+use nw_login::certificate::{
+    CertificateUse, read_chain, read_file, read_private_key, self_signed_certificate, write_new,
 };
-use openssl::x509::{X509, X509NameBuilder};
+use nw_login::config::{AwsMirrorConfig, EdgeConfig};
 use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
-use rustls::pki_types::pem::PemObject;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 
-/// RSA key size of the mirror certificate.
-const MIRROR_KEY_BITS: u32 = 2048;
+/// A certificate file or key could not be made, read or used.
+pub use nw_login::certificate::CertificateError as TlsError;
+
 /// Days the mirror certificate is valid. The launcher fetches it at every game start, so a new
 /// one reaches players at once.
 pub const MIRROR_VALID_DAYS: u32 = 825;
-/// Random bits of the serial number, so a new certificate never repeats an old serial.
-const SERIAL_BITS: i32 = 128;
-const X509_VERSION_3: i32 = 2;
-const COMMON_NAME: &str = "CN";
 /// Subject common name of the mirror certificate.
 const MIRROR_COMMON_NAME: &str = "Blighted AWS mirror";
 /// Protocols offered in ALPN, as `axum-server` offers them.
 const ALPN_PROTOCOLS: [&[u8]; 2] = [b"h2", b"http/1.1"];
-/// File mode of the written private key on Unix: owner read and write only.
-#[cfg(unix)]
-const OWNER_ONLY_MODE: u32 = 0o600;
-
-/// A certificate file or key could not be made, read or used.
-#[derive(Debug, thiserror::Error)]
-pub enum TlsError {
-    /// A file cannot be read or written.
-    #[error("cannot access {}: {source}", .path.display())]
-    Io {
-        /// The file.
-        path: PathBuf,
-        /// The I/O error.
-        #[source]
-        source: std::io::Error,
-    },
-    /// A PEM file holds no usable certificate or key.
-    #[error("{} holds no valid {what}", .path.display())]
-    Pem {
-        /// The file.
-        path: PathBuf,
-        /// `certificate` or `private key`.
-        what: &'static str,
-    },
-    /// The key does not fit the certificate, or the TLS library refused them.
-    #[error("TLS setup failed: {0}")]
-    Rustls(#[from] rustls::Error),
-    /// OpenSSL could not make the certificate.
-    #[error("certificate generation failed: {0}")]
-    OpenSsl(#[from] ErrorStack),
-    /// No process crypto provider is installed.
-    #[error("no TLS crypto provider is installed")]
-    NoProvider,
-}
 
 /// Picks the mirror certificate for the `[aws_mirror]` hosts and the main one otherwise.
 #[derive(Debug)]
@@ -98,30 +50,13 @@ impl ResolvesServerCert for ByServerName {
     }
 }
 
-fn read(path: &Path) -> Result<Vec<u8>, TlsError> {
-    std::fs::read(path).map_err(|source| TlsError::Io {
-        path: path.to_path_buf(),
-        source,
-    })
-}
-
 fn certified_key(
     certificate_path: &Path,
     key_path: &Path,
     provider: &CryptoProvider,
 ) -> Result<Arc<CertifiedKey>, TlsError> {
-    let chain = CertificateDer::pem_slice_iter(&read(certificate_path)?)
-        .collect::<Result<Vec<_>, _>>()
-        .ok()
-        .filter(|chain| !chain.is_empty())
-        .ok_or_else(|| TlsError::Pem {
-            path: certificate_path.to_path_buf(),
-            what: "certificate",
-        })?;
-    let key = PrivateKeyDer::from_pem_slice(&read(key_path)?).map_err(|_| TlsError::Pem {
-        path: key_path.to_path_buf(),
-        what: "private key",
-    })?;
+    let chain = read_chain(certificate_path)?;
+    let key = read_private_key(key_path)?;
     Ok(Arc::new(CertifiedKey::from_der(chain, key, provider)?))
 }
 
@@ -152,7 +87,7 @@ pub fn server_config(config: &EdgeConfig) -> Result<ServerConfig, TlsError> {
 /// The mirror certificate as PEM text, for the launcher info.
 pub fn mirror_certificate_pem(mirror: &AwsMirrorConfig) -> Result<String, TlsError> {
     let path = &mirror.certificate_pem_path;
-    String::from_utf8(read(path)?).map_err(|_| TlsError::Pem {
+    String::from_utf8(read_file(path)?).map_err(|_| TlsError::Pem {
         path: path.clone(),
         what: "certificate",
     })
@@ -160,60 +95,13 @@ pub fn mirror_certificate_pem(mirror: &AwsMirrorConfig) -> Result<String, TlsErr
 
 /// A self-signed RSA certificate for exactly `hosts`: not a CA, server use only, valid
 /// [`MIRROR_VALID_DAYS`] days. Returns the certificate and PKCS#8 key, as PEM.
-fn mirror_certificate(hosts: &[String]) -> Result<(Vec<u8>, Vec<u8>), ErrorStack> {
-    let key = PKey::from_rsa(Rsa::generate(MIRROR_KEY_BITS)?)?;
-    let mut name = X509NameBuilder::new()?;
-    name.append_entry_by_text(COMMON_NAME, MIRROR_COMMON_NAME)?;
-    let name = name.build();
-    let mut builder = X509::builder()?;
-    builder.set_version(X509_VERSION_3)?;
-    let mut serial = BigNum::new()?;
-    serial.rand(SERIAL_BITS, MsbOption::MAYBE_ZERO, false)?;
-    let serial = serial.to_asn1_integer()?;
-    builder.set_serial_number(&serial)?;
-    builder.set_subject_name(&name)?;
-    builder.set_issuer_name(&name)?;
-    builder.set_pubkey(&key)?;
-    let not_before = Asn1Time::days_from_now(0)?;
-    let not_after = Asn1Time::days_from_now(MIRROR_VALID_DAYS)?;
-    builder.set_not_before(&not_before)?;
-    builder.set_not_after(&not_after)?;
-    builder.append_extension(BasicConstraints::new().critical().build()?)?;
-    builder.append_extension(
-        KeyUsage::new()
-            .critical()
-            .digital_signature()
-            .key_encipherment()
-            .build()?,
-    )?;
-    builder.append_extension(ExtendedKeyUsage::new().server_auth().build()?)?;
-    let mut names = SubjectAlternativeName::new();
-    for host in hosts {
-        names.dns(host);
-    }
-    let names = names.build(&builder.x509v3_context(None, None))?;
-    builder.append_extension(names)?;
-    builder.sign(&key, MessageDigest::sha256())?;
-    Ok((builder.build().to_pem()?, key.private_key_to_pem_pkcs8()?))
-}
-
-/// Writes `bytes` to a new file; an existing file is an error, so no certificate is replaced.
-fn write_new(path: &Path, bytes: &[u8]) -> Result<(), TlsError> {
-    let io_error = |source| TlsError::Io {
-        path: path.to_path_buf(),
-        source,
-    };
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(OWNER_ONLY_MODE);
-    }
-    options
-        .open(path)
-        .and_then(|mut file| file.write_all(bytes))
-        .map_err(io_error)
+fn mirror_certificate(hosts: &[String]) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
+    Ok(self_signed_certificate(
+        MIRROR_COMMON_NAME,
+        hosts,
+        CertificateUse::Server,
+        MIRROR_VALID_DAYS,
+    )?)
 }
 
 /// Makes the mirror certificate for the `[aws_mirror]` hosts and writes it and its key to the
@@ -227,6 +115,10 @@ pub fn write_mirror_certificate(mirror: &AwsMirrorConfig) -> Result<(), TlsError
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use nw_login::certificate::OWNER_ONLY_MODE;
+    use openssl::x509::X509;
+    use std::path::PathBuf;
 
     const HOSTS: [&str; 2] = [
         "ags-javelin-remote-config.s3.amazonaws.com",
