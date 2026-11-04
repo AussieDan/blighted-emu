@@ -174,6 +174,8 @@ cargo run -p launcher
 
 `edge-http aws-mirror-certificate` makes the self-signed certificate of the `[aws_mirror]` hosts in `config/edge.toml`. It never replaces a file. When the host list changes, move the two old files away and make the certificate again. The launcher maps those Amazon host names to this server for the game process only (see [docs/client-patch.md](docs/client-patch.md)). The two news hosts serve the files in `config/cms/` (`[cms]` in `config/edge.toml`): the message of the day, the news stories and the menu tiles, and their images. The tracked files have no news. `ping_listen` (port 80, plain HTTP) answers the client's region ping on `dynamodb.us-east-1.amazonaws.com`; the `setcap` right covers it too.
 
+Experience is normal by default: the tracked remote config layers give each gain 1. `[remote_config] experience_multiplier` in `config/edge.toml` multiplies every `javelin.xp-multipliers` value the server sends to the game and the sims read, for example `experience_multiplier = 2` for double experience on a test server. Restart `edge-http` and the sims after a change.
+
 For a release build, `setcap` takes `target/release/edge-http`. Run `setcap` again after each build, because a new file loses the right.
 
 In Discord mode, add `https://login.<domain>/launcher/discord/callback` as a redirect URL of your Discord application. The server asks Discord for the scopes `identify email`, and saves the Discord username and email of each Discord login (written again at every login) so staff can help a player get an account back. To let in only the members of one Discord server, set `[discord] guild_id` to its server id; the login then also asks for `guilds.members.read` and refuses users outside that server.

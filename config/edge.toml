@@ -88,6 +88,11 @@ directory = "config/remote-config"
 bucket = "ags-javelin-remote-config"
 # Our own id, sent to the client as -CognitoPool. It names no Amazon pool.
 cognito_pool_id = "b04fbfcd-942c-472d-88c0-c762c4076b2f"
+# The experience multiplier: every javelin.xp-multipliers value of the layers (character
+# experience, trade skills, weapon masteries, territory standing) is multiplied by it, for the
+# client and the sims alike. The tracked layers give each gain 1, so 1 is normal experience; a
+# test server sets 2 for double experience.
+experience_multiplier = 1
 
 # Our own news: the message of the day, the news stories and the menu tiles the client reads
 # from its news host, and their images. One subfolder per host, named after it; every file in it

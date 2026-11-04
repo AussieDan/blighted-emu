@@ -93,6 +93,8 @@ pub fn load_gameplay(edge_config: &Path, world: Uuid) -> Result<GameplayConfig, 
 
 #[cfg(test)]
 mod tests {
+    use nw_content::gameplay_config::NEUTRAL_MULTIPLIER;
+    use nw_login::config::NORMAL_EXPERIENCE_MULTIPLIER;
     use serde_json::Map;
 
     use super::*;
@@ -100,15 +102,21 @@ mod tests {
     const COMMITTED_EDGE_CONFIG: &str = "config/edge.toml";
     const COMMITTED_WORLD: &str = "8d0f4c2e-0000-4000-8000-000000000001";
 
-    /// The edge config of the repository, with its relative config set folder made absolute.
-    fn committed_edge_config(folder: &Path) -> PathBuf {
+    /// The edge config of the repository, with its relative config set folder made absolute and
+    /// this experience multiplier.
+    fn committed_edge_config(folder: &Path, experience_multiplier: u32) -> PathBuf {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let text = std::fs::read_to_string(root.join(COMMITTED_EDGE_CONFIG)).expect("edge.toml");
         let sets = root.join("config/remote-config");
-        let text = text.replace(
-            "directory = \"config/remote-config\"",
-            &format!("directory = {:?}", sets.display().to_string()),
-        );
+        let text = text
+            .replace(
+                "directory = \"config/remote-config\"",
+                &format!("directory = {:?}", sets.display().to_string()),
+            )
+            .replace(
+                &format!("experience_multiplier = {NORMAL_EXPERIENCE_MULTIPLIER}"),
+                &format!("experience_multiplier = {experience_multiplier}"),
+            );
         let path = folder.join("edge.toml");
         std::fs::write(&path, text).expect("written");
         path
@@ -119,18 +127,21 @@ mod tests {
     }
 
     #[test]
-    fn the_committed_sets_give_the_retail_gameplay_values() {
+    fn the_committed_sets_give_normal_experience_and_the_retail_gameplay_values() {
         let folder = std::env::temp_dir().join(format!("sim-gameplay-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&folder).expect("folder");
-        let config = load_gameplay(&committed_edge_config(&folder), world()).expect("gameplay");
-        assert!((config.xp.character - 2.0).abs() < f64::EPSILON);
-        assert!((config.xp.progression("UmbralCurrency") - 3.0).abs() < f64::EPSILON);
-        assert!((config.xp.progression("17") - 3.0).abs() < f64::EPSILON);
-        assert!(
-            (config.xp.progression("Musician") - 2.0).abs() < f64::EPSILON,
-            "the CognitoId layer's list replaces the ProductId one"
-        );
-        assert!((config.xp.progression("Music") - 1.0).abs() < f64::EPSILON);
+        let config = load_gameplay(
+            &committed_edge_config(&folder, NORMAL_EXPERIENCE_MULTIPLIER),
+            world(),
+        )
+        .expect("gameplay");
+        assert!((config.xp.character - NEUTRAL_MULTIPLIER).abs() < f64::EPSILON);
+        for id in ["UmbralCurrency", "17", "Riding", "Musician"] {
+            assert!(
+                (config.xp.progression(id) - NEUTRAL_MULTIPLIER).abs() < f64::EPSILON,
+                "{id}"
+            );
+        }
         assert_eq!(config.disabled_item_classes, ["Dagger"]);
         assert_eq!(config.wallet_cap, Some(1_000_000_000));
         assert_eq!(config.paid_loadouts, Some(27));
@@ -146,10 +157,29 @@ mod tests {
     }
 
     #[test]
+    fn a_test_server_s_experience_multiplier_reaches_the_sim() {
+        /// Double experience.
+        const DOUBLE: u32 = 2;
+        let folder = std::env::temp_dir().join(format!("sim-gameplay-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).expect("folder");
+        let config =
+            load_gameplay(&committed_edge_config(&folder, DOUBLE), world()).expect("gameplay");
+        let doubled = NEUTRAL_MULTIPLIER * f64::from(DOUBLE);
+        assert!((config.xp.character - doubled).abs() < f64::EPSILON);
+        assert!((config.xp.progression("Riding") - doubled).abs() < f64::EPSILON);
+        assert!((config.xp.progression("UmbralCurrency") - doubled).abs() < f64::EPSILON);
+        std::fs::remove_dir_all(&folder).expect("removed");
+    }
+
+    #[test]
     fn the_two_applications_set_no_key_to_different_values() {
         let folder = std::env::temp_dir().join(format!("sim-gameplay-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&folder).expect("folder");
-        let edge = load_edge_config(&committed_edge_config(&folder)).expect("edge config");
+        let edge = load_edge_config(&committed_edge_config(
+            &folder,
+            NORMAL_EXPERIENCE_MULTIPLIER,
+        ))
+        .expect("edge config");
         let sets = RemoteConfigSets::load(&edge).expect("sets");
         let layers_of = |application: &str| -> Vec<Map<String, Value>> {
             requested_layers(&edge)
@@ -173,8 +203,11 @@ mod tests {
     fn a_world_the_edge_config_does_not_name_is_refused() {
         let folder = std::env::temp_dir().join(format!("sim-gameplay-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&folder).expect("folder");
-        let error =
-            load_gameplay(&committed_edge_config(&folder), Uuid::nil()).expect_err("refused");
+        let error = load_gameplay(
+            &committed_edge_config(&folder, NORMAL_EXPERIENCE_MULTIPLIER),
+            Uuid::nil(),
+        )
+        .expect_err("refused");
         assert!(
             matches!(error, GameplayError::UnknownWorld { .. }),
             "{error}"
