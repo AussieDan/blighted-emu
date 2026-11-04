@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Helpers for tests in this and other crates (`test-util` feature).
 
+use nw_protocol::store_api::StoreTable;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -11,7 +12,7 @@ use nw_db::PgPool;
 use uuid::Uuid;
 
 use crate::cms::CmsRouters;
-use crate::config::EdgeConfig;
+use crate::config::{EdgeConfig, ShopConfig};
 use crate::discord::DiscordHttp;
 use crate::game::GameState;
 use crate::host::{ServiceRouters, edge_router};
@@ -93,6 +94,8 @@ pub fn edge_app(
         game,
         ServiceRouters::on_postgres(
             global,
+            Arc::new(StoreTable::default()),
+            Arc::new(ShopConfig::default()),
             Router::new(),
             CmsRouters {
                 news: Router::new(),

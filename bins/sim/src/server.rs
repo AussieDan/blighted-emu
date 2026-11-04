@@ -13,6 +13,7 @@ use std::future::Future;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::world::store_purchase::StoreGrant;
 use crate::world::transmog::SkinJob;
 use nw_bus::InstanceCommand;
 use nw_bus::ItemState;
@@ -35,6 +36,7 @@ use nw_db::{
     save_character_items, save_character_position, save_character_progression,
     save_character_quests, submit_stats,
 };
+use nw_db::{Purchase, buy_entitlement};
 use nw_db::{clear_new_account_titles, company_listings, earn_account_titles, stored_players};
 use nw_messages::ArenaClientMsg;
 use nw_messages::EconomyCall;
@@ -371,6 +373,7 @@ struct Loop {
     economy_jobs: JoinSet<Option<EconomyResult>>,
     /// The skin collection jobs that run (transmog module).
     skin_jobs: JoinSet<(SkinJob, Result<AccountSkins, nw_db::DbError>)>,
+    store_grants: JoinSet<(StoreGrant, Result<Purchase, nw_db::DbError>)>,
     /// The expedition requests that wait for the director.
     instance_link: InstanceLink,
     handoff_results: mpsc::Sender<HandoffResult>,
@@ -439,6 +442,7 @@ pub async fn serve(
         lookups: JoinSet::new(),
         economy_jobs: JoinSet::new(),
         skin_jobs: JoinSet::new(),
+        store_grants: JoinSet::new(),
         instance_link: InstanceLink::default(),
         handoff_results,
         started: Instant::now(),
@@ -503,6 +507,7 @@ pub async fn serve(
             Some(answer) = state.lookups.join_next() => state.looked_up(answer),
             Some(done) = state.economy_jobs.join_next() => state.economy_done(done),
             Some(done) = state.skin_jobs.join_next() => state.skins_done(done),
+            Some(done) = state.store_grants.join_next() => state.store_granted(done),
             _ = delivery_timer.tick() => state.world.economy_round(),
             Some(command) = inbox.instance.next() => match command {
                 Ok(command) => {
@@ -1082,6 +1087,35 @@ impl Loop {
         }
     }
 
+    /// Pays and saves each store purchase of the world to its account, each in its own task
+    /// (store purchase module).
+    fn run_store_grants(&mut self) {
+        for grant in self.world.take_store_grants() {
+            let global = self.global_db.clone();
+            self.store_grants.spawn(async move {
+                let bought = buy_entitlement(
+                    &global,
+                    grant.account,
+                    &grant.entitlement,
+                    i64::from(grant.price),
+                )
+                .await;
+                (grant, bought)
+            });
+        }
+    }
+
+    /// Gives the result of a store purchase to the world.
+    fn store_granted(
+        &mut self,
+        done: Result<(StoreGrant, Result<Purchase, nw_db::DbError>), tokio::task::JoinError>,
+    ) {
+        match done {
+            Ok((grant, bought)) => self.world.store_granted(&grant, bought),
+            Err(error) => tracing::error!(%error, "store grant task failed"),
+        }
+    }
+
     /// Gives the answer of a skin collection job to the world.
     fn skins_done(
         &mut self,
@@ -1448,6 +1482,7 @@ impl Loop {
         self.add_stats();
         self.run_economy_jobs();
         self.run_skin_jobs();
+        self.run_store_grants();
         if !output.script_log.is_empty() {
             let subject = subject::sim_script_log(self.settings.world_id, &self.settings.sim_id);
             let log = ScriptLog {
@@ -2761,6 +2796,7 @@ mod tests {
             progression: PlayerProgression::default(),
             game_master: false,
             account_in_probation: false,
+            entitlements: Vec::new(),
         }
     }
 
@@ -3836,6 +3872,7 @@ mod tests {
             let offer = HandoffOffer {
                 connection: gateway.connection(CONNECTION),
                 character: character(db).await.1,
+                account: Uuid::nil(),
                 name: CHARACTER_NAME.to_owned(),
                 entity: CONNECTION,
                 gde_ref: nw_messages::raw_id_of_entity(CONNECTION),
@@ -3862,6 +3899,7 @@ mod tests {
                 fishing_sequence: 0,
                 game_master: false,
                 account_in_probation: false,
+                entitlements: Vec::new(),
                 quests: PlayerQuests::default(),
                 progression: PlayerProgression::default(),
                 achievement_version: 0,

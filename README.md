@@ -103,6 +103,7 @@ A sim needs only the bundle, the world file and the collision file of its level.
 | `dungeon-scripts-<build>.json` | `cargo run --release -p content-tool -- dungeon-scripts` | Instances run without encounters |
 | `camp-slices-<build>.json` | `cargo run --release -p content-tool -- camp-slices` | No camp can be placed |
 | `quick-courses-<build>.json` | `cargo run --release -p content-tool -- quick-courses` | No course can be ridden |
+| `store-<build>.json` | `cargo run --release -p content-tool -- store` (reads the content bundle; for `edge-http`, `[shop] store_table`) | The game's store sells nothing (the sims build the same table from the bundle themselves) |
 | `design-<build>.json` | `just design` | No scripts or events |
 
 The tools that take a bundle read the merged bundle `local-data/content/bundle-<build>.bin`, so run `just design` first. The tools that read ledgers (`mob-prefabs`, `ftue-entities`) use a lot of memory. Run them under a limit, for example `ulimit -v 4000000`. `cargo run -p content-tool -- --help` lists every subcommand.
@@ -173,6 +174,8 @@ cargo run -p launcher
 ```
 
 `edge-http aws-mirror-certificate` makes the self-signed certificate of the `[aws_mirror]` hosts in `config/edge.toml`. It never replaces a file. When the host list changes, move the two old files away and make the certificate again. The launcher maps those Amazon host names to this server for the game process only (see [docs/client-patch.md](docs/client-patch.md)). The two news hosts serve the files in `config/cms/` (`[cms]` in `config/edge.toml`): the message of the day, the news stories and the menu tiles, and their images. The tracked files have no news. `ping_listen` (port 80, plain HTTP) answers the client's region ping on `dynamodb.us-east-1.amazonaws.com`; the `setcap` right covers it too.
+
+The game's store sells the store mounts of the game data. `[shop]` in `config/edge.toml` turns it on or off (`enabled`) and makes every mount free (`free`, as retail in its last weeks) or priced in Marks of Fortune (`mount_price`, `[shop.mount_prices]`), paid from the account's wallet. `blighted-admin give-marks <login name> <amount>` gives an account Marks of Fortune. `edge-http` serves the catalog, each account's unlocks and its wallet from the store table (`[shop] store_table`); a purchase in the game unlocks the mount for the account (global migration 0005; run `edge-http migrate` after this update). Each store call is logged (`store call`).
 
 Experience is normal by default: 1.0 for every gain, as retail without an event. The `[experience]` section of `config/edge.toml` sets each kind on its own: `character`, `umbral_crystals`, one value per trade skill (`[experience.trade_skills]`), per weapon mastery (`[experience.weapon_masteries]`) and per territory's standing (`[experience.territory_standing]`). A comment above each setting says what it changes. The server sends these values to the game, and the sims use the same values. Restart `edge-http` and the sims after a change.
 

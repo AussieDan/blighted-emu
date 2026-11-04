@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `serve`, `migrate` and `link-discord`.
 
+use nw_protocol::store_api::{StoreTable, StoreTableError};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::Path;
@@ -82,6 +83,9 @@ pub enum RunError {
     /// The news files cannot be loaded.
     #[error(transparent)]
     Cms(#[from] CmsError),
+    /// The store table cannot be loaded.
+    #[error(transparent)]
+    StoreTable(#[from] StoreTableError),
     /// A listener failed.
     #[error("listener failed")]
     Listen(#[source] std::io::Error),
@@ -224,6 +228,13 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
 async fn serve_async(config: EdgeConfig, secrets: Secrets) -> Result<(), RunError> {
     let remote_config = RemoteConfigSets::load(&config)?;
     let cms = CmsObjects::load(&config)?;
+    let store = Arc::new(match &config.shop.store_table {
+        Some(path) => StoreTable::load(path)?,
+        None => StoreTable::default(),
+    });
+    if store.mounts.is_empty() {
+        tracing::warn!("the store table has no mounts: the store sells nothing");
+    }
     let tls = RustlsConfig::from_config(Arc::new(server_config(&config)?));
     let aws_mirror_certificate_pem = mirror_certificate_pem(&config.aws_mirror)?.into();
     let (global, worlds) = connect_all(&config, &secrets.database_passwords)
@@ -260,8 +271,13 @@ async fn serve_async(config: EdgeConfig, secrets: Secrets) -> Result<(), RunErro
         hasher: PasswordHasher::new(config.auth.argon2_parallel)?,
         aws_mirror_certificate_pem,
     };
-    let services =
-        ServiceRouters::on_postgres(&global, remote_config_router(remote_config), cms.routers());
+    let services = ServiceRouters::on_postgres(
+        &global,
+        store,
+        Arc::new(config.shop.clone()),
+        remote_config_router(remote_config),
+        cms.routers(),
+    );
     let game = GameState {
         config: shared_config,
         game_sessions: valkey.clone(),

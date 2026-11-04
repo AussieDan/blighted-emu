@@ -118,6 +118,7 @@ mod stamina;
 mod statics;
 mod status_effects;
 mod storage_search;
+pub(crate) mod store_purchase;
 mod title_choice;
 mod tradeskill;
 pub mod transmog;
@@ -693,6 +694,10 @@ struct Player {
     game_master: bool,
     /// Whether its account is in probation: its client blocks global and trade chat.
     account_in_probation: bool,
+    /// Its account.
+    account: Uuid,
+    /// The store entitlements its account holds (the store mounts it got).
+    entitlements: BTreeSet<String>,
     /// The crafting station it uses and the interaction it opened it with, until that
     /// interaction ends.
     station: Option<String>,
@@ -1121,6 +1126,10 @@ struct Arrival {
     game_master: bool,
     /// Whether its account is in probation.
     account_in_probation: bool,
+    /// Its account.
+    account: Uuid,
+    /// The store entitlements its account holds.
+    entitlements: BTreeSet<String>,
     /// Its saved or carried quests.
     quests: PlayerQuests,
 }
@@ -1312,6 +1321,8 @@ impl SimWorld {
             fishing_sequence: 0,
             game_master: admit.game_master,
             account_in_probation: admit.account_in_probation,
+            account: admit.account,
+            entitlements: admit.entitlements.iter().cloned().collect(),
             quests: admit.quests.clone(),
         };
         self.check(&arrival)?;
@@ -1467,6 +1478,8 @@ impl SimWorld {
             fishing_sequence: offer.fishing_sequence,
             game_master: offer.game_master,
             account_in_probation: offer.account_in_probation,
+            account: offer.account,
+            entitlements: offer.entitlements.iter().cloned().collect(),
             quests: offer.quests.clone(),
         };
         self.check(&arrival)?;
@@ -4374,6 +4387,8 @@ impl SimWorld {
                     level_sent: None,
                     game_master: arrival.game_master,
                     account_in_probation: arrival.account_in_probation,
+                    account: arrival.account,
+                    entitlements: arrival.entitlements.clone(),
                     station: None,
                     station_interaction: None,
                     faction: arrival.progression.faction,
@@ -5469,6 +5484,8 @@ fn handoff_offer(
         fishing_sequence: player.fishing.next_sequence(),
         game_master: player.game_master,
         account_in_probation: player.account_in_probation,
+        account: player.account,
+        entitlements: player.entitlements.iter().cloned().collect(),
         quests,
         progression: player.progression(),
         achievement_version: player.flow.achievement_version(),
@@ -5851,6 +5868,7 @@ mod tests {
             progression: PlayerProgression::default(),
             game_master: false,
             account_in_probation: false,
+            entitlements: Vec::new(),
         }
     }
 

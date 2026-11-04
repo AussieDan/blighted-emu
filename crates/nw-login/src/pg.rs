@@ -5,12 +5,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use nw_db::{
-    Account, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character, DbError,
-    DiscordProfile, NewCharacter, PgPool, StatValues,
+    Account, AccountEntitlement, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character,
+    DbError, DiscordProfile, NewCharacter, PgPool, StatValues, Wallet, account_entitlements,
+    wallet,
 };
 use uuid::Uuid;
 
-use crate::store::{AccountStore, AnalyticsStore, CharacterStore, StatsStore, StoreError};
+use crate::store::{
+    AccountStore, AnalyticsStore, CharacterStore, EntitlementStore, StatsStore, StoreError,
+};
 
 /// Accounts and launcher sessions in PostgreSQL.
 #[derive(Debug, Clone)]
@@ -336,6 +339,32 @@ impl PgStats {
     /// Uses a pool of the migrated global database.
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
+    }
+}
+
+/// The store entitlements of accounts in the global database.
+#[derive(Debug, Clone)]
+pub struct PgEntitlements {
+    pool: PgPool,
+}
+
+impl PgEntitlements {
+    /// Uses a pool of the migrated global database.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl EntitlementStore for PgEntitlements {
+    async fn held(&self, account: Uuid) -> Result<Vec<AccountEntitlement>, StoreError> {
+        account_entitlements(&self.pool, account)
+            .await
+            .map_err(StoreError::unavailable)
+    }
+    async fn wallet(&self, account: Uuid) -> Result<Wallet, StoreError> {
+        wallet(&self.pool, account)
+            .await
+            .map_err(StoreError::unavailable)
     }
 }
 

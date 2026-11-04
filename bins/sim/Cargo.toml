@@ -22,6 +22,7 @@ nw-db.workspace = true
 nw-formats.workspace = true
 nw-login.workspace = true
 nw-messages.workspace = true
+nw-protocol.workspace = true
 nw-reflect.workspace = true
 nw-sim-core.workspace = true
 nw-social.workspace = true

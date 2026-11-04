@@ -580,6 +580,10 @@ pub(super) struct Economy {
     next_trade: u64,
     /// The generic invites that wait for their answer.
     pub(super) invites: super::invites::Invites,
+    /// The store purchases whose entitlement the loop saves next.
+    pub(super) grants: Vec<super::store_purchase::StoreGrant>,
+    /// The last store transaction number given.
+    pub(super) last_transaction: u64,
 }
 
 impl Economy {
@@ -637,7 +641,7 @@ const fn refusal_reason(refusal: OrderRefusal) -> u32 {
     }
 }
 
-fn count_call(call: &'static str, accepted: bool) {
+pub(super) fn count_call(call: &'static str, accepted: bool) {
     metrics::counter!(
         METRIC_ECONOMY_CALLS,
         CALL_LABEL => call,
@@ -1471,13 +1475,8 @@ impl SimWorld {
                 }
                 count_call("store_flag", true);
             }
-            StoreCall::Purchase { purchase, .. } => {
-                // This server sells nothing: no store purchase and no paid currency.
-                count_call("store_purchase", false);
-                tracing::info!(
-                    product = %String::from_utf8_lossy(&purchase.product),
-                    "store purchase refused: this server has no store"
-                );
+            StoreCall::Purchase { header, purchase } => {
+                self.store_purchase(entity, *header, purchase);
             }
             StoreCall::ClaimEntitlement { entitlement, .. } => {
                 // No entitlement is granted on this server, so none can be claimed.

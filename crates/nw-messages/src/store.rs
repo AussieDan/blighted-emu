@@ -7,12 +7,17 @@
 //!   no message (`unlock_store_content`, `menus-linux-2026-09-12`, both new characters).
 //! - 898 `EntitlementComponentServerFacet_ClientInitializeTransaction`: a store purchase (retail
 //!   `unlock_store_content`: three purchases of `Marks of Fortune`).
+//! - 5936 `EntitlementComponentClientFacet_OnRequestInitialized` and 1285 `OnRequestSuccess`: the
+//!   server's answers to a purchase, 0.12 s and 0.24 s after it (retail
+//!   `mount-menu-buying-all-store-horses`, 35 free mounts): the call's request id, a transaction
+//!   number, and the entitlements it changed (none, then the bought one and the wallet).
 //! - 5107 `EntitlementComponentServerFacet_RequestClaimEntitlement`: the claim of an external
 //!   reward (retail `ExternalRewards`, `menus-linux-2026-09-12`: a Twitch drop container).
 //! - 4932 `RewardTrackComponentServerFacet_RequestPurchaseReward` (slot, item, cost) and 4910
 //!   `RequestResetRewardTrack`: the PvP reward track (`pvp_track_unlocked`); retail answers
 //!   through the track's replicated state and the bag, no message.
 
+use crate::BodyCodec;
 use crate::combat::{read_string, write_string};
 use crate::facet::FacetHeader;
 use crate::wire::{MessageError, RAW_ID_LEN, Reader, Writer};
@@ -27,6 +32,16 @@ pub const CLAIM_ENTITLEMENT_TYPE_INDEX: u64 = 5107;
 pub const PURCHASE_REWARD_TYPE_INDEX: u64 = 4932;
 /// `RewardTrackComponentServerFacet_RequestResetRewardTrack`.
 pub const RESET_REWARD_TRACK_TYPE_INDEX: u64 = 4910;
+/// `EntitlementComponentClientFacet_OnRequestInitialized`.
+pub const REQUEST_INITIALIZED_TYPE_INDEX: u64 = 5936;
+/// `EntitlementComponentClientFacet_OnRequestSuccess`.
+pub const REQUEST_SUCCESS_TYPE_INDEX: u64 = 1285;
+/// The request status of both answers (every retail answer: 2; its meaning is Unknown).
+pub const RETAIL_REQUEST_STATUS: u32 = 2;
+/// The kind of a durable entitlement, such as a mount (retail: 0).
+pub const DURABLE_ENTITLEMENT_KIND: u32 = 0;
+/// The kind of the store currency's wallet (retail: 2, the `Marks of Fortune` record).
+pub const WALLET_ENTITLEMENT_KIND: u32 = 2;
 
 /// A store purchase (898): the client's locale, the offer, and its price.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +69,167 @@ pub struct StorePurchase {
     /// A byte (retail 1).
     pub byte_c: u8,
 }
+
+/// One entitlement of a store answer (retail 1285: the bought mount, and the Marks of Fortune
+/// wallet).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntitlementRecord {
+    /// The service's entitlement id.
+    pub id: Vec<u8>,
+    /// The entitlement alias: the game data's `UniqueTagID` (`Ent_Mount_MTX_7_bear_Ronin`).
+    pub alias: Vec<u8>,
+    /// Its display name (`Ronin Bear Mount`).
+    pub name: Vec<u8>,
+    /// [`DURABLE_ENTITLEMENT_KIND`] for a mount; [`WALLET_ENTITLEMENT_KIND`] for the wallet.
+    pub kind: u32,
+    /// Three amounts: a wallet's free, paid and pending Marks (Inferred from retail 8000, 5000,
+    /// 0 beside a total of 13000, and the store service's `freeAmount`, `paidAmount`,
+    /// `pendingAmount`); a mount: 0.
+    pub amounts: [u32; 3],
+    /// The total amount (a mount: 1; the wallet: 13000, the balance the store showed).
+    pub total: u32,
+    /// A `u64` (retail 0).
+    pub word_a: u64,
+    /// The ids of its instances (a mount: one UUID text).
+    pub instances: Vec<Vec<u8>>,
+    /// A `u64` (retail 0).
+    pub word_b: u64,
+    /// When it changed, ISO 8601 text (`2026-11-04T12:32:26.000Z`).
+    pub updated: Vec<u8>,
+    /// A byte (retail 0).
+    pub byte_c: u8,
+}
+
+/// The body of a store answer (5936 and 1285).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EntitlementRequest {
+    /// The header: the purchase call's own.
+    pub header: FacetHeader,
+    /// The request id of the purchase call ([`StorePurchase::transaction`]).
+    pub request: [u8; RAW_ID_LEN],
+    /// The transaction number, decimal text (retail 19 digits).
+    pub transaction: Vec<u8>,
+    /// [`RETAIL_REQUEST_STATUS`].
+    pub status: u32,
+    /// A byte (retail 0).
+    pub byte_a: u8,
+    /// The entitlements the request changed: none in 5936.
+    pub entitlements: Vec<EntitlementRecord>,
+    /// A flag (retail true).
+    pub done: bool,
+}
+
+impl EntitlementRequest {
+    fn write(&self, writer: &mut Writer) -> Result<(), MessageError> {
+        self.header.write(writer);
+        writer.bytes(&self.request);
+        write_string(writer, &self.transaction)?;
+        writer.u32(self.status).u8(self.byte_a);
+        writer.prefixed(self.entitlements.len() as u64)?;
+        for record in &self.entitlements {
+            write_string(writer, &record.id)?;
+            write_string(writer, &record.alias)?;
+            write_string(writer, &record.name)?;
+            writer.u32(record.kind);
+            for amount in record.amounts {
+                writer.u32(amount);
+            }
+            writer.u32(record.total).u64(record.word_a);
+            writer.prefixed(record.instances.len() as u64)?;
+            for instance in &record.instances {
+                write_string(writer, instance)?;
+            }
+            writer.u64(record.word_b);
+            write_string(writer, &record.updated)?;
+            writer.u8(record.byte_c);
+        }
+        writer.boolean(self.done);
+        Ok(())
+    }
+
+    fn read(reader: &mut Reader<'_>) -> Result<Self, MessageError> {
+        let header = FacetHeader::read(reader)?;
+        let request = reader.raw_id()?;
+        let transaction = read_string(reader)?;
+        let status = reader.u32()?;
+        let byte_a = reader.u8()?;
+        let count = reader.prefixed()?;
+        let mut entitlements = Vec::new();
+        for _ in 0..count {
+            let id = read_string(reader)?;
+            let alias = read_string(reader)?;
+            let name = read_string(reader)?;
+            let kind = reader.u32()?;
+            let amounts = [reader.u32()?, reader.u32()?, reader.u32()?];
+            let total = reader.u32()?;
+            let word_a = reader.u64()?;
+            let instance_count = reader.prefixed()?;
+            let mut instances = Vec::new();
+            for _ in 0..instance_count {
+                instances.push(read_string(reader)?);
+            }
+            entitlements.push(EntitlementRecord {
+                id,
+                alias,
+                name,
+                kind,
+                amounts,
+                total,
+                word_a,
+                instances,
+                word_b: reader.u64()?,
+                updated: read_string(reader)?,
+                byte_c: reader.u8()?,
+            });
+        }
+        Ok(Self {
+            header,
+            request,
+            transaction,
+            status,
+            byte_a,
+            entitlements,
+            done: reader.boolean()?,
+        })
+    }
+}
+
+/// Defines a store answer: an [`EntitlementRequest`] under its own type index.
+macro_rules! entitlement_answer {
+    ($(#[$doc:meta])* $name:ident, $type_index:expr) => {
+        $(#[$doc])*
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub struct $name(pub EntitlementRequest);
+
+        impl BodyCodec for $name {
+            const TYPE_INDEX: u64 = $type_index;
+
+            fn encode(&self) -> Result<Vec<u8>, MessageError> {
+                let mut writer = Writer::new();
+                self.0.write(&mut writer)?;
+                Ok(writer.finish())
+            }
+
+            fn decode(body: &[u8]) -> Result<Self, MessageError> {
+                let mut reader = Reader::new(body);
+                let request = EntitlementRequest::read(&mut reader)?;
+                reader.finish()?;
+                Ok(Self(request))
+            }
+        }
+    };
+}
+
+entitlement_answer!(
+    /// 5936: the purchase is taken.
+    RequestInitializedMsg,
+    REQUEST_INITIALIZED_TYPE_INDEX
+);
+entitlement_answer!(
+    /// 1285: the purchase is done, with the entitlements it changed.
+    RequestSuccessMsg,
+    REQUEST_SUCCESS_TYPE_INDEX
+);
 
 /// One store call of the client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -252,6 +428,46 @@ mod tests {
             panic!("reward");
         };
         assert_eq!((slot, cost), (7, 50_000));
+    }
+
+    /// Retail answers to the first purchase of `mount-menu-buying-all-store-horses` (the Ronin
+    /// Bear Mount, 545.93 s and 546.05 s).
+    const INITIALIZED: &str = "dbff741f993e0651193a1ff815806fc8606425b0a4464137b37787b0d13b7dd71336323130363032383339393533353939353933000000020000\
+        01";
+    const SUCCESS: &str = "dbff741f993e0651193a1ff815806fc8606425b0a4464137b37787b0d13b7dd71336323130363032383339393533353939353933000000020002153045443359\
+        61427a536c5845504b485649316d35371a456e745f4d6f756e745f4d54585f375f626561725f526f6e696e10526f6e696e2042656172204d6f756e74\
+        00000000000000000000000000000000000000010000000000000000012438616661623433322d313434352d343236392d623135392d383034393165\
+        303666663238000000000000000018323032362d31312d30345431323a33323a32362e3030305a00163168436c77424a7846326568346d44634359\
+        56343562104d61726b73206f6620466f7274756e651c4e657720576f726c64202d204d61726b73206f6620466f7274756e650000000200001f4000\
+        00138800000000000032c8000000000000000000000000000000000018323032362d31312d30345431323a33323a32362e3030305a0001";
+
+    #[test]
+    fn retail_store_answers_read_and_write_back() {
+        let initialized = RequestInitializedMsg::decode(&hex_bytes(INITIALIZED)).expect("5936");
+        assert_eq!(initialized.0.status, RETAIL_REQUEST_STATUS);
+        assert!(initialized.0.entitlements.is_empty());
+        assert_eq!(
+            initialized.encode().expect("encode"),
+            hex_bytes(INITIALIZED)
+        );
+        let success = RequestSuccessMsg::decode(&hex_bytes(SUCCESS)).expect("1285");
+        assert_eq!(success.encode().expect("encode"), hex_bytes(SUCCESS));
+        assert_eq!(success.0.request, initialized.0.request);
+        assert_eq!(success.0.transaction, b"6210602839953599593");
+        let [mount, wallet] = &success.0.entitlements[..] else {
+            panic!("two entitlements");
+        };
+        assert_eq!(mount.alias, b"Ent_Mount_MTX_7_bear_Ronin");
+        assert_eq!((mount.kind, mount.total), (DURABLE_ENTITLEMENT_KIND, 1));
+        assert_eq!(
+            mount.instances,
+            [b"8afab432-1445-4269-b159-80491e06ff28".to_vec()]
+        );
+        assert_eq!(
+            (wallet.alias.as_slice(), wallet.total),
+            (&b"Marks of Fortune"[..], 13_000)
+        );
+        assert_eq!(wallet.kind, WALLET_ENTITLEMENT_KIND);
     }
 
     #[test]

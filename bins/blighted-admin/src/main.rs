@@ -47,6 +47,18 @@ enum Command {
         /// The account's login name, Discord user id or Discord username.
         username: String,
     },
+    /// Gives a game account Marks of Fortune, the in-game store's currency (a negative amount
+    /// takes them; a wallet never goes below 0).
+    GiveMarks {
+        /// Configuration file (its `[access]` names the global database).
+        #[arg(long, default_value = DEFAULT_CONFIG)]
+        config: PathBuf,
+        /// The account's login name, Discord user id or Discord username.
+        username: String,
+        /// How many Marks of Fortune.
+        #[arg(allow_hyphen_values = true)]
+        amount: i64,
+    },
 }
 
 fn parse_rank(name: &str) -> Result<AdminRank, String> {
@@ -76,6 +88,17 @@ fn main() -> ExitCode {
         } => match blighted_admin::run::change_rank(&config, &username, Some(rank)) {
             Ok(_) => {
                 println!("{username} is now {}", rank.name());
+                ExitCode::SUCCESS
+            }
+            Err(error) => report(&error),
+        },
+        Command::GiveMarks {
+            config,
+            username,
+            amount,
+        } => match blighted_admin::run::give_marks(&config, &username, amount) {
+            Ok(wallet) => {
+                println!("{username} has {} Marks of Fortune now", wallet.marks);
                 ExitCode::SUCCESS
             }
             Err(error) => report(&error),

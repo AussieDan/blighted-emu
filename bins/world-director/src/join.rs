@@ -14,8 +14,9 @@ use nw_bus::{
 use nw_db::{
     AdminRank, PgPool, SavedArena, SavedInventory, SavedItem, SavedItemRolls, SavedMounts,
     SavedPlace, SavedPosition, SavedProgression, SavedQuests, SavedStatusEffect, SavedTravel,
-    account_by_id, admin_rank, character_by_id, character_inventory, character_items,
-    character_position, character_progression, character_quests, next_entity_number,
+    account_by_id, account_entitlements, admin_rank, character_by_id, character_inventory,
+    character_items, character_position, character_progression, character_quests,
+    next_entity_number,
 };
 use nw_login::look::{saved_backstory, saved_look};
 use nw_sim_core::{Position, TUTORIAL_FOLDER, TUTORIAL_START};
@@ -298,6 +299,7 @@ pub async fn route_join(
         progression,
         game_master,
         account_in_probation: standing.in_probation,
+        entitlements: standing.entitlements,
     };
     let reply = context
         .bus
@@ -314,18 +316,20 @@ pub async fn route_join(
     }
 }
 
-/// What an account's admin rank and age give it in the world.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// What an account's admin rank, age and store entitlements give it in the world.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 struct Standing {
     /// It has the game master rank (or a higher one).
     game_master: bool,
     /// It is in probation ([`in_probation`]).
     in_probation: bool,
+    /// The store entitlements it holds.
+    entitlements: Vec<String>,
 }
 
 /// The standing of `account` from the global database `ranks`. No database, or a failed or slow
-/// read (above [`RANK_READ_TIMEOUT`]), gives no GM rights and no probation, so a database fault
-/// never refuses, holds up or mutes a join.
+/// read (above [`RANK_READ_TIMEOUT`]), gives no GM rights, no probation and no store
+/// entitlements, so a database fault never refuses, holds up or mutes a join.
 async fn account_standing(ranks: Option<&PgPool>, account: Uuid) -> Standing {
     let Some(ranks) = ranks else {
         return Standing::default();
@@ -334,12 +338,14 @@ async fn account_standing(ranks: Option<&PgPool>, account: Uuid) -> Standing {
         Ok::<_, nw_db::DbError>((
             admin_rank(ranks, account).await?,
             account_by_id(ranks, account).await?,
+            account_entitlements(ranks, account).await?,
         ))
     };
     match tokio::time::timeout(RANK_READ_TIMEOUT, read).await {
-        Ok(Ok((rank, found))) => Standing {
+        Ok(Ok((rank, found, held))) => Standing {
             game_master: rank.is_some_and(|rank| rank >= AdminRank::GameMaster),
             in_probation: in_probation(rank, found.map(|found| found.created_at_unix), unix_now()),
+            entitlements: held.into_iter().map(|held| held.entitlement).collect(),
         },
         Ok(Err(error)) => {
             tracing::warn!(%error, %account, "account read failed; no GM rights, no probation");

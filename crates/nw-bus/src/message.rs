@@ -203,6 +203,10 @@ pub struct Admit {
     /// (`accountInProbation`).
     #[serde(default)]
     pub account_in_probation: bool,
+    /// The store entitlements the account holds (the game data's `UniqueTagID`s): the store
+    /// mounts it got.
+    #[serde(default)]
+    pub entitlements: Vec<String>,
 }
 
 /// The answer to [`Admit`].
@@ -347,6 +351,9 @@ pub struct HandoffOffer {
     pub connection: ConnectionRef,
     /// The character.
     pub character: Uuid,
+    /// The account: a store purchase on the taker is granted to it.
+    #[serde(default)]
+    pub account: Uuid,
     /// The character's name, for the admin snapshot.
     pub name: String,
     /// The entity number; it stays the same.
@@ -417,6 +424,9 @@ pub struct HandoffOffer {
     /// Whether the account is in probation, as in [`Admit::account_in_probation`].
     #[serde(default)]
     pub account_in_probation: bool,
+    /// The account's store entitlements, as in [`Admit::entitlements`].
+    #[serde(default)]
+    pub entitlements: Vec<String>,
     /// The player's quests: the active one with its run, and the finished ones.
     #[serde(default)]
     pub quests: PlayerQuests,
@@ -1497,6 +1507,7 @@ mod tests {
             progression: progression(),
             game_master: false,
             account_in_probation: true,
+            entitlements: vec!["Ent_Mount_MTX_7_bear_Ronin".to_owned()],
         });
         round_trip(AdmitReply::Admitted);
         round_trip(AdmitReply::Refused {
@@ -1516,6 +1527,7 @@ mod tests {
         let offer = HandoffOffer {
             connection: connection(),
             character: Uuid::new_v4(),
+            account: Uuid::new_v4(),
             name: "Ada".to_owned(),
             entity: CONNECTION,
             gde_ref: GDE_REF,
@@ -1539,6 +1551,7 @@ mod tests {
             fishing_sequence: 4,
             game_master: true,
             account_in_probation: true,
+            entitlements: vec!["Ent_Mount_MTX_1_wolf".to_owned()],
             achievement_version: 25,
             items: Some(vec![CarriedItem {
                 item_id: "PotionHealthT1".to_owned(),

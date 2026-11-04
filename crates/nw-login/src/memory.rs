@@ -7,8 +7,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use nw_db::{
-    Account, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character, DiscordProfile,
-    NewCharacter, StatValues,
+    Account, AccountEntitlement, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character,
+    DiscordProfile, NewCharacter, StatValues, Wallet,
 };
 use nw_protocol::launcher_api::LauncherSession;
 use uuid::Uuid;
@@ -19,7 +19,7 @@ use crate::queue::{
 };
 use crate::store::{
     AccountStore, AnalyticsStore, CharacterStore, DiscordAttempt, DiscordStateStore,
-    GameSessionStore, RateLimiter, StatsStore, StoreError,
+    EntitlementStore, GameSessionStore, RateLimiter, StatsStore, StoreError,
 };
 use crate::time::MILLIS_PER_SECOND;
 use nw_common::time::{unix_ms, unix_seconds};
@@ -586,6 +586,47 @@ struct Stats {
     values: StatValues,
     last_page: Option<PageRequest>,
     last_values: Option<ValuesRequest>,
+}
+
+/// The store of each account in memory: its entitlements and its wallet.
+#[derive(Default)]
+struct AccountStores {
+    held: HashMap<Uuid, Vec<AccountEntitlement>>,
+    wallets: HashMap<Uuid, Wallet>,
+}
+
+/// Store entitlements and wallets in memory, by account.
+#[derive(Clone, Default)]
+pub(crate) struct MemoryEntitlements(Arc<Mutex<AccountStores>>);
+
+impl MemoryEntitlements {
+    /// `account` holds `held`.
+    pub(crate) fn hold(&self, account: Uuid, held: AccountEntitlement) {
+        lock(&self.0).held.entry(account).or_default().push(held);
+    }
+
+    /// The wallet of `account` is `wallet`.
+    pub(crate) fn set_wallet(&self, account: Uuid, wallet: Wallet) {
+        lock(&self.0).wallets.insert(account, wallet);
+    }
+}
+
+impl EntitlementStore for MemoryEntitlements {
+    async fn held(&self, account: Uuid) -> Result<Vec<AccountEntitlement>, StoreError> {
+        Ok(lock(&self.0)
+            .held
+            .get(&account)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn wallet(&self, account: Uuid) -> Result<Wallet, StoreError> {
+        Ok(lock(&self.0)
+            .wallets
+            .get(&account)
+            .copied()
+            .unwrap_or_default())
+    }
 }
 
 /// Stats in memory: set boards and values answer every request, and the last requests are kept.

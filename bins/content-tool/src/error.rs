@@ -6,6 +6,7 @@ use nw_content::ContainerError;
 use nw_content::combat::CombatDataError;
 use nw_content::fill::FillError;
 use nw_design::DesignRunError;
+use nw_protocol::store_api::StoreTableError;
 
 use crate::ai_data::AiDataError;
 use crate::ai_trace::AiTraceError;
@@ -57,6 +58,9 @@ pub enum ToolError {
     /// A road file cannot be built, written or read back.
     #[error(transparent)]
     Roads(#[from] RoadsError),
+    /// The store table cannot be written.
+    #[error(transparent)]
+    StoreTable(#[from] StoreTableError),
     /// A water file cannot be built, written or read back.
     #[error(transparent)]
     Water(#[from] WaterError),

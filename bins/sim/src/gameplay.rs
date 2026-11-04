@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use nw_content::gameplay_config::{GameplayConfig, GameplayConfigError, KeyStack};
-use nw_login::config::{EdgeConfigError, load_edge_config};
+use nw_login::config::{EdgeConfig, EdgeConfigError, ShopConfig, load_edge_config};
 use nw_login::remote_config::{
     APPLICATIONS, Dimension, RemoteConfigError, RemoteConfigSets, VERSIONLESS, object_key,
     requested_layers,
@@ -52,13 +52,24 @@ pub enum GameplayError {
     Values(#[from] GameplayConfigError),
 }
 
+/// The `edge-http` config at `edge_config`.
+fn edge_config_at(edge_config: &Path) -> Result<EdgeConfig, GameplayError> {
+    load_edge_config(edge_config).map_err(|source| GameplayError::EdgeConfig {
+        path: edge_config.to_path_buf(),
+        source,
+    })
+}
+
+/// The store settings (`[shop]`) of the `edge-http` config at `edge_config`: the sims sell what
+/// the store service lists, at its prices.
+pub fn load_shop(edge_config: &Path) -> Result<ShopConfig, GameplayError> {
+    Ok(edge_config_at(edge_config)?.shop)
+}
+
 /// The gameplay values of world `world` in the config sets that the `edge-http` config at
 /// `edge_config` names.
 pub fn load_gameplay(edge_config: &Path, world: Uuid) -> Result<GameplayConfig, GameplayError> {
-    let config = load_edge_config(edge_config).map_err(|source| GameplayError::EdgeConfig {
-        path: edge_config.to_path_buf(),
-        source,
-    })?;
+    let config = edge_config_at(edge_config)?;
     if config.world(world).is_none() {
         return Err(GameplayError::UnknownWorld {
             path: edge_config.to_path_buf(),

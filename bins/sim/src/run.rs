@@ -23,6 +23,7 @@ use nw_content::mob_prefabs::MobPrefabs;
 use nw_content::player_abilities::PlayerAbilities;
 use nw_content::player_attacks::PlayerAttacks;
 use nw_content::player_sequences::PlayerSequences;
+use nw_content::store::store_table;
 use nw_db::{DbError, GLOBAL_MIGRATOR, WORLD_MIGRATOR, check_schema};
 use nw_sim_core::{LevelGround, level_bounds};
 use nw_world::WorldFile;
@@ -38,7 +39,7 @@ use nw_world::world_file::world_file_path;
 
 use crate::asset_solids::AssetSolids;
 use crate::config::{SimConfig, SimConfigError, SimRole, load_sim_config};
-use crate::gameplay::{GameplayError, load_gameplay};
+use crate::gameplay::{GameplayError, load_gameplay, load_shop};
 use crate::mob_ai::{LookAssets, MobAi, SliceVitals, resolve_ai};
 use crate::mobs::{SpawnFilter, sim_spawns, spawns_of_level};
 use crate::player_content::{MobLooks, PlayerContent};
@@ -281,6 +282,16 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
     content.asset_solids =
         AssetSolids::of(&deferred_level, &collision, &content.tutorial_level.assets);
     content.trading_post = config.trading_post.clone();
+    content.store = store_table(&bundle.tables, &bundle.text);
+    content.shop = load_shop(&config.edge_config)?;
+    for entitlement in content.shop.mount_prices.keys() {
+        if content.store.mount_of(entitlement).is_none() {
+            tracing::warn!(
+                entitlement,
+                "[shop] mount_prices names no store mount: left out"
+            );
+        }
+    }
     content.start_tools = config.start_tools()?;
     for tool in &content.start_tools {
         if content.kits.item(&tool.item).is_none() {

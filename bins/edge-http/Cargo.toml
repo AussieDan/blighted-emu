@@ -16,6 +16,7 @@ metrics-exporter-prometheus.workspace = true
 nw-common.workspace = true
 nw-db.workspace = true
 nw-login.workspace = true
+nw-protocol.workspace = true
 openssl.workspace = true
 rustls.workspace = true
 sqlx.workspace = true

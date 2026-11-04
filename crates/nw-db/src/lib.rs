@@ -14,6 +14,7 @@ mod arena;
 mod character;
 mod connect;
 mod consumable_cooldowns;
+mod entitlements;
 mod entity;
 mod error;
 mod faction;
@@ -54,6 +55,9 @@ pub use character::{
 };
 pub use connect::{DatabaseConfig, connect, connect_lazy, connect_options};
 pub use consumable_cooldowns::SavedConsumableCooldown;
+pub use entitlements::{
+    AccountEntitlement, Purchase, Wallet, account_entitlements, buy_entitlement, give_marks, wallet,
+};
 pub use entity::{MAX_ENTITY_NUMBER, next_entity_number};
 pub use error::DbError;
 pub use faction::SavedFaction;

@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
-use nw_db::AdminRank;
+use nw_db::{AdminRank, PgPool};
+use uuid::Uuid;
 use nw_login::config::TlsConfig;
 use nw_login::discord::DiscordHttp;
 use nw_login::install_crypto_provider;
@@ -152,9 +153,9 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
         })
 }
 
-/// A rank change could not be made.
+/// An account command (a rank change, Marks of Fortune) could not be made.
 #[derive(Debug, thiserror::Error)]
-pub enum RankError {
+pub enum AccountCommandError {
     /// The configuration cannot be used.
     #[error(transparent)]
     Config(#[from] AdminConfigError),
@@ -175,14 +176,13 @@ pub enum RankError {
     Io(#[source] std::io::Error),
 }
 
-/// Gives the account named `username` (a login name, a Discord user id or a Discord username)
-/// the rank `rank`, or removes its rank when `rank` is `None` (`blighted-admin grant-rank` /
-/// `revoke-rank`). Returns `false` when there was no rank to remove.
-pub fn change_rank(
+/// Runs `job` on the account named `username` (a login name, a Discord user id or a Discord
+/// username) in the global database that the configuration at `config_path` names.
+fn on_account<T>(
     config_path: &Path,
     username: &str,
-    rank: Option<AdminRank>,
-) -> Result<bool, RankError> {
+    job: impl AsyncFnOnce(&PgPool, Uuid) -> Result<T, nw_db::DbError>,
+) -> Result<T, AccountCommandError> {
     let config = load_admin_config(config_path)?;
     let (database, password_env) = config
         .access
@@ -193,34 +193,57 @@ pub fn change_rank(
                 .as_ref()
                 .zip(access.global_database_password_env.as_ref())
         })
-        .ok_or(RankError::NoDatabase)?;
-    let password =
-        std::env::var(password_env).map_err(|_| RankError::MissingSecret(password_env.clone()))?;
+        .ok_or(AccountCommandError::NoDatabase)?;
+    let password = std::env::var(password_env)
+        .map_err(|_| AccountCommandError::MissingSecret(password_env.clone()))?;
     let username = username.trim().to_owned();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(RankError::Io)?
+        .map_err(AccountCommandError::Io)?
         .block_on(async {
             let database_error =
-                |error: &dyn std::fmt::Display| RankError::Database(error.to_string());
+                |error: &dyn std::fmt::Display| AccountCommandError::Database(error.to_string());
             let pool = nw_db::connect(database, &password)
                 .await
                 .map_err(|error| database_error(&error))?;
             let account = nw_db::account_by_login_name(&pool, &username)
                 .await
                 .map_err(|error| database_error(&error))?
-                .ok_or_else(|| RankError::UnknownUser(username.clone()))?;
-            match rank {
-                Some(rank) => nw_db::set_admin_rank(&pool, account.id, rank, None)
-                    .await
-                    .map(|()| true)
-                    .map_err(|error| database_error(&error)),
-                None => nw_db::remove_admin_rank(&pool, account.id)
-                    .await
-                    .map_err(|error| database_error(&error)),
-            }
+                .ok_or_else(|| AccountCommandError::UnknownUser(username.clone()))?;
+            job(&pool, account.id)
+                .await
+                .map_err(|error| database_error(&error))
         })
+}
+
+/// Gives the account named `username` the rank `rank`, or removes its rank when `rank` is
+/// `None` (`blighted-admin grant-rank` / `revoke-rank`). Returns `false` when there was no rank
+/// to remove.
+pub fn change_rank(
+    config_path: &Path,
+    username: &str,
+    rank: Option<AdminRank>,
+) -> Result<bool, AccountCommandError> {
+    on_account(config_path, username, async |pool, account| match rank {
+        Some(rank) => nw_db::set_admin_rank(pool, account, rank, None)
+            .await
+            .map(|()| true),
+        None => nw_db::remove_admin_rank(pool, account).await,
+    })
+}
+
+/// Adds `amount` Marks of Fortune, the store currency, to the wallet of the account named
+/// `username` (a negative amount takes them; a wallet never goes below 0) and returns the
+/// wallet (`blighted-admin give-marks`).
+pub fn give_marks(
+    config_path: &Path,
+    username: &str,
+    amount: i64,
+) -> Result<nw_db::Wallet, AccountCommandError> {
+    on_account(config_path, username, async |pool, account| {
+        nw_db::give_marks(pool, account, amount).await
+    })
 }
 
 /// The access of `config`: local mode without login, or server mode with the global database,

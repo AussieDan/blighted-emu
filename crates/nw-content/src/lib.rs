@@ -62,6 +62,7 @@ pub mod skins;
 pub mod starter;
 pub mod starting_ranks;
 pub mod status_effects;
+pub mod store;
 pub mod table;
 pub mod titles;
 pub mod tradeskill_xp;

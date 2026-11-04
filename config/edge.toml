@@ -115,6 +115,30 @@ hosts = [
 certificate_pem_path = "local-data/edge-http/aws-mirror.pem"
 private_key_pem_path = "local-data/edge-http/aws-mirror-key.pem"
 
+# The in-game store. edge-http serves its catalog, each account's unlocks and each account's
+# Marks of Fortune (the store currency) on game.<domain>; a purchase goes through the game
+# connection to the sim, which pays it from the account's wallet and saves the unlock. Restart
+# edge-http and the sims after a change. Give an account Marks of Fortune with
+# `blighted-admin give-marks <login name> <amount>` (a negative amount takes them).
+[shop]
+# The store table that `content-tool store` writes from the content bundle: the mounts the store
+# sells (52 in build 25810808). Without the file the store sells nothing.
+store_table = "local-data/content/store-25810808.json"
+# Whether the store sells. false: the catalog is empty and purchases are refused; the mounts an
+# account already got stay its own.
+enabled = true
+# Whether every mount costs 0 Marks of Fortune, as in retail's last weeks. false: a mount costs
+# its price below, paid from the account's wallet; a wallet below the price buys nothing.
+free = true
+# The price of a mount in Marks of Fortune when the store is not free (retail: 20000 for most
+# mounts, 15000 or 10000 for some).
+mount_price = 20000
+
+# The price of single mounts, by the store entitlement that unlocks them (the `entitlement` of the
+# store table); every other mount costs mount_price. For example:
+# Ent_Mount_MTX_1_wolf = 15000
+[shop.mount_prices]
+
 # Experience multipliers. Each value multiplies one kind of experience: 1.0 is normal (the
 # amount the game data gives), 2.0 is double, 0.5 is half, 0.0 gives none. Any number of 0 or
 # more works. The server sends these values to the game (remote config javelin.xp-multipliers,

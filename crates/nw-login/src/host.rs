@@ -15,16 +15,18 @@ use tower::ServiceExt;
 
 use nw_db::PgPool;
 use nw_protocol::aws_mirror::{CMS_HOST, CMS_IMAGE_HOST, remote_config_host};
+use nw_protocol::store_api::StoreTable;
 
 use crate::analytics::{AnalyticsState, is_kinesis_host, is_sts_host, kinesis_router, sts_router};
 use crate::cms::CmsRouters;
+use crate::config::ShopConfig;
 use crate::discord::DiscordApi;
 use crate::error::ApiError;
 use crate::game::{GameState, channel_router, game_router, unknown_route};
 use crate::launcher::{LauncherState, launcher_router};
-use crate::pg::PgStats;
+use crate::pg::{PgEntitlements, PgStats};
 use crate::queue::QueueStore;
-use crate::shop::shop_router;
+use crate::shop::{ShopState, shop_router};
 use crate::stats::{StatsState, stats_router};
 use crate::store::{
     AccountStore, CharacterStore, DiscordStateStore, GameSessionStore, RateLimiter,
@@ -52,6 +54,8 @@ struct HostRoutes {
 pub struct ServiceRouters {
     /// The stats service ([`crate::stats::stats_router`]), on `game.<domain>`.
     pub stats: Router,
+    /// The shop and entitlement services ([`crate::shop::shop_router`]), on `game.<domain>`.
+    pub shop: Router,
     /// The analytics stream ([`crate::analytics::kinesis_router`]).
     pub kinesis: Router,
     /// The credentials of the analytics stream ([`crate::analytics::sts_router`]).
@@ -64,15 +68,27 @@ pub struct ServiceRouters {
 }
 
 impl ServiceRouters {
-    /// The services over the migrated global database `global`, the remote config route
+    /// The services over the migrated global database `global`, the store table `store` and the
+    /// store settings `settings`, the remote config route
     /// ([`crate::remote_config::remote_config_router`]) and the news routes.
-    pub fn on_postgres(global: &PgPool, remote_config: Router, cms: CmsRouters) -> Self {
-        let store = PgStats::new(global.clone());
+    pub fn on_postgres(
+        global: &PgPool,
+        store: Arc<StoreTable>,
+        settings: Arc<ShopConfig>,
+        remote_config: Router,
+        cms: CmsRouters,
+    ) -> Self {
+        let stats = PgStats::new(global.clone());
         Self {
-            stats: stats_router(StatsState {
-                stats: store.clone(),
+            shop: shop_router(ShopState {
+                table: store,
+                settings,
+                entitlements: PgEntitlements::new(global.clone()),
             }),
-            kinesis: kinesis_router(AnalyticsState { analytics: store }),
+            stats: stats_router(StatsState {
+                stats: stats.clone(),
+            }),
+            kinesis: kinesis_router(AnalyticsState { analytics: stats }),
             sts: sts_router(),
             remote_config,
             cms,
@@ -137,7 +153,7 @@ where
             .merge(channel_router(game.clone()))
             .fallback(unknown_route)
             .method_not_allowed_fallback(unknown_route),
-        game: game_router(game).merge(services.stats).merge(shop_router()),
+        game: game_router(game).merge(services.stats).merge(services.shop),
         kinesis: services.kinesis,
         sts: services.sts,
         remote_config: services.remote_config,
@@ -160,7 +176,7 @@ mod tests {
     use crate::game::SESSION_PREFIX;
     use crate::game::tests::fixture;
     use crate::launcher::tests::state;
-    use crate::memory::{MemoryAnalytics, MemoryStats};
+    use crate::memory::{MemoryAnalytics, MemoryEntitlements, MemoryStats};
     use crate::remote_config::remote_config_router;
     use crate::remote_config::tests::committed_sets;
     use crate::test_http::{self, error_code};
@@ -174,6 +190,11 @@ mod tests {
         launcher.game_sessions = game.state.game_sessions.clone();
         let stats = MemoryStats::default();
         let services = ServiceRouters {
+            shop: shop_router(ShopState {
+                table: Arc::new(StoreTable::default()),
+                settings: Arc::new(ShopConfig::default()),
+                entitlements: MemoryEntitlements::default(),
+            }),
             stats: stats_router(StatsState { stats }),
             kinesis: kinesis_router(AnalyticsState {
                 analytics: MemoryAnalytics::default(),

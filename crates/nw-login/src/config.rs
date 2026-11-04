@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `config/edge.toml` (M2 spec section 9). Secrets are not in this file; see [`crate::secrets`].
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 
@@ -105,6 +105,9 @@ pub struct EdgeConfig {
     /// The experience multipliers; normal experience when left out.
     #[serde(default)]
     pub experience: ExperienceConfig,
+    /// The store; an empty store when left out.
+    #[serde(default)]
+    pub shop: ShopConfig,
     /// Worlds, one `[[world]]` block each.
     #[serde(rename = "world")]
     pub worlds: Vec<WorldConfig>,
@@ -198,6 +201,74 @@ pub struct RemoteConfigConfig {
     /// Our Cognito pool id: the client's [`COGNITO_POOL_ARGUMENT`] and the id of the
     /// `CognitoId` layers. It names no Amazon pool.
     pub cognito_pool_id: Uuid,
+}
+
+/// `[shop]`: the in-game store: its mounts (the store table of `content-tool store`,
+/// [`nw_protocol::store_api`]), whether it sells, and whether its mounts are free or cost Marks of
+/// Fortune from the account's wallet.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShopConfig {
+    /// The store table file; no file, or none set, gives an empty store.
+    pub store_table: Option<PathBuf>,
+    /// Whether the store sells. Off, the catalog is empty and purchases are refused; the mounts an
+    /// account got stay its own.
+    #[serde(default = "switched_on")]
+    pub enabled: bool,
+    /// Whether every mount costs 0 (retail's last weeks). Off, a mount costs its price from the
+    /// account's wallet.
+    #[serde(default = "switched_on")]
+    pub free: bool,
+    /// The price of a mount, in Marks of Fortune (Observed: 20 of retail's 31 mount offers cost
+    /// 20000, 10 cost 15000, 1 cost 10000).
+    #[serde(default = "default_mount_price")]
+    pub mount_price: u32,
+    /// The price of single mounts, by the entitlement that unlocks them
+    /// (`Ent_Mount_MTX_1_wolf`); the others cost [`ShopConfig::mount_price`].
+    #[serde(default)]
+    pub mount_prices: BTreeMap<String, u32>,
+}
+
+/// The retail price of most store mounts, in Marks of Fortune.
+pub const DEFAULT_MOUNT_PRICE: u32 = 20_000;
+
+const fn switched_on() -> bool {
+    true
+}
+
+const fn default_mount_price() -> u32 {
+    DEFAULT_MOUNT_PRICE
+}
+
+impl Default for ShopConfig {
+    fn default() -> Self {
+        Self {
+            store_table: None,
+            enabled: switched_on(),
+            free: switched_on(),
+            mount_price: DEFAULT_MOUNT_PRICE,
+            mount_prices: BTreeMap::new(),
+        }
+    }
+}
+
+impl ShopConfig {
+    /// The listed price of the mount that `entitlement` unlocks.
+    pub fn list_price(&self, entitlement: &str) -> u32 {
+        self.mount_prices
+            .get(entitlement)
+            .copied()
+            .unwrap_or(self.mount_price)
+    }
+
+    /// What the mount that `entitlement` unlocks costs: 0 in a free store, else its listed price.
+    pub fn price(&self, entitlement: &str) -> u32 {
+        if self.free {
+            0
+        } else {
+            self.list_price(entitlement)
+        }
+    }
 }
 
 /// `[cms]`: our own news documents and images, answered as the client's news host and its image
@@ -604,6 +675,8 @@ max_connections = 5
     fn valid_file_loads() {
         let config = valid();
         assert_eq!(config.experience, ExperienceConfig::default());
+        assert_eq!(config.shop, ShopConfig::default());
+        assert!(config.shop.enabled && config.shop.free);
         assert_eq!(config.login_host(), "login.example.org");
         assert_eq!(config.game_host(), "game.example.org");
         assert_eq!(config.login_authority(), "login.example.org");
@@ -648,6 +721,32 @@ max_connections = 5
             config.launch_arguments()[1],
             "https://login.example.org:8443"
         );
+    }
+
+    #[test]
+    fn a_store_mount_costs_its_price_unless_the_store_is_free() {
+        const WOLF: &str = "Ent_Mount_MTX_1_wolf";
+        const BEAR: &str = "Ent_Mount_MTX_7_bear_Ronin";
+        const MOUNT_PRICE: u32 = 15_000;
+        const WOLF_PRICE: u32 = 10_000;
+        let shop = load(&VALID.replace(
+            "[cms]",
+            &format!(
+                "[shop]\nfree = false\nmount_price = {MOUNT_PRICE}\n\
+                 [shop.mount_prices]\n{WOLF} = {WOLF_PRICE}\n\n[cms]"
+            ),
+        ))
+        .expect("config")
+        .shop;
+        assert!(shop.enabled);
+        assert_eq!(shop.price(WOLF), WOLF_PRICE);
+        assert_eq!(shop.price(BEAR), MOUNT_PRICE);
+        let free = ShopConfig {
+            free: true,
+            ..shop.clone()
+        };
+        assert_eq!(free.price(WOLF), 0);
+        assert_eq!(free.list_price(WOLF), WOLF_PRICE);
     }
 
     #[test]

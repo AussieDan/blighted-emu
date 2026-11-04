@@ -20,6 +20,7 @@ nw-content.workspace = true
 nw-design.workspace = true
 nw-formats.workspace = true
 nw-oodle.workspace = true
+nw-protocol.workspace = true
 nw-reflect.workspace = true
 nw-sim-core.workspace = true
 nw-world.workspace = true

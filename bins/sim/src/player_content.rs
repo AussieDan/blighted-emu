@@ -44,6 +44,8 @@ use nw_content::status_effects::StatusEffectRules;
 use nw_content::titles::TitleRules;
 use nw_content::tradeskill_xp::{BonusChances, TradeskillCurves};
 use nw_formats::objectstream::lowercase_crc32;
+use nw_login::config::ShopConfig;
+use nw_protocol::store_api::StoreTable;
 use nw_sim_core::{EquipLoad, EquipLoadLimits, Position};
 use nw_world::camps::CampSlices;
 use nw_world::collision::QuestVolume;
@@ -713,6 +715,11 @@ pub struct PlayerContent {
     pub camp_slices: CampSlices,
     /// The quick course rules.
     pub quick_courses: QuickCourseRules,
+    /// The store: the mounts it sells and the entitlements every account holds; empty until the
+    /// sim builds it from the content bundle.
+    pub store: StoreTable,
+    /// Whether the store sells, and its prices (`[shop]` of the edge config).
+    pub shop: ShopConfig,
     /// The quick course paths; empty until the sim loads the quick course file.
     pub quick_course_paths: QuickCoursePaths,
     /// The loot value of a player's level by its experience.
@@ -1177,6 +1184,8 @@ impl PlayerContent {
             camps: CampRules::from_tables(tables),
             camp_slices: CampSlices::default(),
             quick_courses: QuickCourseRules::from_tables(tables),
+            store: StoreTable::default(),
+            shop: ShopConfig::default(),
             quick_course_paths: QuickCoursePaths::default(),
             player_loot_levels: PlayerLootLevels::from_tables(tables),
             poi_tags: PoiTags::from_tables(tables),

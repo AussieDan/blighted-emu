@@ -41,6 +41,7 @@ use content_tool::player_attacks::{BundleRows, PlayerAttacksReport, build_stance
 use content_tool::quick_courses::build_quick_courses;
 use content_tool::roads::{RoadsError, RoadsReport, build_level_roads};
 use content_tool::source::GameSource;
+use content_tool::store::write_store_table;
 use content_tool::water::{WaterError, build_level_water};
 use content_tool::world::{LevelReport, UnmatchedIds, run_world, world_totals};
 use nw_capture::{CLIENT_TO_SERVER, CaptureError, SERVER_TO_CLIENT, TypeNames};
@@ -318,6 +319,13 @@ enum Command {
         /// Output folder for `quick-courses-<build>.json`.
         #[arg(long, default_value = DEFAULT_CONTENT_DIR)]
         out_dir: PathBuf,
+    },
+    /// Writes the store table (`store-<build>.json`): the store mounts and the entitlements every
+    /// account holds, from the content bundle, for `edge-http`'s store. Needs no game install.
+    Store {
+        /// Folder of the content bundle and of the table.
+        #[arg(long, default_value = DEFAULT_CONTENT_DIR)]
+        content_dir: PathBuf,
     },
     /// Worker of `mob-prefabs`: reads one ledger and prints its tally as JSON.
     #[command(name = "mob-prefabs-ledger", hide = true)]
@@ -686,6 +694,15 @@ fn run(cli: Cli) -> Result<(), ToolError> {
                 report.path.display(),
                 report.courses,
                 report.slices
+            );
+        }
+        Command::Store { content_dir } => {
+            let report = write_store_table(&content_dir, &client_build)?;
+            println!(
+                "{}: {} store mounts, {} entitlements every account holds",
+                report.path.display(),
+                report.mounts,
+                report.held_by_all
             );
         }
         Command::MobPrefabsLedger { ledger, entry } => {

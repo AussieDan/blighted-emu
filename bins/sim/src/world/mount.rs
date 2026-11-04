@@ -909,18 +909,25 @@ impl SimWorld {
     }
 
     /// The mount `mount` with its type, when `player` owns it and its type is unlocked: its
-    /// `RequiredAchievementId` and its type's achievement are set. A store mount
-    /// (`IsEntitlement`) needs an entitlement, which this server does not hold.
+    /// `RequiredAchievementId` is set, or, for a store mount (`IsEntitlement`), the player's
+    /// account holds the store entitlement that unlocks it; and its type's achievement is set.
     fn usable<'a>(
         &'a self,
         player: &Player,
         mount: &'a MountRule,
     ) -> Option<(&'a MountRule, &'a MountTypeRule)> {
         let rules = &self.achievement_rules;
-        let owned = mount
+        let by_achievement = mount
             .required_achievement
             .as_deref()
             .is_some_and(|id| has_achievement(rules, player, id));
+        let bought = mount.entitlement
+            && self
+                .content
+                .store
+                .unlock_of(&mount.id)
+                .is_some_and(|store| player.entitlements.contains(&store.unlock.entitlement));
+        let owned = by_achievement || bought;
         let mount_type = self.content.mounts.mount_type(mount)?;
         (owned && has_achievement(rules, player, &mount_type.required_achievement))
             .then_some((mount, mount_type))
@@ -1567,9 +1574,19 @@ mod tests {
         };
         use super::*;
         use crate::player_content::PlayerContent;
+        use nw_db::{AccountEntitlement, Purchase, Wallet};
+        use nw_login::config::ShopConfig;
+        use nw_messages::store::StorePurchase;
+        use nw_messages::store::WALLET_ENTITLEMENT_KIND;
+        use nw_messages::{RAW_ID_LEN, ServerMessage};
+        use nw_protocol::store_api::{STORE_CURRENCY, StoreEntitlement, StoreMount, StoreTable};
+        use uuid::Uuid;
 
         const PLAYER: u64 = 1;
         const HORSE: &str = "Mount_Horse_1";
+        /// A store mount of the store table, and the entitlement that unlocks it.
+        const STORE_BEAR: &str = "Mount_MTX_7_bear_Ronin";
+        const BEAR_ENTITLEMENT: &str = "Ent_Mount_MTX_7_bear_Ronin";
         const HORSE_UNLOCK: &str = "MountType_Unlock_Horse";
         const HORSE_GIFT: &str = "AwardAchievement_Mount_Horse_1";
         const UNLOCK_BIT: u32 = 1_000;
@@ -1598,6 +1615,173 @@ mod tests {
                 dash_acceleration_scale: 1.15,
                 stamina: riding_stamina(),
             }
+        }
+
+        /// Whether the player of `world` may use the mount `id`.
+        fn may_use(world: &mut SimWorld, id: &str) -> bool {
+            let entity = world.player_by_number(PLAYER).expect("player");
+            let player = world.world.get::<Player>(entity).expect("player");
+            let rule = world
+                .content
+                .mounts
+                .mount(lowercase_crc32(id))
+                .expect("mount rule");
+            world.usable(player, rule).is_some()
+        }
+
+        /// A free store purchase of offer `offer`, as retail's client sends it.
+        fn purchase(offer: &str) -> StorePurchase {
+            StorePurchase {
+                language: b"en-US".to_vec(),
+                currency: b"USD".to_vec(),
+                country: b"US".to_vec(),
+                word_a: 1,
+                transaction: [7; RAW_ID_LEN],
+                offer: offer.as_bytes().to_vec(),
+                offer_again: offer.as_bytes().to_vec(),
+                byte_b: 0,
+                product: b"Marks of Fortune".to_vec(),
+                price: 0,
+                byte_c: 1,
+            }
+        }
+
+        fn store_answers(world: &mut SimWorld) -> Vec<ServerMessage> {
+            std::mem::take(&mut world.combat_messages)
+                .into_iter()
+                .filter(|out| out.connection == connection(PLAYER))
+                .flat_map(|out| out.envelopes)
+                .filter_map(|bytes| {
+                    let envelope = Envelope::decode(&bytes).ok()?;
+                    ServerMessage::decode(envelope.type_index()?, &envelope.body)?.ok()
+                })
+                .filter(|message| {
+                    matches!(
+                        message,
+                        ServerMessage::RequestInitialized(_) | ServerMessage::RequestSuccess(_)
+                    )
+                })
+                .collect()
+        }
+
+        #[test]
+        fn a_store_mount_is_free_and_usable_once_its_account_holds_it() {
+            /// When the account got it: 2026-11-04 12:32:26.050 UTC.
+            const GRANTED_MS: i64 = 1_793_795_546_050;
+            /// The account's Marks of Fortune.
+            const BALANCE: i64 = 13_000;
+            let mut world = world_with(vec![UNLOCK_BIT]);
+            let entity = world.player_by_number(PLAYER).expect("player");
+            // Any facet header: the answers carry the call's own.
+            let header = FacetHeader::of(MOUNT_FACET, PLAYER);
+            assert!(!may_use(&mut world, STORE_BEAR), "not bought yet");
+            world.store_purchase(entity, header, &purchase("Ent_Unknown"));
+            assert!(store_answers(&mut world).is_empty(), "no such offer");
+            assert!(world.take_store_grants().is_empty());
+            world.store_purchase(entity, header, &purchase(BEAR_ENTITLEMENT));
+            let [ServerMessage::RequestInitialized(started)] = &store_answers(&mut world)[..]
+            else {
+                panic!("5936 at once");
+            };
+            assert_eq!(started.0.header, header);
+            assert_eq!(started.0.request, [7; RAW_ID_LEN]);
+            assert!(started.0.entitlements.is_empty());
+            let grants = world.take_store_grants();
+            let [grant] = &grants[..] else {
+                panic!("one grant");
+            };
+            assert_eq!(
+                (grant.entitlement.as_str(), grant.price),
+                (BEAR_ENTITLEMENT, 0)
+            );
+            assert!(!may_use(&mut world, STORE_BEAR), "not saved yet");
+            world.store_granted(
+                grant,
+                Ok(Purchase::Bought {
+                    held: AccountEntitlement {
+                        entitlement: BEAR_ENTITLEMENT.to_owned(),
+                        instance: Uuid::from_u128(7),
+                        granted_at_ms: GRANTED_MS,
+                    },
+                    wallet: Wallet {
+                        marks: BALANCE,
+                        updated_at_ms: GRANTED_MS,
+                    },
+                }),
+            );
+            let [ServerMessage::RequestSuccess(done)] = &store_answers(&mut world)[..] else {
+                panic!("1285 after the save");
+            };
+            assert_eq!(done.0.transaction, started.0.transaction);
+            let [bought, wallet] = &done.0.entitlements[..] else {
+                panic!("the bought entitlement and the wallet");
+            };
+            assert_eq!(wallet.alias, STORE_CURRENCY.as_bytes());
+            assert_eq!(
+                (wallet.kind, wallet.total),
+                (WALLET_ENTITLEMENT_KIND, 13_000)
+            );
+            assert_eq!(wallet.amounts, [13_000, 0, 0]);
+            assert_eq!(bought.alias, BEAR_ENTITLEMENT.as_bytes());
+            assert_eq!(bought.name, b"Ronin Bear Mount");
+            assert_eq!(
+                bought.instances,
+                [Uuid::from_u128(7).to_string().into_bytes()]
+            );
+            assert_eq!(bought.updated, b"2026-11-04T12:32:26.050Z");
+            assert!(may_use(&mut world, STORE_BEAR));
+            world.change_mount(entity, lowercase_crc32(STORE_BEAR), NOW);
+            assert_eq!(
+                mount_of(&mut world).selected,
+                Some(lowercase_crc32(STORE_BEAR))
+            );
+        }
+
+        /// The sim of [`world_with`] whose store has the settings `shop`.
+        fn world_with_shop(shop: ShopConfig) -> SimWorld {
+            let mut world = world_with(vec![UNLOCK_BIT]);
+            Arc::make_mut(&mut world.content).shop = shop;
+            world
+        }
+
+        #[test]
+        fn a_closed_store_sells_nothing() {
+            let mut world = world_with_shop(ShopConfig {
+                enabled: false,
+                ..ShopConfig::default()
+            });
+            let entity = world.player_by_number(PLAYER).expect("player");
+            let header = FacetHeader::of(MOUNT_FACET, PLAYER);
+            world.store_purchase(entity, header, &purchase(BEAR_ENTITLEMENT));
+            assert!(store_answers(&mut world).is_empty());
+            assert!(world.take_store_grants().is_empty());
+        }
+
+        #[test]
+        fn a_store_mount_costs_its_price_and_a_short_wallet_gets_no_success() {
+            const PRICE: u32 = 15_000;
+            let mut world = world_with_shop(ShopConfig {
+                free: false,
+                mount_price: PRICE,
+                ..ShopConfig::default()
+            });
+            let entity = world.player_by_number(PLAYER).expect("player");
+            let header = FacetHeader::of(MOUNT_FACET, PLAYER);
+            world.store_purchase(entity, header, &purchase(BEAR_ENTITLEMENT));
+            assert_eq!(store_answers(&mut world).len(), 1, "5936");
+            let grants = world.take_store_grants();
+            let [grant] = &grants[..] else {
+                panic!("one grant");
+            };
+            assert_eq!(grant.price, PRICE);
+            world.store_granted(
+                grant,
+                Ok(Purchase::TooPoor {
+                    wallet: Wallet::default(),
+                }),
+            );
+            assert!(store_answers(&mut world).is_empty(), "no 1285");
+            assert!(!may_use(&mut world, STORE_BEAR));
         }
 
         #[test]
@@ -1867,15 +2051,26 @@ mod tests {
         /// level flow holds the achievement bits, so achievements set later reach it.
         fn world_admitted(achievements: Vec<u32>, login: bool) -> SimWorld {
             let mounts = MountRules::build(
-                [MountRule {
-                    id: HORSE.to_owned(),
-                    crc: lowercase_crc32(HORSE),
-                    mount_type: "Horse".to_owned(),
-                    required_achievement: Some(HORSE_GIFT.to_owned()),
-                    entitlement: false,
-                    sorted_order: 1,
-                    disabled_dye_channels: [false; MOUNT_DYE_LEN],
-                }],
+                [
+                    MountRule {
+                        id: HORSE.to_owned(),
+                        crc: lowercase_crc32(HORSE),
+                        mount_type: "Horse".to_owned(),
+                        required_achievement: Some(HORSE_GIFT.to_owned()),
+                        entitlement: false,
+                        sorted_order: 1,
+                        disabled_dye_channels: [false; MOUNT_DYE_LEN],
+                    },
+                    MountRule {
+                        id: STORE_BEAR.to_owned(),
+                        crc: lowercase_crc32(STORE_BEAR),
+                        mount_type: "Horse".to_owned(),
+                        required_achievement: None,
+                        entitlement: true,
+                        sorted_order: 2,
+                        disabled_dye_channels: [false; MOUNT_DYE_LEN],
+                    },
+                ],
                 [MountTypeRule {
                     id: "Horse".to_owned(),
                     summon_ms: SUMMON_MS,
@@ -1900,6 +2095,16 @@ mod tests {
             world.content = Arc::new(PlayerContent {
                 mounts,
                 achievements: indexes,
+                store: StoreTable {
+                    mounts: vec![StoreMount {
+                        unlock: StoreEntitlement {
+                            entitlement: BEAR_ENTITLEMENT.to_owned(),
+                            name: "Ronin Bear Mount".to_owned(),
+                        },
+                        mount: STORE_BEAR.to_owned(),
+                    }],
+                    held_by_all: Vec::new(),
+                },
                 ..PlayerContent::default()
             });
             let mut admit = admit_at(PLAYER, 0.0, login);

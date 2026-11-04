@@ -30,6 +30,7 @@ pub mod quick_courses;
 pub mod roads;
 pub mod source;
 pub mod stand_in_trees;
+pub mod store;
 pub mod water;
 pub mod world;
 

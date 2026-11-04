@@ -39,6 +39,7 @@ use crate::spawn_point::ReceivePlayerSpawnPointMsg;
 use crate::spreadshot::SpreadshotProcessedMsg;
 use crate::storage_search::StorageSearchReadyMsg;
 use crate::storage_search::StorageSearchResultsMsg;
+use crate::store::{RequestInitializedMsg, RequestSuccessMsg};
 use crate::time_change::SyncTimeChangeMsg;
 use crate::time_synch::TimeSynchMsg;
 use crate::titles::{AvailableTitlesMsg, TitlesUnlockMsg};
@@ -104,6 +105,10 @@ pub enum ServerMessage {
     MeleeHit(MeleeHitMsg),
     /// 608.
     AdjustFxScripts(AdjustFxScriptsMsg),
+    /// 5936.
+    RequestInitialized(RequestInitializedMsg),
+    /// 1285.
+    RequestSuccess(RequestSuccessMsg),
     /// 4299.
     DeathRecap(DeathRecapMsg),
     /// 4298.
@@ -252,6 +257,12 @@ impl ServerMessage {
             MeleeHitMsg::TYPE_INDEX => MeleeHitMsg::decode(body).map(Self::MeleeHit),
             AdjustFxScriptsMsg::TYPE_INDEX => {
                 AdjustFxScriptsMsg::decode(body).map(Self::AdjustFxScripts)
+            }
+            RequestInitializedMsg::TYPE_INDEX => {
+                RequestInitializedMsg::decode(body).map(Self::RequestInitialized)
+            }
+            RequestSuccessMsg::TYPE_INDEX => {
+                RequestSuccessMsg::decode(body).map(Self::RequestSuccess)
             }
             DeathRecapMsg::TYPE_INDEX => DeathRecapMsg::decode(body).map(Self::DeathRecap),
             OnHealedMsg::TYPE_INDEX => OnHealedMsg::decode(body).map(Self::OnHealed),
@@ -409,6 +420,8 @@ impl ServerMessage {
             Self::OnDamage(_) => OnDamageMsg::TYPE_INDEX,
             Self::MeleeHit(_) => MeleeHitMsg::TYPE_INDEX,
             Self::AdjustFxScripts(_) => AdjustFxScriptsMsg::TYPE_INDEX,
+            Self::RequestInitialized(_) => RequestInitializedMsg::TYPE_INDEX,
+            Self::RequestSuccess(_) => RequestSuccessMsg::TYPE_INDEX,
             Self::DeathRecap(_) => DeathRecapMsg::TYPE_INDEX,
             Self::OnHealed(_) => OnHealedMsg::TYPE_INDEX,
             Self::UpdatePhasing(_) => UpdatePhasingMsg::TYPE_INDEX,
@@ -501,6 +514,8 @@ impl ServerMessage {
             Self::OnDamage(message) => message.encode(),
             Self::MeleeHit(message) => message.encode(),
             Self::AdjustFxScripts(message) => message.encode(),
+            Self::RequestInitialized(message) => message.encode(),
+            Self::RequestSuccess(message) => message.encode(),
             Self::DeathRecap(message) => message.encode(),
             Self::OnHealed(message) => message.encode(),
             Self::UpdatePhasing(message) => message.encode(),

@@ -5,8 +5,8 @@
 use std::future::Future;
 
 use nw_db::{
-    Account, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character, DiscordProfile,
-    NewCharacter, StatValues,
+    Account, AccountEntitlement, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character,
+    DiscordProfile, NewCharacter, StatValues, Wallet,
 };
 use nw_protocol::launcher_api::LauncherSession;
 use uuid::Uuid;
@@ -190,6 +190,18 @@ pub trait DiscordStateStore: Clone + Send + Sync + 'static {
 
     /// The attempt state; `Ready` is removed when it is returned.
     fn poll(&self, state: &str) -> impl Future<Output = Result<DiscordAttempt, StoreError>> + Send;
+}
+
+/// The store entitlements and wallets of accounts (global database): the store service lists them.
+pub trait EntitlementStore: Clone + Send + Sync + 'static {
+    /// The entitlements `account` holds, oldest first.
+    fn held(
+        &self,
+        account: Uuid,
+    ) -> impl Future<Output = Result<Vec<AccountEntitlement>, StoreError>> + Send;
+
+    /// The Marks of Fortune of `account`.
+    fn wallet(&self, account: Uuid) -> impl Future<Output = Result<Wallet, StoreError>> + Send;
 }
 
 /// Stats and leaderboards (global database).
