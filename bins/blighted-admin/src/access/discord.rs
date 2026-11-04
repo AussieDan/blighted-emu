@@ -220,7 +220,7 @@ fn page(message: &str, target: &str) -> String {
         format!(r#"<meta http-equiv="refresh" content="0;url={target}">"#)
     };
     format!(
-        r#"<!doctype html><html lang="en"><head><meta charset="utf-8">{refresh}<title>Log in · Blighted Emu</title><link rel="stylesheet" href="/web/style.css"></head><body><main class="work login-page"><p>{message}</p><p><a href="{target}">Continue</a></p></main></body></html>"#
+        r#"<!doctype html><html lang="en"><head><meta charset="utf-8">{refresh}<title>Log in · Blighted Emu</title><link rel="stylesheet" href="/web/style.css"></head><body class="login-page"><main class="work"><p>{message}</p><p><a href="{target}">Continue</a></p></main></body></html>"#
     )
 }
 
