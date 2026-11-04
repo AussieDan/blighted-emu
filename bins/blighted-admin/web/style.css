@@ -685,9 +685,13 @@ details + details, .section-head ~ details { border-top: 1px solid var(--line); 
 .game-note:empty { display: none; }
 /* Home: the world facts, then every page as a game panel. */
 .home-board { display: flex; flex-direction: column; gap: 22px; padding: 22px; }
-.world .facts { padding: 0; gap: 8px 40px; }
-.world .fact { font: 600 22px var(--font-sign); }
-.world .fact span { font: 600 11px var(--font-serif); letter-spacing: 0.14em; text-transform: uppercase; color: var(--gm-mute); }
+.world .facts, .host .facts { padding: 0; gap: 8px 40px; }
+.world .fact, .host .fact { font: 600 22px var(--font-sign); }
+.world .fact span, .host .fact span, .meter span { font: 600 11px var(--font-serif); letter-spacing: 0.14em; text-transform: uppercase; color: var(--gm-mute); }
+.meters { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 40px; margin-top: 14px; }
+.meter { display: grid; grid-template-columns: 110px minmax(0, 1fr); align-items: center; gap: 12px; }
+.meter-bar { height: 8px; background: var(--gm-row); border: 1px solid var(--gm-edge); }
+.meter-bar i { display: block; height: 100%; width: 0; background: var(--gm-gold); transition: width 300ms ease-out; }
 .game .pages { padding: 0; gap: 22px; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); }
 .game .pages li {
   color: var(--gm-ink);
@@ -986,6 +990,7 @@ details + details, .section-head ~ details { border-top: 1px solid var(--line); 
   .records-board { grid-template-columns: minmax(0, 1fr); height: auto; padding: 12px; }
   .scripts-board { grid-template-columns: minmax(0, 1fr); height: auto; padding: 12px; }
   .todo-board { grid-template-columns: minmax(0, 1fr); height: auto; padding: 12px; }
+  .meters { grid-template-columns: minmax(0, 1fr); }
   .script-canvas-box { height: 70vh; }
   .game .editor-map { height: 70vh; }
   .viewer-page .work { height: auto; min-height: 100vh; }

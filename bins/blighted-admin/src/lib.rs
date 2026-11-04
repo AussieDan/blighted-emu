@@ -8,6 +8,7 @@ pub mod captures;
 pub mod config;
 pub mod gm;
 pub mod guard;
+pub mod host;
 pub mod live;
 pub mod relay;
 pub mod relief;

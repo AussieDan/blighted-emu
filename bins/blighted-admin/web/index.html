@@ -31,10 +31,19 @@
       <h2>World</h2>
       <div class="facts" id="facts"><div class="fact"><span>World</span>Reading the world facts.</div></div>
     </section>
+    <section class="game-panel host" aria-label="Server">
+      <h2>Server</h2>
+      <p class="hint">The machine the game servers run on, read every few seconds.</p>
+      <div class="facts" id="host-facts"><div class="fact"><span>Server</span>Reading the server.</div></div>
+      <div class="meters">
+        <div class="meter"><span>Memory</span><div class="meter-bar"><i id="memory-bar"></i></div></div>
+        <div class="meter"><span>Processor</span><div class="meter-bar"><i id="cpu-bar"></i></div></div>
+      </div>
+    </section>
     <ul class="pages">
       <li><a href="/live">Live</a><p>Server status, figures, players and mobs on the map, and the bot batch buttons.</p></li>
-      <li><a href="/live3d">Live 3D</a><p>The selected player and everything around it in 3D.</p></li>
-      <li><a href="/gm">GM</a><p>The audit log of GM commands, bans, and admin ranks (head admins).</p></li>
+      <li><a href="/live3d">Live 3D</a><p>The world as a low-poly 3D model: ground, rocks, buildings, trees, players and mobs.</p></li>
+      <li><a href="/gm">GM</a><p>The players online and their GM controls, bans, admin ranks, and the audit log.</p></li>
       <li><a href="/studio">Studio</a><p>The team's design files in content/: their problems, a full check, and Apply into the local world.</p></li>
       <li><a href="/records">Records</a><p>Find a game data record and edit it as a design file.</p></li>
       <li><a href="/scripts">Scripts</a><p>The script editor: blocks for triggers, conditions and actions.</p></li>
@@ -45,7 +54,31 @@
     </div>
   </main>
   <script type="module">
-    import { factElements } from '/web/tiles.js';
+    import { factElements, hostFacts } from '/web/tiles.js';
+
+    /** How often the server figures are read again. */
+    const HOST_REFRESH_MS = 3000;
+    const hostBox = document.getElementById('host-facts');
+    const showShare = (id, share) => {
+      document.getElementById(id).style.width = share === null ? '0' : `${share}%`;
+    };
+    async function showHost() {
+      try {
+        const response = await fetch('/api/host');
+        if (!response.ok) {
+          throw new Error(`${response.status} ${await response.text()}`);
+        }
+        const facts = hostFacts(await response.json());
+        hostBox.replaceChildren(...factElements(facts.pairs));
+        showShare('memory-bar', facts.memoryShare);
+        showShare('cpu-bar', facts.cpuShare);
+      } catch (error) {
+        hostBox.replaceChildren(...factElements([['Server', `The server figures cannot be read: ${error.message ?? error}`]]));
+        hostBox.firstChild.classList.add('bad');
+      }
+    }
+    showHost();
+    setInterval(showHost, HOST_REFRESH_MS);
 
     const facts = document.getElementById('facts');
     try {

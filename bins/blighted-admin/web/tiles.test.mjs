@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
-import { TILE_KINDS, UNKNOWN, formatTile, trailPush } from './tiles.js';
+import { TILE_KINDS, UNKNOWN, formatTile, hostFacts, trailPush } from './tiles.js';
 
 test('formatTile shows Unknown for null', () => {
   for (const kind of Object.values(TILE_KINDS)) {
@@ -31,4 +31,20 @@ test('trailPush keeps the last points and drops leavers', () => {
   trails = trailPush(trails, [at(8, 50)], 3);
   assert.equal(trails.has(7), false, 'a player that left loses its trail');
   assert.deepEqual(trails.get(8).map((point) => point.x), [30, 40, 50]);
+});
+
+test('hostFacts shows memory and processor use, and Unknown without them', () => {
+  const gib = 1024 ** 3;
+  const facts = hostFacts({ memory: { total_bytes: 16 * gib, used_bytes: 4 * gib }, cpu: { cores: 8, percent: 37.4 } });
+  assert.deepEqual(facts.pairs, [
+    ['Memory used', '4.0 GiB of 16.0 GiB'],
+    ['Memory use', '25 %'],
+    ['Processor cores', '8'],
+    ['Processor use', '37 %'],
+  ]);
+  assert.equal(facts.memoryShare, 25);
+  assert.equal(facts.cpuShare, 37.4);
+  const none = hostFacts({ memory: null, cpu: null });
+  assert.ok(none.pairs.every(([, value]) => value === UNKNOWN));
+  assert.equal(none.memoryShare, null);
 });

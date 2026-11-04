@@ -31,6 +31,7 @@ test('ratioText is a dash for a missing side', () => {
 test('formatBytes picks its unit', () => {
   assert.equal(formatBytes(512), '512 B');
   assert.equal(formatBytes(2048), '2.0 KiB');
+  assert.equal(formatBytes(16 * 1024 ** 3), '16.0 GiB');
   assert.equal(formatBytes(3 * 1024 * 1024), '3.0 MiB');
 });
 

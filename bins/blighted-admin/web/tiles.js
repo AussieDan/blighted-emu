@@ -69,3 +69,28 @@ export function trailPush(trails, players, maxPoints) {
   }
   return next;
 }
+
+/** Decimals of a use share in percent. */
+const SHARE_DECIMALS = 0;
+const PERCENT = 100;
+
+/**
+ * The figures of `/api/host` ({ memory: { total_bytes, used_bytes } | null, cpu: { cores,
+ * percent } | null }) as [label, value] pairs, and the use shares (0 to 100) of memory and
+ * processor, null where unknown.
+ */
+export function hostFacts(host) {
+  const memory = host.memory;
+  const cpu = host.cpu;
+  const memoryShare = memory && memory.total_bytes > 0 ? (memory.used_bytes / memory.total_bytes) * PERCENT : null;
+  return {
+    pairs: [
+      ['Memory used', memory ? `${formatBytes(memory.used_bytes)} of ${formatBytes(memory.total_bytes)}` : UNKNOWN],
+      ['Memory use', memoryShare === null ? UNKNOWN : `${memoryShare.toFixed(SHARE_DECIMALS)} %`],
+      ['Processor cores', cpu ? String(cpu.cores) : UNKNOWN],
+      ['Processor use', cpu ? `${cpu.percent.toFixed(SHARE_DECIMALS)} %` : UNKNOWN],
+    ],
+    memoryShare,
+    cpuShare: cpu ? cpu.percent : null,
+  };
+}

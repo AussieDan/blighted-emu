@@ -20,6 +20,7 @@ use crate::captures::catalog::search;
 use crate::gm::Commands;
 use crate::gm::api::gm_routes;
 use crate::guard::{AdminOrigin, admin_guard};
+use crate::host::{HOST_ROUTE, host};
 use crate::live::Live;
 use crate::live::bots::bot_routes;
 use crate::live::stream::live_routes;
@@ -166,6 +167,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/world/spawns", get(spawns))
         .route("/api/world/spawn-cells", get(spawn_cells))
         .route(SHAPES_ROUTE, get(shapes))
+        .route(HOST_ROUTE, get(host))
         .route(HEIGHT_ROUTE, get(ground_height))
         .route(HEIGHT_GRID_ROUTE, get(height_grid))
         .route("/api/captures/sessions", get(sessions))

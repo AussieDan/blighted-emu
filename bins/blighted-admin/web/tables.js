@@ -5,6 +5,7 @@ const MISSING = '—';
 const ONE_DECIMAL_BELOW = 10;
 const KIB = 1024;
 const MIB = KIB * KIB;
+const GIB = MIB * KIB;
 const DIRECTIONS = ['server → client', 'client → server'];
 
 function missing(value) {
@@ -45,6 +46,9 @@ export function ratioText(ratio) {
 
 /** A byte count with its unit. */
 export function formatBytes(bytes) {
+  if (bytes >= GIB) {
+    return `${(bytes / GIB).toFixed(1)} GiB`;
+  }
   if (bytes >= MIB) {
     return `${(bytes / MIB).toFixed(1)} MiB`;
   }

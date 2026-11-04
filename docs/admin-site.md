@@ -23,6 +23,15 @@ servers running (`[live]` in the configuration).
 
 The tab bar at the top opens each page. The button at its right end switches night and day.
 
+### Home
+
+- World: the level, the world size, the ocean level and the map tiles.
+- Server: the machine the admin runs on (the game machine when the site is served through the
+  relay): memory used of the total, memory use, processor cores and processor use (all cores
+  together), with a bar for each. It reads them again every 3 seconds, from Linux's `/proc`; on
+  another system they show Unknown.
+- A card for each page.
+
 ### Live
 
 The world map with every sim, player, bot and mob, live.
