@@ -446,7 +446,7 @@ blighted-admin grant-rank ada game_master
 blighted-admin revoke-rank ada
 ```
 
-A server in Discord mode adds `[access.discord]` with the `client_id` of the game login's Discord app and `client_secret_env`, the variable with its secret. The login page then shows **Log in with Discord**. Add `https://<first [access] host>/login/discord/callback` as a redirect of that app. Only a Discord user who has logged in to the game, with an admin rank, gets in. The ban and rank forms of the GM page also take a Discord username or Discord user id.
+A server in Discord mode adds `[access.discord]` with the `client_id` of the game login's Discord app and `client_secret_env`, the variable with its secret. The login page then shows only **Log in with Discord**: a site has one login method, and name and password login is off. Add `https://<first [access] host>/login/discord/callback` as a redirect of that app. Only a Discord user who has logged in to the game, with an admin rank, gets in. The ban and rank forms of the GM page also take a Discord username or Discord user id.
 
 Five wrong passwords in 10 minutes lock a name for 15 minutes. The session cookie is `HttpOnly`, `Secure` and `SameSite=Strict`, and lasts 12 hours. In server mode, the site refuses the design routes (Check, Apply), the bot batches and the to-do routes. Design work happens on the PC of a team member and reaches the server through git.
 

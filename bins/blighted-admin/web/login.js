@@ -9,13 +9,16 @@ const ADMIN_HEADERS = Object.freeze({ 'X-Blighted-Admin': '1', 'Content-Type': '
 const form = document.getElementById('login');
 const status = document.getElementById('status');
 
-// The Discord button shows only when the server has Discord login.
+// The site has one login method: the name and password form, or the Discord button.
 fetch(METHODS_URL)
-  .then((response) => (response.ok ? response.json() : { discord: false }))
+  .then((response) => (response.ok ? response.json() : { password: false, discord: false }))
   .then((methods) => {
+    document.getElementById('password-login').hidden = !methods.password;
     document.getElementById('discord').hidden = !methods.discord;
   })
-  .catch(() => {});
+  .catch((error) => {
+    status.textContent = `Login methods failed: ${error.message ?? error}`;
+  });
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();

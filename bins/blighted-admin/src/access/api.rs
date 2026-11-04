@@ -44,6 +44,8 @@ const PAGES: [&str; 7] = [
 /// team member's own PC (spec section 4).
 const LOCAL_ONLY_PREFIXES: [&str; 3] = ["/api/studio/", "/api/live/bots", "/api/todo"];
 pub(crate) const MS_PER_SECOND: u64 = 1000;
+/// The answer to a name and password on a site without password login.
+const PASSWORD_LOGIN_OFF: &str = "password login is off";
 
 /// The login routes.
 pub fn access_routes() -> Router<AppState> {
@@ -110,8 +112,8 @@ async fn login(State(state): State<AppState>, Json(form): Json<LoginRequest>) ->
     let (Some(store), Some(hasher)) = (access.store(), access.hasher()) else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if access.mode() != AccessMode::Server {
-        return StatusCode::NOT_FOUND.into_response();
+    if !access.password_login() {
+        return (StatusCode::NOT_FOUND, PASSWORD_LOGIN_OFF).into_response();
     }
     let username = form.username.trim().to_lowercase();
     let now_ms = unix_ms();
@@ -498,6 +500,7 @@ mod tests {
             let methods: serde_json::Value =
                 serde_json::from_str(&body_text(methods).await).expect("json");
             assert_eq!(methods["discord"], on);
+            assert_eq!(methods["password"], !on);
         }
         let off = send(
             &fixture().await,
@@ -505,6 +508,18 @@ mod tests {
         )
         .await;
         assert_eq!(off.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_site_with_discord_login_refuses_a_name_and_password() {
+        let fixture = discord_fixture(Some(AdminRank::HeadAdmin)).await;
+        let response = send(
+            &fixture,
+            request(Method::POST, LOGIN_ROUTE, None, &form(GM, PASSWORD)),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_text(response).await, PASSWORD_LOGIN_OFF);
     }
 
     #[tokio::test]

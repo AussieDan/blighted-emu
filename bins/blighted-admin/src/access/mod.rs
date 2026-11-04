@@ -124,6 +124,12 @@ impl Access {
     }
 
     /// Discord login; only in server mode.
+    /// Whether the site takes a name and password: server mode without Discord login. A site
+    /// has one login method only.
+    pub(crate) fn password_login(&self) -> bool {
+        self.mode == AccessMode::Server && self.discord().is_none()
+    }
+
     pub(crate) fn discord(&self) -> Option<&AdminDiscord> {
         self.discord
             .as_ref()

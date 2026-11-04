@@ -86,9 +86,10 @@ pub fn discord_routes() -> Router<AppState> {
         .route(LOGIN_METHODS_ROUTE, get(login_methods))
 }
 
-/// What the login page offers.
+/// What the login page offers: one of the two.
 #[derive(Debug, Serialize)]
 struct LoginMethods {
+    password: bool,
     discord: bool,
 }
 
@@ -101,6 +102,7 @@ struct CallbackQuery {
 
 async fn login_methods(State(state): State<AppState>) -> Json<LoginMethods> {
     Json(LoginMethods {
+        password: state.access.password_login(),
         discord: state.access.discord().is_some(),
     })
 }

@@ -14,9 +14,11 @@
     </header>
     <form class="login" id="login">
       <p class="muted">Log in with your game account. It needs an admin rank.</p>
-      <label>Name <input type="text" id="username" autocomplete="username" required></label>
-      <label>Password <input type="password" id="password" autocomplete="current-password" required></label>
-      <button type="submit">Log in</button>
+      <div class="login-fields" id="password-login" hidden>
+        <label>Name <input type="text" id="username" autocomplete="username" required></label>
+        <label>Password <input type="password" id="password" autocomplete="current-password" required></label>
+        <button type="submit">Log in</button>
+      </div>
       <a class="button" id="discord" href="/login/discord" hidden>Log in with Discord</a>
       <p class="status error" id="status" role="status"></p>
     </form>
