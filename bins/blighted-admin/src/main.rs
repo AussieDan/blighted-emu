@@ -33,7 +33,7 @@ enum Command {
         /// Configuration file (its `[access]` names the global database).
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
-        /// The account's login name.
+        /// The account's login name, Discord user id or Discord username.
         username: String,
         /// The rank.
         #[arg(value_parser = parse_rank)]
@@ -44,7 +44,7 @@ enum Command {
         /// Configuration file.
         #[arg(long, default_value = DEFAULT_CONFIG)]
         config: PathBuf,
-        /// The account's login name.
+        /// The account's login name, Discord user id or Discord username.
         username: String,
     },
 }

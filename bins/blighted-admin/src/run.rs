@@ -11,6 +11,7 @@ use axum_server::Handle;
 use axum_server::tls_rustls::RustlsConfig;
 use nw_db::AdminRank;
 use nw_login::config::TlsConfig;
+use nw_login::discord::DiscordHttp;
 use nw_login::install_crypto_provider;
 use nw_login::password::PasswordHasher;
 
@@ -18,6 +19,7 @@ use nw_common::logging::{LoggingError, init_logging};
 use nw_content::client_build::load_client_build;
 use tokio::sync::watch;
 
+use crate::access::discord::{AdminDiscord, DiscordClient};
 use crate::access::store::Store;
 use crate::access::{Access, AccessMode};
 use crate::captures::Captures;
@@ -62,6 +64,12 @@ pub enum RunError {
     /// The password hasher cannot start.
     #[error(transparent)]
     Password(#[from] nw_login::password::PasswordError),
+    /// The variable named by `[access.discord] client_secret_env` is not set.
+    #[error("the variable {0} with the Discord client secret is not set")]
+    MissingDiscordSecret(String),
+    /// The Discord client cannot start.
+    #[error(transparent)]
+    Discord(#[from] nw_login::discord::DiscordError),
     /// The TLS certificate or key cannot be read (server mode).
     #[error("TLS certificate or key")]
     Tls(#[source] std::io::Error),
@@ -159,17 +167,17 @@ pub enum RankError {
     /// The database failed.
     #[error("global database: {0}")]
     Database(String),
-    /// No password login has this name.
-    #[error("no account has the login name {0}")]
+    /// No account has this login name, Discord user id or Discord username.
+    #[error("no account has the name {0}")]
     UnknownUser(String),
     /// The runtime cannot start.
     #[error("runtime")]
     Io(#[source] std::io::Error),
 }
 
-/// Gives the account of the login `username` the rank `rank`, or removes its rank when `rank`
-/// is `None` (`blighted-admin grant-rank` / `revoke-rank`). Returns `false` when there was no
-/// rank to remove.
+/// Gives the account named `username` (a login name, a Discord user id or a Discord username)
+/// the rank `rank`, or removes its rank when `rank` is `None` (`blighted-admin grant-rank` /
+/// `revoke-rank`). Returns `false` when there was no rank to remove.
 pub fn change_rank(
     config_path: &Path,
     username: &str,
@@ -188,7 +196,7 @@ pub fn change_rank(
         .ok_or(RankError::NoDatabase)?;
     let password =
         std::env::var(password_env).map_err(|_| RankError::MissingSecret(password_env.clone()))?;
-    let username = username.trim().to_lowercase();
+    let username = username.trim().to_owned();
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -199,7 +207,7 @@ pub fn change_rank(
             let pool = nw_db::connect(database, &password)
                 .await
                 .map_err(|error| database_error(&error))?;
-            let (account, _) = nw_db::password_login(&pool, &username)
+            let account = nw_db::account_by_login_name(&pool, &username)
                 .await
                 .map_err(|error| database_error(&error))?
                 .ok_or_else(|| RankError::UnknownUser(username.clone()))?;
@@ -215,8 +223,9 @@ pub fn change_rank(
         })
 }
 
-/// The access of `config`: local mode without login, or server mode with the global database
-/// and the password hasher. A configured global database also keeps the audit log in local mode.
+/// The access of `config`: local mode without login, or server mode with the global database,
+/// the password hasher and, with `[access.discord]`, Discord login. A configured global database
+/// also keeps the audit log in local mode.
 async fn access_of(config: &AdminConfig) -> Result<Access, RunError> {
     let mode = AccessConfig::mode_of(config.access.as_ref());
     let database = config.access.as_ref().and_then(|access| {
@@ -243,7 +252,21 @@ async fn access_of(config: &AdminConfig) -> Result<Access, RunError> {
         AccessMode::Server => Some(PasswordHasher::new(HASH_PARALLEL)?),
         AccessMode::Local => None,
     };
-    Ok(Access::new(mode, store, hasher))
+    let access = Access::new(mode, store, hasher);
+    match config
+        .access
+        .as_ref()
+        .and_then(|access| access.discord.as_ref().zip(access.hosts.first()))
+    {
+        Some((discord, host)) => {
+            let secret = std::env::var(&discord.client_secret_env)
+                .map_err(|_| RunError::MissingDiscordSecret(discord.client_secret_env.clone()))?;
+            install_crypto_provider();
+            let client = DiscordClient::Http(DiscordHttp::new(discord.client_id.clone(), secret)?);
+            Ok(access.with_discord(AdminDiscord::new(client, discord.client_id.clone(), host)))
+        }
+        None => Ok(access),
+    }
 }
 
 /// The request checks of `config`: the `[access] hosts` over HTTPS in server mode, else the

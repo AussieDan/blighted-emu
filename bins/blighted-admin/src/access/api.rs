@@ -11,6 +11,9 @@ use nw_common::time::unix_ms;
 use nw_login::keys::{new_random_token, token_hash};
 use serde::{Deserialize, Serialize};
 
+use crate::access::discord::{
+    DISCORD_CALLBACK_ROUTE, DISCORD_LOGIN_ROUTE, LOGIN_METHODS_ROUTE, discord_routes,
+};
 use crate::access::session::{Actor, SESSION_TTL_MS};
 use crate::access::{Access, AccessMode, SESSION_COOKIE, session_token};
 use crate::server::AppState;
@@ -23,6 +26,14 @@ pub const LOGIN_ROUTE: &str = "/api/auth/login";
 pub const LOGOUT_ROUTE: &str = "/api/auth/logout";
 /// `GET`: who is logged in.
 pub const ME_ROUTE: &str = "/api/auth/me";
+/// Routes that need no session: the login page, its API and the Discord login.
+const PUBLIC_ROUTES: [&str; 5] = [
+    LOGIN_PAGE_ROUTE,
+    LOGIN_ROUTE,
+    LOGIN_METHODS_ROUTE,
+    DISCORD_LOGIN_ROUTE,
+    DISCORD_CALLBACK_ROUTE,
+];
 /// Prefix of the web files, which need no session.
 const WEB_PREFIX: &str = "/web/";
 /// Pages that send a visitor without a session to the login page.
@@ -32,7 +43,7 @@ const PAGES: [&str; 7] = [
 /// Changing routes that only local mode allows: design work and bot batches are for a
 /// team member's own PC (spec section 4).
 const LOCAL_ONLY_PREFIXES: [&str; 3] = ["/api/studio/", "/api/live/bots", "/api/todo"];
-const MS_PER_SECOND: u64 = 1000;
+pub(crate) const MS_PER_SECOND: u64 = 1000;
 
 /// The login routes.
 pub fn access_routes() -> Router<AppState> {
@@ -40,6 +51,7 @@ pub fn access_routes() -> Router<AppState> {
         .route(LOGIN_ROUTE, post(login))
         .route(LOGOUT_ROUTE, post(logout))
         .route(ME_ROUTE, get(me))
+        .merge(discord_routes())
 }
 
 /// What the login form sends.
@@ -57,8 +69,8 @@ struct MeView {
 }
 
 /// Puts the request's [`Actor`] into its extensions. In server mode a request without a session
-/// gets the login page (pages) or 401 (the rest), except the login page, its API and the web
-/// files; the local-only routes get 403.
+/// gets the login page (pages) or 401 (the rest), except [`PUBLIC_ROUTES`] and the web files;
+/// the local-only routes get 403.
 pub async fn access_guard(
     State(state): State<AppState>,
     mut request: Request,
@@ -81,8 +93,7 @@ pub async fn access_guard(
             next.run(request).await
         }
         None => {
-            let public =
-                path == LOGIN_PAGE_ROUTE || path == LOGIN_ROUTE || path.starts_with(WEB_PREFIX);
+            let public = PUBLIC_ROUTES.contains(&path.as_str()) || path.starts_with(WEB_PREFIX);
             if public {
                 next.run(request).await
             } else if !changing && PAGES.contains(&path.as_str()) {
@@ -181,13 +192,13 @@ async fn me(State(state): State<AppState>, headers: HeaderMap) -> Response {
 }
 
 /// The `Set-Cookie` value of a session token that lives `max_age_s` seconds.
-fn session_cookie(token: &str, max_age_s: u64) -> String {
+pub(crate) fn session_cookie(token: &str, max_age_s: u64) -> String {
     format!(
         "{SESSION_COOKIE}={token}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age={max_age_s}"
     )
 }
 
-fn server_error(error: &dyn std::error::Error) -> Response {
+pub(crate) fn server_error(error: &dyn std::error::Error) -> Response {
     tracing::warn!(%error, "login failed");
     StatusCode::INTERNAL_SERVER_ERROR.into_response()
 }
@@ -210,9 +221,11 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::access::discord::tests::{DISCORD_USER_ID, DISCORD_USERNAME, GOOD_CODE};
+    use crate::access::discord::{AdminDiscord, DiscordClient};
     use crate::access::session::LOCK_FAILS;
     use crate::access::store::memory::MemoryStore;
-    use crate::access::store::{LoginRecord, Store};
+    use crate::access::store::{AccountRecord, LoginRecord, Store};
     use crate::captures::Captures;
     use crate::guard::{ADMIN_HEADER, ADMIN_HEADER_VALUE, AdminOrigin};
     use crate::server::{AppState, router};
@@ -224,6 +237,9 @@ mod tests {
     const GM: &str = "gm";
     const NO_RANK: &str = "player";
     const ONE_HASH: usize = 1;
+    /// The account of the Discord user of the tests.
+    const DISCORD_ACCOUNT: Uuid = Uuid::from_u128(9);
+    const ADMIN_HOST: &str = "admin.example.test";
 
     struct Fixture {
         memory: Arc<Mutex<MemoryStore>>,
@@ -231,6 +247,15 @@ mod tests {
     }
 
     async fn fixture() -> Fixture {
+        fixture_with(None).await
+    }
+
+    /// The fixture with Discord login; the Discord user has a game account with `rank`.
+    async fn discord_fixture(rank: Option<AdminRank>) -> Fixture {
+        fixture_with(Some(rank)).await
+    }
+
+    async fn fixture_with(discord: Option<Option<AdminRank>>) -> Fixture {
         let hasher = PasswordHasher::new(ONE_HASH).expect("hasher");
         let hash = hasher.hash(PASSWORD.to_owned()).await.expect("hash");
         let mut memory = MemoryStore::default();
@@ -248,12 +273,34 @@ mod tests {
                 memory.ranks.insert(account, AdminRank::GameMaster);
             }
         }
+        if let Some(rank) = discord {
+            memory.discord.insert(
+                DISCORD_USER_ID.to_owned(),
+                (
+                    DISCORD_USERNAME.to_owned(),
+                    AccountRecord {
+                        account: DISCORD_ACCOUNT,
+                        banned: false,
+                    },
+                ),
+            );
+            if let Some(rank) = rank {
+                memory.ranks.insert(DISCORD_ACCOUNT, rank);
+            }
+        }
         let memory = Arc::new(Mutex::new(memory));
-        let access = Access::new(
+        let mut access = Access::new(
             AccessMode::Server,
             Some(Store::Memory(memory.clone())),
             Some(hasher),
         );
+        if discord.is_some() {
+            access = access.with_discord(AdminDiscord::new(
+                DiscordClient::Fake,
+                "1".to_owned(),
+                ADMIN_HOST,
+            ));
+        }
         let listen = LISTEN.parse().expect("address");
         let state = AppState::new(
             test_layer(CAP),
@@ -401,5 +448,174 @@ mod tests {
         assert_eq!(logout.status(), StatusCode::NO_CONTENT);
         let after = send(&fixture, request(Method::GET, ME_ROUTE, Some(&pair), "")).await;
         assert_eq!(after.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    async fn body_text(response: Response) -> String {
+        let bytes = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        String::from_utf8(bytes.to_vec()).expect("text")
+    }
+
+    /// Starts a Discord login and gives the state of its Discord page link.
+    async fn discord_state(fixture: &Fixture) -> String {
+        let start = send(fixture, request(Method::GET, DISCORD_LOGIN_ROUTE, None, "")).await;
+        assert_eq!(start.status(), StatusCode::SEE_OTHER);
+        let location = start.headers()[header::LOCATION]
+            .to_str()
+            .expect("location")
+            .to_owned();
+        assert!(location.starts_with("https://discord.com/oauth2/authorize?"));
+        assert!(location.contains(
+            "redirect_uri=https%3A%2F%2Fadmin.example.test%2Flogin%2Fdiscord%2Fcallback"
+        ));
+        location
+            .split('&')
+            .find_map(|pair| pair.strip_prefix("state="))
+            .expect("state")
+            .to_owned()
+    }
+
+    fn callback(code: &str, state: &str) -> String {
+        format!("{DISCORD_CALLBACK_ROUTE}?code={code}&state={state}")
+    }
+
+    #[tokio::test]
+    async fn the_login_page_offers_discord_only_when_it_is_on() {
+        for (fixture, on) in [
+            (fixture().await, false),
+            (discord_fixture(None).await, true),
+        ] {
+            let methods = send(
+                &fixture,
+                request(Method::GET, LOGIN_METHODS_ROUTE, None, ""),
+            )
+            .await;
+            assert_eq!(methods.status(), StatusCode::OK);
+            let methods: serde_json::Value =
+                serde_json::from_str(&body_text(methods).await).expect("json");
+            assert_eq!(methods["discord"], on);
+        }
+        let off = send(
+            &fixture().await,
+            request(Method::GET, DISCORD_LOGIN_ROUTE, None, ""),
+        )
+        .await;
+        assert_eq!(off.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_discord_login_of_a_ranked_account_opens_a_session_once() {
+        let fixture = discord_fixture(Some(AdminRank::HeadAdmin)).await;
+        let state = discord_state(&fixture).await;
+        let done = send(
+            &fixture,
+            request(Method::GET, &callback(GOOD_CODE, &state), None, ""),
+        )
+        .await;
+        assert_eq!(done.status(), StatusCode::OK);
+        let cookie = done.headers()[header::SET_COOKIE]
+            .to_str()
+            .expect("cookie")
+            .to_owned();
+        assert!(cookie.contains("SameSite=Strict"));
+        assert!(body_text(done).await.contains(r#"content="0;url=/""#));
+        let pair = cookie.split(';').next().expect("pair").to_owned();
+        let me = send(&fixture, request(Method::GET, ME_ROUTE, Some(&pair), "")).await;
+        let me: serde_json::Value = serde_json::from_str(&body_text(me).await).expect("json");
+        assert_eq!(me["actor"]["rank"], "head_admin");
+        assert_eq!(me["actor"]["username"], "nelly");
+        let via = crate::access::store::memory::lock(&fixture.memory)
+            .audit
+            .last()
+            .expect("audit")
+            .detail["via"]
+            .clone();
+        assert_eq!(via, "discord");
+        let again = send(
+            &fixture,
+            request(Method::GET, &callback(GOOD_CODE, &state), None, ""),
+        )
+        .await;
+        assert_eq!(
+            again.status(),
+            StatusCode::NOT_FOUND,
+            "a state is used once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_discord_login_without_a_rank_an_account_or_a_good_code_is_refused() {
+        let no_rank = discord_fixture(None).await;
+        let state = discord_state(&no_rank).await;
+        let refused = send(
+            &no_rank,
+            request(Method::GET, &callback(GOOD_CODE, &state), None, ""),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert!(!refused.headers().contains_key(header::SET_COOKIE));
+
+        let no_account = discord_fixture(Some(AdminRank::GameMaster)).await;
+        crate::access::store::memory::lock(&no_account.memory)
+            .discord
+            .clear();
+        let state = discord_state(&no_account).await;
+        let refused = send(
+            &no_account,
+            request(Method::GET, &callback(GOOD_CODE, &state), None, ""),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+        assert!(body_text(refused).await.contains("no game account"));
+
+        let bad_code = discord_fixture(Some(AdminRank::GameMaster)).await;
+        let state = discord_state(&bad_code).await;
+        let refused = send(
+            &bad_code,
+            request(Method::GET, &callback("bad", &state), None, ""),
+        )
+        .await;
+        assert_eq!(refused.status(), StatusCode::BAD_GATEWAY);
+        let unknown = send(
+            &bad_code,
+            request(Method::GET, &callback(GOOD_CODE, "unknown"), None, ""),
+        )
+        .await;
+        assert_eq!(unknown.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn staff_give_a_rank_and_ban_by_discord_username_or_id() {
+        let fixture = discord_fixture(None).await;
+        let store = fixture.state.access.store().expect("store").clone();
+        assert!(
+            store
+                .set_rank("NELLY", Some(AdminRank::Csr), None)
+                .await
+                .expect("rank")
+        );
+        assert_eq!(
+            store.rank(DISCORD_ACCOUNT).await.expect("rank"),
+            Some(AdminRank::Csr)
+        );
+        let rows = store.ranks().await.expect("ranks");
+        assert!(
+            rows.iter()
+                .any(|row| row.username.as_deref() == Some(DISCORD_USERNAME))
+        );
+        assert!(store.set_banned(DISCORD_USER_ID, true).await.expect("ban"));
+        assert_eq!(
+            store
+                .discord_account(DISCORD_USER_ID)
+                .await
+                .expect("account")
+                .map(|record| record.banned),
+            Some(true)
+        );
+        assert!(!store.set_banned("ghost", true).await.expect("unknown"));
     }
 }

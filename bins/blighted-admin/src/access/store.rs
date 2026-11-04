@@ -15,6 +15,24 @@ pub struct LoginRecord {
     pub password_hash: String,
 }
 
+/// An account and its ban flag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AccountRecord {
+    /// The account.
+    pub account: Uuid,
+    /// True when the account is banned.
+    pub banned: bool,
+}
+
+impl AccountRecord {
+    fn of(account: &nw_db::Account) -> Self {
+        Self {
+            account: account.id,
+            banned: account.banned,
+        }
+    }
+}
+
 /// The store of an admin site.
 #[derive(Debug, Clone)]
 pub enum Store {
@@ -43,6 +61,37 @@ impl Store {
         }
     }
 
+    /// The account that staff name by `name`: a password login name, a Discord user id or a
+    /// Discord username.
+    pub async fn account_by_name(&self, name: &str) -> Result<Option<AccountRecord>, DbError> {
+        match self {
+            Self::Postgres(pool) => Ok(nw_db::account_by_login_name(pool, name)
+                .await?
+                .as_ref()
+                .map(AccountRecord::of)),
+            #[cfg(test)]
+            Self::Memory(memory) => Ok(memory::lock(memory).account_by_name(name)),
+        }
+    }
+
+    /// The account of a Discord user id.
+    pub async fn discord_account(
+        &self,
+        discord_user_id: &str,
+    ) -> Result<Option<AccountRecord>, DbError> {
+        match self {
+            Self::Postgres(pool) => Ok(nw_db::account_by_discord(pool, discord_user_id)
+                .await?
+                .as_ref()
+                .map(AccountRecord::of)),
+            #[cfg(test)]
+            Self::Memory(memory) => Ok(memory::lock(memory)
+                .discord
+                .get(discord_user_id)
+                .map(|(_, record)| *record)),
+        }
+    }
+
     /// The rank of an account.
     pub async fn rank(&self, account: Uuid) -> Result<Option<AdminRank>, DbError> {
         match self {
@@ -61,15 +110,15 @@ impl Store {
         }
     }
 
-    /// Gives the account of login `username` the rank `rank` (`None`: removes it); `false`
-    /// when no account has that login.
+    /// Gives the account named `name` ([`Self::account_by_name`]) the rank `rank` (`None`:
+    /// removes it); `false` when no account has that name.
     pub async fn set_rank(
         &self,
-        username: &str,
+        name: &str,
         rank: Option<AdminRank>,
         given_by: Option<Uuid>,
     ) -> Result<bool, DbError> {
-        let Some(record) = self.login(username).await? else {
+        let Some(record) = self.account_by_name(name).await? else {
             return Ok(false);
         };
         match self {
@@ -92,19 +141,19 @@ impl Store {
         .map(|()| true)
     }
 
-    /// Bans or unbans the account of login `username`; `false` when no account has it.
-    pub async fn set_banned(&self, username: &str, banned: bool) -> Result<bool, DbError> {
-        let Some(record) = self.login(username).await? else {
+    /// Bans or unbans the account named `name` ([`Self::account_by_name`]); `false` when no
+    /// account has that name.
+    pub async fn set_banned(&self, name: &str, banned: bool) -> Result<bool, DbError> {
+        let Some(record) = self.account_by_name(name).await? else {
             return Ok(false);
         };
         match self {
             Self::Postgres(pool) => nw_db::set_banned(pool, record.account, banned).await,
             #[cfg(test)]
-            Self::Memory(memory) => Ok(memory::lock(memory)
-                .logins
-                .get_mut(username)
-                .map(|login| login.banned = banned)
-                .is_some()),
+            Self::Memory(memory) => {
+                memory::lock(memory).set_banned(record.account, banned);
+                Ok(true)
+            }
         }
     }
 
@@ -148,6 +197,8 @@ pub mod memory {
     pub struct MemoryStore {
         /// By lower-case username.
         pub logins: HashMap<String, LoginRecord>,
+        /// Discord logins by Discord user id: the Discord username and the account.
+        pub discord: HashMap<String, (String, AccountRecord)>,
         /// By account.
         pub ranks: HashMap<Uuid, AdminRank>,
         /// In order.
@@ -155,6 +206,49 @@ pub mod memory {
     }
 
     impl MemoryStore {
+        pub(super) fn account_by_name(&self, name: &str) -> Option<AccountRecord> {
+            let name = name.trim();
+            self.logins
+                .get(&name.to_lowercase())
+                .map(|login| AccountRecord {
+                    account: login.account,
+                    banned: login.banned,
+                })
+                .or_else(|| self.discord.get(name).map(|(_, record)| *record))
+                .or_else(|| {
+                    self.discord
+                        .values()
+                        .find(|(username, _)| username.eq_ignore_ascii_case(name))
+                        .map(|(_, record)| *record)
+                })
+        }
+
+        pub(super) fn set_banned(&mut self, account: Uuid, banned: bool) {
+            for login in self.logins.values_mut() {
+                if login.account == account {
+                    login.banned = banned;
+                }
+            }
+            for (_, record) in self.discord.values_mut() {
+                if record.account == account {
+                    record.banned = banned;
+                }
+            }
+        }
+
+        fn username_of(&self, account: Uuid) -> Option<String> {
+            self.logins
+                .iter()
+                .find(|(_, login)| login.account == account)
+                .map(|(name, _)| name.clone())
+                .or_else(|| {
+                    self.discord
+                        .values()
+                        .find(|(_, record)| record.account == account)
+                        .map(|(username, _)| username.clone())
+                })
+        }
+
         pub(super) fn rows(&self, account: Option<Uuid>, limit: i64) -> Vec<AuditRow> {
             let limit = usize::try_from(limit).unwrap_or(0);
             self.audit
@@ -179,11 +273,7 @@ pub mod memory {
                 .iter()
                 .map(|(account, rank)| RankRow {
                     account: *account,
-                    username: self
-                        .logins
-                        .iter()
-                        .find(|(_, login)| login.account == *account)
-                        .map(|(name, _)| name.clone()),
+                    username: self.username_of(*account),
                     rank: *rank,
                     given_by: None,
                     given_at_unix_ms: 0,

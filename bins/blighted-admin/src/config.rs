@@ -61,6 +61,18 @@ pub struct AccessConfig {
     pub global_database_password_env: Option<String>,
     /// Server mode: the certificate and key.
     pub tls: Option<TlsConfig>,
+    /// Server mode: log in with Discord, for accounts made by a Discord login in the game.
+    pub discord: Option<AdminDiscordConfig>,
+}
+
+/// `[access.discord]`: the Discord app of the game login (the same client id and secret).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminDiscordConfig {
+    /// Discord application (client) id.
+    pub client_id: String,
+    /// Name of the variable that holds the client secret.
+    pub client_secret_env: String,
 }
 
 impl AccessConfig {
@@ -193,6 +205,12 @@ pub fn load_admin_config(path: &Path) -> Result<AdminConfig, AdminConfigError> {
                     reason: "server mode needs tls, global_database, global_database_password_env and hosts",
                 });
             }
+        }
+        Some(access) if access.discord.is_some() => {
+            return Err(AdminConfigError::Invalid {
+                key: "access.discord",
+                reason: "Discord login needs server mode",
+            });
         }
         _ if !config.listen.ip().is_loopback() => {
             return Err(AdminConfigError::NotLoopback(config.listen));
@@ -392,6 +410,39 @@ mod tests {
         let access = config.access.expect("access");
         assert_eq!(access.mode, AccessMode::Server);
         assert_eq!(access.hosts, ["admin.example.test"]);
+    }
+
+    /// `[access.discord]` of the tests.
+    const DISCORD_ACCESS: &str = "[access.discord]\nclient_id = \"1567248535328522280\"\nclient_secret_env = \"NW_SECRET_DISCORD_CLIENT_SECRET\"\n";
+
+    #[test]
+    fn discord_login_is_read_in_server_mode_and_refused_in_local_mode() {
+        let committed =
+            std::fs::read_to_string(repo_root().join("config/blighted-admin.toml")).expect("read");
+        let dir = tempfile::tempdir().expect("dir");
+        let path = dir.path().join("blighted-admin.toml");
+        let server = committed.replace(
+            "mode = \"local\"\n",
+            &format!("{SERVER_ACCESS}{DISCORD_ACCESS}"),
+        );
+        std::fs::write(&path, server).expect("write");
+        let discord = load_admin_config(&path)
+            .expect("server config")
+            .access
+            .and_then(|access| access.discord)
+            .expect("discord");
+        assert_eq!(discord.client_id, "1567248535328522280");
+        assert_eq!(discord.client_secret_env, "NW_SECRET_DISCORD_CLIENT_SECRET");
+        assert!(matches!(
+            load_changed(
+                "mode = \"local\"\n",
+                &format!("mode = \"local\"\n{DISCORD_ACCESS}")
+            ),
+            Err(AdminConfigError::Invalid {
+                key: "access.discord",
+                ..
+            })
+        ));
     }
 
     #[test]

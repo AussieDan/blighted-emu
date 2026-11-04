@@ -2,11 +2,20 @@
 // The login form of a server-mode admin site.
 
 const LOGIN_URL = '/api/auth/login';
+const METHODS_URL = '/api/auth/methods';
 const HOME_URL = '/';
 const ADMIN_HEADERS = Object.freeze({ 'X-Blighted-Admin': '1', 'Content-Type': 'application/json' });
 
 const form = document.getElementById('login');
 const status = document.getElementById('status');
+
+// The Discord button shows only when the server has Discord login.
+fetch(METHODS_URL)
+  .then((response) => (response.ok ? response.json() : { discord: false }))
+  .then((methods) => {
+    document.getElementById('discord').hidden = !methods.discord;
+  })
+  .catch(() => {});
 
 form.addEventListener('submit', async (event) => {
   event.preventDefault();

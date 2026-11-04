@@ -16,6 +16,10 @@ pub const LOCK_FAILS: usize = 5;
 pub const FAIL_WINDOW_MS: u64 = 10 * 60 * 1000;
 /// How long a username stays locked.
 pub const LOCK_MS: u64 = 15 * 60 * 1000;
+/// Time to finish a Discord login on the Discord page.
+pub const DISCORD_LOGIN_MS: u64 = 5 * 60 * 1000;
+/// Most Discord logins that wait at one time; more are refused until some end.
+pub const MAX_DISCORD_LOGINS: usize = 1000;
 
 /// Who sends a request: an account with a rank, or the local user.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -51,6 +55,8 @@ pub struct Sessions {
     by_token: HashMap<[u8; 32], Session>,
     fails: HashMap<String, Vec<u64>>,
     locked_until: HashMap<String, u64>,
+    /// PKCE verifier and end time of each Discord login by its state.
+    discord_logins: HashMap<String, (String, u64)>,
 }
 
 impl Sessions {
@@ -103,6 +109,27 @@ impl Sessions {
     pub fn succeeded(&mut self, username: &str) {
         self.fails.remove(username);
     }
+
+    /// Starts a Discord login of `state` with its PKCE `verifier` at `now_ms`; `false` when
+    /// [`MAX_DISCORD_LOGINS`] wait already.
+    pub fn begin_discord(&mut self, state: String, verifier: String, now_ms: u64) -> bool {
+        self.discord_logins
+            .retain(|_, (_, expires_ms)| *expires_ms > now_ms);
+        if self.discord_logins.len() >= MAX_DISCORD_LOGINS {
+            return false;
+        }
+        self.discord_logins
+            .insert(state, (verifier, now_ms + DISCORD_LOGIN_MS));
+        true
+    }
+
+    /// The verifier of a waiting Discord login of `state`; it can be taken once.
+    pub fn take_discord(&mut self, state: &str, now_ms: u64) -> Option<String> {
+        self.discord_logins
+            .remove(state)
+            .filter(|(_, expires_ms)| *expires_ms > now_ms)
+            .map(|(verifier, _)| verifier)
+    }
 }
 
 #[cfg(test)]
@@ -143,6 +170,30 @@ mod tests {
         assert!(sessions.locked("ada", NOW + LOCK_MS));
         assert!(!sessions.locked("ada", NOW + 10 + LOCK_MS));
         assert!(!sessions.locked("bob", NOW + 11), "other names are free");
+    }
+
+    #[test]
+    fn a_discord_login_is_taken_once_before_it_expires() {
+        let mut sessions = Sessions::default();
+        assert!(sessions.begin_discord("s1".to_owned(), "v1".to_owned(), NOW));
+        assert!(sessions.begin_discord("s2".to_owned(), "v2".to_owned(), NOW));
+        assert_eq!(sessions.take_discord("s1", NOW + 1).as_deref(), Some("v1"));
+        assert_eq!(sessions.take_discord("s1", NOW + 2), None, "only once");
+        assert_eq!(sessions.take_discord("s2", NOW + DISCORD_LOGIN_MS), None);
+        assert_eq!(sessions.take_discord("unknown", NOW), None);
+    }
+
+    #[test]
+    fn too_many_waiting_discord_logins_are_refused() {
+        let mut sessions = Sessions::default();
+        for index in 0..MAX_DISCORD_LOGINS {
+            assert!(sessions.begin_discord(index.to_string(), String::new(), NOW));
+        }
+        assert!(!sessions.begin_discord("one more".to_owned(), String::new(), NOW));
+        assert!(
+            sessions.begin_discord("later".to_owned(), String::new(), NOW + DISCORD_LOGIN_MS),
+            "expired logins make room"
+        );
     }
 
     #[test]

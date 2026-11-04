@@ -3,6 +3,7 @@
 //! this PC, every right) or server mode (logins with the game accounts, ranks, HTTPS).
 
 pub mod api;
+pub mod discord;
 pub mod session;
 pub mod store;
 
@@ -15,6 +16,7 @@ use nw_login::keys::token_hash;
 use nw_login::password::PasswordHasher;
 use serde::Deserialize;
 
+use crate::access::discord::AdminDiscord;
 use crate::access::session::{Actor, Sessions};
 use crate::access::store::Store;
 
@@ -39,6 +41,7 @@ pub struct Access {
     store: Option<Store>,
     sessions: Arc<Mutex<Sessions>>,
     hasher: Option<PasswordHasher>,
+    discord: Option<AdminDiscord>,
 }
 
 impl Access {
@@ -50,6 +53,16 @@ impl Access {
             store,
             sessions: Arc::default(),
             hasher,
+            discord: None,
+        }
+    }
+
+    /// The same access with Discord login (server mode).
+    #[must_use]
+    pub fn with_discord(self, discord: AdminDiscord) -> Self {
+        Self {
+            discord: Some(discord),
+            ..self
         }
     }
 
@@ -108,6 +121,13 @@ impl Access {
 
     pub(crate) fn hasher(&self) -> Option<&PasswordHasher> {
         self.hasher.as_ref()
+    }
+
+    /// Discord login; only in server mode.
+    pub(crate) fn discord(&self) -> Option<&AdminDiscord> {
+        self.discord
+            .as_ref()
+            .filter(|_| self.mode == AccessMode::Server)
     }
 
     pub(crate) fn sessions(&self) -> MutexGuard<'_, Sessions> {

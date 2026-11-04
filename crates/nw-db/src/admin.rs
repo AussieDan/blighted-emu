@@ -115,7 +115,7 @@ pub async fn remove_admin_rank(pool: &PgPool, account: Uuid) -> Result<bool, DbE
 pub struct RankRow {
     /// The account.
     pub account: Uuid,
-    /// Its password login name, when it has one.
+    /// Its password login name, else its Discord username, when it has one.
     pub username: Option<String>,
     /// The rank.
     pub rank: AdminRank,
@@ -131,10 +131,12 @@ type RankRecord = (Uuid, Option<String>, String, Option<Uuid>, i64);
 /// Every account with an admin rank, highest rank first, then by name.
 pub async fn admin_ranks(pool: &PgPool) -> Result<Vec<RankRow>, DbError> {
     let rows: Vec<RankRecord> = sqlx::query_as(
-        "SELECT admin_rank.account_id, password_login.username, admin_rank.rank, \
+        "SELECT admin_rank.account_id, \
+         COALESCE(password_login.username, discord_login.discord_username), admin_rank.rank, \
          admin_rank.given_by, CAST(EXTRACT(EPOCH FROM admin_rank.given_at) * 1000 AS BIGINT) \
-         FROM admin_rank LEFT JOIN password_login \
-         ON password_login.account_id = admin_rank.account_id",
+         FROM admin_rank \
+         LEFT JOIN password_login ON password_login.account_id = admin_rank.account_id \
+         LEFT JOIN discord_login ON discord_login.account_id = admin_rank.account_id",
     )
     .fetch_all(pool)
     .await?;
@@ -240,7 +242,8 @@ mod tests {
 #[cfg(all(test, feature = "infra"))]
 mod infra_tests {
     use super::*;
-    use crate::account::create_password_account;
+    use crate::DiscordProfile;
+    use crate::account::{create_password_account, discord_account};
     use crate::migrate::GLOBAL_MIGRATOR;
     use crate::test_db::with_test_schema;
 
@@ -277,10 +280,30 @@ mod infra_tests {
             let own = audit_rows(pool, Some(account.id), AUDIT_LIMIT)
                 .await
                 .expect("own");
+            let discord = discord_account(
+                pool,
+                &DiscordProfile {
+                    user_id: "80351110224678912".to_owned(),
+                    username: "nelly".to_owned(),
+                    display_name: "Nelly".to_owned(),
+                    email: None,
+                    email_verified: false,
+                },
+            )
+            .await
+            .expect("discord account");
+            set_admin_rank(pool, discord.id, AdminRank::Csr, None)
+                .await
+                .expect("discord rank");
             let listed = admin_ranks(pool).await.expect("ranks");
-            assert_eq!(listed.len(), 1);
+            assert_eq!(listed.len(), 2);
             assert_eq!(listed[0].username.as_deref(), Some("gm"));
             assert_eq!(listed[0].rank, AdminRank::GameMaster);
+            assert_eq!(
+                listed[1].username.as_deref(),
+                Some("nelly"),
+                "a Discord account is listed by its Discord username"
+            );
             let removed = remove_admin_rank(pool, account.id).await.expect("remove");
             (rank, changed, removed, rows, own)
         })

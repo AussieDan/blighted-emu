@@ -170,7 +170,7 @@ h1, h2 { font-family: var(--font-sign); font-stretch: condensed; margin: 0; }
 }
 
 /* Controls ----------------------------------------------------------------------------------- */
-button, select, input[type="search"] {
+button, a.button, select, input[type="search"] {
   font: 600 13px var(--font-sign);
   letter-spacing: 0.04em;
   color: var(--accent);
@@ -181,8 +181,9 @@ button, select, input[type="search"] {
 }
 input[type="search"] { font: 14px var(--font-body); letter-spacing: 0; color: var(--ink); border-width: 1px; border-color: var(--line); }
 input[type="search"]::placeholder { color: var(--mute); }
-button { cursor: pointer; transition: background-color 150ms var(--ease-out); }
-button:hover:not(:disabled) { background: color-mix(in srgb, var(--accent) 16%, var(--ground)); }
+button, a.button { cursor: pointer; transition: background-color 150ms var(--ease-out); }
+a.button { text-align: center; text-decoration: none; }
+button:hover:not(:disabled), a.button:hover { background: color-mix(in srgb, var(--accent) 16%, var(--ground)); }
 button:disabled { opacity: 0.45; cursor: not-allowed; }
 button.danger { color: var(--alert); border-color: var(--alert); }
 button.danger:hover:not(:disabled) { background: color-mix(in srgb, var(--alert) 10%, var(--ground)); }

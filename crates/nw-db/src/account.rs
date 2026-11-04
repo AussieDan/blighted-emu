@@ -169,6 +169,22 @@ pub async fn account_by_id(pool: &PgPool, account_id: Uuid) -> Result<Option<Acc
     Ok(row.map(account_from_row))
 }
 
+/// The account that staff name by `name`: a password login name (any case), else a Discord user
+/// id, else a Discord username (any case; the newest login when an old name is stored twice).
+pub async fn account_by_login_name(pool: &PgPool, name: &str) -> Result<Option<Account>, DbError> {
+    let row: Option<AccountRow> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        "SELECT {ACCOUNT_COLUMNS} FROM account WHERE account.account_id = COALESCE( \
+         (SELECT account_id FROM password_login WHERE username = lower($1)), \
+         (SELECT account_id FROM discord_login WHERE discord_user_id = $1), \
+         (SELECT account_id FROM discord_login WHERE lower(discord_username) = lower($1) \
+          ORDER BY last_login_at DESC NULLS LAST LIMIT 1))"
+    )))
+    .bind(name.trim())
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(account_from_row))
+}
+
 /// Sets or clears the ban flag. Returns false when the account does not exist.
 pub async fn set_banned(pool: &PgPool, account_id: Uuid, banned: bool) -> Result<bool, DbError> {
     let result = sqlx::query("UPDATE account SET banned = $2 WHERE account_id = $1")
@@ -251,6 +267,42 @@ mod tests {
         assert_eq!(found, Some((created, HASH.to_owned())));
         assert!(matches!(duplicate, Err(DbError::DuplicateUsername)));
         assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn staff_find_an_account_by_login_name_discord_id_or_discord_username() {
+        let profile = DiscordProfile {
+            user_id: DISCORD_ID.to_owned(),
+            username: DISCORD_USERNAME.to_owned(),
+            display_name: DISCORD_NAME.to_owned(),
+            email: None,
+            email_verified: false,
+        };
+        let (password, discord, by_id, by_name, missing) = with_test_schema(async |pool| {
+            GLOBAL_MIGRATOR.run(pool).await.expect("migrate");
+            let password = create_password_account(pool, USERNAME, HASH)
+                .await
+                .expect("password");
+            let discord = discord_account(pool, &profile).await.expect("discord");
+            let found = async |name: &str| {
+                account_by_login_name(pool, name)
+                    .await
+                    .expect("lookup")
+                    .map(|account| account.id)
+            };
+            (
+                (password.id, found("ADA").await),
+                discord.id,
+                found(DISCORD_ID).await,
+                found("Nelly").await,
+                found("ghost").await,
+            )
+        })
+        .await;
+        assert_eq!(password.1, Some(password.0));
+        assert_eq!(by_id, Some(discord));
+        assert_eq!(by_name, Some(discord));
+        assert_eq!(missing, None);
     }
 
     #[tokio::test]
