@@ -8,9 +8,10 @@
 //! shape is stored once and placed many times; a line's parameter is the same in both spaces.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::sync::Arc;
 
-use nw_formats::rigid::{Vec3, add, cross, dot, scale, sub};
+use nw_formats::rigid::{Vec3, add, cross, dot, length, scale, sub};
 
 use crate::collision::{
     Affine, Body, Geometry, LevelCollision, invert, transform_point, transform_vector,
@@ -33,6 +34,12 @@ const BOX_CORNERS: u32 = 8;
 const AXES: usize = 3;
 /// The index of the up axis.
 const UP: usize = 2;
+/// Sides of the ring that stands for a round shape (sphere, capsule, cylinder) in the triangles
+/// of [`CollisionIndex::triangles_in`] (our choice: a low-poly view).
+const ROUND_SIDES: u32 = 8;
+/// A convex corner is on a face when it is this near the face's plane, m (our choice: well
+/// under the millimetre of the asset data, as the hull check of `collision`).
+const FACE_TOLERANCE_M: f32 = 1e-3;
 
 /// An axis-aligned box.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -212,6 +219,17 @@ struct Shapes {
     trees: Vec<Option<MeshTree>>,
 }
 
+/// Placed shapes as world-space triangles, for a view of the level.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct WorldTriangles {
+    /// The corners, in world metres.
+    pub points: Vec<Vec3>,
+    /// The corners of each triangle, as indices into `points`.
+    pub triangles: Vec<[u32; 3]>,
+    /// False when the triangle limit left bodies out.
+    pub complete: bool,
+}
+
 /// The searchable collision of a level.
 #[derive(Debug, Clone, Default)]
 pub struct CollisionIndex {
@@ -302,6 +320,70 @@ impl CollisionIndex {
             + size_of_val(self.bodies.as_slice())
             + size_of_val(self.grid.starts.as_slice())
             + size_of_val(self.grid.items.as_slice())
+    }
+
+    /// The bodies whose ground-plane bounds meet the box from `min` to `max` (x, y), as
+    /// world-space triangles, at most `max_triangles` of them, the largest bodies first. A round
+    /// shape is a ring of [`ROUND_SIDES`] sides; a body that does not fit whole under the limit
+    /// is left out, and the answer is then not complete.
+    pub fn triangles_in(
+        &self,
+        min: [f32; 2],
+        max: [f32; 2],
+        max_triangles: usize,
+    ) -> WorldTriangles {
+        let mut out = WorldTriangles {
+            complete: true,
+            ..WorldTriangles::default()
+        };
+        if self.grid.columns == 0 || self.grid.rows == 0 || min[0] > max[0] || min[1] > max[1] {
+            return out;
+        }
+        let (first_column, last_column) =
+            self.grid
+                .cell_range(min[0], max[0], self.grid.origin[0], self.grid.columns);
+        let (first_row, last_row) =
+            self.grid
+                .cell_range(min[1], max[1], self.grid.origin[1], self.grid.rows);
+        let mut seen = HashSet::new();
+        let mut found: Vec<&PlacedBody> = Vec::new();
+        for row in first_row..=last_row {
+            for column in first_column..=last_column {
+                for &index in self.grid.bodies_in(column, row) {
+                    let placed = &self.bodies[index as usize];
+                    let meets = (0..2).all(|axis| {
+                        placed.bounds.min[axis] <= max[axis] && placed.bounds.max[axis] >= min[axis]
+                    });
+                    if meets && seen.insert(index) {
+                        found.push(placed);
+                    }
+                }
+            }
+        }
+        let size = |placed: &PlacedBody| length(sub(placed.bounds.max, placed.bounds.min));
+        found.sort_by(|a, b| size(b).total_cmp(&size(a)));
+        for placed in found {
+            let Some(geometry) = self.shapes.geometries.get(placed.body.geometry as usize) else {
+                continue;
+            };
+            let (points, triangles) = local_triangles(geometry);
+            if out.triangles.len() + triangles.len() > max_triangles {
+                out.complete = false;
+                continue;
+            }
+            let base = small_index(out.points.len());
+            out.points.extend(
+                points
+                    .iter()
+                    .map(|&point| transform_point(&placed.body.place, point)),
+            );
+            out.triangles.extend(
+                triangles
+                    .iter()
+                    .map(|triangle| triangle.map(|corner| corner + base)),
+            );
+        }
+        out
     }
 
     /// The height of the floor under a body whose feet are at (`x`, `y`, `z`): the highest
@@ -839,6 +921,161 @@ fn geometry_bounds(geometry: &Geometry) -> Bounds {
     bounds
 }
 
+/// A shape as triangles in its own space: a mesh as it is (leaving out a triangle with a corner
+/// out of range), a box as 12 triangles, a sphere as an octahedron, a capsule or a cylinder as a
+/// capped prism of [`ROUND_SIDES`] sides, and a convex solid as a fan over each face.
+fn local_triangles(geometry: &Geometry) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+    match geometry {
+        Geometry::Mesh { points, triangles } => {
+            let corners = points.len();
+            let kept = triangles
+                .iter()
+                .filter(|triangle| triangle.iter().all(|&corner| usize::from(corner) < corners))
+                .map(|triangle| triangle.map(u32::from))
+                .collect();
+            (points.clone(), kept)
+        }
+        Geometry::Box { half_extents } => box_triangles(*half_extents),
+        Geometry::Sphere { radius } => sphere_triangles(*radius),
+        Geometry::Capsule { from, to, radius } | Geometry::Cylinder { from, to, radius } => {
+            prism_triangles(*from, *to, *radius)
+        }
+        Geometry::Convex { points, planes } => convex_triangles(points, planes),
+    }
+}
+
+fn box_triangles(half: Vec3) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+    let points = (0..BOX_CORNERS)
+        .map(|corner| {
+            [0, 1, 2].map(|axis| {
+                if corner & (1 << axis) == 0 {
+                    -half[axis]
+                } else {
+                    half[axis]
+                }
+            })
+        })
+        .collect();
+    // Corner bits: x 1, y 2, z 4; each face as two triangles turning outward.
+    let triangles = vec![
+        [0, 2, 3],
+        [0, 3, 1],
+        [4, 5, 7],
+        [4, 7, 6],
+        [0, 1, 5],
+        [0, 5, 4],
+        [2, 6, 7],
+        [2, 7, 3],
+        [0, 4, 6],
+        [0, 6, 2],
+        [1, 3, 7],
+        [1, 7, 5],
+    ];
+    (points, triangles)
+}
+
+fn sphere_triangles(radius: f32) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+    let points = vec![
+        [radius, 0.0, 0.0],
+        [-radius, 0.0, 0.0],
+        [0.0, radius, 0.0],
+        [0.0, -radius, 0.0],
+        [0.0, 0.0, radius],
+        [0.0, 0.0, -radius],
+    ];
+    let triangles = vec![
+        [0, 2, 4],
+        [2, 1, 4],
+        [1, 3, 4],
+        [3, 0, 4],
+        [2, 0, 5],
+        [1, 2, 5],
+        [3, 1, 5],
+        [0, 3, 5],
+    ];
+    (points, triangles)
+}
+
+/// Two unit vectors across `axis` and across each other.
+fn across(axis: Vec3) -> (Vec3, Vec3) {
+    let helper = if axis[UP].abs() < 0.9 {
+        [0.0, 0.0, 1.0]
+    } else {
+        [1.0, 0.0, 0.0]
+    };
+    let first = cross(axis, helper);
+    let first = scale(first, length(first).recip());
+    (first, cross(axis, first))
+}
+
+fn prism_triangles(from: Vec3, to: Vec3, radius: f32) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+    let along = sub(to, from);
+    let span = length(along);
+    let axis = if span > 0.0 {
+        scale(along, span.recip())
+    } else {
+        [0.0, 0.0, 1.0]
+    };
+    let (first, second) = across(axis);
+    let ring = |centre: Vec3| {
+        (0..ROUND_SIDES).map(move |side| {
+            let angle = std::f32::consts::TAU * side as f32 / ROUND_SIDES as f32;
+            add(
+                centre,
+                add(
+                    scale(first, radius * angle.cos()),
+                    scale(second, radius * angle.sin()),
+                ),
+            )
+        })
+    };
+    let mut points: Vec<Vec3> = ring(from).chain(ring(to)).collect();
+    points.push(from);
+    points.push(to);
+    let (low_centre, high_centre) = (2 * ROUND_SIDES, 2 * ROUND_SIDES + 1);
+    let mut triangles = Vec::new();
+    for side in 0..ROUND_SIDES {
+        let next = (side + 1) % ROUND_SIDES;
+        let (low, low_next) = (side, next);
+        let (high, high_next) = (side + ROUND_SIDES, next + ROUND_SIDES);
+        triangles.push([low, low_next, high_next]);
+        triangles.push([low, high_next, high]);
+        triangles.push([low_centre, low_next, low]);
+        triangles.push([high_centre, high, high_next]);
+    }
+    (points, triangles)
+}
+
+fn convex_triangles(points: &[Vec3], planes: &[[f32; 4]]) -> (Vec<Vec3>, Vec<[u32; 3]>) {
+    let mut triangles = Vec::new();
+    for plane in planes {
+        let normal = [plane[0], plane[1], plane[2]];
+        let mut face: Vec<u32> = (0..points.len())
+            .filter(|&corner| (dot(normal, points[corner]) - plane[3]).abs() <= FACE_TOLERANCE_M)
+            .map(small_index)
+            .collect();
+        if face.len() < 3 {
+            continue;
+        }
+        let centre = scale(
+            face.iter().fold([0.0; AXES], |sum, &corner| {
+                add(sum, points[corner as usize])
+            }),
+            (face.len() as f32).recip(),
+        );
+        let (first, second) = across(normal);
+        let angle = |corner: u32| {
+            let offset = sub(points[corner as usize], centre);
+            dot(offset, second).atan2(dot(offset, first))
+        };
+        face.sort_by(|a, b| angle(*a).total_cmp(&angle(*b)));
+        for pair in face[1..].windows(2) {
+            triangles.push([face[0], pair[0], pair[1]]);
+        }
+    }
+    (points.to_vec(), triangles)
+}
+
 /// The tree of a mesh geometry; `None` for the other kinds.
 fn mesh_tree(geometry: &Geometry) -> Option<MeshTree> {
     let Geometry::Mesh { points, triangles } = geometry else {
@@ -1041,6 +1278,118 @@ mod tests {
         place[1][3] = y;
         place[2][3] = z;
         place
+    }
+
+    #[test]
+    fn triangles_in_place_each_body_once_in_the_world() {
+        let index = index(
+            vec![Geometry::Box {
+                half_extents: [1.0, 1.0, 1.0],
+            }],
+            vec![
+                Body {
+                    geometry: 0,
+                    place: moved(100.0, 100.0, 5.0),
+                },
+                Body {
+                    geometry: 0,
+                    place: moved(900.0, 900.0, 5.0),
+                },
+            ],
+        );
+        let shapes = index.triangles_in([0.0, 0.0], [200.0, 200.0], usize::MAX);
+        assert!(shapes.complete);
+        assert_eq!(shapes.triangles.len(), 12, "one box");
+        assert!(
+            shapes
+                .points
+                .iter()
+                .all(|point| (point[0] - 100.0).abs() <= 1.0 + TOLERANCE)
+        );
+        let all = index.triangles_in([0.0, 0.0], [1_000.0, 1_000.0], usize::MAX);
+        assert_eq!(all.triangles.len(), 24, "two boxes, each once");
+    }
+
+    #[test]
+    fn triangles_in_stop_at_the_limit() {
+        let index = index(
+            vec![deck()],
+            vec![
+                Body {
+                    geometry: 0,
+                    place: moved(0.0, 0.0, 0.0),
+                },
+                Body {
+                    geometry: 0,
+                    place: moved(20.0, 0.0, 0.0),
+                },
+            ],
+        );
+        let shapes = index.triangles_in([-10.0, -10.0], [30.0, 10.0], 6);
+        assert!(!shapes.complete);
+        assert_eq!(shapes.triangles.len(), 4, "only one deck fits");
+    }
+
+    #[test]
+    fn triangles_in_take_the_largest_bodies_first() {
+        let index = index(
+            vec![
+                Geometry::Box {
+                    half_extents: [0.5, 0.5, 0.5],
+                },
+                Geometry::Box {
+                    half_extents: [20.0, 20.0, 8.0],
+                },
+            ],
+            vec![
+                Body {
+                    geometry: 0,
+                    place: moved(0.0, 0.0, 0.0),
+                },
+                Body {
+                    geometry: 1,
+                    place: moved(10.0, 0.0, 0.0),
+                },
+            ],
+        );
+        let shapes = index.triangles_in([-50.0, -50.0], [50.0, 50.0], 12);
+        assert!(!shapes.complete);
+        let widest = shapes
+            .points
+            .iter()
+            .map(|point| point[0])
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            (widest - 30.0).abs() <= TOLERANCE,
+            "the large box is the one kept"
+        );
+    }
+
+    #[test]
+    fn round_and_convex_shapes_become_closed_low_poly_solids() {
+        let (_, cylinder) = local_triangles(&Geometry::Cylinder {
+            from: [0.0, 0.0, 0.0],
+            to: [0.0, 0.0, 2.0],
+            radius: 0.5,
+        });
+        assert_eq!(cylinder.len(), 4 * ROUND_SIDES as usize);
+        let (_, sphere) = local_triangles(&Geometry::Sphere { radius: 1.0 });
+        assert_eq!(sphere.len(), 8);
+        let cube: Vec<Vec3> = (0..BOX_CORNERS)
+            .map(|corner| [0, 1, 2].map(|axis| if corner & (1 << axis) == 0 { -1.0 } else { 1.0 }))
+            .collect();
+        let planes = crate::collision::hull_planes(&cube);
+        let (_, faces) = local_triangles(&Geometry::Convex {
+            points: cube,
+            planes,
+        });
+        assert_eq!(faces.len(), 12, "six square faces, two triangles each");
+    }
+
+    #[test]
+    fn an_empty_index_has_no_triangles() {
+        let shapes = index(Vec::new(), Vec::new()).triangles_in([0.0, 0.0], [10.0, 10.0], 10);
+        assert!(shapes.complete && shapes.triangles.is_empty());
     }
 
     fn index(geometries: Vec<Geometry>, bodies: Vec<Body>) -> CollisionIndex {
