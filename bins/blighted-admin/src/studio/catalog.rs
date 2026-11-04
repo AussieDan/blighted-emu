@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use nw_content::ContentBundle;
+use nw_content::bundle::english;
 use nw_design::{Kind, client_records};
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -24,8 +25,6 @@ pub const CATALOG_KINDS: [Kind; 10] = [
 ];
 /// The field that holds a record's name key.
 const NAME_FIELD: &str = "name";
-/// The prefix of a text key in a datasheet cell.
-const TEXT_KEY_PREFIX: char = '@';
 
 /// One client record, its fields kept as compact JSON text to hold many records in little memory.
 #[derive(Debug, Clone, PartialEq)]
@@ -123,13 +122,7 @@ fn name_of(
     fields: &Map<String, Value>,
     text: &std::collections::BTreeMap<String, String>,
 ) -> Option<String> {
-    let key = fields
-        .get(NAME_FIELD)?
-        .as_str()?
-        .trim_start_matches(TEXT_KEY_PREFIX);
-    text.get(key)
-        .or_else(|| text.get(&key.to_lowercase()))
-        .cloned()
+    english(text, fields.get(NAME_FIELD)?.as_str()?).map(str::to_owned)
 }
 
 #[cfg(test)]

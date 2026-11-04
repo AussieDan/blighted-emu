@@ -64,6 +64,18 @@ impl ContentBundle {
     }
 }
 
+/// The first character of a localization key in a datasheet cell (`@ui_riding`).
+pub const TEXT_KEY_PREFIX: char = '@';
+
+/// The English text of the datasheet cell `key` (`@ui_riding` or `ui_riding`): by the key as the
+/// localization file writes it, else in lower case.
+pub fn english<'a>(text: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
+    let key = key.trim_start_matches(TEXT_KEY_PREFIX);
+    text.get(key)
+        .or_else(|| text.get(&key.to_lowercase()))
+        .map(String::as_str)
+}
+
 /// The bundle path of a client build: `<dir>/bundle-<client_build>.bin`.
 pub fn bundle_path(dir: &Path, client_build: &str) -> PathBuf {
     dir.join(format!("bundle-{client_build}.bin"))
