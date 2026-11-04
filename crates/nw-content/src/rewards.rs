@@ -111,6 +111,13 @@ pub struct EventGrant {
     /// `Reward_MountReward_Box_1`, the salvage event of the mount quest's reward box, earns
     /// `AwardAchievement_Mount_Horse_1`, the achievement that owns the horse `Mount_Horse_1`).
     pub achievement: Option<String>,
+    /// `LootLimitID`: the loot limit each firing counts 1 on (the mount foods'
+    /// `Mount_FoodDailyXP_Limit`, 3 a day). Inferred from the column names: a firing at the
+    /// limit grants nothing and fires `limit_reached` instead.
+    pub loot_limit: Option<String>,
+    /// `LootLimitReachedGameEventID`: the event a firing at the limit fires
+    /// (`Mount_FoodDailyXP_LimitReached`, `Riding` 0).
+    pub limit_reached: Option<String>,
 }
 
 impl EventGrant {
@@ -168,6 +175,14 @@ impl EventGrants {
                             territory_standing: number_of(row.territory_standing.as_deref()),
                             achievement: row
                                 .achievement_id
+                                .clone()
+                                .filter(|id| !id.trim().is_empty()),
+                            loot_limit: row
+                                .loot_limit_id
+                                .clone()
+                                .filter(|id| !id.trim().is_empty()),
+                            limit_reached: row
+                                .loot_limit_reached_game_event_id
                                 .clone()
                                 .filter(|id| !id.trim().is_empty()),
                         },
@@ -266,6 +281,7 @@ mod tests {
                     coins: (0, 0),
                     territory_standing: 0.0,
                     achievement: None,
+                    ..EventGrant::default()
                 },
             ),
             (
@@ -275,6 +291,7 @@ mod tests {
                     coins: coin_range(Some("2000-5000")),
                     territory_standing: number_of(Some("1")),
                     achievement: None,
+                    ..EventGrant::default()
                 },
             ),
         ]);

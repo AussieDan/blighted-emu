@@ -1643,6 +1643,222 @@ mod tests {
             }
         }
 
+        #[test]
+        fn a_mount_food_of_quick_slot_3_feeds_the_horse_up_to_the_daily_limit() {
+            use nw_content::item_rules::{ConsumableRow, ItemRuleRow, ItemRuleSource, ItemRules};
+            use nw_content::loot_limits::{
+                LimitRow, LootLimitRules, LootLimits, ResetClock, Weekday,
+            };
+            use nw_content::progression::{Progression, ProgressionSource};
+            use nw_content::rewards::{EventGrant, EventGrants};
+            use nw_content::status_effects::{
+                EffectSourceRow, StatusEffectRules, StatusEffectSource,
+            };
+            use nw_messages::ServerMessage;
+            use nw_messages::paperdoll::slot;
+
+            use super::super::super::attack::MOUNT_FOOD_USE_MS;
+            use super::super::super::tests::messages_to;
+
+            use crate::objectives::{TaskBook, TaskRow};
+            use crate::player_content::{ObjectiveRow, QuestBook};
+            use crate::world::gear::{Gear, tests as gear_tests};
+            // Retail rows (content bundle 25810808): `MountConsum_GruelT1` adds the effect, whose
+            // game event gives `Riding` 2,500 and counts on the daily limit of 3; the quest step
+            // `9401_TutorialFood` counts the event.
+            const GRUEL: &str = "MountConsum_GruelT1";
+            const FOOD_EFFECT: &str = "Status_Mount_GrantRidingXP_Small";
+            const FOOD_EVENT: &str = "Mount_GrantRidingXP_Small";
+            const FOOD_LIMIT: &str = "Mount_FoodDailyXP_Limit";
+            const DAILY_USES: i64 = 3;
+            const DAILY_EXPIRE_S: i64 = 86_400;
+            const RIDING_REWARD: f64 = 2_500.0;
+            const RATIONS: u32 = 5;
+            /// Input 140, `Use_Quickslot_3` (value 2 bit 12).
+            const QUICK_SLOT_3_KEY: u64 = 1 << 12;
+            const FOOD_QUEST: &str = "q_feed";
+            let task = |id: &str, kind: &str, children: &[&str]| TaskRow {
+                task_id: id.to_owned(),
+                kind: kind.to_owned(),
+                sub_tasks: children.iter().map(|child| (*child).to_owned()).collect(),
+                ..TaskRow::default()
+            };
+            let mut world = world_with(vec![UNLOCK_BIT, GIFT_BIT]);
+            let content = Arc::make_mut(&mut world.content);
+            content.item_rules = ItemRules::build(ItemRuleSource {
+                items: vec![ItemRuleRow {
+                    item_id: GRUEL.to_owned(),
+                    stats_ref: None,
+                    consume_on_use: true,
+                    not_droppable: false,
+                    nonremovable: false,
+                }],
+                consumables: vec![ConsumableRow {
+                    id: GRUEL.to_owned(),
+                    add_status_effects: Some(FOOD_EFFECT.to_owned()),
+                    potency: Some(1.0),
+                    duration_override_s: None,
+                    cooldown_id: None,
+                    cooldown_s: Some(15),
+                    disabled_in_combat: false,
+                    use_tag: Some("MountItem".to_owned()),
+                    mount_only: true,
+                    required_inactive_limit: Some(FOOD_LIMIT.to_owned()),
+                    remove_categories: Some("MountFoodUtility".to_owned()),
+                }],
+                effects: Vec::new(),
+            });
+            content.status_effects = StatusEffectRules::build(StatusEffectSource {
+                effects: vec![EffectSourceRow {
+                    status_id: FOOD_EFFECT.to_owned(),
+                    categories: Some("MountFoodUtility+Food".to_owned()),
+                    game_event: Some(FOOD_EVENT.to_owned()),
+                    shows_damage_text: true,
+                    ..EffectSourceRow::default()
+                }],
+                ..StatusEffectSource::default()
+            });
+            content.event_grants = EventGrants::build([(
+                FOOD_EVENT.to_owned(),
+                EventGrant {
+                    progression: Some(("Riding".to_owned(), RIDING_REWARD)),
+                    loot_limit: Some(FOOD_LIMIT.to_owned()),
+                    limit_reached: Some("Mount_FoodDailyXP_LimitReached".to_owned()),
+                    ..EventGrant::default()
+                },
+            )]);
+            content.loot_limits = Some(LootLimitRules {
+                limits: LootLimits::build([LimitRow {
+                    id: FOOD_LIMIT,
+                    count_limit: DAILY_USES,
+                    expire_seconds: DAILY_EXPIRE_S,
+                    max_limit_mult: 64_800,
+                    replicated: true,
+                }]),
+                clock: ResetClock {
+                    hour_utc: 3,
+                    weekly_day: Weekday::Tuesday,
+                },
+            });
+            content.progression = Progression::default().with_progressions([ProgressionSource {
+                id: "Riding".to_owned(),
+                max_level: 200,
+                auto_rank_up: true,
+                ranks: vec![(0, 1_000_000)],
+            }]);
+            content.quests = QuestBook::build(
+                [ObjectiveRow {
+                    id: FOOD_QUEST.to_owned(),
+                    root: "t_root".to_owned(),
+                    ..ObjectiveRow::default()
+                }],
+                TaskBook::new(vec![
+                    task("t_root", "ConsecutiveTaskContainer", &["t_feed", "t_wait"]),
+                    TaskRow {
+                        kill_enemy_type: Some(FOOD_EVENT.to_owned()),
+                        target_qty: Some(1),
+                        ..task("t_feed", "TaskGameEvent", &[])
+                    },
+                    TaskRow {
+                        kill_enemy_type: Some("Never".to_owned()),
+                        target_qty: Some(1),
+                        ..task("t_wait", "TaskGameEvent", &[])
+                    },
+                ]),
+            );
+            let entity = world.player_by_number(PLAYER).expect("player");
+            let kits = gear_tests::kits_with(&[(GRUEL, "Consumable+MountConsumable")]);
+            let mut gear = Gear::starter(&kits, gear_tests::CHARACTER, Some(gear_tests::BACKSTORY))
+                .expect("gear");
+            gear.renew(
+                kits.item(GRUEL).expect("gruel"),
+                RATIONS,
+                slot::QUICK_SLOTS[2],
+                0,
+            );
+            world.world.get_mut::<Player>(entity).expect("player").gear = Some(gear);
+            world.start_quest(PLAYER, FOOD_QUEST, NOW).expect("start");
+            let left = |world: &SimWorld| -> u32 {
+                world
+                    .world
+                    .get::<Player>(entity)
+                    .and_then(|player| player.gear.as_ref())
+                    .map(Gear::carried)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter(|stack| stack.item_id == GRUEL)
+                    .map(|stack| stack.quantity)
+                    .sum()
+            };
+            let riding = |world: &SimWorld| -> u32 {
+                let mastery = world
+                    .content
+                    .progression
+                    .categorical("Riding")
+                    .expect("riding");
+                world
+                    .world
+                    .get::<Player>(entity)
+                    .expect("player")
+                    .masteries
+                    .experience(mastery)
+            };
+            let played = |world: &SimWorld| -> bool {
+                messages_to(&world.combat_messages, PLAYER)
+                    .iter()
+                    .any(|message| {
+                        matches!(message, ServerMessage::AdjustFxScripts(script)
+                            if script.script == lowercase_crc32(FOOD_EFFECT))
+                    })
+            };
+            // A press of quick slot key 3 and its release; the food is used at its use time.
+            let feed = |world: &mut SimWorld, counter: u16, at_ms: u64| {
+                world.combat_messages.clear();
+                world.attack_input(
+                    &connection(PLAYER),
+                    &[record(counter, vec![0, 0, QUICK_SLOT_3_KEY])],
+                    at_ms,
+                );
+                world.attack_input(&connection(PLAYER), &[record(counter + 1, vec![0])], at_ms);
+                let before = left(world);
+                world.drink_due(at_ms + MOUNT_FOOD_USE_MS - 1, SERVER_TIME);
+                assert_eq!(left(world), before, "nothing before the use time");
+                world.drink_due(at_ms + MOUNT_FOOD_USE_MS, SERVER_TIME);
+            };
+            feed(&mut world, 1, NOW);
+            assert_eq!(
+                left(&world),
+                RATIONS,
+                "a mount food off the mount is not used"
+            );
+            assert!(world.ride(entity, lowercase_crc32(HORSE)));
+            for day_use in 1..=DAILY_USES as u32 {
+                feed(
+                    &mut world,
+                    (day_use * 2 + 1) as u16,
+                    NOW + u64::from(day_use) * 1_000,
+                );
+                assert_eq!(left(&world), RATIONS - day_use, "use {day_use}");
+                assert_eq!(
+                    riding(&world),
+                    RIDING_REWARD as u32 * day_use,
+                    "use {day_use}"
+                );
+                assert!(played(&world), "the effect's visual script, use {day_use}");
+            }
+            assert!(
+                world.quests_of_player(PLAYER)[0].run.is_done("t_feed"),
+                "the quest step counts the food's event"
+            );
+            feed(&mut world, 9, NOW + 9_000);
+            assert_eq!(
+                left(&world),
+                RATIONS - DAILY_USES as u32,
+                "the daily limit of 3 is reached"
+            );
+            assert_eq!(riding(&world), RIDING_REWARD as u32 * DAILY_USES as u32);
+        }
+
         fn world_with(achievements: Vec<u32>) -> SimWorld {
             world_admitted(achievements, false)
         }

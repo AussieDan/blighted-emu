@@ -94,6 +94,11 @@ fn rent_share(share: f64, scale: f64, category: DamageCategory) -> f64 {
 const HEAL_SCRIPT: u32 = 0xf7e1_e0d6;
 /// Microseconds per millisecond.
 const US_PER_MS: u64 = 1000;
+/// When a mount food takes effect after its quick slot press (its `MannequinTag` `MountItem` is
+/// no use of a weapon stance). Observed: retail's press record of
+/// `9401_tutorialfood-Hungry-as-a-horse` at 67.12 s, the emptied quick slot and the done quest
+/// step at 67.81 s.
+pub(super) const MOUNT_FOOD_USE_MS: u64 = 690;
 /// A blocked hit that breaks the guard takes half its health (newchar-retail 422387: 17.025 of
 /// the same attack's 34.05 unblocked).
 const BROKEN_GUARD_DAMAGE_DIVISOR: u32 = 2;
@@ -174,8 +179,8 @@ pub(super) struct Vitals {
     /// A dodge press waits for a cancel window of the playing attack while the key stays held
     /// (`CanDodgeBuffer`, Inferred: a press let go before the window was refused in retail).
     dodge_waiting: bool,
-    /// The player pressed quick slot 1 in the newest input record.
-    quick_slot_held: bool,
+    /// The quick slot key (0 to 3) the player pressed in the newest input record.
+    quick_slot_held: Option<usize>,
     /// The invulnerability of its dodge roll, from and until: mob hits miss.
     invulnerable_ms: Option<(u64, u64)>,
     /// It went down to death's door then ([`nw_content::deaths_door`]): at 0 health, not dead
@@ -218,7 +223,7 @@ impl Vitals {
             guard_broken: false,
             dodge_held: false,
             dodge_waiting: false,
-            quick_slot_held: false,
+            quick_slot_held: None,
             invulnerable_ms: None,
             deaths_door_since_ms: None,
             deaths_door_ms: None,
@@ -1152,19 +1157,20 @@ impl SimWorld {
         }
     }
 
-    /// Drinks the potions whose press is due at `now_ms`, at server time `server_ms` (ms since
-    /// 2000-01-01).
+    /// Uses the quick slot items whose press is due at `now_ms`, at server time `server_ms` (ms
+    /// since 2000-01-01).
     pub(super) fn drink_due(&mut self, now_ms: u64, server_ms: u64) {
         let (due, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.drinks)
             .into_iter()
-            .partition(|(_, at)| now_ms >= *at);
+            .partition(|(_, _, at)| now_ms >= *at);
         self.drinks = later;
-        for (number, _) in due {
-            self.drink(number, now_ms, server_ms);
+        for (number, quick_slot, _) in due {
+            self.drink(number, quick_slot, now_ms, server_ms);
         }
     }
 
-    /// The player `number` uses the item of its quick slot 1 at `now_ms`. A healing potion is
+    /// The player `number` uses the item of its quick slot `quick_slot` (a paperdoll slot,
+    /// [`slot::QUICK_SLOTS`]) at `now_ms`. A healing potion is
     /// drunk unless the slot is empty, holds a disabled item (`javelin.disabled-item-classes`),
     /// or the item's cooldown runs (xp-potion-exit note, section 2.5): one less in the slot, the
     /// cooldown, the heal (`health` + `health share` x max, at most to the max) and the heal's
@@ -1173,14 +1179,14 @@ impl SimWorld {
     /// 4298 tells a healer of another player). Another consumable (food: live 2026-10-29, the
     /// light ration gave no buff from the quick slot) is used as from the bag
     /// ([`SimWorld::consume`]).
-    fn drink(&mut self, number: u64, now_ms: u64, server_ms: u64) {
+    fn drink(&mut self, number: u64, quick_slot: u32, now_ms: u64, server_ms: u64) {
         let Some(entity) = self.player_by_number(number) else {
             return;
         };
         let worn = self
             .world
             .get::<Player>(entity)
-            .and_then(|player| player.gear.as_ref()?.worn_item(slot::QUICK_SLOT_1))
+            .and_then(|player| player.gear.as_ref()?.worn_item(quick_slot))
             .map(str::to_owned);
         // Food and other consumables that do not heal at once take effect as a use from the bag.
         if let Some(item) = worn
@@ -1190,7 +1196,7 @@ impl SimWorld {
                 entity,
                 number,
                 &item,
-                super::item_calls::UsedFrom::Worn(slot::QUICK_SLOT_1),
+                super::item_calls::UsedFrom::Worn(quick_slot),
                 now_ms,
             );
             return;
@@ -1204,8 +1210,12 @@ impl SimWorld {
             tracing::debug!(player = number, "drink: no gear");
             return;
         };
-        let Some(item) = gear.worn_item(slot::QUICK_SLOT_1).map(str::to_owned) else {
-            tracing::debug!(player = number, "drink: quick slot 1 is empty");
+        let Some(item) = gear.worn_item(quick_slot).map(str::to_owned) else {
+            tracing::debug!(
+                player = number,
+                quick_slot,
+                "drink: the quick slot is empty"
+            );
             return;
         };
         if self.content.is_item_disabled(&item) {
@@ -1222,7 +1232,7 @@ impl SimWorld {
             tracing::debug!(player = number, item, "drink: the cooldown runs");
             return;
         }
-        gear.use_one(slot::QUICK_SLOT_1);
+        gear.use_one(quick_slot);
         player.cooldowns_changed = true;
         let connection = player.connection.clone();
         // The held `HealMod`s and `ConsumableHealMod`s scale the potion (disease: less).
@@ -1318,9 +1328,9 @@ impl SimWorld {
     }
 
     /// Keeps whether the player holds block, starts a dodge roll on a new press of the dodge key
-    /// and a drink on a new press of quick slot 1 (the first, newest record), then reads the
-    /// attacks (a press and its release) in the records of `records` not read before, oldest
-    /// first, with the stance of the weapon the attack key uses: a release picks the light or
+    /// and a quick slot use on a new press of a quick slot key (the first, newest record), then
+    /// reads the attacks (a press and its release) in the records of `records` not read before,
+    /// oldest first, with the stance of the weapon the attack key uses: a release picks the light or
     /// heavy attack by the hold, a hold to the charge starts the charged attack
     /// ([`Stance::released`]). The first attack starts ([`SimWorld::player_swings_due`] lands
     /// it); the others of the same message are [`AttackRefusal::TooFast`], which this returns.
@@ -1649,11 +1659,30 @@ impl SimWorld {
         data.stance(weapon.stance)
     }
 
+    /// When the use of the item in quick slot `quick_slot` of player `entity` takes effect after
+    /// its press: at the use of the item's `MannequinTag` in `stance` (a potion at `Potion`, 333
+    /// ms; food at `Eat`, 1,000 ms), a mount food at [`MOUNT_FOOD_USE_MS`]. `None` for an empty
+    /// slot or an item that no use plays.
+    fn quick_slot_use_ms(
+        &self,
+        entity: Entity,
+        quick_slot: u32,
+        stance: Option<&Stance>,
+    ) -> Option<u64> {
+        let player = self.world.get::<Player>(entity)?;
+        let item = player.gear.as_ref()?.worn_item(quick_slot)?;
+        let consumable = self.content.item_rules.consumable(item)?;
+        if consumable.mount_only {
+            return Some(MOUNT_FOOD_USE_MS);
+        }
+        stance?.use_effect_ms(consumable.use_tag.as_deref()?)
+    }
+
     /// The block, dodge and quick slot keys of the newest input record `newest` of player
     /// `number`: a release of block starts its stamina's regen delay again; a new press of dodge
     /// starts a roll, or a dash when `swimming`, if its stamina allows it, and a roll keeps mob
-    /// hits off in its stance's invulnerability window; a new press of quick slot 1 drinks when
-    /// the stance's item use of the slot's item takes effect.
+    /// hits off in its stance's invulnerability window; a new press of a quick slot key uses the
+    /// slot's item when its use takes effect ([`SimWorld::quick_slot_use_ms`]).
     fn stamina_input(
         &mut self,
         entity: Entity,
@@ -1668,14 +1697,14 @@ impl SimWorld {
             .get::<Player>(entity)
             .and_then(|player| player.attack_playing.as_ref())
             .is_none_or(|playing| playing.dodge_free(now_ms));
-        // A potion takes effect at its stance's `Potion` use (333 ms), food at `Eat` (1,000 ms).
-        let drink_ms = self
-            .world
-            .get::<Player>(entity)
-            .and_then(|player| player.gear.as_ref()?.worn_item(slot::QUICK_SLOT_1))
-            .and_then(|item| self.content.item_rules.consumable(item))
-            .and_then(|consumable| consumable.use_tag.as_deref())
-            .and_then(|tag| stance.as_ref()?.use_effect_ms(tag));
+        let quick_key = newest.quick_slot_key();
+        let quick_use = quick_key.and_then(|key| {
+            let quick_slot = slot::QUICK_SLOTS[key];
+            Some((
+                quick_slot,
+                self.quick_slot_use_ms(entity, quick_slot, stance.as_ref())?,
+            ))
+        });
         // A stun keeps the block down and the dodge back; a root or tether only the dodge.
         let control = self.player_control(entity);
         let Some(mut vitals) = self.world.get_mut::<Vitals>(entity) else {
@@ -1699,14 +1728,13 @@ impl SimWorld {
         } else if vitals.dodge_waiting {
             tracing::debug!(player = number, "dodge waits for a cancel window");
         }
-        let quick = newest.using_quick_slot_1();
-        if quick
-            && !vitals.quick_slot_held
-            && let Some(drink_ms) = drink_ms
+        if quick_key != vitals.quick_slot_held
+            && let Some((quick_slot, use_ms)) = quick_use
         {
-            self.drinks.push((number, now_ms.saturating_add(drink_ms)));
+            self.drinks
+                .push((number, quick_slot, now_ms.saturating_add(use_ms)));
         }
-        vitals.quick_slot_held = quick;
+        vitals.quick_slot_held = quick_key;
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
         };
@@ -6019,6 +6047,9 @@ mod tests {
                 cooldown_s: None,
                 disabled_in_combat: false,
                 use_tag: Some("Eat".to_owned()),
+                mount_only: false,
+                required_inactive_limit: None,
+                remove_categories: None,
             }],
             effects: vec![EffectRow {
                 status_id: "FoodRecoveryT1".to_owned(),
@@ -6043,7 +6074,7 @@ mod tests {
         );
         let entity = world.by_connection[&connection(1)];
         world.world.get_mut::<Player>(entity).expect("player").gear = Some(gear);
-        world.drink(1, NOW, SERVER_TIME);
+        world.drink(1, slot::QUICK_SLOT_1, NOW, SERVER_TIME);
         let rations: u32 = world
             .world
             .get::<Player>(entity)
@@ -6102,7 +6133,7 @@ mod tests {
     fn a_potion_of_a_disabled_class_is_not_drunk() {
         for (disabled, left) in [(false, POTIONS - 1), (true, POTIONS)] {
             let (mut world, entity) = potion_world(disabled);
-            world.drink(1, NOW, SERVER_TIME);
+            world.drink(1, slot::QUICK_SLOT_1, NOW, SERVER_TIME);
             let potions: u32 = world
                 .world
                 .get::<Player>(entity)
@@ -6139,7 +6170,7 @@ mod tests {
             .health
             .take(HURT);
         let _ = world.take_messages();
-        world.drink(1, NOW, SERVER_TIME);
+        world.drink(1, slot::QUICK_SLOT_1, NOW, SERVER_TIME);
         assert!(health(&world) > max - HURT, "healed");
         let messages = messages_to(&world.take_messages(), 1);
         assert!(

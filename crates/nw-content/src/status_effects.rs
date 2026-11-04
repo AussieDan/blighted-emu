@@ -181,6 +181,12 @@ pub struct StatusEffectRule {
     /// `GameEventID`: the game event its application fires (the mount foods'
     /// `Mount_GrantRidingXP_*`: riding experience, and the quest step `9401_TutorialFood`).
     pub game_event: Option<String>,
+    /// `ShowTextInDamageNumbers`: its application by a consumable plays its visual script
+    /// (608). Observed: retail sent 608 with `Status_Mount_GrantRidingXP_Small` 730 ms after the
+    /// mount food press of `9401_tutorialfood-Hungry-as-a-horse` (67.85 s), and none at the
+    /// `FoodRecoveryT2` use of `general-other-01` (502.111 s), an effect without it. Inferred:
+    /// the column is what sends it.
+    pub shows_damage_text: bool,
 }
 
 /// What a status effect keeps its holder from doing (the flag columns of `StatusEffectData`).
@@ -348,6 +354,8 @@ pub struct EffectSourceRow {
     pub initial_stacks: Option<i64>,
     /// `GameEventID`.
     pub game_event: Option<String>,
+    /// `ShowTextInDamageNumbers`.
+    pub shows_damage_text: bool,
 }
 
 impl EffectSourceRow {
@@ -501,6 +509,7 @@ impl EffectSourceRow {
             on_death: row.on_death_status_effect.clone(),
             initial_stacks: row.initial_stack_size,
             game_event: row.game_event_id.clone().filter(|event| !event.is_empty()),
+            shows_damage_text: row.show_text_in_damage_numbers.unwrap_or(false),
         }
     }
 }
@@ -744,11 +753,12 @@ fn rule(
             .and_then(|stacks| u8::try_from(stacks).ok())
             .filter(|stacks| *stacks > 1),
         game_event: row.game_event.clone(),
+        shows_damage_text: row.shows_damage_text,
     }
 }
 
 /// The lowercase names of a `+`-separated cell.
-fn names(cell: Option<&str>) -> Vec<String> {
+pub(crate) fn names(cell: Option<&str>) -> Vec<String> {
     cell.unwrap_or_default()
         .split(LIST_SEPARATOR)
         .map(str::trim)

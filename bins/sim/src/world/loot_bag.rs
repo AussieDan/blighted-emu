@@ -812,12 +812,34 @@ impl SimWorld {
         ) {
             (Some(rules), Some(mut player)) => {
                 for limit in &rolled.limit_visits {
-                    player.loot.limits.visit(rules, limit, now_ns);
+                    player.loot.limits.count_one(rules, limit, now_ns);
                 }
                 player.loot.limits.admit(rules, rolled.items, now_ns)
             }
             _ => rolled.items,
         }
+    }
+
+    /// The firings of `times` that loot limit `limit` of player `number` lets through at the
+    /// server time, each counted on it; its client gets the new counts. All of them without
+    /// limits or without the player.
+    pub(super) fn limited_firings(&mut self, number: u64, limit: &str, times: u32) -> u32 {
+        let content = Arc::clone(&self.content);
+        let now_ns = unix_ns(self.server_ms);
+        let Some(rules) = content.loot_limits.as_ref() else {
+            return times;
+        };
+        let Some(mut player) = self
+            .player_by_number(number)
+            .and_then(|entity| self.world.get_mut::<Player>(entity))
+        else {
+            return times;
+        };
+        let passed = (0..times)
+            .filter(|_| player.loot.limits.count_one(rules, limit, now_ns))
+            .count();
+        self.send_loot_limits(number, LimitsSent::Changed);
+        u32::try_from(passed).unwrap_or(times)
     }
 
     /// The lowercase ids of player `number`'s loot limits at their limit at the server time:

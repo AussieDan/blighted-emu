@@ -448,6 +448,19 @@ impl StatusEffects {
         self.changed |= self.held.len() != before;
     }
 
+    /// Ends the held effects of any of `categories` (lowercase: a consumable's
+    /// `RemoveStatusEffectCategories`).
+    pub(super) fn remove_categories(&mut self, rules: &StatusEffectRules, categories: &[String]) {
+        if categories.is_empty() {
+            return;
+        }
+        self.remove_where(rules, |rule| {
+            rule.categories
+                .iter()
+                .any(|category| categories.contains(category))
+        });
+    }
+
     /// Ends the held effects whose rule `ends` picks.
     fn remove_where(
         &mut self,
@@ -907,8 +920,9 @@ fn equip_load_effects(rules: &StatusEffectRules, load: EquipLoad) -> Vec<u32> {
 }
 
 impl SimWorld {
-    /// Player `entity` used `consumable` at `now_ms` (sim ms): it holds the effects the
-    /// consumable adds, of its potency and duration override, from the server time now. Each
+    /// Player `entity` used `consumable` at `now_ms` (sim ms): the held effects of the
+    /// consumable's remove categories end, and it holds the effects the consumable adds, of its
+    /// potency and duration override, from the server time now. Each
     /// added effect with a game event fires it: its grant (a mount food's riding experience) and
     /// the quest steps that count it (`9401_TutorialFood`).
     pub(super) fn add_consumable_effects(
@@ -932,6 +946,9 @@ impl SimWorld {
             hit_amount: 0.0,
         };
         let number = player.number;
+        player
+            .status_effects
+            .remove_categories(rules, &consumable.remove_categories);
         for crc in &consumable.status_effects {
             let added = player
                 .status_effects
@@ -1709,6 +1726,23 @@ mod tests {
             !effects.add(&rules, stun, hit_by(MOB), START_MS),
             "AntirequisiteEffectCategories"
         );
+    }
+
+    #[test]
+    fn a_consumable_s_remove_categories_end_the_held_effects_of_them() {
+        let rules = rules();
+        let mut effects = StatusEffects::default();
+        let (food, stun) = (crc(&rules, FOOD), crc(&rules, STUN));
+        assert!(effects.add(&rules, food, Application::plain(PLAYER), START_MS));
+        assert!(effects.add(&rules, stun, hit_by(MOB), START_MS));
+        effects.remove_categories(&rules, &[]);
+        assert!(
+            effects.holds(food) && effects.holds(stun),
+            "no category ends nothing"
+        );
+        effects.remove_categories(&rules, &["foodutility".to_owned()]);
+        assert!(!effects.holds(food), "the food is of FoodUtility");
+        assert!(effects.holds(stun), "the stun is not");
     }
 
     #[test]

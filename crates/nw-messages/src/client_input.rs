@@ -481,11 +481,13 @@ const BLOCK_SLOT_BIT: u32 = 62;
 /// water) 33 ms later (xp-potion-exit note, section 5).
 const DODGE_SLOT_VALUE: usize = 1;
 const DODGE_SLOT_BIT: u32 = 3;
-/// The slot value and its bit of a press of quick slot 1 (the potion): set in one record only,
-/// the one before the retail server used the potion of paperdoll slot 14 (xp-potion-exit note,
-/// section 2.1; Inferred from one use).
-const QUICK_SLOT_1_VALUE: usize = 1;
-const QUICK_SLOT_1_BIT: u32 = 23;
+/// The input numbers of the quick slot keys 1 to 4 (`Use_Quickslot_1` to `Use_Quickslot_4`,
+/// [`nw_formats::input_profile`]), each set in one record per press. Observed: the retail potion
+/// press of `newchar-linux-2026-09-12` (516.87 s) set `Use_Quickslot_1` and the server used the
+/// potion of quick slot 1 (xp-potion-exit note, section 2.1); the mount food press of
+/// `9401_tutorialfood-Hungry-as-a-horse` (67.12 s) set `Use_Quickslot_3` and the server used the
+/// food of quick slot 3 690 ms later.
+pub const QUICK_SLOT_KEYS: [u32; 4] = [404, 117, 140, 513];
 /// The slot value and bit of an attack key press: set in one record only (input note: the
 /// client's action set, 317 retail presses; the mask bits 9, 10, 13 and 15 that we read before are
 /// field presence bits in 873 to 1042 of about 1200 records).
@@ -585,9 +587,11 @@ impl InputRecord {
         self.slot_bit(DODGE_SLOT_VALUE, DODGE_SLOT_BIT)
     }
 
-    /// Whether the player presses quick slot 1 in this record.
-    pub fn using_quick_slot_1(&self) -> bool {
-        self.slot_bit(QUICK_SLOT_1_VALUE, QUICK_SLOT_1_BIT)
+    /// The quick slot key (0 to 3) whose press this record holds ([`QUICK_SLOT_KEYS`]).
+    pub fn quick_slot_key(&self) -> Option<usize> {
+        QUICK_SLOT_KEYS
+            .iter()
+            .position(|number| self.input_on(*number))
     }
 
     /// Whether this record holds input number `number` (the place of its action name in the
@@ -1742,7 +1746,8 @@ mod tests {
         );
         assert_eq!(message(vec![open, blocking]).blocking(), Some(false));
         assert_eq!(message(Vec::new()).blocking(), None);
-        // Retail dodge press (slot value 1 bit 3) and quick slot 1 press (bit 23).
+        // Retail dodge press (slot value 1 bit 3) and the key 3 press of the retail potion (bit
+        // 23, `dialogueOption3`, set with `Use_Quickslot_1`), which is no quick slot key.
         let press = |value: u64| InputRecord {
             slots: InputSlots {
                 count: 19,
@@ -1753,8 +1758,18 @@ mod tests {
         };
         assert!(press(8_796_093_022_216).dodging());
         assert!(!press(8_796_093_022_208).dodging());
-        assert!(press(8_388_608).using_quick_slot_1());
+        assert_eq!(press(8_388_608).quick_slot_key(), None);
         assert!(!press(8_388_608).dodging());
+        // The retail mount food press: slot value 2 bit 12 (`Use_Quickslot_3`), the third key.
+        let food = InputRecord {
+            slots: InputSlots {
+                count: 19,
+                values: vec![0, 0, 1 << 12],
+                bytes: [128; SLOT_BYTES],
+            },
+            ..InputRecord::default()
+        };
+        assert_eq!(food.quick_slot_key(), Some(2));
         let at = InputPosition::from_metres(1.0, 2.0, 3.0).expect("finite");
         for blocking in [true, false] {
             let input = ClientInputMsg::position_with_block(at, blocking);

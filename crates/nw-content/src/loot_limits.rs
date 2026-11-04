@@ -344,12 +344,15 @@ impl LootLimitCounts {
             .collect()
     }
 
-    /// A roll visited a table with `TriggerLimitOnVisit` that names limit `id` at Unix
-    /// nanosecond `now_ns`: the limit counts 1. A limit that is not applied counts nothing.
-    pub fn visit(&mut self, rules: &LootLimitRules, id: &str, now_ns: u64) {
-        if let Some(limit) = rules.limits.get(id) {
-            self.add(rules.clock, limit, id, VISIT_COUNT, now_ns);
-        }
+    /// Limit `id` counts 1 at Unix nanosecond `now_ns` (a roll visited a table with
+    /// `TriggerLimitOnVisit` that names it, or a game event with its `LootLimitID` fired) unless
+    /// it is at its limit. Returns whether it let the count through: `false` at the limit, `true`
+    /// for a limit that is not applied, which counts nothing.
+    pub fn count_one(&mut self, rules: &LootLimitRules, id: &str, now_ns: u64) -> bool {
+        rules
+            .limits
+            .get(id)
+            .is_none_or(|limit| self.add(rules.clock, limit, id, VISIT_COUNT, now_ns))
     }
 
     /// Counts `amount` on limit `limit` (id `id`) at `now_ns` unless it is reached; a count
@@ -583,11 +586,18 @@ mod tests {
     }
 
     #[test]
-    fn a_visit_counts_one_and_a_reached_limit_is_listed() {
+    fn a_count_counts_one_until_the_limit_and_a_reached_limit_is_listed() {
         let rules = rules();
         let mut counts = LootLimitCounts::default();
-        counts.visit(&rules, "pvpgm725gear_limit", KILL_NS);
-        counts.visit(&rules, "Kill_TerrorTurkey", KILL_NS);
+        assert!(counts.count_one(&rules, "pvpgm725gear_limit", KILL_NS));
+        assert!(
+            counts.count_one(&rules, "Kill_TerrorTurkey", KILL_NS),
+            "a limit that is not applied lets it through"
+        );
+        assert!(
+            !counts.count_one(&rules, "PvPGM725Gear_Limit", KILL_NS),
+            "the limit of 1 is reached"
+        );
         assert_eq!(counts.count("PvPGM725Gear_Limit", KILL_NS), 1);
         assert_eq!(counts.count("Kill_TerrorTurkey", KILL_NS), 0, "not applied");
         assert_eq!(
@@ -608,7 +618,7 @@ mod tests {
         let mut counts = LootLimitCounts::default();
         counts.admit(&rules, vec![(WARHAMMER.to_owned(), 1)], KILL_NS);
         counts.admit(&rules, vec![("GypsumGreen".to_owned(), 2)], KILL_NS);
-        counts.visit(&rules, "PvPGM725Gear_Limit", KILL_NS);
+        counts.count_one(&rules, "PvPGM725Gear_Limit", KILL_NS);
         let mut expected = vec![
             // The newchar entry: at its limit, both times are its end.
             ShownLimit {
@@ -638,7 +648,7 @@ mod tests {
         let rules = rules();
         let mut counts = LootLimitCounts::default();
         counts.admit(&rules, vec![("GypsumGreen".to_owned(), 5)], KILL_NS);
-        counts.visit(&rules, "PvPGM725Gear_Limit", KILL_NS + ONE_SECOND_NS);
+        counts.count_one(&rules, "PvPGM725Gear_Limit", KILL_NS + ONE_SECOND_NS);
         let saved = counts.counts();
         assert_eq!(
             saved

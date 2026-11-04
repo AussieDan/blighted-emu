@@ -1172,6 +1172,7 @@ mod tests {
                     coins: (0, 0),
                     territory_standing: 0.0,
                     achievement: None,
+                    ..EventGrant::default()
                 },
             )]),
             ..PlayerContent::default()

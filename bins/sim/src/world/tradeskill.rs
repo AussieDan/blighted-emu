@@ -125,8 +125,9 @@ impl SimWorld {
     /// Player `number` fires game event `event` `times` times, each scaled by `scale`: the
     /// categorical progression it names gains its experience, the territory the player is in
     /// its standing, its coins (each firing rolled) go to the wallet, and the player earns its
-    /// achievement. An event without a grant, or a progression the content does not know, gives
-    /// nothing of it (logged).
+    /// achievement. An event with a loot limit counts each firing on it; a firing at the limit
+    /// grants nothing and fires the event's limit-reached event instead. An event without a
+    /// grant, or a progression the content does not know, gives nothing of it (logged).
     pub(super) fn grant_scaled_event(
         &mut self,
         number: u64,
@@ -139,6 +140,23 @@ impl SimWorld {
         let Some(event_grant) = content.event_grants.get(event) else {
             return;
         };
+        let times = match &event_grant.loot_limit {
+            Some(limit) => {
+                let passed = self.limited_firings(number, limit, times);
+                let held_back = times.saturating_sub(passed);
+                if held_back > 0 {
+                    tracing::debug!(player = number, event, limit = %limit, held_back, "event at its loot limit");
+                    if let Some(reached) = &event_grant.limit_reached {
+                        self.grant_scaled_event(number, reached, held_back, scale, now_ms);
+                    }
+                }
+                passed
+            }
+            None => times,
+        };
+        if times == 0 {
+            return;
+        }
         let dice = &mut self.dice;
         let coins = (0..times).fold(0_u64, |total, _| {
             total.saturating_add(event_grant.coins_rolled(&mut |below| dice.below(below)))
@@ -412,6 +430,7 @@ mod tests {
                     coins: (0, 0),
                     territory_standing: 1.0,
                     achievement: None,
+                    ..EventGrant::default()
                 },
             )]),
             ..PlayerContent::default()
@@ -443,6 +462,100 @@ mod tests {
         assert_eq!(standing(&world), Some(6));
         world.grant_event_standing(PLAYER, RATION_EVENT);
         assert_eq!(standing(&world), Some(9));
+    }
+
+    #[test]
+    fn an_event_with_a_loot_limit_grants_up_to_the_limit_then_its_reached_event() {
+        use nw_content::loot_limits::{LimitRow, LootLimitRules, LootLimits, ResetClock, Weekday};
+        // Content bundle 25810808: `Mount_GrantRidingXP_Small` gives `Riding` 2,500 and counts on
+        // `Mount_FoodDailyXP_Limit` (3 a day); its limit-reached event gives `Riding` 0, here a
+        // test progression to see it fire.
+        const FOOD_EVENT: &str = "Mount_GrantRidingXP_Small";
+        const REACHED_EVENT: &str = "Mount_FoodDailyXP_LimitReached";
+        const LIMIT: &str = "Mount_FoodDailyXP_Limit";
+        const RIDING: &str = "Riding";
+        const REACHED_MARK: &str = "Test_Limit_Reached";
+        const RIDING_REWARD: f64 = 2_500.0;
+        const DAILY_USES: u32 = 3;
+        let mut world = world_with_spawns(Vec::new());
+        let progression = |id: &str| ProgressionSource {
+            id: id.to_owned(),
+            max_level: 200,
+            auto_rank_up: true,
+            ranks: vec![(0, 1_000_000)],
+        };
+        world.content = Arc::new(PlayerContent {
+            progression: Progression::default()
+                .with_progressions([progression(RIDING), progression(REACHED_MARK)]),
+            event_grants: EventGrants::build([
+                (
+                    FOOD_EVENT.to_owned(),
+                    EventGrant {
+                        progression: Some((RIDING.to_owned(), RIDING_REWARD)),
+                        loot_limit: Some(LIMIT.to_owned()),
+                        limit_reached: Some(REACHED_EVENT.to_owned()),
+                        ..EventGrant::default()
+                    },
+                ),
+                (
+                    REACHED_EVENT.to_owned(),
+                    EventGrant {
+                        progression: Some((REACHED_MARK.to_owned(), 1.0)),
+                        ..EventGrant::default()
+                    },
+                ),
+            ]),
+            loot_limits: Some(LootLimitRules {
+                limits: LootLimits::build([LimitRow {
+                    id: LIMIT,
+                    count_limit: i64::from(DAILY_USES),
+                    expire_seconds: 86_400,
+                    max_limit_mult: 64_800,
+                    replicated: true,
+                }]),
+                clock: ResetClock {
+                    hour_utc: 3,
+                    weekly_day: Weekday::Tuesday,
+                },
+            }),
+            ..PlayerContent::default()
+        });
+        world
+            .admit(&admit_at(PLAYER, 0.0, true), NOW, SERVER_TIME)
+            .expect("admit");
+        let entity = world.player_by_number(PLAYER).expect("player");
+        let experience = |world: &SimWorld, id: &str| {
+            let mastery = world
+                .content
+                .progression
+                .categorical(id)
+                .expect("progression");
+            world
+                .world
+                .get::<Player>(entity)
+                .expect("player")
+                .masteries
+                .experience(mastery)
+        };
+        for _ in 0..DAILY_USES {
+            world.grant_event(PLAYER, FOOD_EVENT, ONE_FIRING, NOW);
+        }
+        assert_eq!(
+            experience(&world, RIDING),
+            RIDING_REWARD as u32 * DAILY_USES
+        );
+        assert_eq!(experience(&world, REACHED_MARK), 0);
+        world.grant_event(PLAYER, FOOD_EVENT, ONE_FIRING, NOW);
+        assert_eq!(
+            experience(&world, RIDING),
+            RIDING_REWARD as u32 * DAILY_USES,
+            "the fourth firing is at the limit"
+        );
+        assert_eq!(
+            experience(&world, REACHED_MARK),
+            1,
+            "it fired the reached event"
+        );
     }
 
     #[test]

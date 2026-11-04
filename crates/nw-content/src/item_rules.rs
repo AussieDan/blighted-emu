@@ -90,6 +90,14 @@ pub struct Consumable {
     /// `MannequinTag`: the item use its user plays (`Eat` for food, `Potion`); the use takes
     /// effect at that use's moment of the user's stance.
     pub use_tag: Option<String>,
+    /// `IsMountConsumable`: a mount food, used while its user rides.
+    pub mount_only: bool,
+    /// `RequiredInactiveLootLimitID`: the loot limit that must not be at its limit for a use
+    /// (the mount foods' `Mount_FoodDailyXP_Limit`, 3 a day).
+    pub required_inactive_limit: Option<String>,
+    /// `RemoveStatusEffectCategories`, lowercase: a use first ends the held effects of these
+    /// categories (a new mount food ends the one before, `MountFoodUtility`).
+    pub remove_categories: Vec<String>,
 }
 
 /// One `StatusEffectData` row, as the consumables need it.
@@ -134,6 +142,12 @@ pub struct ConsumableRow {
     pub disabled_in_combat: bool,
     /// `MannequinTag`: the item use its user plays (`Eat`, `Potion`).
     pub use_tag: Option<String>,
+    /// `IsMountConsumable`.
+    pub mount_only: bool,
+    /// `RequiredInactiveLootLimitID`.
+    pub required_inactive_limit: Option<String>,
+    /// `RemoveStatusEffectCategories`.
+    pub remove_categories: Option<String>,
 }
 
 /// One `MasterItemDefinitions` row, as the rules need it.
@@ -195,6 +209,12 @@ impl ItemRuleSource {
                         .and_then(|seconds| u32::try_from(seconds).ok()),
                     disabled_in_combat: row.disable_use_in_combat.unwrap_or(false),
                     use_tag: row.mannequin_tag.clone().filter(|tag| !tag.is_empty()),
+                    mount_only: row.is_mount_consumable.unwrap_or(false),
+                    required_inactive_limit: row
+                        .required_inactive_loot_limit_id
+                        .clone()
+                        .filter(|id| !id.is_empty()),
+                    remove_categories: row.remove_status_effect_categories.clone(),
                 })
                 .collect(),
             effects: tables
@@ -278,6 +298,11 @@ impl ItemRules {
                     duration_override_ms: duration_override
                         .map(|seconds| (seconds * MS_PER_SECOND).round() as u64),
                     use_tag: row.use_tag.clone(),
+                    mount_only: row.mount_only,
+                    required_inactive_limit: row.required_inactive_limit.clone(),
+                    remove_categories: crate::status_effects::names(
+                        row.remove_categories.as_deref(),
+                    ),
                 };
                 (row.id.to_lowercase(), consumable)
             })
@@ -412,6 +437,9 @@ mod tests {
             cooldown_s: None,
             disabled_in_combat: false,
             use_tag: None,
+            mount_only: false,
+            required_inactive_limit: None,
+            remove_categories: None,
         }
     }
 

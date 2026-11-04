@@ -1006,8 +1006,8 @@ pub struct SimWorld {
     /// Messages that go out after the bundles of this tick: an answer that must reach the client
     /// after the states it names (the craft progress after its items, crafting module).
     after_bundles: Vec<Outgoing>,
-    /// Potions pressed: the player number and when the drink works.
-    drinks: Vec<(u64, u64)>,
+    /// Quick slot items pressed: the player number, the quick slot and when the use works.
+    drinks: Vec<(u64, u32, u64)>,
     /// Mob swings that have not hit yet: the time they hit, the server time they started, and
     /// the swing.
     swings: Vec<PendingMobSwing>,
@@ -10601,6 +10601,9 @@ mod tests {
             potency: 1.0,
             duration_override_ms: None,
             use_tag: None,
+            mount_only: false,
+            required_inactive_limit: None,
+            remove_categories: Vec::new(),
         };
         world.add_consumable_effects(entity, &food, NOW);
         assert!(

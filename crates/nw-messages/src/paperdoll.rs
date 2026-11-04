@@ -32,6 +32,11 @@ pub mod slot {
     pub const GATHERABLE_HAND: u32 = 9;
     /// `QUICK_SLOT_1` (paperdoll note, the slot table).
     pub const QUICK_SLOT_1: u32 = 14;
+    /// `QUICK_SLOT_1` to `QUICK_SLOT_4`, the slots of the quick slot keys 1 to 4
+    /// ([`crate::QUICK_SLOT_KEYS`]). Observed: retail equipped the mount food of
+    /// `9401_tutorialfood-Hungry-as-a-horse` to slot 16 and used it at a press of quick slot key
+    /// 3; Inferred: the slots follow in order (the client names `QUICK_SLOT_1` to `QUICK_SLOT_6`).
+    pub const QUICK_SLOTS: [u32; 4] = [QUICK_SLOT_1, 15, 16, 17];
     /// `MAIN_HAND_OPTION_1`, the main hand.
     pub const MAIN_HAND_OPTION_1: u32 = 24;
     /// `MAIN_HAND_OPTION_2`, the second weapon.

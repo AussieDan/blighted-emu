@@ -423,9 +423,12 @@ impl SimWorld {
     }
 
     /// Player `number` (`entity`) uses its item `item_id` from `from` at `now_ms`: a
-    /// consumable whose cooldown does not run, which its class does not disable and that the
-    /// fight allows, takes one of the stack (`ConsumeOnUse`), starts its cooldown, changes the
-    /// vitals by its status effects and plays the visual script of each that has one.
+    /// consumable whose cooldown does not run, which its class does not disable, that the fight
+    /// allows, that a mount food's rider uses (Inferred from `IsMountConsumable`; retail fed the
+    /// mount of `9401_tutorialfood-Hungry-as-a-horse` while riding) and whose required inactive
+    /// loot limit is below its limit, takes one of the stack (`ConsumeOnUse`), starts its
+    /// cooldown, changes the vitals by its status effects and plays the visual script of each
+    /// that has one or shows text ([`nw_content::status_effects::StatusEffectRule`]).
     pub(super) fn consume(
         &mut self,
         entity: Entity,
@@ -444,6 +447,14 @@ impl SimWorld {
             tracing::debug!(player = number, item = %item_id, "use of an item that is no consumable");
             return;
         };
+        if let Some(limit) = &consumable.required_inactive_limit
+            && self
+                .reached_loot_limits(number)
+                .contains(&limit.to_lowercase())
+        {
+            tracing::debug!(player = number, item = %item_id, %limit, "use: the loot limit is reached");
+            return;
+        }
         let consumes = content
             .item_rules
             .item(&item_id)
@@ -456,6 +467,10 @@ impl SimWorld {
         let player = &mut *player;
         if consumable.disabled_in_combat && player.combat.in_combat() {
             tracing::debug!(player = number, item = %item_id, "use: not in combat");
+            return;
+        }
+        if consumable.mount_only && !player.tracked.is_mounted() {
+            tracing::debug!(player = number, item = %item_id, "use: a mount food off the mount");
             return;
         }
         let cooldown = consumable
@@ -488,16 +503,28 @@ impl SimWorld {
         // Every effect it adds goes in the player's status effects (4236): attributes,
         // absorption, food and potion buffs, immunities ([`super::status_effects`]).
         self.add_consumable_effects(entity, consumable, now_ms);
-        let scripts: Vec<ServerMessage> = consumable
+        let mut played: Vec<u32> = consumable
             .effects
             .iter()
             .filter(|effect| effect.has_fx)
-            .map(|effect| {
-                ServerMessage::AdjustFxScripts(AdjustFxScriptsMsg::on(
-                    number,
-                    lowercase_crc32(&effect.status_id),
-                ))
+            .map(|effect| lowercase_crc32(&effect.status_id))
+            .collect();
+        let texts: Vec<u32> = consumable
+            .status_effects
+            .iter()
+            .copied()
+            .filter(|crc| {
+                !played.contains(crc)
+                    && content
+                        .status_effects
+                        .get(*crc)
+                        .is_some_and(|rule| rule.shows_damage_text)
             })
+            .collect();
+        played.extend(texts);
+        let scripts: Vec<ServerMessage> = played
+            .into_iter()
+            .map(|script| ServerMessage::AdjustFxScripts(AdjustFxScriptsMsg::on(number, script)))
             .collect();
         send_now(&mut self.combat_messages, &connection, &scripts);
         self.quest_event(number, Event::ItemUsed(&item_id), now_ms);
@@ -926,6 +953,9 @@ mod tests {
                     cooldown_s: Some(COOLDOWN_S),
                     disabled_in_combat: false,
                     use_tag: None,
+                    mount_only: false,
+                    required_inactive_limit: None,
+                    remove_categories: None,
                 }],
                 effects: vec![EffectRow {
                     status_id: "PotionHeal".to_owned(),
@@ -1103,6 +1133,9 @@ mod tests {
                         cooldown_s: None,
                         disabled_in_combat: false,
                         use_tag: Some("Eat".to_owned()),
+                        mount_only: false,
+                        required_inactive_limit: None,
+                        remove_categories: None,
                     }],
                     effects: vec![EffectRow {
                         status_id: FOOD.to_owned(),
