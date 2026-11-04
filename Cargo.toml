@@ -32,7 +32,9 @@ md-5 = { version = "0.11.0", default-features = false }
 lz4_flex = { version = "0.14.0", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 metrics = { version = "0.24.6", default-features = false }
 metrics-exporter-prometheus = { version = "0.18.3", default-features = false }
-openssl = { version = "0.10.81", default-features = false }
+# Vendored: OpenSSL is built into the programs, so a build runs on a host with another OpenSSL
+# (this PC has OpenSSL 4, the Ubuntu 26.04 game host has 3.5).
+openssl = { version = "0.10.81", default-features = false, features = ["vendored"] }
 oozextract = { version = "0.5.5", default-features = false }
 open = { version = "5.4.4", default-features = false }
 png = { version = "0.18.1", default-features = false }
