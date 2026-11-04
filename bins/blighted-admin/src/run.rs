@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! `serve`: reads the configuration, the world file and the content bundle names, starts the
-//! live readers when `[live]` is set, and serves the admin pages until Ctrl-C (on `listen`, or
+//! live readers when `[live]` is set, and serves the admin pages until stopped (on `listen`, or
 //! through a relay with `[access.relay]`). `relay`: runs the admin relay. `relay_keys`: makes
 //! its certificates.
 
@@ -87,12 +87,12 @@ pub enum RunError {
     Relay(#[from] RelayError),
 }
 
-/// Time open requests get after Ctrl-C.
+/// Time open requests get after the stop signal.
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Parallel password hashes in server mode (0: one per CPU).
 const HASH_PARALLEL: usize = 0;
 
-/// Serves the admin pages of `config_path` until Ctrl-C.
+/// Serves the admin pages of `config_path` until stopped.
 ///
 /// # Errors
 ///
@@ -154,7 +154,7 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
                 }
                 Front::Relay(link, _) => {
                     let closing = close.subscribe();
-                    tokio::spawn(close_on_ctrl_c(close));
+                    tokio::spawn(close_on_stop(close));
                     tracing::info!(relay = %link.address, "serving through the relay");
                     Ok(serve_agent(link, router(state), closing).await?)
                 }
@@ -162,7 +162,7 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
         })
 }
 
-/// Runs the admin relay of `config_path` until Ctrl-C: the agent connection on `agent_listen`,
+/// Runs the admin relay of `config_path` until stopped: the agent connection on `agent_listen`,
 /// the browsers on `listen` (admin relay spec section 5.1).
 ///
 /// # Errors
@@ -204,16 +204,16 @@ pub fn relay_keys(relay_name: &str, out: &Path) -> Result<(), RunError> {
     Ok(())
 }
 
-/// Turns `close` true at Ctrl-C. With a failed signal handler it never returns: the server runs
-/// until killed.
-async fn close_on_ctrl_c(close: watch::Sender<bool>) {
-    if tokio::signal::ctrl_c().await.is_err() {
+/// Turns `close` true at the stop signal (Ctrl-C or SIGTERM). With a failed signal handler it
+/// never returns: the server runs until killed.
+async fn close_on_stop(close: watch::Sender<bool>) {
+    if nw_common::shutdown::stop_signal().await.is_err() {
         std::future::pending::<()>().await;
     }
     let _ = close.send(true);
 }
 
-/// Serves `app` over plain HTTP on `listen` until Ctrl-C.
+/// Serves `app` over plain HTTP on `listen` until stopped.
 async fn serve_http(
     listen: SocketAddr,
     app: axum::Router,
@@ -226,7 +226,7 @@ async fn serve_http(
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             // The live streams never end by themselves; the server waits for them.
-            close_on_ctrl_c(close).await;
+            close_on_stop(close).await;
         })
         .await
         .map_err(RunError::Io)
@@ -388,7 +388,7 @@ pub async fn tls_config(tls: &TlsConfig) -> Result<RustlsConfig, RunError> {
         .map_err(RunError::Tls)
 }
 
-/// Serves `app` over HTTPS on `listen` until Ctrl-C (server mode).
+/// Serves `app` over HTTPS on `listen` until stopped (server mode).
 async fn serve_https(
     listen: SocketAddr,
     tls: &TlsConfig,
@@ -399,7 +399,7 @@ async fn serve_https(
     let handle = Handle::new();
     let shutdown = handle.clone();
     tokio::spawn(async move {
-        close_on_ctrl_c(close).await;
+        close_on_stop(close).await;
         shutdown.graceful_shutdown(Some(SHUTDOWN_GRACE));
     });
     tracing::info!(%listen, "serving HTTPS");

@@ -301,7 +301,7 @@ async fn serve_async(config: EdgeConfig, secrets: Secrets) -> Result<(), RunErro
     let handle = Handle::new();
     let shutdown = handle.clone();
     tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
+        if nw_common::shutdown::stop_signal().await.is_ok() {
             shutdown.graceful_shutdown(Some(Duration::from_secs(SHUTDOWN_GRACE_SECONDS)));
         }
     });

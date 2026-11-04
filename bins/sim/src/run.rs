@@ -525,7 +525,7 @@ async fn serve_async(
     };
     let shutdown = async {
         // A failed signal handler means sim runs until killed.
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = nw_common::shutdown::stop_signal().await;
     };
     let databases = Databases { world: db, global };
     Ok(serve_loop(settings, ground, bus, databases, shutdown).await?)

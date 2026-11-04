@@ -163,7 +163,7 @@ async fn serve_async(
     tracing::info!(world = %config.world_id, level = %config.level, "serving");
     let shutdown = async {
         // A failed signal handler means the director runs until killed.
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = nw_common::shutdown::stop_signal().await;
     };
     Ok(serve_loop(settings, bus, db, ranks, store, shutdown).await?)
 }

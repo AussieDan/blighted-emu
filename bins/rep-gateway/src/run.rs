@@ -136,7 +136,7 @@ async fn serve_async(config: GatewayConfig, key: SigningKey) -> Result<(), RunEr
     for (worker, (socket, events)) in (0_u16..).zip(sockets.into_iter().zip(events)) {
         let shutdown = async {
             // A failed signal handler means the gateway runs until killed.
-            let _ = tokio::signal::ctrl_c().await;
+            let _ = nw_common::shutdown::stop_signal().await;
         };
         workers.spawn(serve_udp(gateway.clone(), socket, events, worker, shutdown));
     }

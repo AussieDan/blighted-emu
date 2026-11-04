@@ -164,7 +164,7 @@ async fn serve_async(
         .map_err(|error| RunError::Metrics(error.to_string()))?;
     let shutdown = async {
         // A failed signal handler means the service runs until killed.
-        let _ = tokio::signal::ctrl_c().await;
+        let _ = nw_common::shutdown::stop_signal().await;
     };
     tracing::info!(world = %config.world_id, "serving");
     serve_loop(&config, world, bus, db, shutdown).await
