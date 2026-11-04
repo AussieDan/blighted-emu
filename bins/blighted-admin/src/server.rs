@@ -24,12 +24,13 @@ use crate::live::Live;
 use crate::live::bots::bot_routes;
 use crate::live::stream::live_routes;
 use crate::relief::relief_tile;
+use crate::shapes::{LevelShapes, SHAPES_ROUTE, shapes};
 use crate::studio::Studio;
 use crate::studio::api::studio_routes;
 use crate::studio::loot::loot_routes;
 use crate::studio::quests::quest_routes;
 use crate::todo::api::todo_routes;
-use crate::world::{SpawnKind, SpawnQuery, WorldLayer, WorldSlot};
+use crate::world::{SPAWN_CELL_M, SpawnCell, SpawnKind, SpawnQuery, WorldLayer, WorldSlot};
 use nw_world::map_tiles::tile_file;
 
 /// Content type of map tiles.
@@ -69,6 +70,7 @@ pub struct AppState {
     pub(crate) studio: Option<Studio>,
     pub(crate) access: Access,
     pub(crate) commands: Option<Commands>,
+    pub(crate) shapes: Option<LevelShapes>,
 }
 
 impl AppState {
@@ -90,6 +92,15 @@ impl AppState {
             studio: None,
             access: local_access(),
             commands: None,
+            shapes: None,
+        }
+    }
+
+    /// The same state with the level's solids for the 3D page.
+    pub fn with_shapes(self, shapes: LevelShapes) -> Self {
+        Self {
+            shapes: Some(shapes),
+            ..self
         }
     }
 
@@ -153,6 +164,8 @@ pub fn router(state: AppState) -> Router {
         .route("/api/world/tiles/{level}/{row}/{column}", get(map_tile))
         .route("/api/world/relief/{level}/{row}/{column}", get(relief))
         .route("/api/world/spawns", get(spawns))
+        .route("/api/world/spawn-cells", get(spawn_cells))
+        .route(SHAPES_ROUTE, get(shapes))
         .route(HEIGHT_ROUTE, get(ground_height))
         .route(HEIGHT_GRID_ROUTE, get(height_grid))
         .route("/api/captures/sessions", get(sessions))
@@ -334,6 +347,29 @@ async fn spawns(State(state): State<AppState>, Query(params): Query<SpawnParams>
     });
     match answer {
         Ok(points) => Json(points).into_response(),
+        Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct KindParams {
+    kinds: String,
+}
+
+/// The spawn counts per cell of the zoomed out map, with the cell edge.
+#[derive(Debug, Serialize)]
+struct SpawnCells {
+    cell_m: f32,
+    cells: Vec<SpawnCell>,
+}
+
+async fn spawn_cells(State(state): State<AppState>, Query(params): Query<KindParams>) -> Response {
+    match SpawnKind::parse_list(&params.kinds) {
+        Ok(kinds) => Json(SpawnCells {
+            cell_m: SPAWN_CELL_M,
+            cells: state.world.get().spawn_cells(&kinds),
+        })
+        .into_response(),
         Err(error) => (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
     }
 }
@@ -563,6 +599,62 @@ mod tests {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn spawn_cells_come_with_the_cell_edge_and_a_bad_kind_is_400() {
+        let dir = tempfile::tempdir().expect("dir");
+        let (status, _, body) = get(
+            app(dir.path()),
+            "/api/world/spawn-cells?kinds=vitals,landmarks",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let answer: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(answer["cell_m"].as_f64(), Some(f64::from(SPAWN_CELL_M)));
+        assert_eq!(answer["cells"].as_array().map(Vec::len), Some(2));
+        let (status, _, _) = get(app(dir.path()), "/api/world/spawn-cells?kinds=dragons").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn shapes_come_as_flat_triangles_and_need_the_collision_file() {
+        use nw_world::collision::{Body, Geometry, IDENTITY_AFFINE, LevelCollision};
+        use nw_world::collision_index::CollisionIndex;
+
+        let dir = tempfile::tempdir().expect("dir");
+        let (status, _, _) = get(app(dir.path()), "/api/world/shapes?x=0&y=0&half=10").await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "no shapes on this site");
+        let index = CollisionIndex::new(LevelCollision {
+            geometries: vec![Geometry::Box {
+                half_extents: [1.0, 1.0, 1.0],
+            }],
+            bodies: vec![Body {
+                geometry: 0,
+                place: IDENTITY_AFFINE,
+            }],
+            ..LevelCollision::default()
+        });
+        let with_shapes = || {
+            router(
+                AppState::new(
+                    test_layer(CAP),
+                    dir.path().to_path_buf(),
+                    AdminOrigin::of(LISTEN.parse().expect("address")),
+                    Captures::default(),
+                    None,
+                )
+                .with_shapes(LevelShapes::of_index(index.clone())),
+            )
+        };
+        let (status, _, body) = get(with_shapes(), "/api/world/shapes?x=0&y=0&half=10").await;
+        assert_eq!(status, StatusCode::OK);
+        let answer: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(answer["triangles"].as_array().map(Vec::len), Some(12 * 3));
+        assert_eq!(answer["points"].as_array().map(Vec::len), Some(8 * 3));
+        assert_eq!(answer["complete"], serde_json::Value::Bool(true));
+        let (status, _, _) = get(with_shapes(), "/api/world/shapes?x=0&y=0&half=5000").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "too large a square");
     }
 
     #[tokio::test]

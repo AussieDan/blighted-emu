@@ -13,6 +13,7 @@ pub mod relay;
 pub mod relief;
 pub mod run;
 pub mod server;
+pub mod shapes;
 pub mod studio;
 pub mod todo;
 pub mod world;

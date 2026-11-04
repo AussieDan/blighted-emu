@@ -37,8 +37,10 @@ use crate::relay::config::load_relay_config;
 use crate::relay::front::{AgentLink, accept_agents, relay_agent_tls, relay_router};
 use crate::relay::keys::write_relay_keys;
 use crate::server::{AppState, router};
+use crate::shapes::LevelShapes;
 use crate::studio::{LoadWorld, Studio};
 use crate::world::{WorldLayer, WorldLayerError, map_dir};
+use nw_world::collision::collision_file_path;
 
 /// Environment variable that names the New World install folder (for `typeindex.json`).
 pub const GAME_DIR_ENV: &str = "NW_GAME_DIR";
@@ -121,7 +123,11 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
             let (close, closing) = watch::channel(false);
             let live = config.live.as_ref().map(|live| live::start(live, closing));
             let live_state = live.as_ref().map(|live| live.state().clone());
-            let state = AppState::new(world, map, origin, captures, live);
+            let state =
+                AppState::new(world, map, origin, captures, live).with_shapes(LevelShapes::new(
+                    collision_file_path(&config.content_dir, &client_build, &config.level),
+                    client_build.clone(),
+                ));
             let reload_config = Arc::new(config.clone());
             let load_world: LoadWorld = Arc::new(move || {
                 WorldLayer::load(&reload_config).map_err(|error| error.to_string())

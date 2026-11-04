@@ -132,6 +132,20 @@ pub struct SpawnPoint {
     pub z: f32,
 }
 
+/// How many points of one kind one cell of the spawn index holds: the overview of a zoomed out
+/// map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SpawnCell {
+    /// Kind.
+    pub kind: SpawnKind,
+    /// Column of the cell, west to east; its west edge is `x` times [`SPAWN_CELL_M`].
+    pub x: i64,
+    /// Row of the cell, south to north; its south edge is `y` times [`SPAWN_CELL_M`].
+    pub y: i64,
+    /// Points of the kind in the cell.
+    pub count: usize,
+}
+
 /// The world facts the map page needs.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct WorldInfo {
@@ -171,6 +185,16 @@ enum PointRef {
     Vitals(usize),
     Gatherable(usize),
     Landmark(usize),
+}
+
+impl PointRef {
+    fn kind(self) -> SpawnKind {
+        match self {
+            Self::Vitals(_) => SpawnKind::Vitals,
+            Self::Gatherable(_) => SpawnKind::Gatherables,
+            Self::Landmark(_) => SpawnKind::Landmarks,
+        }
+    }
 }
 
 /// The world layer the routes read; an Apply that writes new merged files puts a new one in.
@@ -384,6 +408,24 @@ impl WorldLayer {
             }
         }
         Ok(points)
+    }
+
+    /// The point count of each wanted kind in each cell of the spawn index, west to east in cell
+    /// rows from south to north, kinds in the order of `kinds`.
+    pub fn spawn_cells(&self, kinds: &[SpawnKind]) -> Vec<SpawnCell> {
+        let mut cells: Vec<SpawnCell> = self
+            .cells
+            .iter()
+            .flat_map(|(&(x, y), points)| {
+                kinds.iter().filter_map(move |&kind| {
+                    let count = points.iter().filter(|point| point.kind() == kind).count();
+                    (count > 0).then_some(SpawnCell { kind, x, y, count })
+                })
+            })
+            .collect();
+        let rank = |kind: SpawnKind| kinds.iter().position(|wanted| *wanted == kind);
+        cells.sort_by_key(|cell| (cell.y, cell.x, rank(cell.kind)));
+        cells
     }
 
     fn point(&self, point: PointRef, kinds: &[SpawnKind]) -> Option<SpawnPoint> {
@@ -622,6 +664,33 @@ pub(crate) mod tests {
             .spawns(&query((0.0, 0.0), (500.0, 500.0), &ALL))
             .expect("query");
         assert_eq!(points.len(), 1, "only the vitals spawn");
+    }
+
+    #[test]
+    fn spawn_cells_count_each_kind_per_cell() {
+        let cells = test_layer(CAP).spawn_cells(&ALL);
+        let vitals_cell = cell_of(100.0);
+        let gatherable_cell = (cell_of(1_500.0), cell_of(200.0));
+        assert!(cells.contains(&SpawnCell {
+            kind: SpawnKind::Vitals,
+            x: vitals_cell,
+            y: vitals_cell,
+            count: 1,
+        }));
+        assert!(cells.contains(&SpawnCell {
+            kind: SpawnKind::Gatherables,
+            x: gatherable_cell.0,
+            y: gatherable_cell.1,
+            count: 1,
+        }));
+        assert_eq!(cells.iter().map(|cell| cell.count).sum::<usize>(), 3);
+    }
+
+    #[test]
+    fn spawn_cells_leave_out_unwanted_kinds() {
+        let cells = test_layer(CAP).spawn_cells(&[SpawnKind::Landmarks]);
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].kind, SpawnKind::Landmarks);
     }
 
     #[test]
