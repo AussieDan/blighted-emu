@@ -16,6 +16,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::discord::is_discord_user_id;
+use crate::experience::ExperienceConfig;
 use crate::game::API_REGION;
 use crate::secrets::SECRET_ENV_PREFIX;
 
@@ -54,7 +55,7 @@ pub const AUTH_BACKEND_NW: &str = "nw";
 pub const COGNITO_POOL_ARGUMENT: &str = "-CognitoPool";
 
 /// The whole `edge-http` configuration.
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EdgeConfig {
     /// Name shown in the launcher.
@@ -101,6 +102,9 @@ pub struct EdgeConfig {
     pub cms: CmsConfig,
     /// The Amazon names this server answers for its game clients.
     pub aws_mirror: AwsMirrorConfig,
+    /// The experience multipliers; normal experience when left out.
+    #[serde(default)]
+    pub experience: ExperienceConfig,
     /// Worlds, one `[[world]]` block each.
     #[serde(rename = "world")]
     pub worlds: Vec<WorldConfig>,
@@ -194,19 +198,6 @@ pub struct RemoteConfigConfig {
     /// Our Cognito pool id: the client's [`COGNITO_POOL_ARGUMENT`] and the id of the
     /// `CognitoId` layers. It names no Amazon pool.
     pub cognito_pool_id: Uuid,
-    /// This server's experience multiplier: each `javelin.xp-multipliers` value of the layers
-    /// (character experience and each categorical progression) is multiplied by it. Default
-    /// [`NORMAL_EXPERIENCE_MULTIPLIER`]; a test server sets 2 for double experience.
-    #[serde(default = "default_experience_multiplier")]
-    pub experience_multiplier: u32,
-}
-
-/// Normal experience: the layers' `javelin.xp-multipliers` values as written (the tracked files
-/// give every gain 1).
-pub const NORMAL_EXPERIENCE_MULTIPLIER: u32 = 1;
-
-const fn default_experience_multiplier() -> u32 {
-    NORMAL_EXPERIENCE_MULTIPLIER
 }
 
 /// `[cms]`: our own news documents and images, answered as the client's news host and its image
@@ -446,8 +437,8 @@ impl EdgeConfig {
                 "must be a bucket the client asks for",
             );
         }
-        if self.remote_config.experience_multiplier == 0 {
-            return invalid("remote_config.experience_multiplier", "must be above 0");
+        if let Err(error) = self.experience.validate() {
+            return invalid("experience", &error.to_string());
         }
         self.validate_aws_mirror()?;
         if self.worlds.is_empty() {
@@ -612,10 +603,7 @@ max_connections = 5
     #[test]
     fn valid_file_loads() {
         let config = valid();
-        assert_eq!(
-            config.remote_config.experience_multiplier,
-            NORMAL_EXPERIENCE_MULTIPLIER
-        );
+        assert_eq!(config.experience, ExperienceConfig::default());
         assert_eq!(config.login_host(), "login.example.org");
         assert_eq!(config.game_host(), "game.example.org");
         assert_eq!(config.login_authority(), "login.example.org");
@@ -723,12 +711,8 @@ max_connections = 5
             "remote_config.bucket",
         );
         refused(
-            &VALID.replace(
-                "cognito_pool_id = \"b04fbfcd-942c-472d-88c0-c762c4076b2f\"",
-                "cognito_pool_id = \"b04fbfcd-942c-472d-88c0-c762c4076b2f\"\n\
-                 experience_multiplier = 0",
-            ),
-            "remote_config.experience_multiplier",
+            &VALID.replace("[cms]", "[experience.trade_skills]\nridin = 2.0\n\n[cms]"),
+            "experience",
         );
         refused(
             &VALID.replace(

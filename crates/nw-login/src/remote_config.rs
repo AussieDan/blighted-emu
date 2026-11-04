@@ -16,7 +16,8 @@ use std::path::PathBuf;
 use axum::Router;
 use serde_json::{Map, Value};
 
-use crate::config::{EdgeConfig, NORMAL_EXPERIENCE_MULTIPLIER};
+use crate::config::EdgeConfig;
+use crate::experience::ExperienceConfig;
 use crate::game::CLUSTER_ID;
 use crate::s3::{S3Objects, s3_router};
 
@@ -41,8 +42,12 @@ pub const GAME_HOST_ENDPOINTS: [(&[&str], &str); 4] = [
 ];
 /// Between the parts of a key path in an error message.
 const KEY_PATH_SEPARATOR: &str = ".";
-/// The path of the experience multipliers object in a layer: `javelin.xp-multipliers`.
-const XP_MULTIPLIERS_PATH: [&str; 2] = ["javelin", "xp-multipliers"];
+/// The application of the layer that gets the experience multipliers of `[experience]`: its
+/// lowest layer, `ProductId` (retail sets them there, and again in `CognitoId`).
+pub const EXPERIENCE_APPLICATION: &str = "publicGameplay";
+/// The object that holds the experience multipliers, and its key in it.
+const XP_PARENT: &str = "javelin";
+const XP_MULTIPLIERS: &str = "xp-multipliers";
 /// Its character experience multiplier, a number.
 const XP_CHARACTER: &str = "character";
 /// Its list of `<CategoricalProgressionId>:<multiplier>` entries.
@@ -166,7 +171,8 @@ pub enum RemoteConfigError {
         /// What is wrong.
         reason: String,
     },
-    /// A layer's `javelin.xp-multipliers` value cannot be multiplied.
+    /// A file sets `javelin.xp-multipliers`, which the server fills from `[experience]`, or the
+    /// experience layer's `javelin` is no object.
     #[error("remote config {key}: {reason}")]
     Experience {
         /// The key.
@@ -186,13 +192,17 @@ impl RemoteConfigSets {
     /// Loads the `versionless` layer of every application and layer of [`requested_layers`]
     /// from its file in `[remote_config] directory` ([`layer_file_name`]). Each must be a JSON
     /// object, and the folder may hold no other file. The [`GAME_HOST_ENDPOINTS`] of the
-    /// [`ENDPOINTS_APPLICATION`] `RegionId` layer are set to `game.<domain>`, and with an
-    /// `experience_multiplier` other than [`NORMAL_EXPERIENCE_MULTIPLIER`] each other layer's
-    /// `javelin.xp-multipliers` values are multiplied by it; other layers are served byte for
-    /// byte.
+    /// [`ENDPOINTS_APPLICATION`] `RegionId` layer are set to `game.<domain>`, and the
+    /// [`EXPERIENCE_APPLICATION`] `ProductId` layer gets `javelin.xp-multipliers` from
+    /// `[experience]`, which no file may set; other layers are served byte for byte.
     pub fn load(config: &EdgeConfig) -> Result<Self, RemoteConfigError> {
         let root = &config.remote_config.directory;
-        let experience_multiplier = config.remote_config.experience_multiplier;
+        let experience_key = object_key(
+            EXPERIENCE_APPLICATION,
+            Dimension::ProductId,
+            PRODUCT_ID,
+            VERSIONLESS,
+        );
         let endpoints_key = object_key(
             ENDPOINTS_APPLICATION,
             Dimension::RegionId,
@@ -221,13 +231,20 @@ impl RemoteConfigSets {
                 let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(&bytes) else {
                     return Err(RemoteConfigError::NotObject { key });
                 };
+                if sets_experience(&object) {
+                    return Err(RemoteConfigError::Experience {
+                        key,
+                        reason: format!(
+                            "sets {XP_PARENT}{KEY_PATH_SEPARATOR}{XP_MULTIPLIERS}, which the server fills from [experience]"
+                        ),
+                    });
+                }
                 let body = if key == endpoints_key {
                     with_game_host_endpoints(object, &config.game_authority(), &key)?
-                } else if experience_multiplier == NORMAL_EXPERIENCE_MULTIPLIER {
-                    bytes
+                } else if key == experience_key {
+                    with_experience(object, &config.experience, &key)?
                 } else {
-                    with_experience_multiplied(object, experience_multiplier, &key)?
-                        .unwrap_or(bytes)
+                    bytes
                 };
                 objects.insert(key, body);
                 layer_files.insert(path);
@@ -291,57 +308,46 @@ fn with_game_host_endpoints(
     serde_json::to_vec_pretty(&Value::Object(object)).map_err(|error| fail(error.to_string()))
 }
 
-/// `object` with its `javelin.xp-multipliers` values multiplied by `multiplier`, as JSON text:
-/// the `character` number and the multiplier of each `progression` entry. `None` when the layer
-/// has no such object.
-fn with_experience_multiplied(
+/// Whether `object` sets `javelin.xp-multipliers` or a key in it, nested or written flat
+/// (the key stack of the sims reads both).
+fn sets_experience(object: &Map<String, Value>) -> bool {
+    let flat = format!("{XP_PARENT}{KEY_PATH_SEPARATOR}{XP_MULTIPLIERS}");
+    let names = |name: &str, prefix: &str| {
+        name == prefix || name.starts_with(&format!("{prefix}{KEY_PATH_SEPARATOR}"))
+    };
+    object.keys().any(|name| names(name, &flat))
+        || object
+            .get(XP_PARENT)
+            .and_then(Value::as_object)
+            .is_some_and(|parent| parent.keys().any(|name| names(name, XP_MULTIPLIERS)))
+}
+
+/// `object` with `javelin.xp-multipliers` from `experience`, as JSON text: the `character`
+/// number and one `<CategoricalProgressionId>:<multiplier>` entry for each progression.
+fn with_experience(
     mut object: Map<String, Value>,
-    multiplier: u32,
+    experience: &ExperienceConfig,
     key: &str,
-) -> Result<Option<Vec<u8>>, RemoteConfigError> {
+) -> Result<Vec<u8>, RemoteConfigError> {
     let fail = |reason: String| RemoteConfigError::Experience {
         key: key.to_owned(),
         reason,
     };
-    let name = XP_MULTIPLIERS_PATH.join(KEY_PATH_SEPARATOR);
-    let Some(section) = XP_MULTIPLIERS_PATH
-        .iter()
-        .try_fold(&mut object, |parent, part| {
-            parent.get_mut(*part).and_then(Value::as_object_mut)
-        })
-    else {
-        return Ok(None);
-    };
-    let factor = f64::from(multiplier);
-    if let Some(character) = section.get_mut(XP_CHARACTER) {
-        let value = character
-            .as_f64()
-            .ok_or_else(|| fail(format!("{name}.{XP_CHARACTER} is not a number")))?;
-        *character = Value::from(value * factor);
-    }
-    if let Some(progression) = section.get_mut(XP_PROGRESSION) {
-        let entries = progression
-            .as_array_mut()
-            .ok_or_else(|| fail(format!("{name}.{XP_PROGRESSION} is not a list")))?;
-        for entry in entries {
-            let text = entry.as_str().unwrap_or_default();
-            let (id, value) = text
-                .rsplit_once(PROGRESSION_ENTRY_SEPARATOR)
-                .and_then(|(id, value)| Some((id, value.parse::<f64>().ok()?)))
-                .ok_or_else(|| {
-                    fail(format!(
-                        "{name}.{XP_PROGRESSION} entry {entry} is not <id>{PROGRESSION_ENTRY_SEPARATOR}<multiplier>"
-                    ))
-                })?;
-            *entry = Value::String(format!(
-                "{id}{PROGRESSION_ENTRY_SEPARATOR}{}",
-                value * factor
-            ));
-        }
-    }
-    serde_json::to_vec_pretty(&Value::Object(object))
-        .map(Some)
-        .map_err(|error| fail(error.to_string()))
+    let progression = experience
+        .progressions()
+        .into_iter()
+        .map(|(id, value)| Value::String(format!("{id}{PROGRESSION_ENTRY_SEPARATOR}{value}")))
+        .collect();
+    let mut multipliers = Map::new();
+    multipliers.insert(XP_CHARACTER.to_owned(), Value::from(experience.character));
+    multipliers.insert(XP_PROGRESSION.to_owned(), Value::Array(progression));
+    object
+        .entry(XP_PARENT)
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| fail(format!("{XP_PARENT} is not an object")))?
+        .insert(XP_MULTIPLIERS.to_owned(), Value::Object(multipliers));
+    serde_json::to_vec_pretty(&Value::Object(object)).map_err(|error| fail(error.to_string()))
 }
 
 /// The S3 route: `GET /<key>` (and `HEAD`).
@@ -360,6 +366,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::config::tests::valid;
+    use crate::experience::NORMAL_EXPERIENCE;
     use crate::s3::{
         ANY_ETAG, ERROR_CONTENT_TYPE, HOST_ID_HEADER, OBJECT_CONTENT_TYPE, REQUEST_ID_BYTES,
         REQUEST_ID_HEADER,
@@ -392,7 +399,8 @@ pub(crate) mod tests {
     /// `stats-assume-role`, `ingestion-assume-role`), plus the switches the leaderboards study
     /// asks for (`analytics/enable` and seven `javelin` keys of the publicGameplay `RegionId`
     /// layer; leaderboards note section 1), plus the shop service keys `omni/fcs/*` that retail
-    /// leaves to the client's defaults (shop note).
+    /// leaves to the client's defaults (shop note). The experience multipliers are served once, in
+    /// the `ProductId` layer, from `[experience]`.
     const SERVED_KEY_PATHS: [(&str, Dimension, &[&str]); 8] = [
         (
             "public",
@@ -484,8 +492,6 @@ pub(crate) mod tests {
                 "javelin/territory-entry-requirement-enabled",
                 "javelin/transmog-own-all-appearances",
                 "javelin/wallet-cap-player",
-                "javelin/xp-multipliers/character",
-                "javelin/xp-multipliers/progression",
             ],
         ),
         (
@@ -713,85 +719,111 @@ pub(crate) mod tests {
         }
     }
 
-    /// The `javelin.xp-multipliers` object of a served layer.
-    fn served_experience(sets: &RemoteConfigSets, dimension: Dimension, id: &str) -> Value {
-        let key = object_key("publicGameplay", dimension, id, VERSIONLESS);
-        served_json(sets, &key)["javelin"]["xp-multipliers"].clone()
-    }
-
-    /// A test server's double experience.
-    const DOUBLE_EXPERIENCE: u32 = 2;
-
-    #[test]
-    fn the_tracked_sets_give_normal_experience_and_a_test_server_multiplies_it() {
-        let normal = sets();
-        let (_dir, mut config) = copied_sets();
-        config.remote_config.experience_multiplier = DOUBLE_EXPERIENCE;
-        let doubled = RemoteConfigSets::load(&config).expect("sets");
-        for (dimension, id) in [
-            (Dimension::ProductId, PRODUCT_ID),
-            (Dimension::CognitoId, COGNITO_ID),
-        ] {
-            let key = object_key("publicGameplay", dimension, id, VERSIONLESS);
-            let file = std::fs::read(committed_directory().join(layer_file_name(
-                "publicGameplay",
-                dimension,
-                id,
-            )))
-            .expect("file");
-            assert_eq!(normal.body(&key), Some(file.as_slice()), "{key} as written");
-            let normal = served_experience(&normal, dimension, id);
-            let doubled = served_experience(&doubled, dimension, id);
-            assert_eq!(normal["character"].as_f64(), Some(1.0), "{key}");
-            assert_eq!(doubled["character"].as_f64(), Some(2.0), "{key}");
-            let entries = |value: &Value| -> Vec<String> {
-                value["progression"]
-                    .as_array()
-                    .expect("progression")
-                    .iter()
-                    .map(|entry| entry.as_str().expect("entry").to_owned())
-                    .collect()
-            };
-            let normal = entries(&normal);
-            assert!(normal.iter().any(|entry| entry == "Riding:1"), "{key}");
-            assert!(normal.iter().all(|entry| entry.ends_with(":1")), "{key}");
-            let expected: Vec<String> = normal
-                .iter()
-                .map(|entry| entry.replace(":1", ":2"))
-                .collect();
-            assert_eq!(entries(&doubled), expected, "{key}");
-        }
-        let world = object_key("publicGameplay", Dimension::WorldId, WORLD_ID, VERSIONLESS);
-        assert_eq!(
-            doubled.body(&world),
-            normal.body(&world),
-            "no multipliers, as written"
-        );
-    }
-
-    #[test]
-    fn a_progression_entry_without_a_multiplier_is_refused() {
-        let (dir, mut config) = copied_sets();
-        config.remote_config.experience_multiplier = DOUBLE_EXPERIENCE;
-        let path = dir.path().join(layer_file_name(
-            "publicGameplay",
-            Dimension::ProductId,
-            PRODUCT_ID,
-        ));
-        let mut layer: Value =
-            serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
-        layer["javelin"]["xp-multipliers"]["progression"] = serde_json::json!(["Riding"]);
-        std::fs::write(&path, serde_json::to_vec(&layer).expect("json")).expect("write");
+    /// The served `javelin.xp-multipliers` object of `sets`.
+    fn served_experience(sets: &RemoteConfigSets) -> Value {
         let key = object_key(
-            "publicGameplay",
+            EXPERIENCE_APPLICATION,
             Dimension::ProductId,
             PRODUCT_ID,
             VERSIONLESS,
         );
-        assert!(matches!(
-            RemoteConfigSets::load(&config),
-            Err(RemoteConfigError::Experience { key: found, .. }) if found == key
-        ));
+        served_json(sets, &key)["javelin"]["xp-multipliers"].clone()
+    }
+
+    /// The served progression entries.
+    fn progression_entries(experience: &Value) -> Vec<String> {
+        experience["progression"]
+            .as_array()
+            .expect("progression")
+            .iter()
+            .map(|entry| entry.as_str().expect("entry").to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn normal_experience_is_served_for_every_progression_by_default() {
+        let experience = served_experience(&sets());
+        assert_eq!(experience["character"].as_f64(), Some(NORMAL_EXPERIENCE));
+        let entries = progression_entries(&experience);
+        assert_eq!(
+            entries.len(),
+            ExperienceConfig::default().progressions().len()
+        );
+        for id in [
+            "UmbralCurrency",
+            "Riding",
+            "Musician",
+            "SwordAbilityTable",
+            "2",
+            "17",
+        ] {
+            assert!(entries.contains(&format!("{id}:1")), "{id}: {entries:?}");
+        }
+    }
+
+    #[test]
+    fn each_experience_setting_reaches_its_own_progression() {
+        /// The live event of 2026-11: character, trade skills and masteries double, territory
+        /// standing triple.
+        const DOUBLE: f64 = 2.0;
+        const TRIPLE: f64 = 3.0;
+        let (_dir, mut config) = copied_sets();
+        config.experience.character = DOUBLE;
+        config.experience.umbral_crystals = TRIPLE;
+        config
+            .experience
+            .trade_skills
+            .insert("riding".to_owned(), DOUBLE);
+        config
+            .experience
+            .weapon_masteries
+            .insert("life_staff".to_owned(), DOUBLE);
+        config
+            .experience
+            .territory_standing
+            .insert("nighthaven".to_owned(), TRIPLE);
+        let experience = served_experience(&RemoteConfigSets::load(&config).expect("sets"));
+        assert_eq!(experience["character"].as_f64(), Some(DOUBLE));
+        let entries = progression_entries(&experience);
+        for entry in [
+            "UmbralCurrency:3",
+            "Riding:2",
+            "LifeMagicAbilityTable:2",
+            "17:3",
+            "Mining:1",
+            "2:1",
+        ] {
+            assert!(entries.iter().any(|served| served == entry), "{entry}");
+        }
+    }
+
+    #[test]
+    fn a_file_must_not_set_the_experience_multipliers() {
+        for (application, dimension, id) in [
+            (EXPERIENCE_APPLICATION, Dimension::ProductId, PRODUCT_ID),
+            (EXPERIENCE_APPLICATION, Dimension::CognitoId, COGNITO_ID),
+            ("public", Dimension::WorldId, WORLD_ID),
+        ] {
+            for javelin in [
+                serde_json::json!({"xp-multipliers": {"character": 2}}),
+                serde_json::json!({"xp-multipliers.progression": ["Riding:2"]}),
+            ] {
+                let (dir, config) = copied_sets();
+                let path = dir.path().join(layer_file_name(application, dimension, id));
+                let mut layer: Value =
+                    serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("json");
+                layer["javelin"] = javelin;
+                std::fs::write(&path, serde_json::to_vec(&layer).expect("json")).expect("write");
+                let key = object_key(application, dimension, id, VERSIONLESS);
+                assert!(
+                    matches!(
+                        RemoteConfigSets::load(&config),
+                        Err(RemoteConfigError::Experience { key: found, .. }) if found == key
+                    ),
+                    "{key}"
+                );
+            }
+        }
     }
 
     async fn get(path: &str, if_none_match: Option<&str>) -> (StatusCode, HeaderMap, Bytes) {

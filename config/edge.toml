@@ -88,11 +88,6 @@ directory = "config/remote-config"
 bucket = "ags-javelin-remote-config"
 # Our own id, sent to the client as -CognitoPool. It names no Amazon pool.
 cognito_pool_id = "b04fbfcd-942c-472d-88c0-c762c4076b2f"
-# The experience multiplier: every javelin.xp-multipliers value of the layers (character
-# experience, trade skills, weapon masteries, territory standing) is multiplied by it, for the
-# client and the sims alike. The tracked layers give each gain 1, so 1 is normal experience; a
-# test server sets 2 for double experience.
-experience_multiplier = 1
 
 # Our own news: the message of the day, the news stories and the menu tiles the client reads
 # from its news host, and their images. One subfolder per host, named after it; every file in it
@@ -119,6 +114,106 @@ hosts = [
 ]
 certificate_pem_path = "local-data/edge-http/aws-mirror.pem"
 private_key_pem_path = "local-data/edge-http/aws-mirror-key.pem"
+
+# Experience multipliers. Each value multiplies one kind of experience: 1.0 is normal (the
+# amount the game data gives), 2.0 is double, 0.5 is half, 0.0 gives none. Any number of 0 or
+# more works. The server sends these values to the game (remote config javelin.xp-multipliers,
+# publicGameplay-ProductId layer) and the sims use the same values, so what a player sees and
+# what the server gives match. A setting left out is 1.0. Restart edge-http and the sims after
+# a change. Retail without an event is 1.0 everywhere; retail's last event (servers closing) was
+# character 2.0, trade skills 2.0, weapon masteries 2.0 and territory standing 3.0.
+[experience]
+# Character experience: everything that raises the character level (mob kills, quests, town
+# projects, expeditions, gathering and crafting character experience).
+character = 1.0
+# Umbral Crystals (the UmbralCurrency progression of the game data).
+umbral_crystals = 1.0
+
+# Trade skill experience, one value per trade skill.
+[experience.trade_skills]
+# Crafting skills.
+# Weaponsmithing: crafting melee weapons (swords, axes, hammers, ...).
+weaponsmithing = 1.0
+# Armoring: crafting heavy, medium and light armor.
+armoring = 1.0
+# Engineering: crafting ranged weapons, tools and ammunition.
+engineering = 1.0
+# Jewelcrafting: crafting amulets, rings and earrings.
+jewelcrafting = 1.0
+# Arcana: crafting potions, coatings and magic weapons.
+arcana = 1.0
+# Cooking: cooking food.
+cooking = 1.0
+# Furnishing: crafting house furniture and decorations.
+furnishing = 1.0
+# Refining skills.
+# Smelting: ore into ingots.
+smelting = 1.0
+# Woodworking: wood into timber.
+woodworking = 1.0
+# Leatherworking: rawhide into leather.
+leatherworking = 1.0
+# Weaving: fibers into cloth.
+weaving = 1.0
+# Stonecutting: stone into blocks, and cutting gems.
+stonecutting = 1.0
+# Gathering skills.
+# Mining: ore and stone nodes.
+mining = 1.0
+# Logging: trees.
+logging = 1.0
+# Harvesting: plants, fibers and herbs.
+harvesting = 1.0
+# Tracking and Skinning: animal carcasses (the game data calls it Skinning).
+skinning = 1.0
+# Fishing: catching fish.
+fishing = 1.0
+# Other skills.
+# Musician: playing instruments.
+musician = 1.0
+# Riding: for example mount food, mount races and mount quests.
+riding = 1.0
+
+# Weapon mastery experience, one value per weapon.
+[experience.weapon_masteries]
+# One-handed weapons.
+sword_and_shield = 1.0
+rapier = 1.0
+hatchet = 1.0
+flail = 1.0
+dagger = 1.0
+# Two-handed weapons.
+spear = 1.0
+great_axe = 1.0
+war_hammer = 1.0
+greatsword = 1.0
+# Ranged weapons.
+bow = 1.0
+musket = 1.0
+blunderbuss = 1.0
+# Magic weapons.
+fire_staff = 1.0
+life_staff = 1.0
+ice_gauntlet = 1.0
+void_gauntlet = 1.0
+
+# Territory standing experience, one value per territory: standing points from quests, town
+# projects, crafting, gathering and kills in that territory.
+[experience.territory_standing]
+brightwood = 1.0
+everfall = 1.0
+reekwater = 1.0
+windsward = 1.0
+ebonscale_reach = 1.0
+elysian_wilds = 1.0
+cutlass_keys = 1.0
+mourningdale = 1.0
+monarchs_bluffs = 1.0
+weavers_fen = 1.0
+edengrove = 1.0
+restless_shore = 1.0
+brimstone_sands = 1.0
+nighthaven = 1.0
 
 [[world]]
 id = "8d0f4c2e-0000-4000-8000-000000000001"
