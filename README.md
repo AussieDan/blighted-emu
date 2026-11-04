@@ -182,6 +182,8 @@ To let in only chosen people, set `[discord] allow_list = true` and put their Di
 
 To keep the characters of a password account when a server moves to Discord mode, run `edge-http link-discord --username <name> --discord-user-id <id>` before the first Discord login (Discord: Settings, Advanced, Developer Mode on; then right-click your name, Copy User ID). Discord login then opens that account with its characters, ranks and account items; nothing is copied. The password login stays, and the admin site still uses it. When that Discord user already made a new account without characters, the login moves over; when that account has characters, the command refuses.
 
+The launcher keeps a list of saved servers (the same on Windows and Linux). Type a domain and click Connect: once it connects, the server is saved under the server's own name. Click a saved server to connect to it. Each saved server keeps its own login, so a switch does not log you out of the other one. "Saved as" renames the selected server; Remove forgets it and its login. The list is in `settings.json` (Settings, "Saved in"); the one server of an older launcher's file becomes the first saved server.
+
 `edge-http` logs every request that no route serves (`request for an unknown route`, with the session key masked). These lines show what the client asks for that the server does not answer yet.
 
 ### M2 exit test (manual)

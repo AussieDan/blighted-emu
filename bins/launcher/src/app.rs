@@ -1,14 +1,17 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The launcher window (M2 spec section 6). Network calls run on a worker thread; the window
-//! reads their results each frame. The window shows one status line (a state bar, a
-//! state word and a detail line), then the server, account, options and settings sections
-//! divided by rules.
+//! The launcher window (M2 spec section 6), the same on Windows and Linux. Network calls run on a
+//! worker thread; the window reads their results each frame. The window shows one status line (a
+//! state bar, a state word and a detail line), then the server (the saved servers, the address
+//! field and the connected server), account, options and settings sections divided by rules.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, RichText, Sense, TextStyle, vec2};
+use eframe::egui::{
+    self, Align, Color32, CornerRadius, Layout, RichText, Sense, StrokeKind, TextStyle, UiBuilder,
+    vec2,
+};
 use nw_protocol::launcher_api::{AuthMode, DiscordPollReply, LauncherInfo, PasswordCredentials};
 
 use crate::api::{ApiError, LauncherApi, discord_login_page};
@@ -27,7 +30,7 @@ use crate::mirror::{NETWORK_DIR, write_network_files};
 use crate::options::LaunchOptions;
 use crate::options::{DEFAULT_PREFIX_DIR, ProtonSwitch};
 use crate::server::api_base_url;
-use crate::settings::Settings;
+use crate::settings::{ServerProfile, Settings, same_server};
 use crate::steam::{self, Found};
 use crate::theme::{self, LABEL_STYLE, LINE_WIDTH, Palette, TITLE_STYLE, ThemeChoice, mix};
 
@@ -54,6 +57,10 @@ const LABEL_TRACKING: f32 = 0.9;
 /// Width of the fact label column, and of the server field.
 const FACT_LABEL_WIDTH: f32 = 96.0;
 const CONNECT_BUTTON_WIDTH: f32 = 88.0;
+/// Width of the remove button of the saved server.
+const REMOVE_BUTTON_WIDTH: f32 = 88.0;
+/// Space inside a saved server row, left and right of its text.
+const ROW_PADDING: f32 = 10.0;
 /// Width of the state word after a path field.
 const PATH_STATE_WIDTH: f32 = 64.0;
 /// Rows of the extra environment field.
@@ -117,7 +124,7 @@ impl Status {
         Self::new(
             Tone::Idle,
             "not connected",
-            "Enter the server domain, for example example.org.",
+            "Pick a saved server, or enter the server domain, for example example.org.",
         )
     }
 
@@ -173,6 +180,8 @@ pub struct LauncherApp {
     settings_path: PathBuf,
     settings: Settings,
     server_input: String,
+    /// The name field of the selected saved server.
+    name_input: String,
     username: String,
     password: String,
     connection: Option<(LauncherApi, LauncherInfo)>,
@@ -340,6 +349,67 @@ fn path_row(
     .inner
 }
 
+/// One saved server row, as wide as the section: its name, then its address at the right end;
+/// the selected row is raised and outlined, a hovered row is quiet-filled. True when the player
+/// picked it (a click, or Enter or Space with the focus on it).
+fn profile_row(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    profile: &ServerProfile,
+    selected: bool,
+) -> bool {
+    let size = vec2(ui.available_width(), ui.spacing().interact_size.y);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let enabled = ui.is_enabled();
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::SelectableLabel,
+            enabled,
+            selected,
+            &profile.name,
+        )
+    });
+    let fill = if selected {
+        palette.raised
+    } else if response.hovered() {
+        palette.surface
+    } else {
+        Color32::TRANSPARENT
+    };
+    let outline = if response.has_focus() {
+        ui.visuals().selection.stroke
+    } else if selected {
+        egui::Stroke::new(LINE_WIDTH, palette.accent)
+    } else {
+        egui::Stroke::NONE
+    };
+    let corner = CornerRadius::same(theme::CONTROL_CORNER);
+    ui.painter().rect_filled(rect, corner, fill);
+    ui.painter()
+        .rect_stroke(rect, corner, outline, StrokeKind::Inside);
+    let mut row = ui.new_child(
+        UiBuilder::new()
+            .max_rect(rect.shrink2(vec2(ROW_PADDING, 0.0)))
+            .layout(Layout::right_to_left(Align::Center)),
+    );
+    row.add(
+        egui::Label::new(
+            RichText::new(&profile.server)
+                .monospace()
+                .color(palette.mute),
+        )
+        .selectable(false),
+    );
+    row.with_layout(Layout::left_to_right(Align::Center), |row| {
+        row.add(
+            egui::Label::new(RichText::new(&profile.name).color(palette.ink))
+                .selectable(false)
+                .truncate(),
+        );
+    });
+    response.clicked()
+}
+
 /// Whether Enter was pressed in the field of `response`.
 fn submitted(ui: &egui::Ui, response: &egui::Response) -> bool {
     response.lost_focus() && ui.input(|input| input.key_pressed(egui::Key::Enter))
@@ -348,8 +418,14 @@ fn submitted(ui: &egui::Ui, response: &egui::Response) -> bool {
 impl LauncherApp {
     /// The window state from saved settings; connects at once when a server is saved.
     pub fn new(settings_path: PathBuf, settings: Settings, found: Found) -> Self {
+        let selected = settings.selected_profile();
         let mut app = Self {
-            server_input: settings.server.clone(),
+            server_input: selected
+                .map(|profile| profile.server.clone())
+                .unwrap_or_default(),
+            name_input: selected
+                .map(|profile| profile.name.clone())
+                .unwrap_or_default(),
             settings_path,
             settings,
             username: String::new(),
@@ -535,6 +611,39 @@ impl LauncherApp {
         }));
     }
 
+    /// Connects to the saved server `server`.
+    fn pick(&mut self, server: &str) {
+        self.server_input = server.to_owned();
+        self.connect();
+    }
+
+    /// Saves the name field as the selected server's name; an empty field gets the old name back.
+    fn rename_selected(&mut self) {
+        let Some(server) = self.settings.selected.clone() else {
+            return;
+        };
+        self.settings.rename(&server, &self.name_input);
+        self.name_input = self
+            .settings
+            .selected_profile()
+            .map(|profile| profile.name.clone())
+            .unwrap_or_default();
+        self.save();
+    }
+
+    /// Forgets the selected server and its login, and leaves it.
+    fn remove_selected(&mut self) {
+        let Some(server) = self.settings.selected.clone() else {
+            return;
+        };
+        self.settings.remove(&server);
+        self.connection = None;
+        self.server_input.clear();
+        self.name_input.clear();
+        self.set_status(Status::not_connected());
+        self.save();
+    }
+
     fn set_theme(&mut self, ctx: &egui::Context, choice: ThemeChoice) {
         if self.settings.theme != choice {
             self.settings.theme = choice;
@@ -551,8 +660,13 @@ impl LauncherApp {
                     "connected",
                     format!("Connected to {}.", info.server_name),
                 ));
+                self.settings.connected(&server, &info.server_name);
+                self.name_input = self
+                    .settings
+                    .selected_profile()
+                    .map(|profile| profile.name.clone())
+                    .unwrap_or_default();
                 self.connection = Some((api, info));
-                self.settings.set_server(&server);
                 self.save();
             }
             Event::LoggedIn(token) => {
@@ -561,7 +675,7 @@ impl LauncherApp {
                     "logged in",
                     "Press Play to start the game.",
                 ));
-                self.settings.launcher_token = Some(token);
+                self.settings.set_token(Some(token));
                 self.save();
             }
             Event::GameStarted => self.set_status(Status::new(
@@ -571,7 +685,7 @@ impl LauncherApp {
             )),
             Event::LoggedOut => {
                 self.set_status(Status::new(Tone::Idle, "logged out", "Log in to play."));
-                self.settings.launcher_token = None;
+                self.settings.set_token(None);
                 self.save();
             }
             Event::SessionExpired => {
@@ -580,7 +694,7 @@ impl LauncherApp {
                     "login expired",
                     "Your login expired. Log in again.",
                 ));
-                self.settings.launcher_token = None;
+                self.settings.set_token(None);
                 self.save();
             }
             Event::Failed(message) => self.set_status(Status::error(message)),
@@ -635,6 +749,23 @@ impl LauncherApp {
 
     fn draw_server(&mut self, ui: &mut egui::Ui, palette: &Palette) {
         section(ui, palette, "Server", |ui| {
+            let mut picked = None;
+            for profile in &self.settings.profiles {
+                let selected = self
+                    .settings
+                    .selected
+                    .as_deref()
+                    .is_some_and(|server| same_server(server, &profile.server));
+                if profile_row(ui, palette, profile, selected) {
+                    picked = Some(profile.server.clone());
+                }
+            }
+            if let Some(server) = picked {
+                self.pick(&server);
+            }
+            if !self.settings.profiles.is_empty() {
+                ui.add_space(SECTION_GAP / 2.0);
+            }
             ui.horizontal(|ui| {
                 let field_width =
                     ui.available_width() - CONNECT_BUTTON_WIDTH - ui.spacing().item_spacing.x;
@@ -652,6 +783,19 @@ impl LauncherApp {
                     self.connect();
                 }
             });
+            let typed = self.server_input.trim();
+            let is_new = !typed.is_empty()
+                && !self
+                    .settings
+                    .profiles
+                    .iter()
+                    .any(|profile| same_server(&profile.server, typed));
+            if is_new {
+                ui.label(
+                    RichText::new("A new address is saved here once it connects.")
+                        .color(palette.mute),
+                );
+            }
             let Some((api, info)) = &self.connection else {
                 return;
             };
@@ -689,7 +833,41 @@ impl LauncherApp {
                     RichText::new(sign_up).color(palette.ink),
                 );
             }
+            if self.settings.selected_profile().is_some() {
+                self.draw_saved_as(ui, palette);
+            }
         });
+    }
+
+    /// The selected server's row: the label column, its name field, then the remove button.
+    fn draw_saved_as(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let (renamed, remove) = ui
+            .horizontal(|ui| {
+                ui.add_sized(
+                    vec2(FACT_LABEL_WIDTH, ui.spacing().interact_size.y),
+                    egui::Label::new(label_text("Saved as", palette.mute)),
+                );
+                let field_width =
+                    ui.available_width() - REMOVE_BUTTON_WIDTH - ui.spacing().item_spacing.x;
+                let field = ui.add_sized(
+                    vec2(field_width, ui.spacing().interact_size.y),
+                    egui::TextEdit::singleline(&mut self.name_input).hint_text("Server name"),
+                );
+                let remove = ui
+                    .add_sized(
+                        vec2(REMOVE_BUTTON_WIDTH, ui.spacing().interact_size.y),
+                        egui::Button::new("Remove"),
+                    )
+                    .on_hover_text("Forget this server and its login.")
+                    .clicked();
+                (field.lost_focus(), remove)
+            })
+            .inner;
+        if remove {
+            self.remove_selected();
+        } else if renamed {
+            self.rename_selected();
+        }
     }
 
     fn draw_account(&mut self, ui: &mut egui::Ui, palette: &Palette) {
@@ -698,7 +876,7 @@ impl LauncherApp {
                 ui.label(RichText::new("Connect to a server first.").color(palette.mute));
                 return;
             };
-            if let Some(token) = self.settings.launcher_token.clone() {
+            if let Some(token) = self.settings.token().map(str::to_owned) {
                 let play_size = vec2(ui.available_width(), PLAY_HEIGHT);
                 if primary_button(ui, palette, "Play", play_size) {
                     self.play(api.clone(), info, token.clone());
@@ -1010,16 +1188,64 @@ mod tests {
         app.apply(Event::LoggedIn("token".to_owned()));
         assert_eq!(app.status().word, "logged in");
         let saved = Settings::load(&app.settings_path).expect("load");
-        assert_eq!(saved.server, "example.org");
-        assert_eq!(saved.launcher_token.as_deref(), Some("token"));
+        let profile = saved.selected_profile().expect("the server is saved");
+        assert_eq!(
+            (profile.name.as_str(), profile.server.as_str()),
+            ("Test world", "example.org"),
+            "saved under the server's own name"
+        );
+        assert_eq!(saved.token(), Some("token"));
+        assert_eq!(app.name_input, "Test world");
         app.apply(Event::SessionExpired);
         assert_eq!(
             (app.status().tone, app.status().word),
             (Tone::Fault, "login expired")
         );
-        assert_eq!(app.settings.launcher_token, None);
+        assert_eq!(app.settings.token(), None);
         app.apply(Event::Failed("server unreachable".to_owned()));
         assert_eq!(app.status(), &Status::error("server unreachable"));
+    }
+
+    #[test]
+    fn a_saved_server_is_picked_renamed_and_removed() {
+        let (_dir, mut app) = app();
+        let api = LauncherApi::new("https://login.example.org".to_owned()).expect("api");
+        app.apply(Event::Connected("example.org".to_owned(), api, info()));
+        app.name_input = " ".to_owned();
+        app.rename_selected();
+        assert_eq!(
+            app.name_input, "Test world",
+            "an empty name gets the old one back"
+        );
+        app.name_input = "Main".to_owned();
+        app.rename_selected();
+        let saved = Settings::load(&app.settings_path).expect("load");
+        assert_eq!(saved.profiles[0].name, "Main");
+        app.server_input.clear();
+        app.pick("example.org");
+        assert_eq!(app.server_input, "example.org");
+        assert_eq!(app.status().word, "connecting");
+        app.job = None;
+        app.remove_selected();
+        assert_eq!(app.status(), &Status::not_connected());
+        assert!(app.connection.is_none() && app.server_input.is_empty());
+        let saved = Settings::load(&app.settings_path).expect("load");
+        assert!(saved.profiles.is_empty() && saved.selected.is_none());
+    }
+
+    #[test]
+    fn the_launcher_starts_on_the_selected_saved_server() {
+        let dir = tempfile::tempdir().expect("dir");
+        let mut settings = Settings::default();
+        settings.connected("example.org", "Test world");
+        settings.connected("local.example.org", "Local world");
+        settings.connected("example.org", "Test world");
+        let app = LauncherApp::new(dir.path().join("settings.json"), settings, Found::default());
+        assert_eq!(
+            (app.server_input.as_str(), app.name_input.as_str()),
+            ("example.org", "Test world")
+        );
+        assert_eq!(app.status().word, "connecting");
     }
 
     #[test]
