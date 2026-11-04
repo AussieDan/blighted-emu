@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/web/style.css">
   <script src="/web/theme.js"></script>
 </head>
-<body class="map-page">
+<body class="map-page game">
   <nav class="rail" aria-label="Pages">
+    <span class="brand">Blighted Emu</span>
     <a href="/">Home</a>
     <a href="/live">Live</a>
     <a href="/live3d">Live 3D</a>
@@ -19,15 +20,18 @@
     <a href="/gm">GM</a>
     <a href="/web/map.html" aria-current="page">Map</a>
     <a href="/web/captures.html">Captures</a>
-    <button type="button" class="theme" id="theme"></button>
+    <span class="bar-end">
+      <button type="button" class="theme" id="theme"></button>
+    </span>
   </nav>
   <main class="work">
-    <header class="masthead">
-      <h1>Blighted Emu <span>· Map</span></h1>
-      <div class="end"><span class="status" id="status"></span></div>
-    </header>
-    <div class="toolbar">
-      <label>Layer
+    <h1 class="unseen">Blighted Emu · Map</h1>
+    <div class="board">
+    <section class="chart stage" aria-label="World map">
+    <canvas id="map" class="map"></canvas>
+    <aside class="game-panel map-layers" aria-label="Layers">
+      <h2>Layers</h2>
+      <label>Ground
         <select id="layer">
           <option value="tiles">Map tiles</option>
           <option value="relief">Relief</option>
@@ -37,11 +41,15 @@
       <label><input type="checkbox" value="vitals" class="kind"> <i class="swatch" data-kind="vitals"></i> Mob spawns</label>
       <label><input type="checkbox" value="gatherables" class="kind"> <i class="swatch" data-kind="gatherables"></i> Gatherables</label>
       <label><input type="checkbox" value="landmarks" class="kind"> <i class="swatch" data-kind="landmarks"></i> Landmarks</label>
+    </aside>
+    <div class="map-tools">
       <button id="zoom-in" type="button">Zoom in</button>
       <button id="zoom-out" type="button">Zoom out</button>
       <button id="fit" type="button">Whole world</button>
     </div>
-    <section class="chart" aria-label="World map"><canvas id="map" class="map"></canvas></section>
+    <p class="help" id="status" role="status"></p>
+    </section>
+    </div>
   </main>
   <script type="module">
     import { LAYERS, SPAWN_ZOOM_M_PER_PX, WorldMap } from '/web/map.js';
@@ -56,7 +64,7 @@
     function showStatus() {
       const view = map.currentView();
       const at = cursor ? `${cursor.x.toFixed(1)}, ${cursor.y.toFixed(1)}` : '—';
-      const spawns = view.metresPerPixel > SPAWN_ZOOM_M_PER_PX ? ' · zoom in for spawns' : '';
+      const spawns = view.metresPerPixel > SPAWN_ZOOM_M_PER_PX ? ' · zoom in to see each spawn' : '';
       status.textContent = `cursor ${at} · ${view.metresPerPixel.toFixed(2)} m/px${spawns}`;
     }
     const layer = document.getElementById('layer');

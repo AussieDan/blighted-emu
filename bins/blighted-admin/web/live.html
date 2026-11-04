@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/web/style.css">
   <script src="/web/theme.js"></script>
 </head>
-<body class="live-page">
+<body class="live-page game">
   <nav class="rail" aria-label="Pages">
+    <span class="brand">Blighted Emu</span>
     <a href="/">Home</a>
     <a href="/live" aria-current="page">Live</a>
     <a href="/live3d">Live 3D</a>
@@ -19,42 +20,26 @@
     <a href="/gm">GM</a>
     <a href="/web/map.html">Map</a>
     <a href="/web/captures.html">Captures</a>
-    <button type="button" class="theme" id="theme"></button>
+    <span class="bar-end">
+      <span class="status error" id="status" role="status"></span>
+      <span class="stream" id="socket" data-state="connecting">connecting</span>
+      <button type="button" id="reconnect">Reconnect</button>
+      <button type="button" class="theme" id="theme"></button>
+    </span>
   </nav>
   <main class="work">
-    <header class="masthead">
-      <h1>Blighted Emu <span>· Live</span></h1>
-      <div class="end">
-        <span class="status error" id="status" role="status"></span>
-        <span class="stream" id="socket" data-state="connecting">connecting</span>
-        <button type="button" id="reconnect">Reconnect</button>
-      </div>
-    </header>
-    <section class="servers" id="servers" aria-label="Server status"></section>
-    <div class="figures">
-      <div class="facts" id="tiles"></div>
-      <div class="facts minor" id="tiles-more"></div>
-      <div class="cpu-line">
-        <p class="cpu-help">CPU use: how hard each program works. 100 % is one full CPU core. "Bots" is the fake players, not server work. Unknown: the program is not running.</p>
-        <div class="facts minor" id="cpu"></div>
-      </div>
-    </div>
-    <div class="deck">
-      <section class="chart" aria-label="World map">
+    <h1 class="unseen">Blighted Emu · Live</h1>
+    <div class="board">
+      <section class="chart stage" aria-label="World map">
+        <aside class="standings" aria-label="Server standings">
+          <h2>Server standings</h2>
+          <section class="servers territories" id="servers" aria-label="Sims"></section>
+          <div class="facts statline" id="tiles" aria-label="Figures"></div>
+        </aside>
         <canvas id="map" class="map"></canvas>
-        <ul class="legend" aria-label="Map key">
-          <li><i class="swatch" data-kind="player"></i>Player</li>
-          <li><i class="swatch" data-kind="bot"></i>Bot</li>
-          <li><i class="swatch" data-kind="dead"></i>Dead</li>
-          <li><i class="swatch" data-kind="frozen"></i>Moving between sims</li>
-          <li><i class="swatch" data-kind="idle"></i>Mob idle</li>
-          <li><i class="swatch" data-kind="chase"></i>Mob chasing</li>
-          <li><i class="swatch" data-kind="attack"></i>Mob attacking</li>
-          <li><i class="swatch" data-kind="return"></i>Mob returning</li>
-        </ul>
         <div class="map-tools">
           <label><input type="checkbox" id="trails" checked> Trails</label>
-          <label><input type="checkbox" id="sleeping"> Sleeping mob spawns (zoom in)</label>
+          <label><input type="checkbox" id="sleeping"> Sleeping mob spawns</label>
           <button type="button" id="fit">Whole world</button>
           <button type="button" id="big-map" aria-pressed="false">Big map</button>
         </div>
@@ -63,118 +48,117 @@
           <span id="bot-buttons"></span>
           <button type="button" class="danger" id="stop-all">Stop all</button>
         </div>
-      </section>
-      <aside class="side">
-        <h2>Batches</h2>
-        <ul class="list" id="batches"></ul>
-        <h2>Events</h2>
-        <ul class="list log" id="events"></ul>
-        <h2>Selection</h2>
-        <div class="selection" id="selection"><p class="hint">Click a player, a bot or a mob on the map, or a row of the players table.</p></div>
-        <div class="gm-panel" id="gm-player" hidden>
-          <h2>GM</h2>
-          <form class="gm" id="gm-teleport">
-            <strong>Teleport</strong>
-            <input type="text" id="gm-x" inputmode="decimal" aria-label="x (metres)" placeholder="x">
-            <input type="text" id="gm-y" inputmode="decimal" aria-label="y (metres)" placeholder="y">
-            <input type="text" id="gm-z" inputmode="decimal" aria-label="z (metres)" placeholder="z">
-            <button type="submit">Move</button>
-          </form>
-          <form class="gm" id="gm-to-player">
-            <strong>To player</strong>
-            <input type="text" id="gm-to-entity" inputmode="numeric" aria-label="entity of the player to go to" placeholder="entity">
-            <button type="submit">Move</button>
-          </form>
-          <div class="gm">
-            <button type="button" data-gm="heal">Heal</button>
-            <button type="button" data-gm="god-on">God on</button>
-            <button type="button" data-gm="god-off">God off</button>
-            <button type="button" class="danger" data-gm="kill">Kill</button>
-            <button type="button" class="danger" data-gm="kick">Kick</button>
+        <p class="status toast" id="gm-status" role="status"></p>
+        <aside class="inspector" aria-label="Tools">
+        <details class="drawer" name="inspector" id="selected-panel">
+          <summary><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="7"/><circle cx="12" cy="12" r="2.5"/></svg><span>Selected</span></summary>
+            <div class="drawer-body">
+            <h2 class="drawer-title">Selected</h2>
+          <div class="selection" id="selection"><p class="hint">Click a player, a bot or a mob on the map, or a row of the players list.</p></div>
+          <div class="gm-panel" id="gm-player" hidden>
+            <h2>GM</h2>
+            <div id="gm-player-controls"></div>
           </div>
-          <form class="gm" id="gm-item">
-            <strong>Item</strong>
-            <input type="text" id="gm-item-id" aria-label="item id" placeholder="item id" class="wide">
-            <input type="text" id="gm-item-quantity" inputmode="numeric" aria-label="quantity" placeholder="1">
-            <button type="submit">Give</button>
-            <button type="button" id="gm-take">Take</button>
-          </form>
-          <form class="gm" id="gm-quest">
-            <input type="text" id="gm-quest-id" aria-label="objective id" placeholder="objective id" class="wide">
-            <button type="submit">Start quest</button>
-          </form>
-          <form class="gm" id="gm-level">
-            <strong>Level</strong>
-            <input type="text" id="gm-level-value" inputmode="numeric" aria-label="level" placeholder="level">
-            <button type="submit">Set level</button>
-            <input type="text" id="gm-xp-amount" inputmode="numeric" aria-label="experience points" placeholder="xp">
-            <button type="button" id="gm-give-xp">Give XP</button>
-          </form>
-          <form class="gm" id="gm-mastery">
-            <strong>Weapon mastery</strong>
-            <select id="gm-mastery-id" aria-label="weapon mastery"><option value="">All weapons</option></select>
-            <input type="text" id="gm-mastery-rank" inputmode="numeric" aria-label="mastery rank" placeholder="rank">
-            <button type="submit">Set rank</button>
-            <input type="text" id="gm-mastery-xp" inputmode="numeric" aria-label="mastery points" placeholder="xp">
-            <button type="button" id="gm-give-mastery">Give XP</button>
-          </form>
-          <form class="gm" id="gm-coins">
-            <strong>Coins</strong>
-            <input type="text" id="gm-coins-value" inputmode="numeric" aria-label="coins" placeholder="coins">
-            <button type="submit">Set coins</button>
-          </form>
-        </div>
-        <div class="gm-panel" id="gm-mob" hidden>
-          <h2>GM</h2>
-          <div class="gm"><button type="button" class="danger" id="gm-despawn">Despawn this GM mob</button></div>
-        </div>
-        <div class="gm-panel">
-          <h2>GM mobs</h2>
-          <p class="hint">Right-click the map to fill x and y.</p>
-          <form class="gm" id="gm-spawn">
-            <input type="text" id="gm-spawn-vitals" aria-label="vitals id" placeholder="vitals id" class="wide">
-            <input type="text" id="gm-spawn-level" inputmode="numeric" aria-label="level" placeholder="level">
-            <input type="text" id="gm-spawn-count" inputmode="numeric" aria-label="count" placeholder="count" value="1">
-            <input type="text" id="gm-spawn-x" inputmode="decimal" aria-label="x (metres)" placeholder="x">
-            <input type="text" id="gm-spawn-y" inputmode="decimal" aria-label="y (metres)" placeholder="y">
-            <input type="text" id="gm-spawn-z" inputmode="decimal" aria-label="z (metres)" placeholder="z">
-            <button type="submit">Spawn</button>
-            <button type="button" class="danger" id="gm-despawn-all">Despawn all</button>
-          </form>
-        </div>
-        <div class="gm-panel">
-          <h2>GM events</h2>
-          <form class="gm" id="gm-events">
-            <select id="gm-event" aria-label="event"></select>
-            <button type="submit">Start at the spawn point</button>
-            <button type="button" class="danger" id="gm-event-stop">Stop</button>
-            <button type="button" id="gm-events-refresh">Refresh</button>
-          </form>
-          <ul class="list" id="gm-events-running"></ul>
-        </div>
-        <p class="status" id="gm-status" role="status"></p>
-      </aside>
+          <div class="gm-panel" id="gm-mob" hidden>
+            <h2>GM</h2>
+            <div class="gm"><button type="button" class="danger" id="gm-despawn">Despawn this GM mob</button></div>
+          </div>
+            </div>
+        </details>
+        <details class="drawer" name="inspector" open>
+          <summary><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h9"/></svg><span>Events</span></summary>
+            <div class="drawer-body">
+            <h2 class="drawer-title">Events and bot batches</h2>
+          <h3>Events</h3>
+          <ul class="list log" id="events"></ul>
+          <h3>Bot batches</h3>
+          <ul class="list" id="batches"></ul>
+            </div>
+        </details>
+        <details class="drawer players" name="inspector" id="players-panel">
+          <summary><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4 21c1.2-5 14.8-5 16 0"/></svg><span>Players</span> <span class="status" id="players-count"></span></summary>
+            <div class="drawer-body">
+            <h2 class="drawer-title">Players</h2>
+          <div class="table-scroll">
+            <table class="grid">
+              <thead>
+                <tr>
+                  <th class="sortable" data-column="name">Name</th>
+                  <th class="sortable" data-column="kind">Kind</th>
+                  <th class="sortable" data-column="entity">Entity</th>
+                  <th class="sortable" data-column="sim">Sim</th>
+                  <th class="sortable num" data-column="x">x</th>
+                  <th class="sortable num" data-column="y">y</th>
+                  <th class="sortable num" data-column="z">z</th>
+                  <th class="sortable" data-column="state">State</th>
+                </tr>
+              </thead>
+              <tbody id="players"></tbody>
+            </table>
+          </div>
+            </div>
+        </details>
+        <details class="drawer" name="inspector">
+          <summary><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3l2.8 5.9 6.2.9-4.5 4.4 1.1 6.3L12 17.6l-5.6 2.9 1.1-6.3L3 9.8l6.2-.9z"/></svg><span>GM tools</span></summary>
+            <div class="drawer-body">
+            <h2 class="drawer-title">GM mobs and events</h2>
+          <div class="gm-panel">
+            <h2>GM mobs</h2>
+            <p class="hint">Right-click the map to fill x and y.</p>
+            <form class="gm" id="gm-spawn">
+              <input type="text" id="gm-spawn-vitals" aria-label="vitals id" placeholder="vitals id" class="wide">
+              <input type="text" id="gm-spawn-level" inputmode="numeric" aria-label="level" placeholder="level">
+              <input type="text" id="gm-spawn-count" inputmode="numeric" aria-label="count" placeholder="count" value="1">
+              <input type="text" id="gm-spawn-x" inputmode="decimal" aria-label="x (metres)" placeholder="x">
+              <input type="text" id="gm-spawn-y" inputmode="decimal" aria-label="y (metres)" placeholder="y">
+              <input type="text" id="gm-spawn-z" inputmode="decimal" aria-label="z (metres)" placeholder="z">
+              <button type="submit">Spawn</button>
+              <button type="button" class="danger" id="gm-despawn-all">Despawn all</button>
+            </form>
+          </div>
+          <div class="gm-panel">
+            <h2>GM events</h2>
+            <form class="gm" id="gm-events">
+              <select id="gm-event" aria-label="event"></select>
+              <button type="submit">Start at the spawn point</button>
+              <button type="button" class="danger" id="gm-event-stop">Stop</button>
+              <button type="button" id="gm-events-refresh">Refresh</button>
+            </form>
+            <ul class="list" id="gm-events-running"></ul>
+          </div>
+            </div>
+        </details>
+        <details class="drawer" name="inspector">
+          <summary><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="4" width="16" height="7"/><rect x="4" y="13" width="16" height="7"/></svg><span>Server</span></summary>
+            <div class="drawer-body">
+            <h2 class="drawer-title">Server details</h2>
+          <section class="servers" id="pages" aria-label="Metrics pages"></section>
+          <div class="facts minor" id="tiles-more"></div>
+          <div class="cpu-line">
+            <p class="cpu-help">CPU use: how hard each program works. 100 % is one full CPU core. "Bots" is the fake players, not server work. Unknown: the program is not running.</p>
+            <div class="facts minor" id="cpu"></div>
+          </div>
+            </div>
+        </details>
+        <details class="drawer" name="inspector">
+          <summary><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="11"/><path d="M8 20h8"/></svg><span>Key</span></summary>
+            <div class="drawer-body">
+            <h2 class="drawer-title">Map key</h2>
+          <ul class="legend" aria-label="Map key">
+            <li><i class="swatch" data-kind="player"></i>Player</li>
+            <li><i class="swatch" data-kind="bot"></i>Bot</li>
+            <li><i class="swatch" data-kind="dead"></i>Dead</li>
+            <li><i class="swatch" data-kind="frozen"></i>Moving between sims</li>
+            <li><i class="swatch" data-kind="idle"></i>Mob idle</li>
+            <li><i class="swatch" data-kind="chase"></i>Mob chasing</li>
+            <li><i class="swatch" data-kind="attack"></i>Mob attacking</li>
+            <li><i class="swatch" data-kind="return"></i>Mob returning</li>
+          </ul>
+            </div>
+        </details>
+        </aside>
+      </section>
     </div>
-    <details class="players" id="players-panel" open>
-      <summary class="section-head"><h2>Players</h2><span class="status" id="players-count"></span></summary>
-      <div class="table-scroll">
-        <table class="grid">
-          <thead>
-            <tr>
-              <th class="sortable" data-column="name">Name</th>
-              <th class="sortable" data-column="kind">Kind</th>
-              <th class="sortable" data-column="entity">Entity</th>
-              <th class="sortable" data-column="sim">Sim</th>
-              <th class="sortable num" data-column="x">x</th>
-              <th class="sortable num" data-column="y">y</th>
-              <th class="sortable num" data-column="z">z</th>
-              <th class="sortable" data-column="state">State</th>
-            </tr>
-          </thead>
-          <tbody id="players"></tbody>
-        </table>
-      </div>
-    </details>
   </main>
   <script type="module" src="/web/live.js"></script>
 </body>

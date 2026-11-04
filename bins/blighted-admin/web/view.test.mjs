@@ -7,6 +7,7 @@ import {
   boxOf,
   parentTile,
   screenToWorld,
+  spawnCellSquares,
   tileAt,
   tileLevelFor,
   visibleTiles,
@@ -102,4 +103,43 @@ test('boxAround takes a very long point list', () => {
   const points = Array.from({ length: 400000 }, (_, index) => ({ x: index, y: -index }));
   assert.deepEqual(boxAround(points, 10), { minX: -10, minY: -399999 - 10, maxX: 399999 + 10, maxY: 10 });
   assert.equal(boxAround([], 10), null);
+});
+
+const CELL_M = 256;
+
+test('the first kind fills its cell and later kinds are smaller squares in the centre', () => {
+  const squares = spawnCellSquares({
+    cell_m: CELL_M,
+    cells: [
+      { kind: 'vitals', x: 2, y: 3, count: 4 },
+      { kind: 'landmarks', x: 2, y: 3, count: 1 },
+    ],
+  });
+  const [vitals, landmarks] = squares;
+  assert.deepEqual([vitals.x, vitals.y, vitals.side], [2 * CELL_M, 3 * CELL_M, CELL_M]);
+  assert.ok(landmarks.side < vitals.side);
+  assert.equal(landmarks.x + landmarks.side / 2, 2 * CELL_M + CELL_M / 2);
+  assert.equal(landmarks.y + landmarks.side / 2, 3 * CELL_M + CELL_M / 2);
+});
+
+test('a fuller cell is more opaque than an emptier cell of the same kind', () => {
+  const [full, sparse] = spawnCellSquares({
+    cell_m: CELL_M,
+    cells: [
+      { kind: 'gatherables', x: 0, y: 0, count: 10 },
+      { kind: 'gatherables', x: 1, y: 0, count: 1 },
+    ],
+  });
+  assert.ok(full.alpha > sparse.alpha);
+});
+
+test('each kind is scaled against its own fullest cell', () => {
+  const [vitals, gatherables] = spawnCellSquares({
+    cell_m: CELL_M,
+    cells: [
+      { kind: 'vitals', x: 0, y: 0, count: 2 },
+      { kind: 'gatherables', x: 1, y: 0, count: 200 },
+    ],
+  });
+  assert.equal(vitals.alpha, gatherables.alpha);
 });

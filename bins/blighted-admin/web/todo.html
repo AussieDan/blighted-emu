@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/web/style.css">
   <script src="/web/theme.js"></script>
 </head>
-<body>
+<body class="todo-page game">
   <nav class="rail" aria-label="Pages">
+    <span class="brand">Blighted Emu</span>
     <a href="/">Home</a>
     <a href="/live">Live</a>
     <a href="/live3d">Live 3D</a>
@@ -19,37 +20,39 @@
     <a href="/gm">GM</a>
     <a href="/web/map.html">Map</a>
     <a href="/web/captures.html">Captures</a>
-    <button type="button" class="theme" id="theme"></button>
+    <span class="bar-end">
+      <span class="status" id="status" role="status"></span>
+      <button type="button" class="theme" id="theme"></button>
+    </span>
   </nav>
-  <main class="work">
-    <header class="masthead">
-      <h1>Blighted Emu <span>· To-do</span></h1>
-      <div class="end"><span class="status" id="status" role="status"></span></div>
-    </header>
-    <section class="problems-block" aria-label="New task">
-      <form class="gm" id="import">
-        <input type="url" id="issue-url" aria-label="GitHub issue address" placeholder="https://github.com/owner/repo/issues/1" class="todo-wide">
-        <button type="submit">Import issue</button>
-      </form>
-      <form class="gm" id="add">
-        <input type="text" id="new-title" aria-label="title" placeholder="title" class="todo-wide">
-        <select id="new-kind" aria-label="kind"></select>
-        <button type="submit">Add task</button>
-      </form>
-    </section>
-    <section class="problems-block" aria-label="Tasks">
-      <div class="section-head">
-        <h2>Tasks</h2>
-        <select id="state-filter" aria-label="state filter"></select>
+  <main class="work sheet">
+    <h1 class="unseen">Blighted Emu · To-do</h1>
+    <div class="todo-board">
+      <div class="todo-column">
+        <section class="game-panel" aria-label="New task">
+          <h2>New task</h2>
+          <form class="gm" id="add">
+            <input type="text" id="new-title" aria-label="title" placeholder="title" class="wide">
+            <select id="new-kind" aria-label="kind"></select>
+            <button type="submit">Add task</button>
+          </form>
+          <form class="gm" id="import">
+            <input type="url" id="issue-url" aria-label="GitHub issue address" placeholder="https://github.com/owner/repo/issues/1" class="wide">
+            <button type="submit">Import issue</button>
+          </form>
+        </section>
+        <section class="game-panel changed-files" aria-label="Changed design files">
+          <h2>Changed design files <button type="button" id="refresh-changed">Refresh</button></h2>
+          <p class="hint">Design files that differ from the last commit. Link them to a task before you commit.</p>
+          <ul class="list" id="changed"></ul>
+          <datalist id="changed-files"></datalist>
+        </section>
       </div>
-      <ul class="list todo-tasks" id="tasks"></ul>
-    </section>
-    <section class="problems-block" aria-label="Changed design files">
-      <div class="section-head"><h2>Changed design files</h2><button type="button" id="refresh-changed">Refresh</button></div>
-      <p class="muted">Design files that differ from the last commit. Link them to a task before you commit.</p>
-      <ul class="list" id="changed"></ul>
-      <datalist id="changed-files"></datalist>
-    </section>
+      <section class="game-panel todo-list" aria-label="Tasks">
+        <h2>Tasks <select id="state-filter" aria-label="state filter"></select></h2>
+        <ul class="list todo-tasks" id="tasks"></ul>
+      </section>
+    </div>
   </main>
   <script type="module" src="/web/todo.js"></script>
 </body>

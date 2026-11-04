@@ -148,3 +148,14 @@ export async function sendGm(path, body) {
   });
   return { ok: response.ok, text: await response.text() };
 }
+
+/** Sends a GM command and tells `say` what happens: sending, done (with the answer) or the failure. */
+export async function sendGmAndSay(path, body, say) {
+  say('Sending…');
+  try {
+    const answer = await sendGm(path, body);
+    say(answer.ok ? `Done: ${answer.text}` : answer.text);
+  } catch (failure) {
+    say(`Not sent: ${failure.message ?? failure}`);
+  }
+}

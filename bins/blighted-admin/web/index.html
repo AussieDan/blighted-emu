@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/web/style.css">
   <script src="/web/theme.js"></script>
 </head>
-<body>
+<body class="home-page game">
   <nav class="rail" aria-label="Pages">
+    <span class="brand">Blighted Emu</span>
     <a href="/" aria-current="page">Home</a>
     <a href="/live">Live</a>
     <a href="/live3d">Live 3D</a>
@@ -19,21 +20,29 @@
     <a href="/gm">GM</a>
     <a href="/web/map.html">Map</a>
     <a href="/web/captures.html">Captures</a>
-    <button type="button" class="theme" id="theme"></button>
+    <span class="bar-end">
+      <button type="button" class="theme" id="theme"></button>
+    </span>
   </nav>
-  <main class="work">
-    <header class="masthead">
-      <h1>Blighted Emu</h1>
-    </header>
-    <div class="facts figures" id="facts"><div class="fact"><span>World</span>Reading the world facts.</div></div>
+  <main class="work sheet">
+    <h1 class="unseen">Blighted Emu</h1>
+    <div class="home-board">
+    <section class="game-panel world" aria-label="World">
+      <h2>World</h2>
+      <div class="facts" id="facts"><div class="fact"><span>World</span>Reading the world facts.</div></div>
+    </section>
     <ul class="pages">
-      <li><a href="/live">Live</a>
-    <a href="/live3d">Live 3D</a><p>Server status, figures, players and mobs on the map, and the bot batch buttons.</p></li>
-      <li><a href="/studio">Studio</a><p>The team's design files in content/: their problems, a full check, and Apply into the local world.</p></li>
+      <li><a href="/live">Live</a><p>Server status, figures, players and mobs on the map, and the bot batch buttons.</p></li>
+      <li><a href="/live3d">Live 3D</a><p>The selected player and everything around it in 3D.</p></li>
       <li><a href="/gm">GM</a><p>The audit log of GM commands, bans, and admin ranks (head admins).</p></li>
+      <li><a href="/studio">Studio</a><p>The team's design files in content/: their problems, a full check, and Apply into the local world.</p></li>
+      <li><a href="/records">Records</a><p>Find a game data record and edit it as a design file.</p></li>
+      <li><a href="/scripts">Scripts</a><p>The script editor: blocks for triggers, conditions and actions.</p></li>
+      <li><a href="/todo">To-do</a><p>The team's tasks in content/todo.toml, and GitHub issues to import.</p></li>
       <li><a href="/web/map.html">Map</a><p>The world map with its relief, mob spawns, gatherables and landmarks.</p></li>
       <li><a href="/web/captures.html">Captures</a><p>Recorded retail sessions: paths, message types, bytes, walk stops, and a compare.</p></li>
     </ul>
+    </div>
   </main>
   <script type="module">
     import { factElements } from '/web/tiles.js';

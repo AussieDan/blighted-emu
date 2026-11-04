@@ -5,6 +5,7 @@
 import { POINT_RING, SIGNAL } from './palette.js';
 import {
   boxOf,
+  spawnCellSquares,
   parentTile,
   screenToWorld,
   tileLevelFor,
@@ -22,6 +23,8 @@ export const SPAWN_ZOOM_M_PER_PX = 4;
 export const LAYERS = Object.freeze({ TILES: 'tiles', RELIEF: 'relief', BOTH: 'both' });
 
 const SPAWN_COLOURS = { vitals: SIGNAL.RED, gatherables: SIGNAL.GREEN, landmarks: SIGNAL.YELLOW };
+const SPAWN_CELLS_URL = '/api/world/spawn-cells';
+
 const LABEL_M_PER_PX = 0.6;
 const WHEEL_STEP = 1.2;
 const BUTTON_STEP = 2;
@@ -36,6 +39,8 @@ const PATH_WIDTH_PX = 2;
 const OVERLAY_ALPHA = 0.5;
 const CELL_FILL_ALPHA = 0.15;
 const CELL_LINE_WIDTH_PX = 1;
+/** The centre of a cell, in cells from its corner. */
+const CELL_CENTRE = 0.5;
 const SPAWN_FETCH_DELAY_MS = 150;
 const POINT_RING_PX = 1.5;
 /** Weight and size of the labels; the family is the page's sign face. */
@@ -64,6 +69,10 @@ export class WorldMap {
     this.layer = info.map_tiles ? LAYERS.TILES : LAYERS.RELIEF;
     this.spawnKinds = new Set();
     this.spawns = [];
+    // The zoomed out overview: its squares and the kinds they were fetched for.
+    this.overview = [];
+    this.overviewKinds = '';
+    this.overviewRequest = 0;
     this.paths = [];
     this.points = [];
     this.cells = null;
@@ -93,7 +102,10 @@ export class WorldMap {
     this.redraw();
   }
 
-  /** Sets the spawn kinds to show ('vitals', 'gatherables', 'landmarks'). */
+  /**
+   * Sets the spawn kinds to show ('vitals', 'gatherables', 'landmarks'). Zoomed in, each point
+   * shows; zoomed out, a square per cell shows where the points are.
+   */
   setSpawnKinds(kinds) {
     this.spawnKinds = new Set(kinds);
     this.fetchSpawnsSoon();
@@ -112,8 +124,9 @@ export class WorldMap {
   }
 
   /**
-   * Sim cells: { size, columns, rows, owners, colors } (owners row by row from the south-west
-   * corner, each an index into `colors` or null), or null for none.
+   * Sim cells: { size, columns, rows, owners, colors, names } (owners row by row from the
+   * south-west corner, each an index into `colors` and `names` or null), or null for none. Each
+   * sim's ground is labelled with its name at the centre of its cells.
    */
   setCells(cells) {
     this.cells = cells;
@@ -255,12 +268,43 @@ export class WorldMap {
 
   fetchSpawnsSoon() {
     clearTimeout(this.spawnTimer);
-    if (this.spawnKinds.size === 0 || this.view.metresPerPixel > SPAWN_ZOOM_M_PER_PX) {
+    if (this.spawnKinds.size === 0 || this.zoomedOut()) {
       this.spawns = [];
+      this.fetchOverview();
       this.redraw();
       return;
     }
     this.spawnTimer = setTimeout(() => this.fetchSpawns(), SPAWN_FETCH_DELAY_MS);
+  }
+
+  /** Whether the view is too far out for single spawn points. */
+  zoomedOut() {
+    return this.view.metresPerPixel > SPAWN_ZOOM_M_PER_PX;
+  }
+
+  /** Fetches the overview of the kinds now shown, once per set of kinds. */
+  async fetchOverview() {
+    const kinds = [...this.spawnKinds].sort().join(',');
+    if (kinds === this.overviewKinds) {
+      return;
+    }
+    this.overviewKinds = kinds;
+    const request = ++this.overviewRequest;
+    if (kinds === '') {
+      this.overview = [];
+      return;
+    }
+    try {
+      const response = await fetch(`${SPAWN_CELLS_URL}?${new URLSearchParams({ kinds })}`);
+      const squares = response.ok ? spawnCellSquares(await response.json()) : [];
+      if (request === this.overviewRequest) {
+        this.overview = squares;
+        this.redraw();
+      }
+    } catch {
+      // A failed fetch shows no overview; the next change of kinds fetches again.
+      this.overviewKinds = '';
+    }
   }
 
   async fetchSpawns() {
@@ -315,7 +359,11 @@ export class WorldMap {
       this.drawTiles('relief', RELIEF_TILE_PX, alpha);
     }
     this.drawCells();
-    this.drawSpawns();
+    if (this.zoomedOut()) {
+      this.drawOverview();
+    } else {
+      this.drawSpawns();
+    }
     this.drawPaths();
     this.drawPoints();
   }
@@ -392,6 +440,46 @@ export class WorldMap {
       context.strokeStyle = colors[owner % colors.length];
       context.strokeRect(topLeft.px, topLeft.py, side, side);
     });
+    this.drawCellNames();
+  }
+
+  /** The name of each sim at the centre of the cells it owns. */
+  drawCellNames() {
+    const { size, columns, owners, names } = this.cells;
+    if (!names) {
+      return;
+    }
+    const sums = new Map();
+    owners.forEach((owner, index) => {
+      if (owner === null || owner === undefined) {
+        return;
+      }
+      const sum = sums.get(owner) ?? { x: 0, y: 0, count: 0 };
+      sum.x += (index % columns) + CELL_CENTRE;
+      sum.y += Math.floor(index / columns) + CELL_CENTRE;
+      sum.count += 1;
+      sums.set(owner, sum);
+    });
+    this.context.font = this.labelFont;
+    for (const [owner, sum] of sums) {
+      const name = names[owner];
+      if (name) {
+        const { px, py } = worldToScreen(this.view, (sum.x / sum.count) * size, (sum.y / sum.count) * size);
+        this.drawLabel(name, px, py);
+      }
+    }
+  }
+
+  drawOverview() {
+    const context = this.context;
+    for (const square of this.overview) {
+      const topLeft = worldToScreen(this.view, square.x, square.y + square.side);
+      const side = square.side / this.view.metresPerPixel;
+      context.globalAlpha = square.alpha;
+      context.fillStyle = SPAWN_COLOURS[square.kind];
+      context.fillRect(topLeft.px, topLeft.py, side, side);
+    }
+    context.globalAlpha = 1;
   }
 
   drawSpawns() {

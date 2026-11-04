@@ -3,10 +3,8 @@
 // events) and the bot batch buttons.
 
 import { KINDS, mobEntity, playerEntity, selectionRows } from './entity.js';
-import {
-  coinsRequest, eventStartRequest, eventStopRequest, experienceRequest, itemRequest, levelRequest, masteryName, masteryRankRequest,
-  masteryRequest, questRequest, sendGm, spawnRequest, teleportRequest,
-} from './gm.js';
+import { eventStartRequest, eventStopRequest, sendGmAndSay, spawnRequest } from './gm.js';
+import { mountPlayerControls } from './gm-player.js';
 import { WorldMap } from './map.js';
 import { SERIES, SIGNAL } from './palette.js';
 import { STATUS_GROUPS, isMarked, nextStatuses, statusText } from './status.js';
@@ -58,11 +56,14 @@ const MOB_KEY = 'mob-';
 const status = document.getElementById('status');
 const socketBox = document.getElementById('socket');
 const serversBox = document.getElementById('servers');
+const pagesBox = document.getElementById('pages');
 const tilesBox = document.getElementById('tiles');
 const moreTilesBox = document.getElementById('tiles-more');
 const cpuBox = document.getElementById('cpu');
 const playersCount = document.getElementById('players-count');
 const playersPanel = document.getElementById('players-panel');
+/** The inspector section of the selected entity; a new selection opens it. */
+const selectedPanel = document.getElementById('selected-panel');
 const bigMapButton = document.getElementById('big-map');
 const batchesList = document.getElementById('batches');
 const eventsList = document.getElementById('events');
@@ -192,12 +193,19 @@ function groupElement(title, items) {
   return group;
 }
 
+function mutedLine(text) {
+  const line = document.createElement('p');
+  line.className = 'muted';
+  line.textContent = text;
+  return line;
+}
+
 function showServers(nowMs) {
   if (statuses === null || statuses.size === 0) {
-    const empty = document.createElement('p');
-    empty.className = 'muted';
-    empty.textContent = statuses === null ? 'Waiting for the first state.' : 'No sim heartbeat and no metrics page yet.';
-    serversBox.replaceChildren(empty);
+    serversBox.replaceChildren(
+      mutedLine(statuses === null ? 'Waiting for the first state.' : 'No sim heartbeat and no metrics page yet.'),
+    );
+    pagesBox.replaceChildren();
     return;
   }
   const groups = { [STATUS_GROUPS.SIMS]: [], [STATUS_GROUPS.PAGES]: [] };
@@ -223,18 +231,24 @@ function showServers(nowMs) {
       statusElements.delete(key);
     }
   }
-  serversBox.replaceChildren(
-    ...[['Sims', groups[STATUS_GROUPS.SIMS]], ['Metrics pages', groups[STATUS_GROUPS.PAGES]]]
-      .filter(([, items]) => items.length > 0)
-      .map(([title, items]) => groupElement(title, items)),
-  );
+  const sims = groups[STATUS_GROUPS.SIMS];
+  const pages = groups[STATUS_GROUPS.PAGES];
+  serversBox.replaceChildren(sims.length > 0 ? groupElement('Sims', sims) : mutedLine('No sim heartbeat yet.'));
+  pagesBox.replaceChildren(...(pages.length > 0 ? [groupElement('Metrics pages', pages)] : []));
 }
 
 function showMap() {
   const table = view?.table;
   map.setCells(
     table
-      ? { size: table.cell_size_m, columns: table.columns, rows: table.rows, owners: table.owners, colors: SIM_COLOURS }
+      ? {
+        size: table.cell_size_m,
+        columns: table.columns,
+        rows: table.rows,
+        owners: table.owners,
+        colors: SIM_COLOURS,
+        names: table.sims.map((sim) => sim.id),
+      }
       : null,
   );
   const points = [];
@@ -283,6 +297,9 @@ function showSelection() {
 
 function select(key) {
   selectedKey = key;
+  if (key !== null) {
+    selectedPanel.open = true;
+  }
   map.follow(key);
   showMap();
   showSelection();
@@ -292,7 +309,6 @@ function select(key) {
 const gmStatus = document.getElementById('gm-status');
 const gmPlayer = document.getElementById('gm-player');
 const gmMob = document.getElementById('gm-mob');
-const teleportFields = ['gm-x', 'gm-y', 'gm-z'].map((id) => document.getElementById(id));
 const spawnFields = Object.fromEntries(
   ['vitals', 'level', 'count', 'x', 'y', 'z'].map((name) => [name, document.getElementById(`gm-spawn-${name}`)]),
 );
@@ -311,23 +327,27 @@ function showTeleport() {
   gmMob.hidden = !entity || entity.kind !== KINDS.MOB;
   gmStatus.textContent = '';
   if (entity && entity.kind !== KINDS.MOB) {
-    [entity.x, entity.y, entity.z].forEach((value, index) => {
-      teleportFields[index].value = value.toFixed(1);
-    });
+    playerControls.fill(entity);
     spawnFields.z.value = entity.z.toFixed(1);
   }
 }
 
-/** Sends a GM command and shows its answer. */
-async function gm(path, body) {
-  gmStatus.textContent = 'Sending…';
-  try {
-    const answer = await sendGm(path, body);
-    gmStatus.textContent = answer.ok ? `Done: ${answer.text}` : answer.text;
-  } catch (failure) {
-    gmStatus.textContent = `Not sent: ${failure.message ?? failure}`;
-  }
+function sayGm(text) {
+  gmStatus.textContent = text;
 }
+
+/** Sends a GM command and shows its answer. */
+function gm(path, body) {
+  return sendGmAndSay(path, body, sayGm);
+}
+
+const playerControls = mountPlayerControls(document.getElementById('gm-player-controls'), {
+  entity: () => {
+    const entity = selectedEntity();
+    return entity && entity.kind !== KINDS.MOB ? entity : undefined;
+  },
+  say: sayGm,
+});
 
 /** Runs `send` with the selected entity, or says there is none. */
 function onSelected(send) {
@@ -338,135 +358,6 @@ function onSelected(send) {
     gmStatus.textContent = 'Select a player or a mob first.';
   }
 }
-
-document.getElementById('gm-teleport').addEventListener('submit', (event) => {
-  event.preventDefault();
-  onSelected((entity) => {
-    const { request, error } = teleportRequest(entity.entity, ...teleportFields.map((field) => field.value));
-    if (error) {
-      gmStatus.textContent = error;
-    } else {
-      gm('teleport', request);
-    }
-  });
-});
-
-document.getElementById('gm-to-player').addEventListener('submit', (event) => {
-  event.preventDefault();
-  const toEntity = Number(document.getElementById('gm-to-entity').value.trim());
-  onSelected((entity) => {
-    if (!Number.isInteger(toEntity) || toEntity <= 0) {
-      gmStatus.textContent = 'Give the entity number of the player to go to.';
-    } else {
-      gm('teleport-to-player', { entity: entity.entity, to_entity: toEntity });
-    }
-  });
-});
-
-const PLAYER_COMMANDS = Object.freeze({
-  heal: (entity) => ['heal', { entity }],
-  kill: (entity) => ['kill', { entity }],
-  kick: (entity) => ['kick', { entity }],
-  'god-on': (entity) => ['god', { entity, on: true }],
-  'god-off': (entity) => ['god', { entity, on: false }],
-});
-for (const button of document.querySelectorAll('[data-gm]')) {
-  button.addEventListener('click', () => {
-    onSelected((entity) => gm(...PLAYER_COMMANDS[button.dataset.gm](entity.entity)));
-  });
-}
-
-function sendItem(path) {
-  onSelected((entity) => {
-    const { request, error } = itemRequest(
-      entity.entity,
-      document.getElementById('gm-item-id').value,
-      document.getElementById('gm-item-quantity').value,
-    );
-    if (error) {
-      gmStatus.textContent = error;
-    } else {
-      gm(path, path === 'give-item' ? request : { entity: request.entity, item: request.item });
-    }
-  });
-}
-document.getElementById('gm-item').addEventListener('submit', (event) => {
-  event.preventDefault();
-  sendItem('give-item');
-});
-document.getElementById('gm-take').addEventListener('click', () => sendItem('take-item'));
-const PROGRESSION_URL = '/api/gm/progression';
-/** The tops of the level and the mastery rank; read from the server at start. */
-const progressionTops = { maxLevel: 0, maxRank: 0 };
-const masterySelect = document.getElementById('gm-mastery-id');
-
-/** Runs the request that `build` makes from the selected player, or shows its error. */
-function sendBuilt(path, build) {
-  onSelected((entity) => {
-    const { request, error } = build(entity.entity);
-    if (error) {
-      gmStatus.textContent = error;
-    } else {
-      gm(path, request);
-    }
-  });
-}
-
-document.getElementById('gm-level').addEventListener('submit', (event) => {
-  event.preventDefault();
-  const level = document.getElementById('gm-level-value').value;
-  sendBuilt('set-level', (entity) => levelRequest(entity, level, progressionTops.maxLevel));
-});
-document.getElementById('gm-give-xp').addEventListener('click', () => {
-  const amount = document.getElementById('gm-xp-amount').value;
-  sendBuilt('give-experience', (entity) => experienceRequest(entity, amount));
-});
-document.getElementById('gm-mastery').addEventListener('submit', (event) => {
-  event.preventDefault();
-  const rank = document.getElementById('gm-mastery-rank').value;
-  sendBuilt('set-mastery-rank', (entity) => masteryRankRequest(entity, masterySelect.value, rank, progressionTops.maxRank));
-});
-document.getElementById('gm-give-mastery').addEventListener('click', () => {
-  const amount = document.getElementById('gm-mastery-xp').value;
-  sendBuilt('give-mastery', (entity) => masteryRequest(entity, masterySelect.value, amount));
-});
-document.getElementById('gm-coins').addEventListener('submit', (event) => {
-  event.preventDefault();
-  const coins = document.getElementById('gm-coins-value').value;
-  sendBuilt('set-coins', (entity) => coinsRequest(entity, coins));
-});
-
-/** Reads the weapon masteries and the tops of the level and the rank. */
-async function loadProgression() {
-  const response = await fetch(PROGRESSION_URL);
-  if (!response.ok) {
-    throw new Error(`Progression: ${response.status} ${await response.text()}`);
-  }
-  const progression = await response.json();
-  progressionTops.maxLevel = progression.max_level;
-  progressionTops.maxRank = progression.max_rank;
-  masterySelect.append(...progression.masteries.map((id) => {
-    const option = document.createElement('option');
-    option.value = id;
-    option.textContent = masteryName(id);
-    return option;
-  }));
-}
-loadProgression().catch((error) => {
-  gmStatus.textContent = String(error.message ?? error);
-});
-
-document.getElementById('gm-quest').addEventListener('submit', (event) => {
-  event.preventDefault();
-  onSelected((entity) => {
-    const { request, error } = questRequest(entity.entity, document.getElementById('gm-quest-id').value);
-    if (error) {
-      gmStatus.textContent = error;
-    } else {
-      gm('start-quest', request);
-    }
-  });
-});
 
 document.getElementById('gm-despawn').addEventListener('click', () => {
   onSelected((entity) => gm('despawn', { entities: [entity.entity] }));
@@ -728,7 +619,7 @@ for (const size of BATCH_SIZES) {
 document.getElementById('stop-all').addEventListener('click', () => post(STOP_ALL_URL));
 document.getElementById('reconnect').addEventListener('click', connect);
 document.getElementById('fit').addEventListener('click', () => map.fit());
-playersPanel.open = savedChoice(PLAYERS_OPEN_KEY, true);
+playersPanel.open = savedChoice(PLAYERS_OPEN_KEY, false);
 playersPanel.addEventListener('toggle', () => {
   saveChoice(PLAYERS_OPEN_KEY, playersPanel.open);
   showPlayers();

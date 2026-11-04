@@ -19,16 +19,20 @@ export const SIGNAL = Object.freeze({
   STONE: signal('stone'),
 });
 
-/** Colours of things in a row (sims, tracks): each next to its neighbours is easy to tell. */
+/**
+ * Colours of things in a row (sims, tracks): each next to its neighbours is easy to tell. Navy
+ * comes first: no live map point uses it, so the ground of the first sim never hides a point.
+ */
 export const SERIES = Object.freeze([
+  SIGNAL.NAVY,
+  SIGNAL.ICE,
+  SIGNAL.ORANGE,
   SIGNAL.BLUE,
+  SIGNAL.STONE,
+  SIGNAL.PURPLE,
   SIGNAL.RED,
   SIGNAL.GREEN,
   SIGNAL.YELLOW,
-  SIGNAL.PURPLE,
-  SIGNAL.ORANGE,
-  SIGNAL.NAVY,
-  SIGNAL.ICE,
 ]);
 
 /** The ring around every point, so a point shows on light and dark ground. */

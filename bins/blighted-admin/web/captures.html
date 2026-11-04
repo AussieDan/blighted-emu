@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/web/style.css">
   <script src="/web/theme.js"></script>
 </head>
-<body class="viewer-page">
+<body class="viewer-page game">
   <nav class="rail" aria-label="Pages">
+    <span class="brand">Blighted Emu</span>
     <a href="/">Home</a>
     <a href="/live">Live</a>
     <a href="/live3d">Live 3D</a>
@@ -19,15 +20,15 @@
     <a href="/gm">GM</a>
     <a href="/web/map.html">Map</a>
     <a href="/web/captures.html" aria-current="page">Captures</a>
-    <button type="button" class="theme" id="theme"></button>
+    <span class="bar-end">
+      <span class="status" id="session-title">No session open</span>
+      <button type="button" class="theme" id="theme"></button>
+    </span>
   </nav>
-  <main class="work">
-  <header class="masthead">
-    <h1>Blighted Emu <span>· Captures</span></h1>
-    <div class="end"><span class="status" id="session-title">No session open</span></div>
-  </header>
+  <main class="work sheet">
+  <h1 class="unseen">Blighted Emu · Captures</h1>
   <div class="viewer">
-    <aside class="pane" id="left">
+    <aside class="pane game-panel" id="left">
       <div class="pane-head">
         <input type="search" id="search" placeholder="Search sessions" aria-label="Search sessions">
       </div>
@@ -38,19 +39,20 @@
       </div>
       <ul class="list" id="entities" hidden></ul>
     </aside>
-    <section class="centre">
+    <section class="centre game-panel">
       <div class="facts" id="summary"></div>
-      <div class="chart" aria-label="Session map"><canvas id="map" class="map"></canvas></div>
+      <div class="chart stage" aria-label="Session map"><canvas id="map" class="map"></canvas></div>
       <div class="timeline">
         <input type="range" id="time" min="0" max="0" value="0" aria-label="Time">
         <span class="status" id="time-label">—</span>
       </div>
     </section>
-    <aside class="pane" id="right">
+    <aside class="pane game-panel" id="right">
       <div class="pane-head"><strong>Selection</strong></div>
       <pre class="detail" id="selection"><span class="hint">Click a path, an entity or a message.</span></pre>
     </aside>
   </div>
+  <section class="game-panel capture-tabs" aria-label="Session details">
   <nav class="tabs" id="tabs">
     <button type="button" data-tab="types" class="active">Message types</button>
     <button type="button" data-tab="messages">Messages</button>
@@ -72,6 +74,7 @@
       </div>
       <table class="grid" id="compare-table"></table>
     </div>
+  </section>
   </section>
   </main>
   <script type="module" src="/web/captures.js"></script>

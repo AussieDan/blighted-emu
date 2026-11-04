@@ -129,3 +129,35 @@ export function boxAround(points, margin) {
   }
   return { minX: minX - margin, minY: minY - margin, maxX: maxX + margin, maxY: maxY + margin };
 }
+
+/** The order of the kinds in an overview cell: the first fills the cell, each next one is smaller. */
+const SPAWN_KIND_ORDER = Object.freeze(['vitals', 'gatherables', 'landmarks']);
+/** Opacity of an overview square: the fewest points of a kind, then the most. */
+const OVERVIEW_ALPHA_MIN = 0.25;
+const OVERVIEW_ALPHA_MAX = 0.85;
+/**
+ * The squares of a zoomed out map from `/api/world/spawn-cells`: one per cell and kind, in world
+ * metres from the south-west corner. The first kind of SPAWN_KIND_ORDER fills its cell; each next
+ * kind is a smaller square in the centre, so every kind stays seen. A square is more opaque the
+ * more points of its kind the cell holds, against the fullest cell of that kind.
+ */
+export function spawnCellSquares(answer) {
+  const most = new Map();
+  for (const cell of answer.cells) {
+    most.set(cell.kind, Math.max(most.get(cell.kind) ?? 0, cell.count));
+  }
+  const shares = SPAWN_KIND_ORDER.length;
+  return answer.cells.map((cell) => {
+    const rank = Math.max(SPAWN_KIND_ORDER.indexOf(cell.kind), 0);
+    const side = (answer.cell_m * (shares - rank)) / shares;
+    const inset = (answer.cell_m - side) / 2;
+    const fullness = cell.count / most.get(cell.kind);
+    return {
+      kind: cell.kind,
+      x: cell.x * answer.cell_m + inset,
+      y: cell.y * answer.cell_m + inset,
+      side,
+      alpha: OVERVIEW_ALPHA_MIN + (OVERVIEW_ALPHA_MAX - OVERVIEW_ALPHA_MIN) * fullness,
+    };
+  });
+}

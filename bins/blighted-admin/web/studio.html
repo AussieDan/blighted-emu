@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/web/style.css">
   <script src="/web/theme.js"></script>
 </head>
-<body>
+<body class="studio-page game">
   <nav class="rail" aria-label="Pages">
+    <span class="brand">Blighted Emu</span>
     <a href="/">Home</a>
     <a href="/live">Live</a>
     <a href="/live3d">Live 3D</a>
@@ -19,35 +20,44 @@
     <a href="/gm">GM</a>
     <a href="/web/map.html">Map</a>
     <a href="/web/captures.html">Captures</a>
-    <button type="button" class="theme" id="theme"></button>
+    <span class="bar-end">
+      <span class="status" id="status" role="status"></span>
+      <button type="button" id="check">Check</button>
+      <button type="button" id="apply">Apply</button>
+      <button type="button" class="theme" id="theme"></button>
+    </span>
   </nav>
-  <main class="work">
-    <header class="masthead">
-      <h1>Blighted Emu <span>· Studio</span></h1>
-      <div class="end">
-        <span class="status" id="status" role="status"></span>
-        <button type="button" id="check">Check</button>
-        <button type="button" id="apply">Apply</button>
-      </div>
-    </header>
-    <section class="apply" id="apply-line" data-phase="idle" aria-label="Apply">
+  <main class="work sheet">
+    <h1 class="unseen">Blighted Emu · Studio</h1>
+    <div class="studio-board">
+      <div class="studio-column">
+        <details class="game-panel how-to" open>
+          <summary><h2>How Studio works</h2></summary>
+          <p>Studio changes the game world with no code. Each change is one small design file in the <code>content/</code> folder of this checkout. The game data of the client is never changed.</p>
+          <ol>
+            <li><b>Pick a kind</b> in the Editor: <b>AI profile</b> (how a mob acts: wander, guard, patrol or idle), <b>Path</b> (a walk route for a patrol) or <b>Spawn group</b> (new mobs at points you pick).</li>
+            <li><b>Fill in the fields.</b> For a path or a spawn group, right-click the map to add a point. Undo point and Clear points fix mistakes.</li>
+            <li><b>Save.</b> The file shows in Design files. The game does not change yet.</li>
+            <li><b>Apply</b> (top right). It checks every design file, writes the merged game data, and restarts the local world. If a check fails, Problems lists it, and Apply writes nothing.</li>
+          </ol>
+          <p>Items, loot, mobs and quests are changed on the Records page. Block scripts are on the Scripts page. Every file format is in <code>content/README.md</code>.</p>
+        </details>
+        <section class="game-panel apply" id="apply-line" data-phase="idle" aria-label="Apply">
+          <h2>Apply</h2>
       <div class="apply-bar"><i id="apply-bar"></i></div>
       <p><b id="apply-word">Idle</b> <span id="apply-detail" class="muted">Apply checks the design files, writes the merged content, and restarts the local world.</span></p>
-    </section>
-    <section class="problems-block" aria-label="Problems">
-      <div class="section-head"><h2>Problems</h2></div>
-      <ul class="list problems" id="problems"><li class="muted">None found.</li></ul>
-    </section>
-    <section class="editor" aria-label="Editors">
-      <div class="section-head">
-        <h2>Editors</h2>
+        </section>
+        <section class="game-panel" aria-label="Problems">
+          <h2>Problems</h2>
+          <ul class="list problems" id="problems"><li class="muted">None found.</li></ul>
+        </section>
+        <section class="game-panel editor" aria-label="Editors">
+          <h2>Editor <span class="status" id="editor-status" role="status"></span></h2>
         <div class="tabs" role="group" aria-label="Kind">
           <button type="button" data-editor="ai_profile">AI profile</button>
           <button type="button" data-editor="path">Path</button>
           <button type="button" data-editor="spawn_group">Spawn group</button>
         </div>
-        <span class="status" id="editor-status" role="status"></span>
-      </div>
       <form class="gm" id="form-ai_profile" data-kind="ai_profile">
         <input type="text" name="id" aria-label="profile id" placeholder="profile id" class="wide">
         <select name="behaviour" aria-label="behaviour"></select>
@@ -75,7 +85,20 @@
         <button type="button" id="editor-save">Save</button>
         <button type="button" class="danger" id="editor-delete">Delete</button>
       </div>
-      <section class="chart editor-map" id="editor-map-box" aria-label="Editor map">
+        </section>
+        <section class="game-panel files" aria-label="Design files">
+          <h2>Design files <span class="status" id="files-count"></span></h2>
+      <div class="table-scroll">
+        <table class="grid">
+          <thead>
+            <tr><th>Kind</th><th>Id</th><th>Action</th><th>Map</th><th>File</th></tr>
+          </thead>
+          <tbody id="files"></tbody>
+        </table>
+      </div>
+        </section>
+      </div>
+      <section class="chart stage editor-map" id="editor-map-box" aria-label="Editor map">
         <canvas class="map" id="editor-map"></canvas>
         <form class="map-tools gm" id="editor-goto">
           <input type="text" name="x" inputmode="decimal" aria-label="x (metres)" placeholder="x">
@@ -86,18 +109,8 @@
           <button type="button" id="editor-fit">Whole world</button>
         </form>
       </section>
-    </section>
-    <details class="players" open>
-      <summary class="section-head"><h2>Design files</h2><span class="status" id="files-count"></span></summary>
-      <div class="table-scroll">
-        <table class="grid">
-          <thead>
-            <tr><th>Kind</th><th>Id</th><th>Action</th><th>Map</th><th>File</th></tr>
-          </thead>
-          <tbody id="files"></tbody>
-        </table>
-      </div>
-    </details>
+      <p class="empty-note">The map places points for paths and spawn groups. Pick Path or Spawn group to use it.</p>
+    </div>
   </main>
   <script type="module" src="/web/studio.js"></script>
 </body>

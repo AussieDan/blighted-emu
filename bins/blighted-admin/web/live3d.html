@@ -15,8 +15,9 @@
     }
   </script>
 </head>
-<body class="live3d-page">
+<body class="live3d-page game">
   <nav class="rail" aria-label="Pages">
+    <span class="brand">Blighted Emu</span>
     <a href="/">Home</a>
     <a href="/live">Live</a>
     <a href="/live3d" aria-current="page">Live 3D</a>
@@ -27,23 +28,31 @@
     <a href="/gm">GM</a>
     <a href="/web/map.html">Map</a>
     <a href="/web/captures.html">Captures</a>
-    <button type="button" class="theme" id="theme"></button>
+    <span class="bar-end">
+      <button type="button" class="theme" id="theme"></button>
+    </span>
   </nav>
   <main class="work">
-    <header class="masthead">
-      <h1>Blighted Emu <span>· Live 3D</span></h1>
-      <div class="end">
-        <label for="player">Player</label>
-        <select id="player" aria-label="Player"></select>
-        <span class="status" id="status" role="status"></span>
-      </div>
-    </header>
+    <h1 class="unseen">Blighted Emu · Live 3D</h1>
     <section class="chart" aria-label="Live 3D view">
       <canvas id="scene" class="map"></canvas>
     </section>
-    <p class="muted">
+    <section class="follow" aria-label="Followed player">
+      <h2><label for="player">Follow</label></h2>
+      <select id="player"></select>
+      <form class="gm goto" id="goto">
+        <strong>Go to</strong>
+        <input type="text" id="goto-x" inputmode="decimal" aria-label="x (metres east)" placeholder="x">
+        <input type="text" id="goto-y" inputmode="decimal" aria-label="y (metres north)" placeholder="y">
+        <button type="submit">Go</button>
+      </form>
+      <label><input type="checkbox" id="map-colours"> Map colours on the ground</label>
+      <span class="status" id="status" role="status"></span>
+    </section>
+    <p class="help">
       Left-drag turns, right-drag moves, wheel zooms. Click a player to follow them.
       <kbd>R</kbd> puts the camera back behind the followed player.
+      Gold wire = the ground. Light outlines = rocks, buildings and props. Green cones = trees and bushes.
       Yellow = followed player, blue = player, grey = bot, red = mob, faded = dead.
       Lines: attacker → target. Blue sheet = the sea.
     </p>

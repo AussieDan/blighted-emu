@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/web/style.css">
   <script src="/web/theme.js"></script>
 </head>
-<body>
+<body class="gm-page game">
   <nav class="rail" aria-label="Pages">
+    <span class="brand">Blighted Emu</span>
     <a href="/">Home</a>
     <a href="/live">Live</a>
     <a href="/live3d">Live 3D</a>
@@ -19,45 +20,67 @@
     <a href="/gm" aria-current="page">GM</a>
     <a href="/web/map.html">Map</a>
     <a href="/web/captures.html">Captures</a>
-    <button type="button" class="theme" id="theme"></button>
+    <span class="bar-end">
+      <span class="status" id="me"></span>
+      <button type="button" id="logout" hidden>Log out</button>
+      <button type="button" class="theme" id="theme"></button>
+    </span>
   </nav>
-  <main class="work">
-    <header class="masthead">
-      <h1>Blighted Emu <span>· GM</span></h1>
-      <div class="end"><span class="status" id="me"></span><button type="button" id="logout" hidden>Log out</button></div>
-    </header>
-    <section class="problems-block" aria-label="Bans">
-      <div class="section-head"><h2>Ban</h2></div>
-      <form class="gm" id="ban">
-        <input type="text" id="ban-name" aria-label="login name" placeholder="login name" class="wide">
-        <button type="submit" class="danger">Ban</button>
-        <button type="button" id="unban">Unban</button>
-      </form>
-    </section>
-    <section class="problems-block" aria-label="Ranks" id="ranks-block" hidden>
-      <div class="section-head"><h2>Ranks</h2></div>
-      <form class="gm" id="rank">
-        <input type="text" id="rank-name" aria-label="login name" placeholder="login name" class="wide">
-        <select id="rank-value" aria-label="rank">
-          <option value="csr">CSR</option>
-          <option value="game_master">Game master</option>
-          <option value="head_admin">Head admin</option>
-          <option value="">No rank</option>
-        </select>
-        <button type="submit">Set</button>
-      </form>
-      <ul class="list" id="ranks"></ul>
-    </section>
-    <p class="status" id="status" role="status"></p>
-    <details class="players" open>
-      <summary class="section-head"><h2>Audit log</h2><span class="status" id="audit-count"></span></summary>
-      <div class="table-scroll">
-        <table class="grid">
-          <thead><tr><th>Time</th><th>Who</th><th>Rank</th><th>Command</th><th>Target</th><th>Result</th></tr></thead>
-          <tbody id="audit"></tbody>
-        </table>
+  <main class="work sheet">
+    <h1 class="unseen">Blighted Emu · GM</h1>
+    <div class="gm-board">
+      <div class="gm-column">
+        <section class="game-panel online" aria-label="Players online">
+          <h2>Players online <span class="status" id="online-count"></span></h2>
+          <p class="hint">Everyone in the game now, on every sim. Pick a player to move, heal, give items to or kick.</p>
+          <label class="bots-toggle"><input type="checkbox" id="show-bots"> Show bots</label>
+          <ul class="list online-list" id="online"></ul>
+        </section>
+        <section class="game-panel" aria-label="Bans">
+          <h2>Ban an account</h2>
+          <p class="hint">A banned account cannot log in, online or not. Name it by login name, Discord user id or Discord username.</p>
+          <form class="gm" id="ban">
+            <input type="text" id="ban-name" aria-label="login name" placeholder="login name" class="wide">
+            <button type="submit" class="danger">Ban</button>
+            <button type="button" id="unban">Unban</button>
+          </form>
+        </section>
+        <section class="game-panel" aria-label="Ranks" id="ranks-block" hidden>
+          <h2>Admin ranks</h2>
+          <p class="hint">Who may open this site. A CSR may only kick. A game master may also move, heal, give, set levels and ban. A head admin may also set ranks.</p>
+          <form class="gm" id="rank">
+            <input type="text" id="rank-name" aria-label="login name" placeholder="login name" class="wide">
+            <select id="rank-value" aria-label="rank">
+              <option value="csr">CSR</option>
+              <option value="game_master">Game master</option>
+              <option value="head_admin">Head admin</option>
+              <option value="">No rank</option>
+            </select>
+            <button type="submit">Set</button>
+          </form>
+          <ul class="list" id="ranks"></ul>
+        </section>
       </div>
-    </details>
+      <div class="gm-column gm-main">
+        <section class="game-panel picked" aria-label="Picked player" id="picked" hidden>
+          <h2 id="picked-name"></h2>
+          <p class="hint" id="picked-facts"></p>
+          <div id="picked-controls"></div>
+        </section>
+        <p class="empty-note">Pick a player on the left to act on them. When no one is online, the list is empty.</p>
+        <p class="status game-note" id="status" role="status"></p>
+        <section class="game-panel audit" aria-label="Audit log">
+          <h2>Audit log <span class="status" id="audit-count"></span></h2>
+          <p class="hint">Every GM command and every admin login, newest first.</p>
+          <div class="table-scroll">
+            <table class="grid">
+              <thead><tr><th>Time</th><th>Who</th><th>Rank</th><th>Command</th><th>Target</th><th>Result</th></tr></thead>
+              <tbody id="audit"></tbody>
+            </table>
+          </div>
+        </section>
+      </div>
+    </div>
   </main>
   <script type="module" src="/web/gm-page.js"></script>
 </body>

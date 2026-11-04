@@ -226,7 +226,7 @@ function addBlock(name) {
 
 function drawPalette() {
   elements.palette.replaceChildren(...CATEGORIES.flatMap((category) => {
-    const heading = document.createElement('h2');
+    const heading = document.createElement('h3');
     heading.textContent = category;
     const buttons = [...blocks.values()].filter((block) => block.category === category).map((block) => {
       const button = document.createElement('button');

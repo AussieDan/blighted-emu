@@ -4,11 +4,15 @@ import assert from 'node:assert/strict';
 
 const {
   MOB_STATE_DEAD,
+  TERRAIN_STEP_M,
   fightLines,
   groundTiles,
   labelText,
   lerpPosition,
   northRowHeight,
+  plantOf,
+  plantTriangles,
+  sceneTriangles,
   stateGap,
   terrainSquare,
   toScene,
@@ -88,11 +92,17 @@ test('fightLines pairs a live attacker with its live target both ways', () => {
 
 test('terrainSquare snaps its corner to the sample step and centres on the player', () => {
   const square = terrainSquare(1000.7, 2000.2);
-  assert.equal(square.x0 % 3, 0);
-  assert.equal(square.y0 % 3, 0);
+  assert.equal(square.x0 % TERRAIN_STEP_M, 0);
+  assert.equal(square.y0 % TERRAIN_STEP_M, 0);
   assert.equal(square.side, 768);
-  assert.ok(Math.abs(square.x0 + square.side / 2 - 1000.7) < 3);
-  assert.ok(Math.abs(square.y0 + square.side / 2 - 2000.2) < 3);
+  assert.ok(Math.abs(square.x0 + square.side / 2 - 1000.7) < TERRAIN_STEP_M);
+  assert.ok(Math.abs(square.y0 + square.side / 2 - 2000.2) < TERRAIN_STEP_M);
+});
+
+test('sceneTriangles turns world corners into scene space and keeps the indices', () => {
+  const { positions, index } = sceneTriangles({ points: [10, 20, 3, 11, 20, 3, 10, 21, 4], triangles: [0, 1, 2] });
+  assert.deepEqual([...positions], [10, 3, -20, 11, 3, -20, 10, 4, -21]);
+  assert.deepEqual([...index], [0, 1, 2]);
 });
 
 test('groundTiles places the north tile at the top of the picture', () => {
@@ -115,4 +125,26 @@ test('northRowHeight reads rows from the north and fills missing samples', () =>
   assert.equal(northRowHeight(heights, 2, 0, 0, -1), 3);
   assert.equal(northRowHeight(heights, 2, 0, 1, -1), -1);
   assert.equal(northRowHeight(heights, 2, 1, 1, -1), 2);
+});
+
+test('plantOf sizes trees and bushes by the size word of their id and skips the rest', () => {
+  assert.deepEqual(plantOf('TreeHardwoodHuge'), { tree: true, height: 24 });
+  assert.deepEqual(plantOf('TreeIronwoodTiny'), { tree: true, height: 5 });
+  assert.deepEqual(plantOf('BananaTreeSmall'), { tree: true, height: 8 });
+  assert.equal(plantOf('BushLarge').tree, false);
+  assert.ok(plantOf('BushLarge').height > plantOf('BushSmall').height);
+  assert.equal(plantOf('Damned_Axeman'), null);
+  assert.equal(plantOf('IronVein'), null);
+});
+
+test('plantTriangles builds a closed trunk and crown for a tree and one cone for a bush', () => {
+  const tree = plantTriangles([{ id: 'TreeHardwoodLarge', x: 100, y: 200, z: 30 }]);
+  // A square trunk (4 sides, 2 triangles each) and a six-sided cone (side and base per side).
+  assert.equal(tree.index.length / 3, 4 * 2 + 6 * 2);
+  const heights = [];
+  for (let corner = 1; corner < tree.positions.length; corner += 3) heights.push(tree.positions[corner]);
+  assert.equal(Math.min(...heights), 30, 'the trunk stands on the gatherable point');
+  assert.equal(Math.max(...heights), 30 + 18, 'a large tree is 18 m high');
+  const bush = plantTriangles([{ id: 'BushSmall', x: 0, y: 0, z: 5 }, { id: 'Skeleton', x: 0, y: 0, z: 5 }]);
+  assert.equal(bush.index.length / 3, 6 * 2, 'one cone; the skeleton is left out');
 });

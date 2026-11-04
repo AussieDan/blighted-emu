@@ -7,8 +7,9 @@
   <link rel="stylesheet" href="/web/style.css">
   <script src="/web/theme.js"></script>
 </head>
-<body>
+<body class="scripts-page game">
   <nav class="rail" aria-label="Pages">
+    <span class="brand">Blighted Emu</span>
     <a href="/">Home</a>
     <a href="/live">Live</a>
     <a href="/live3d">Live 3D</a>
@@ -19,40 +20,50 @@
     <a href="/gm">GM</a>
     <a href="/web/map.html">Map</a>
     <a href="/web/captures.html">Captures</a>
-    <button type="button" class="theme" id="theme"></button>
+    <span class="bar-end">
+      <span class="status" id="status" role="status"></span>
+      <button type="button" class="theme" id="theme"></button>
+    </span>
   </nav>
-  <main class="work">
-    <header class="masthead">
-      <h1>Blighted Emu <span>· Scripts</span></h1>
-      <div class="end"><span class="status" id="status" role="status"></span></div>
-    </header>
-    <form class="gm records-search" id="script-form">
-      <select id="script-list" aria-label="script"></select>
-      <button type="button" id="open">Open</button>
-      <input type="text" id="script-id" aria-label="script id" placeholder="script id" class="wide">
-      <button type="button" id="new">New</button>
-      <button type="submit">Save</button>
-      <button type="button" class="danger" id="delete">Delete</button>
-    </form>
-    <section class="problems-block" aria-label="Problems">
-      <ul class="list problems" id="problems"></ul>
-    </section>
-    <div class="script-work">
-      <section class="script-palette" aria-label="Blocks" id="palette"></section>
-      <div class="script-canvas-box">
-        <svg class="script-canvas" id="canvas" width="1600" height="900" aria-label="Script canvas"></svg>
+  <main class="work sheet">
+    <h1 class="unseen">Blighted Emu · Scripts</h1>
+    <div class="scripts-board">
+      <div class="scripts-column">
+        <section class="game-panel" aria-label="Script">
+          <h2>Script</h2>
+          <form class="gm records-search" id="script-form">
+            <select id="script-list" aria-label="script"></select>
+            <button type="button" id="open">Open</button>
+            <input type="text" id="script-id" aria-label="script id" placeholder="script id" class="wide">
+            <button type="button" id="new">New</button>
+            <button type="submit">Save</button>
+            <button type="button" class="danger" id="delete">Delete</button>
+          </form>
+          <ul class="list problems" id="problems" aria-label="Problems"></ul>
+        </section>
+        <section class="game-panel script-palette" aria-label="Blocks">
+          <h2>Blocks</h2>
+          <div class="script-blocks" id="palette"></div>
+        </section>
       </div>
-      <section class="script-node" aria-label="Selected node" id="node-panel" hidden>
-        <h2 id="node-title"></h2>
-        <p class="muted" id="node-help"></p>
-        <form class="script-values" id="node-values"></form>
-        <button type="button" class="danger" id="node-delete">Delete node</button>
+      <section class="game-panel script-canvas-box" aria-label="Script canvas">
+        <svg class="script-canvas" id="canvas" width="1600" height="900" aria-label="Script canvas"></svg>
       </section>
+      <div class="scripts-column">
+        <section class="game-panel script-node" aria-label="Selected node" id="node-panel" hidden>
+          <h2 id="node-title"></h2>
+          <p class="hint" id="node-help"></p>
+          <form class="script-values" id="node-values"></form>
+          <button type="button" class="danger" id="node-delete">Delete node</button>
+        </section>
+        <p class="empty-note">Click a block on the canvas to set its values.</p>
+        <section class="game-panel run-log" aria-label="Run log">
+          <h2>Run log</h2>
+          <p class="hint">The blocks this script passed on the local world, newest last.</p>
+          <ul class="list log" id="run-log"></ul>
+        </section>
+      </div>
     </div>
-    <section class="problems-block" aria-label="Run log">
-      <div class="section-head"><h2>Run log</h2><span class="muted">The blocks this script passed on the local world, newest last.</span></div>
-      <ul class="list log" id="run-log"></ul>
-    </section>
   </main>
   <script type="module" src="/web/scripts.js"></script>
 </body>
