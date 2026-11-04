@@ -98,7 +98,7 @@
 <body>
 <main>
   <h1>Blighted New World Emulator: Progress</h1>
-  <p class="sub">Status on 2026-11-04. Client build 25810808. Last commit <code>be792f40</code>.</p>
+  <p class="sub">Status on 2026-11-04. Client build 25810808. Last commit <code>c02f58a7</code>.</p>
 
   <div class="cards" id="summary"></div>
 
@@ -171,6 +171,7 @@
 
   <h2>Done list</h2>
   <ul class="done">
+    <li>Normal experience by default (2026-11-04, tests): the tracked remote config layers had retail's double experience event of 2026-09-18 (<code>character</code> 2, trade skills and masteries 2, territory standing 3), so a new character reached Riding 39 where the mount quests give Riding 20. Every <code>javelin.xp-multipliers</code> value is now 1. <code>[remote_config] experience_multiplier</code> in <code>edge.toml</code> (default 1) multiplies them for the game and the sims; the local test server sets 2.</li>
     <li>Saved servers in the launcher (2026-11-04, the window seen on Linux, Night and Day; tests): the Server section lists the saved servers, name and address, the selected one raised; a click connects. A new address is saved once it connects, under the server's own name; each server keeps its own launcher login, so a switch logs out of nothing. "Saved as" renames the selected server, Remove forgets it and its login. The one server and token of an older <code>settings.json</code> become the first saved server. One code path for Windows and Linux (no system-only part); the Windows build was not compiled on this PC (no MinGW C compiler for <code>ring</code>).</li>
     <li>Admin tools for Discord accounts (2026-11-04, tests only): <code>blighted-admin grant-rank</code> and <code>revoke-rank</code>, and the ban and rank forms of the GM page, find an account by its login name, Discord user id or Discord username; the rank list shows the Discord username. A server-mode admin site with <code>[access.discord]</code> has <strong>Log in with Discord</strong>: only a Discord user with a game account and an admin rank gets in, and the login writes an audit row.</li>
     <li>OpenSSL built into the programs (2026-11-04, tests only): edge-http, rep-gateway and nw-testclient no longer need the OpenSSL of the host, so one build runs on this PC (OpenSSL 4) and on an Ubuntu 26.04 game host (OpenSSL 3.5). The DTLS, edge and gateway tests pass.</li>
