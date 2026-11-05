@@ -67,6 +67,8 @@ const CONNECT_OK: &[u8] = b"HTTP/1.1 200 Connection Established\r\n\r\n";
 const FORBIDDEN: &[u8] = b"HTTP/1.1 403 Forbidden\r\n\r\n";
 /// Answer to anything that is not a well-formed `CONNECT` or region ping.
 const BAD_REQUEST: &[u8] = b"HTTP/1.1 400 Bad Request\r\n\r\n";
+/// Answer when the server cannot be reached (or its TLS fails the pin): no tunnel opens.
+const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
 
 /// The launcher's own certificate and key for the game-facing TLS leg. The patched client does not
 /// check this certificate (its `verifySSL` is off), so it is a fixed self-signed throwaway.
@@ -249,7 +251,13 @@ async fn serve_connection(mut stream: TcpStream, shared: Arc<Shared>) -> io::Res
     match parse_request(&head) {
         Ok(ProxyRequest::Tunnel(host)) => serve_tunnel(stream, &shared, &host).await,
         Ok(ProxyRequest::Ping) => {
-            let mut server = TcpStream::connect(shared.ping_server).await?;
+            let mut server = match TcpStream::connect(shared.ping_server).await {
+                Ok(server) => server,
+                Err(error) => {
+                    stream.write_all(BAD_GATEWAY).await?;
+                    return Err(error);
+                }
+            };
             server.write_all(&head).await?;
             copy_bidirectional(&mut stream, &mut server).await?;
             Ok(())
@@ -258,17 +266,31 @@ async fn serve_connection(mut stream: TcpStream, shared: Arc<Shared>) -> io::Res
     }
 }
 
-/// Answers the `CONNECT` for `host` and relays the tunnel to the server.
+/// Connects to the server for `host` (TCP and the pinned TLS), then answers the `CONNECT` and
+/// relays the tunnel; a server that cannot be reached gets the game [`BAD_GATEWAY`].
 async fn serve_tunnel(mut stream: TcpStream, shared: &Shared, host: &str) -> io::Result<()> {
+    let mut server = match connect_server(shared, host).await {
+        Ok(server) => server,
+        Err(error) => {
+            stream.write_all(BAD_GATEWAY).await?;
+            return Err(error);
+        }
+    };
     stream.write_all(CONNECT_OK).await?;
-
     let mut game = shared.acceptor.accept(stream).await?;
+    copy_bidirectional(&mut game, &mut server).await?;
+    Ok(())
+}
+
+/// The pinned TLS connection to the server for `host`.
+async fn connect_server(
+    shared: &Shared,
+    host: &str,
+) -> io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
     let upstream = TcpStream::connect(shared.server).await?;
     let name = ServerName::try_from(host.to_owned())
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-    let mut server = shared.connector.connect(name, upstream).await?;
-    copy_bidirectional(&mut game, &mut server).await?;
-    Ok(())
+    shared.connector.connect(name, upstream).await
 }
 
 /// Reads bytes until [`HEAD_TERMINATOR`], up to [`MAX_HEAD_BYTES`].
@@ -387,7 +409,7 @@ mod tests {
         .expect("join")
     }
 
-    /// An address where nothing listens: the tests that use it never reach it.
+    /// An address where nothing listens: a connect to it fails.
     fn unused() -> SocketAddr {
         (Ipv4Addr::LOCALHOST, 0).into()
     }
@@ -555,6 +577,24 @@ mod tests {
         let mut echoed = vec![0_u8; OK_BODY.len()];
         tls.read_exact(&mut echoed).await.expect("read echo");
         assert_eq!(echoed, OK_BODY);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_server_gets_502_and_no_tunnel() {
+        crate::install_crypto_provider();
+        let proxy = start_proxy(unused(), unused()).await;
+        for request in [
+            connect_request(&format!("{MIRROR_HOST}:443")),
+            ping_request(&format!("http://{PING_HOST}/ping")),
+        ] {
+            let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy.port()))
+                .await
+                .expect("connect");
+            stream.write_all(&request).await.expect("send");
+            let mut answer = Vec::new();
+            stream.read_to_end(&mut answer).await.expect("read answer");
+            assert_eq!(answer, BAD_GATEWAY);
+        }
     }
 
     #[tokio::test]
