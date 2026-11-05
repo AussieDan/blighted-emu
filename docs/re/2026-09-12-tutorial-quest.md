@@ -191,7 +191,9 @@ retail reported as blocked (2218 `HandleMeleeDamage` with byte 1, no 3601) fall 
 A hit that does damage sends 3601 and 2218 with byte 0. (One damaging hit, 486029, came while
 the bit was set; **Unknown** why, perhaps a hit from behind.)
 
-Implemented: the player armor keeps 0.6006 (`combat.player_armor_share` 0.3994); the ship sailors
+Implemented (2026-11-05): the player armor is rated from its worn pieces (`ArmorItemDefinitions`,
+gear score ^ 1.2) against the mob's level gear score; the four starter pieces keep 0.6091, 1.4 %
+from the retail 0.6006 (`SimWorld::player_armor`); the ship sailors
 hit with factor 0.2968, every 6 s, the first 6 s after their fight starts (`SAILOR_PACE`); a mob
 hit on a blocking player does no damage and sends 2218 with 1, else 3601 and 2218 with 0.
 
