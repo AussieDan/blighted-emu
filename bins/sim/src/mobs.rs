@@ -3428,6 +3428,8 @@ mod retail_tests {
         );
     }
 
+    /// The open world level.
+    const OPEN_WORLD_LEVEL: &str = "newworld_vitaeeterna";
     /// Janszoon's spawn on the beach of the real level (live 2026-10-29).
     const JANSZOON_SPAWN: [f32; 3] = [7056.03, 3137.94, 41.63];
     /// How near a level spawn is to [`JANSZOON_SPAWN`] to be his (the level's: 1.7 m).
@@ -3438,22 +3440,27 @@ mod retail_tests {
 
     /// Janszoon at his beach spawn and the real ground of his level.
     fn janszoon_on_real_ground() -> (Mobs, RealGround) {
+        const JANSZOON_ID: &str = "Corrupted_Sailor_StarterBeach_Named_00";
+        const JANSZOON: &str = "7214ec6831b058f2a3b60f9b5c285e6c";
+        mob_on_real_ground(JANSZOON_ID, JANSZOON, JANSZOON_SPAWN)
+    }
+
+    /// The mob of vitals id `vitals_id`, shown with slice asset `slice`, at `position` of the
+    /// open world, and the real ground of that level.
+    fn mob_on_real_ground(vitals_id: &str, slice: &str, position: [f32; 3]) -> (Mobs, RealGround) {
         use nw_sim_core::LevelGround;
         use nw_world::WorldFile;
         use nw_world::collision::LevelCollision;
         use nw_world::collision_index::CollisionIndex;
-        const JANSZOON_ID: &str = "Corrupted_Sailor_StarterBeach_Named_00";
-        const JANSZOON: &str = "7214ec6831b058f2a3b60f9b5c285e6c";
-        const LEVEL: &str = "newworld_vitaeeterna";
         let build = load_client_build(&repo().join(CLIENT_BUILD_CONFIG)).expect("client build");
         let content = repo().join("local-data/content");
         let world = WorldFile::load(
-            &nw_world::world_file::world_file_path(&content, &build, LEVEL),
+            &nw_world::world_file::world_file_path(&content, &build, OPEN_WORLD_LEVEL),
             &build,
         )
         .expect("world file");
         let collision = LevelCollision::load(
-            &content.join(format!("collision-{build}-{LEVEL}.bin")),
+            &content.join(format!("collision-{build}-{OPEN_WORLD_LEVEL}.bin")),
             &build,
         )
         .expect("collision file");
@@ -3462,13 +3469,13 @@ mod retail_tests {
             ..collision
         }));
         let spawn = VitalsSpawn {
-            vitals_id: lowercase_crc32(JANSZOON_ID),
+            vitals_id: lowercase_crc32(vitals_id),
             level: TEST_LEVEL,
-            position: JANSZOON_SPAWN,
+            position,
             ..VitalsSpawn::default()
         };
         (
-            retail_mobs(vec![spawn], &[(JANSZOON_ID, asset(JANSZOON))]),
+            retail_mobs(vec![spawn], &[(vitals_id, asset(slice))]),
             LevelGround::new(Arc::new(world), index),
         )
     }
@@ -3607,6 +3614,129 @@ mod retail_tests {
             lowest < -2.0,
             "the chase went more than 2 m below home: {lowest}"
         );
+    }
+
+    #[test]
+    fn the_beach_sword_sailor_walks_home_from_every_side() {
+        // Hunt test 2026-10-31 (1 run of 4): the named sword sailor of spawn `575fea06` (the
+        // crc of its vitals id) stood 18.7 m from its spawn and reset every 2.8 s for minutes
+        // without a step home. It is drawn out on each bearing, then the player leaves, or
+        // stays beside it and hits it every second as a hunt bot does.
+        const SAILOR_ID: &str = "Corrupted_Sailor_1H_Sword_Named_00";
+        const SAILOR: &str = "9cdc9dfea35f575fadc0fca2f7f0d29b";
+        const SPAWN_XY: [f32; 2] = [7170.98, 3146.57];
+        const SPAWN_MATCH_M: f32 = 3.0;
+        const OUT_M: f32 = 18.7;
+        const LEAD_M: f32 = 1.5;
+        const WALK_MPS: f32 = 3.0;
+        const AFTER_MS: u64 = 90_000;
+        const BEARINGS: u16 = 8;
+        const HOME_M: f32 = 3.0;
+        const HIT_EVERY_MS: u64 = 1_000;
+        let build = load_client_build(&repo().join(CLIENT_BUILD_CONFIG)).expect("client build");
+        let content = repo().join("local-data/content");
+        let mut world = nw_world::WorldFile::load(
+            &nw_world::world_file::world_file_path(&content, &build, OPEN_WORLD_LEVEL),
+            &build,
+        )
+        .expect("world file");
+        let spawn = world
+            .vitals
+            .iter()
+            .position(|vitals| {
+                vitals.vitals_id == lowercase_crc32(SAILOR_ID)
+                    && (vitals.position[0] - SPAWN_XY[0]).hypot(vitals.position[1] - SPAWN_XY[1])
+                        < SPAWN_MATCH_M
+            })
+            .expect("its spawn");
+        let position = world.vitals[spawn].position;
+        world.vitals_ai = vec![world.vitals_ai[spawn].clone()];
+        let mut stuck = Vec::new();
+        for (stay, step) in [false, true]
+            .into_iter()
+            .flat_map(|stay| (0..BEARINGS).map(move |step| (stay, step)))
+        {
+            let bearing = std::f32::consts::TAU * f32::from(step) / f32::from(BEARINGS);
+            let (mut mobs, ground) = mob_on_real_ground(SAILOR_ID, SAILOR, position);
+            let ai = MobAi::new(retail_data(), AiRates::default(), LookAssets::default());
+            mobs.set_ai(crate::mob_ai::resolve_ai(&world, &ai));
+            let home = at(&mobs, 0);
+            let mut trace = (None, Vec::new());
+            let close = in_front_of_janszoon(&mobs, &ground, JANSZOON_IN_FACE_M);
+            run_janszoon(
+                &mut mobs,
+                &ground,
+                |_| Some(close),
+                (0, JANSZOON_AGGRO_MS),
+                &mut trace,
+            );
+            if mobs.target(mob_entity(0)) != Some(PLAYER) {
+                stuck.push(format!("bearing {bearing}, player stays {stay}: no aggro {:?}", trace.1));
+                continue;
+            }
+            let walk_ms = (OUT_M / WALK_MPS * 1_000.0) as u64;
+            let mut now = JANSZOON_AGGRO_MS;
+            while now < JANSZOON_AGGRO_MS + walk_ms
+                && at(&mobs, 0).horizontal_distance(home) < OUT_M
+            {
+                // Seconds of a test run.
+                #[allow(clippy::cast_precision_loss)]
+                let walked = WALK_MPS * now.saturating_sub(JANSZOON_AGGRO_MS) as f32 / 1_000.0;
+                let x = home.x + (walked + LEAD_M) * bearing.cos();
+                let y = home.y + (walked + LEAD_M) * bearing.sin();
+                let player = Seen {
+                    entity: PLAYER,
+                    position: Position {
+                        x,
+                        y,
+                        z: ground.height_at(x, y).unwrap_or(home.z),
+                    },
+                };
+                mobs.tick(&[player], now, &ground, 1);
+                played(&mobs, mob_entity(0), &mut trace.0, &mut trace.1);
+                now += TICK_MS;
+            }
+            let out = at(&mobs, 0);
+            let mut nearest = out.horizontal_distance(home);
+            for later in (now..now + AFTER_MS).step_by(TICK_MS as usize) {
+                let beside = |mobs: &Mobs| {
+                    let here = at(mobs, 0);
+                    let (x, y) = (
+                        here.x + LEAD_M * bearing.cos(),
+                        here.y + LEAD_M * bearing.sin(),
+                    );
+                    Seen {
+                        entity: PLAYER,
+                        position: Position {
+                            x,
+                            y,
+                            z: ground.height_at(x, y).unwrap_or(here.z),
+                        },
+                    }
+                };
+                let seen: Vec<Seen> = if stay { vec![beside(&mobs)] } else { Vec::new() };
+                if stay && later % HIT_EVERY_MS < TICK_MS {
+                    mobs.provoke(mob_entity(0), PLAYER, later);
+                }
+                mobs.tick(&seen, later, &ground, 1);
+                played(&mobs, mob_entity(0), &mut trace.0, &mut trace.1);
+                nearest = nearest.min(at(&mobs, 0).horizontal_distance(home));
+            }
+            if nearest > HOME_M {
+                stuck.push(format!(
+                    "bearing {bearing}, player stays {stay}: out at ({}, {}, {}) {} m, nearest home {nearest} m, now ({}, {}, {}); {:?}",
+                    out.x,
+                    out.y,
+                    out.z,
+                    out.horizontal_distance(home),
+                    at(&mobs, 0).x,
+                    at(&mobs, 0).y,
+                    at(&mobs, 0).z,
+                    trace.1.iter().rev().take(20).collect::<Vec<_>>()
+                ));
+            }
+        }
+        assert!(stuck.is_empty(), "{stuck:#?}");
     }
 
     /// A player on the real ground `distance_m` in front of Janszoon (yaw 0 faces +y).
