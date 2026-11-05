@@ -17,6 +17,17 @@ pub struct DatabaseConfig {
     pub max_connections: u32,
 }
 
+/// The global database of a world service and the environment variable with its password (it
+/// starts with `NW_SECRET_`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GlobalDatabase {
+    /// Where it is.
+    pub database: DatabaseConfig,
+    /// The environment variable with its password.
+    pub password_env: String,
+}
+
 /// Connection options: the URL from the config file and the password from the environment.
 ///
 /// # Errors

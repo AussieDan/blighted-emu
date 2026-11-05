@@ -58,6 +58,25 @@ pub async fn insert_analytics_events(
     Ok(ids)
 }
 
+/// Deletes the records received more than `retention_seconds` ago and returns how many went.
+///
+/// # Errors
+///
+/// Returns [`DbError::Database`] when PostgreSQL fails.
+pub async fn delete_old_analytics_events(
+    pool: &PgPool,
+    retention_seconds: u64,
+) -> Result<u64, DbError> {
+    // A retention of days is well inside the `f64` range of `make_interval`.
+    let result = sqlx::query(
+        "DELETE FROM analytics_event WHERE received_at < now() - make_interval(secs => $1)",
+    )
+    .bind(retention_seconds as f64)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 #[cfg(all(test, feature = "infra"))]
 mod tests {
     use super::*;
@@ -73,6 +92,38 @@ mod tests {
         Option<serde_json::Value>,
         Option<Vec<u8>>,
     );
+
+    #[tokio::test]
+    async fn the_clean_up_deletes_only_old_records() {
+        const DAY_SECONDS: u64 = 86_400;
+        let (deleted, left) = with_test_schema(async |pool| {
+            GLOBAL_MIGRATOR.run(pool).await.expect("migrate");
+            let record = AnalyticsRecord {
+                partition_key: "one".to_owned(),
+                data: vec![1],
+            };
+            insert_analytics_events(pool, STREAM, &[record.clone(), record])
+                .await
+                .expect("insert");
+            sqlx::query(
+                "UPDATE analytics_event SET received_at = now() - interval '2 days' \
+                 WHERE event_id = (SELECT min(event_id) FROM analytics_event)",
+            )
+            .execute(pool)
+            .await
+            .expect("age one");
+            let deleted = delete_old_analytics_events(pool, DAY_SECONDS)
+                .await
+                .expect("clean");
+            let left: i64 = sqlx::query_scalar("SELECT count(*) FROM analytics_event")
+                .fetch_one(pool)
+                .await
+                .expect("count");
+            (deleted, left)
+        })
+        .await;
+        assert_eq!((deleted, left), (1, 1));
+    }
 
     #[tokio::test]
     async fn json_records_keep_their_type_and_others_their_bytes() {

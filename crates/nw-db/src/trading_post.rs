@@ -21,6 +21,7 @@ use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::error::DbError;
+use crate::items::{SavedItemRolls, dye_column};
 
 /// SQLSTATE of a serialization failure.
 const SERIALIZATION_FAILURE: &str = "40001";
@@ -46,7 +47,8 @@ macro_rules! order_columns {
     () => {
         "contract_id, kind, status, version, creator_id, outpost, item_id, item_crc, category, \
          family, item_group, tier, gear_score, required_level, perks, gem_perk_count, price, \
-         quantity_posted, quantity_open, reason, tax_rate, \
+         quantity_posted, quantity_open, reason, tax_rate, durability, perk_ids, bound, dye, \
+         appearance, skin_dye, \
          (EXTRACT(EPOCH FROM created_at) * 1000)::BIGINT AS created_ms, \
          (EXTRACT(EPOCH FROM expires_at) * 1000)::BIGINT AS expires_ms, \
          (EXTRACT(EPOCH FROM completed_at) * 1000)::BIGINT AS completed_ms, \
@@ -221,6 +223,23 @@ pub struct OrderItem {
     pub perks: Vec<u32>,
     /// The gem perk count.
     pub gem_perk_count: u32,
+    /// The posted stack's own values (its gear score is [`OrderItem::gear_score`]): what a
+    /// buyer of a sell order gets. A buy order's are the item's data values.
+    pub rolls: SavedItemRolls,
+}
+
+impl OrderItem {
+    /// The own values of the order's stack, its gear score included; a plain stack's (no values
+    /// of its own) are the item's data values.
+    pub fn stack_rolls(&self) -> SavedItemRolls {
+        if self.rolls == SavedItemRolls::default() {
+            return SavedItemRolls::default();
+        }
+        SavedItemRolls {
+            gear_score: Some(self.gear_score),
+            ..self.rolls.clone()
+        }
+    }
 }
 
 /// A new order.
@@ -431,6 +450,8 @@ pub struct Delivery {
     pub completed_count: u32,
     /// The request id of the completing call.
     pub request: Option<Uuid>,
+    /// The own values of its item (the item's data values for coins alone).
+    pub rolls: SavedItemRolls,
 }
 
 /// A delivery a sim took, with its order as it is after the take.
@@ -477,6 +498,12 @@ struct OrderRow {
     quantity_open: i32,
     reason: i16,
     tax_rate: f64,
+    durability: Option<i32>,
+    perk_ids: Option<Vec<String>>,
+    bound: Option<bool>,
+    dye: Vec<i16>,
+    appearance: i64,
+    skin_dye: Vec<i16>,
     created_ms: i64,
     expires_ms: i64,
     completed_ms: Option<i64>,
@@ -494,6 +521,13 @@ struct DeliveryRow {
     quantity: i32,
     completed_count: i32,
     request_id: Option<Uuid>,
+    gear_score: Option<i32>,
+    durability: Option<i32>,
+    perks: Option<Vec<String>>,
+    bound: Option<bool>,
+    dye: Vec<i16>,
+    appearance: i64,
+    skin_dye: Vec<i16>,
 }
 
 fn out_of_range(field: &'static str) -> DbError {
@@ -548,6 +582,18 @@ impl OrderRow {
                     .transpose()?,
                 perks: self.perks.0,
                 gem_perk_count: unsigned(i64::from(self.gem_perk_count), "gem_perk_count")?,
+                rolls: SavedItemRolls {
+                    gear_score: None,
+                    ..SavedItemRolls::of_columns((
+                        None,
+                        self.durability,
+                        self.perk_ids,
+                        self.bound,
+                        self.dye,
+                        self.appearance,
+                        self.skin_dye,
+                    ))
+                },
             },
             price: unsigned(self.price, "price")?,
             posted: unsigned(i64::from(self.quantity_posted), "quantity_posted")?,
@@ -576,6 +622,15 @@ impl DeliveryRow {
             item: self.item_id.map(|item| (item, quantity)),
             completed_count: unsigned(i64::from(self.completed_count), "completed_count")?,
             request: self.request_id,
+            rolls: SavedItemRolls::of_columns((
+                self.gear_score,
+                self.durability,
+                self.perks,
+                self.bound,
+                self.dye,
+                self.appearance,
+                self.skin_dye,
+            )),
         })
     }
 }
@@ -648,7 +703,8 @@ async fn deliver(
     sqlx::query(
         "INSERT INTO trading_post_delivery \
          (character_id, contract_id, notice, coins, item_id, quantity, completed_count, \
-          request_id) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+          request_id, gear_score, durability, perks, bound, dye, appearance, skin_dye) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)",
     )
     .bind(delivery.character)
     .bind(delivery.order)
@@ -661,6 +717,13 @@ async fn deliver(
     )?)
     .bind(int(delivery.completed_count, "completed_count")?)
     .bind(delivery.request)
+    .bind(delivery.rolls.numbers().0)
+    .bind(delivery.rolls.numbers().1)
+    .bind(&delivery.rolls.perks)
+    .bind(delivery.rolls.bound)
+    .bind(dye_column(delivery.rolls.dye))
+    .bind(i64::from(delivery.rolls.appearance))
+    .bind(dye_column(delivery.rolls.skin_dye))
     .execute(&mut **transaction)
     .await?;
     Ok(())
@@ -752,9 +815,10 @@ async fn try_post_order(
         "INSERT INTO trading_post_contract (contract_id, kind, status, version, creator_id, \
          outpost, item_id, item_crc, category, family, item_group, tier, gear_score, \
          required_level, perks, gem_perk_count, price, quantity_posted, quantity_open, reason, \
-         tax_rate, created_at, expires_at, updated_at) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, \
-         $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $17, 0, $18, to_timestamp($19), \
-         to_timestamp($20), to_timestamp($19)) RETURNING ",
+         tax_rate, created_at, expires_at, updated_at, durability, perk_ids, bound, dye, \
+         appearance, skin_dye) VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9, $10, $11, $12, \
+         $13, $14, $15, $16, $17, $17, 0, $18, to_timestamp($19), to_timestamp($20), \
+         to_timestamp($19), $21, $22, $23, $24, $25, $26) RETURNING ",
         order_columns!()
     ))
     .bind(order.id)
@@ -782,6 +846,12 @@ async fn try_post_order(
     .bind(order.tax_rate)
     .bind(seconds(order.created_ms))
     .bind(seconds(order.expires_ms))
+    .bind(order.item.rolls.numbers().1)
+    .bind(&order.item.rolls.perks)
+    .bind(order.item.rolls.bound)
+    .bind(dye_column(order.item.rolls.dye))
+    .bind(i64::from(order.item.rolls.appearance))
+    .bind(dye_column(order.item.rolls.skin_dye))
     .fetch_one(&mut *transaction)
     .await?;
     let posted = row.order()?;
@@ -812,12 +882,17 @@ async fn try_post_order(
 /// order's rate kept back (retail `buy-sell-TP` and `Hivesellandbuyorder`, one settlement: the
 /// buyer and the seller to a buy order paid 2.35 % for one character and 5 % for the other, 4 of
 /// 4; each sell order's creator got 95 %, 2 of 2). What each side gets waits as deliveries
-/// ([`take_deliveries`]).
+/// ([`take_deliveries`]). The buyer of a sell order gets the order's stack; the creator of a buy
+/// order gets the stack the seller gave, with its own values `given`.
 ///
 /// # Errors
 ///
 /// Returns [`DbError::Database`] when PostgreSQL fails (nothing changes) and
 /// [`DbError::OutOfRange`] for a total outside the coin range.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one completion's facts, bound to one query"
+)]
 pub async fn complete_order(
     world: &PgPool,
     order: Uuid,
@@ -825,6 +900,7 @@ pub async fn complete_order(
     units: u32,
     completer_rate: f64,
     request: Uuid,
+    given: &SavedItemRolls,
     now_ms: u64,
 ) -> Result<Result<Completed, OrderRefusal>, DbError> {
     with_retries!(try_complete_order(
@@ -834,10 +910,12 @@ pub async fn complete_order(
         units,
         completer_rate,
         request,
+        given,
         now_ms
     ))
 }
 
+#[allow(clippy::too_many_arguments, reason = "the arguments of complete_order")]
 async fn try_complete_order(
     world: &PgPool,
     order: Uuid,
@@ -845,6 +923,7 @@ async fn try_complete_order(
     units: u32,
     completer_rate: f64,
     request: Uuid,
+    given: &SavedItemRolls,
     now_ms: u64,
 ) -> Result<Result<Completed, OrderRefusal>, DbError> {
     let mut transaction = serializable(world).await?;
@@ -903,6 +982,7 @@ async fn try_complete_order(
                 item: None,
                 completed_count: units,
                 request: Some(request),
+                rolls: SavedItemRolls::default(),
             },
             Delivery {
                 character: completer,
@@ -912,6 +992,7 @@ async fn try_complete_order(
                 item: Some(item.clone()),
                 completed_count: units,
                 request: Some(request),
+                rolls: stored.item.stack_rolls(),
             },
             -signed(
                 total
@@ -930,6 +1011,7 @@ async fn try_complete_order(
                 item: Some(item.clone()),
                 completed_count: units,
                 request: Some(request),
+                rolls: given.clone(),
             },
             Delivery {
                 character: completer,
@@ -939,6 +1021,7 @@ async fn try_complete_order(
                 item: None,
                 completed_count: units,
                 request: Some(request),
+                rolls: SavedItemRolls::default(),
             },
             signed(total - tax, "coins")?,
             AUDIT_SELL,
@@ -1034,6 +1117,10 @@ async fn close_order(
             order: Some(order.id),
             notice,
             coins,
+            rolls: item
+                .as_ref()
+                .map(|_| order.item.stack_rolls())
+                .unwrap_or_default(),
             item: item.filter(|(_, quantity)| *quantity > 0),
             completed_count: 0,
             request: None,
@@ -1229,7 +1316,7 @@ async fn try_take_deliveries(
     let rows: Vec<DeliveryRow> = sqlx::query_as(
         "DELETE FROM trading_post_delivery WHERE character_id = ANY($1) RETURNING \
          character_id, contract_id, notice, coins, item_id, quantity, completed_count, \
-         request_id",
+         request_id, gear_score, durability, perks, bound, dye, appearance, skin_dye",
     )
     .bind(characters)
     .fetch_all(&mut *transaction)
@@ -1529,6 +1616,7 @@ mod infra_tests {
                 required_level: None,
                 perks: Vec::new(),
                 gem_perk_count: 0,
+                rolls: SavedItemRolls::default(),
             },
             price: PRICE,
             quantity,
@@ -1568,15 +1656,33 @@ mod infra_tests {
             )
             .await
             .expect("search");
-            let completed = complete_order(pool, posted.id, buyer, 2, RATE, Uuid::new_v4(), NOW_MS)
-                .await
-                .expect("complete")
-                .expect("completed");
+            let completed = complete_order(
+                pool,
+                posted.id,
+                buyer,
+                2,
+                RATE,
+                Uuid::new_v4(),
+                &SavedItemRolls::default(),
+                NOW_MS,
+            )
+            .await
+            .expect("complete")
+            .expect("completed");
             let seller_gets = take_deliveries(pool, &[seller]).await.expect("take");
             let buyer_gets = take_deliveries(pool, &[buyer]).await.expect("take");
-            let again = complete_order(pool, posted.id, buyer, 1, RATE, Uuid::new_v4(), NOW_MS)
-                .await
-                .expect("complete");
+            let again = complete_order(
+                pool,
+                posted.id,
+                buyer,
+                1,
+                RATE,
+                Uuid::new_v4(),
+                &SavedItemRolls::default(),
+                NOW_MS,
+            )
+            .await
+            .expect("complete");
             (page, completed, seller_gets, buyer_gets, again)
         })
         .await;
@@ -1603,6 +1709,109 @@ mod infra_tests {
             Some(("BeeswaxT1".to_owned(), 2))
         );
         assert_eq!(again, Err(OrderRefusal::NotOpen));
+    }
+
+    #[tokio::test]
+    async fn a_traded_stack_keeps_its_own_values() {
+        const GEAR_SCORE: u32 = 512;
+        let posted_rolls = SavedItemRolls {
+            gear_score: Some(GEAR_SCORE),
+            durability: Some(17),
+            perks: Some(vec!["PerkID_Weapon_DmgCrit".to_owned()]),
+            bound: Some(false),
+            dye: [3, 0, 0, 0],
+            appearance: 0x1234_5678,
+            skin_dye: [0, 2, 0, 0],
+        };
+        let given = SavedItemRolls {
+            durability: Some(9),
+            ..posted_rolls.clone()
+        };
+        let (buyer_gets, creator_gets, cancelled) = with_test_schema(async |pool| {
+            WORLD_MIGRATOR.run(pool).await.expect("migrate");
+            let seller = character(pool, "Seller").await;
+            let buyer = character(pool, "Buyer").await;
+            let mut sell = order(OrderKind::Sell, seller, 1);
+            sell.item.gear_score = GEAR_SCORE;
+            sell.item.rolls = SavedItemRolls {
+                gear_score: None,
+                ..posted_rolls.clone()
+            };
+            let posted = post_order(pool, &sell)
+                .await
+                .expect("post")
+                .expect("posted");
+            complete_order(
+                pool,
+                posted.id,
+                buyer,
+                1,
+                RATE,
+                Uuid::new_v4(),
+                &given,
+                NOW_MS,
+            )
+            .await
+            .expect("complete")
+            .expect("completed");
+            let buyer_gets = take_deliveries(pool, &[buyer]).await.expect("take");
+            let buy = post_order(pool, &order(OrderKind::Buy, buyer, 1))
+                .await
+                .expect("post")
+                .expect("posted");
+            complete_order(
+                pool,
+                buy.id,
+                seller,
+                1,
+                RATE,
+                Uuid::new_v4(),
+                &given,
+                NOW_MS,
+            )
+            .await
+            .expect("complete")
+            .expect("completed");
+            let creator_gets = take_deliveries(pool, &[buyer]).await.expect("take");
+            let kept = post_order(
+                pool,
+                &NewOrder {
+                    id: Uuid::new_v4(),
+                    ..sell.clone()
+                },
+            )
+            .await
+                .expect("post")
+                .expect("posted");
+            cancel_order(pool, kept.id, seller, NOW_MS)
+                .await
+                .expect("cancel")
+                .expect("cancelled");
+            let cancelled = take_deliveries(pool, &[seller]).await.expect("take");
+            (buyer_gets, creator_gets, cancelled)
+        })
+        .await;
+        let rolls_of = |taken: &[TakenDelivery]| {
+            taken
+                .iter()
+                .find(|taken| taken.delivery.item.is_some())
+                .map(|taken| taken.delivery.rolls.clone())
+        };
+        assert_eq!(
+            rolls_of(&buyer_gets),
+            Some(posted_rolls.clone()),
+            "the buyer gets the posted stack"
+        );
+        assert_eq!(
+            rolls_of(&creator_gets),
+            Some(given),
+            "a buy order gets the seller's stack"
+        );
+        assert_eq!(
+            rolls_of(&cancelled),
+            Some(posted_rolls),
+            "a cancel gives the posted stack back"
+        );
     }
 
     fn sell_search(now_ms: u64) -> OrderSearch {
@@ -1667,6 +1876,7 @@ mod infra_tests {
                 FIRST_BUY,
                 BUYER_RATE,
                 Uuid::new_v4(),
+                &SavedItemRolls::default(),
                 NOW_MS,
             )
             .await
@@ -1688,6 +1898,7 @@ mod infra_tests {
                 STACK - FIRST_BUY,
                 BUYER_RATE,
                 Uuid::new_v4(),
+                &SavedItemRolls::default(),
                 NOW_MS,
             )
             .await
@@ -1767,10 +1978,19 @@ mod infra_tests {
                 .expect("post")
                 .expect("posted");
             for units in [FIRST_SALE, STACK - FIRST_SALE] {
-                complete_order(pool, buy.id, seller, units, RATE, Uuid::new_v4(), NOW_MS)
-                    .await
-                    .expect("complete")
-                    .expect("completed");
+                complete_order(
+                    pool,
+                    buy.id,
+                    seller,
+                    units,
+                    RATE,
+                    Uuid::new_v4(),
+                    &SavedItemRolls::default(),
+                    NOW_MS,
+                )
+                .await
+                .expect("complete")
+                .expect("completed");
             }
             let creator_gets = take_deliveries(pool, &[creator]).await.expect("take");
             let seller_gets = take_deliveries(pool, &[seller]).await.expect("take");
@@ -1785,6 +2005,7 @@ mod infra_tests {
                 FIRST_SALE,
                 RATE,
                 Uuid::new_v4(),
+                &SavedItemRolls::default(),
                 NOW_MS,
             )
             .await

@@ -76,7 +76,7 @@ pub struct SavedItemRolls {
 
 /// The migration 0017 columns of a row: gear score, durability, perks, bound, dye, appearance,
 /// skin dye.
-type RollColumns = (
+pub(crate) type RollColumns = (
     Option<i32>,
     Option<i32>,
     Option<Vec<String>>,
@@ -96,13 +96,13 @@ fn dye_of_column(column: &[i16]) -> [u8; DYE_CHANNELS] {
 }
 
 /// A dye as its column.
-fn dye_column(dye: [u8; DYE_CHANNELS]) -> Vec<i16> {
+pub(crate) fn dye_column(dye: [u8; DYE_CHANNELS]) -> Vec<i16> {
     dye.into_iter().map(i16::from).collect()
 }
 
 impl SavedItemRolls {
     /// The rolls of a row's columns; a number out of range is the item's data value.
-    fn of_columns(
+    pub(crate) fn of_columns(
         (gear_score, durability, perks, bound, dye, appearance, skin_dye): RollColumns,
     ) -> Self {
         Self {
@@ -117,7 +117,7 @@ impl SavedItemRolls {
     }
 
     /// The gear score and durability as their columns (both below 2^31 in the data).
-    fn numbers(&self) -> (Option<i64>, Option<i64>) {
+    pub(crate) fn numbers(&self) -> (Option<i64>, Option<i64>) {
         (
             self.gear_score.map(i64::from),
             self.durability.map(i64::from),

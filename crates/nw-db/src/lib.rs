@@ -25,6 +25,7 @@ mod mounts;
 mod music;
 mod notifications;
 mod position;
+mod privacy;
 mod progression;
 mod quests;
 mod recipe_cooldowns;
@@ -47,13 +48,13 @@ pub use admin::{
     AdminRank, AuditEntry, AuditRow, RankRow, admin_rank, admin_ranks, audit_rows, insert_audit,
     remove_admin_rank, set_admin_rank,
 };
-pub use analytics::{AnalyticsRecord, insert_analytics_events};
+pub use analytics::{AnalyticsRecord, delete_old_analytics_events, insert_analytics_events};
 pub use arena::{DUNGEON_ID_LEN, SavedArena, SavedStay};
 pub use character::{
     character_by_id, character_name_taken, characters_for_account, delete_character,
     insert_character, release_character_name, reserve_character_name,
 };
-pub use connect::{DatabaseConfig, connect, connect_lazy, connect_options};
+pub use connect::{DatabaseConfig, GlobalDatabase, connect, connect_lazy, connect_options};
 pub use consumable_cooldowns::SavedConsumableCooldown;
 pub use entitlements::{
     AccountEntitlement, Purchase, Wallet, account_entitlements, buy_entitlement, give_marks, wallet,
@@ -72,6 +73,12 @@ pub use mounts::{DYE_LEN, SavedMount, SavedMounts};
 pub use music::SavedMusic;
 pub use notifications::SavedNotifications;
 pub use position::{SaveOutcome, SavedPosition, character_position, save_character_position};
+pub use privacy::{
+    AccountPrivacySetting, PRIVACY_EVERYONE, PRIVACY_FRIEND_REQUESTS, PRIVACY_FRIENDS,
+    PRIVACY_NO_ONE, PRIVACY_ONLINE_STATUS, PRIVACY_ONLY_ME, PRIVACY_PRIVATE_CHAT,
+    PRIVACY_PUBLIC_CHAT, PRIVACY_VOICE, PrivacySetting, privacy_changes_since, privacy_settings,
+    set_privacy_settings,
+};
 pub use progression::{
     SavedLootLimit, SavedProgression, character_progression, save_character_progression,
 };
@@ -82,12 +89,13 @@ pub use social::{
     AccountTitle, StoredPlayer, clear_new_account_titles, earn_account_titles, stored_players,
 };
 pub use social_graph::{
-    CREST_LEN, CROSSPLAY_LEN, Company, CompanyInvite, CompanyListing, CompanyMember, ICON_LEN,
-    LinkKind, PlayerReport, STREAMER_MODE_LEN, SocialCharacter, SocialGroup, SocialRecords,
-    SocialSettings, TreasuryReason, WITHDRAWAL_WINDOW_MS, add_company_invite, add_social_link,
-    change_treasury, company_listings, create_company, delete_company, delete_group,
-    insert_player_report, load_social, remove_company_invite, remove_company_member,
-    remove_social_link, save_group, save_social_settings, set_company_member, update_company,
+    CREST_LEN, CROSSPLAY_LEN, CoinReturn, Company, CompanyInvite, CompanyListing, CompanyMember,
+    ICON_LEN, LinkKind, PlayerReport, STREAMER_MODE_LEN, SocialCharacter, SocialGroup,
+    SocialRecords, SocialSettings, TreasuryReason, WITHDRAWAL_WINDOW_MS, add_coin_return,
+    add_company_invite, add_social_link, change_treasury, company_by_id, company_listings,
+    create_company, delete_company, delete_group, insert_player_report, load_social,
+    remove_coin_return, remove_company_invite, remove_company_member, remove_social_link,
+    save_group, save_social_settings, set_company_member, update_company,
 };
 pub use sqlx::PgPool;
 pub use stats::{

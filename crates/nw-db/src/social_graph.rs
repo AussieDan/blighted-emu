@@ -33,6 +33,7 @@ const CREST_FIELD: &str = "crest";
 const CROSSPLAY_FIELD: &str = "crossplay";
 const STREAMER_MODE_FIELD: &str = "streamer_mode";
 const TREASURY_FIELD: &str = "treasury";
+const AMOUNT_FIELD: &str = "amount";
 const COUNT_FIELD: &str = "count";
 
 /// A link between two characters.
@@ -247,6 +248,22 @@ pub struct SocialRecords {
     /// The treasury withdrawals and refunds of the last [`WITHDRAWAL_WINDOW_MS`]: character,
     /// Unix milliseconds, change.
     pub withdrawals: Vec<(Uuid, u64, i64)>,
+    /// The coin owed to characters (world migration 0031).
+    pub coin_returns: Vec<CoinReturn>,
+}
+
+/// Coin the social service owes a character (world migration 0031): a deposit the treasury did
+/// not take, or a withdrawal it could not take back, while its sim did not take the coin.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoinReturn {
+    /// The id of the debt.
+    pub id: Uuid,
+    /// The character owed.
+    pub character: Uuid,
+    /// The company the coin came from or went to; `None` once it is deleted.
+    pub company: Option<Uuid>,
+    /// Hundredths of a coin.
+    pub amount: u64,
 }
 
 /// A company as other players see it in a look-up (3610).
@@ -358,6 +375,28 @@ fn company_of(row: CompanyRow) -> Result<Company, DbError> {
     })
 }
 
+/// The columns of a [`CompanyRow`].
+const COMPANY_COLUMNS: &str = "company_id, name, faction, crest, motd, motd_author, \
+     extract(epoch FROM motd_at)::float8, siege_hour, treasury, withdrawal_limit, renames, \
+     crest_changes";
+
+/// The stored company `id`, as the database holds it; `None` when it has none.
+///
+/// # Errors
+///
+/// Returns [`DbError::Database`] when PostgreSQL fails, and [`DbError::OutOfRange`] for a stored
+/// value that does not fit its type.
+pub async fn company_by_id(world: &PgPool, id: Uuid) -> Result<Option<Company>, DbError> {
+    sqlx::query_as::<_, CompanyRow>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COMPANY_COLUMNS} FROM company WHERE company_id = $1"
+    )))
+    .bind(id)
+    .fetch_optional(world)
+    .await?
+    .map(company_of)
+    .transpose()
+}
+
 /// The whole social state of the world.
 ///
 /// # Errors
@@ -398,11 +437,9 @@ pub async fn load_social(world: &PgPool) -> Result<SocialRecords, DbError> {
         LinkKind::of_name(&kind).map(|kind| (character, other, kind))
     })
     .collect();
-    let companies = sqlx::query_as::<_, CompanyRow>(
-        "SELECT company_id, name, faction, crest, motd, motd_author, \
-         extract(epoch FROM motd_at)::float8, siege_hour, treasury, withdrawal_limit, renames, \
-         crest_changes FROM company",
-    )
+    let companies = sqlx::query_as::<_, CompanyRow>(sqlx::AssertSqlSafe(format!(
+        "SELECT {COMPANY_COLUMNS} FROM company"
+    )))
     .fetch_all(world)
     .await?
     .into_iter()
@@ -468,6 +505,22 @@ pub async fn load_social(world: &PgPool) -> Result<SocialRecords, DbError> {
     .into_iter()
     .map(|(character, at, change)| (character, ms_of(Some(at)).unwrap_or_default(), change))
     .collect();
+    let coin_returns = sqlx::query_as::<_, (Uuid, Uuid, Option<Uuid>, i64)>(
+        "SELECT return_id, character_id, company_id, amount FROM company_coin_return \
+         ORDER BY created_at",
+    )
+    .fetch_all(world)
+    .await?
+    .into_iter()
+    .map(|(id, character, company, amount)| {
+        Ok(CoinReturn {
+            id,
+            character,
+            company,
+            amount: narrow(amount, AMOUNT_FIELD)?,
+        })
+    })
+    .collect::<Result<_, DbError>>()?;
     Ok(SocialRecords {
         characters,
         settings,
@@ -477,6 +530,7 @@ pub async fn load_social(world: &PgPool) -> Result<SocialRecords, DbError> {
         invites,
         groups,
         withdrawals,
+        coin_returns,
     })
 }
 
@@ -841,6 +895,43 @@ pub async fn change_treasury(
     narrow(balance, TREASURY_FIELD).map(Some)
 }
 
+/// Stores coin owed to a character (world migration 0031). A second store of the same id changes
+/// nothing, so a repeated write is safe.
+///
+/// # Errors
+///
+/// Returns [`DbError::Database`] when PostgreSQL fails, and [`DbError::OutOfRange`] for an amount
+/// outside the column.
+pub async fn add_coin_return(world: &PgPool, owed: &CoinReturn) -> Result<(), DbError> {
+    let amount = i64::try_from(owed.amount).map_err(|_| DbError::OutOfRange {
+        field: AMOUNT_FIELD,
+    })?;
+    sqlx::query(
+        "INSERT INTO company_coin_return (return_id, character_id, company_id, amount) \
+         VALUES ($1, $2, $3, $4) ON CONFLICT (return_id) DO NOTHING",
+    )
+    .bind(owed.id)
+    .bind(owed.character)
+    .bind(owed.company)
+    .bind(amount)
+    .execute(world)
+    .await?;
+    Ok(())
+}
+
+/// Deletes the coin debt `id`: the character's sim took the coin.
+///
+/// # Errors
+///
+/// Returns [`DbError::Database`] when PostgreSQL fails.
+pub async fn remove_coin_return(world: &PgPool, id: Uuid) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM company_coin_return WHERE return_id = $1")
+        .bind(id)
+        .execute(world)
+        .await?;
+    Ok(())
+}
+
 /// Stores a group with its leader and members.
 ///
 /// # Errors
@@ -1032,6 +1123,17 @@ mod infra_tests {
                     .expect("treasury"),
                 Some(0)
             );
+            assert_eq!(
+                company_by_id(pool, first.id)
+                    .await
+                    .expect("read")
+                    .map(|stored| stored.treasury),
+                Some(0)
+            );
+            assert_eq!(
+                company_by_id(pool, Uuid::new_v4()).await.expect("read"),
+                None
+            );
             let listed = company_listings(pool, &[first.id]).await.expect("listings");
             assert_eq!(listed[0].governor, Some(ann));
             assert_eq!(listed[0].members, 2);
@@ -1062,6 +1164,46 @@ mod infra_tests {
             delete_company(pool, first.id).await.expect("delete");
             let records = load_social(pool).await.expect("load");
             assert!(records.companies.is_empty() && records.members.is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_coin_debt_is_stored_once_and_ends_when_paid() {
+        with_test_schema(async |pool| {
+            WORLD_MIGRATOR.run(pool).await.expect("migrate");
+            let ann = character(pool, "Ann").await;
+            let first = company("Alpha");
+            assert!(create_company(pool, &first, ann).await.expect("create"));
+            let owed = CoinReturn {
+                id: Uuid::new_v4(),
+                character: ann,
+                company: Some(first.id),
+                amount: DEPOSIT as u64,
+            };
+            add_coin_return(pool, &owed).await.expect("owe");
+            add_coin_return(pool, &owed).await.expect("owe again");
+            assert_eq!(
+                load_social(pool).await.expect("load").coin_returns,
+                vec![owed]
+            );
+            delete_company(pool, first.id).await.expect("delete");
+            assert_eq!(
+                load_social(pool).await.expect("load").coin_returns,
+                vec![CoinReturn {
+                    company: None,
+                    ..owed
+                }],
+                "the debt outlives its company"
+            );
+            remove_coin_return(pool, owed.id).await.expect("paid");
+            assert!(
+                load_social(pool)
+                    .await
+                    .expect("load")
+                    .coin_returns
+                    .is_empty()
+            );
         })
         .await;
     }
