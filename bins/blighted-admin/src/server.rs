@@ -38,6 +38,11 @@ use nw_world::map_tiles::tile_file;
 pub const PNG: &str = "image/png";
 const INDEX: &str = "index.html";
 const LIVE_PAGE: &str = "live.html";
+/// The home page.
+pub const HOME_PAGE_ROUTE: &str = "/";
+/// The map and captures pages, served from the web files.
+pub const MAP_PAGE_ROUTE: &str = "/web/map.html";
+pub const CAPTURES_PAGE_ROUTE: &str = "/web/captures.html";
 /// The live page.
 pub const LIVE_PAGE_ROUTE: &str = "/live";
 const LIVE3D_PAGE: &str = "live3d.html";
@@ -130,7 +135,7 @@ impl AppState {
 /// Every route, behind [`admin_guard`].
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/", get(|| web_file(UrlPath(INDEX.to_owned()))))
+        .route(HOME_PAGE_ROUTE, get(|| web_file(UrlPath(INDEX.to_owned()))))
         .route(
             LIVE_PAGE_ROUTE,
             get(|| web_file(UrlPath(LIVE_PAGE.to_owned()))),

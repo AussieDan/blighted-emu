@@ -16,7 +16,11 @@ use crate::access::discord::{
 };
 use crate::access::session::{Actor, SESSION_TTL_MS};
 use crate::access::{Access, AccessMode, SESSION_COOKIE, session_token};
-use crate::server::AppState;
+use crate::server::{
+    AppState, CAPTURES_PAGE_ROUTE, GM_PAGE_ROUTE, HOME_PAGE_ROUTE, LIVE_PAGE_ROUTE,
+    LIVE3D_PAGE_ROUTE, MAP_PAGE_ROUTE, RECORDS_PAGE_ROUTE, SCRIPTS_PAGE_ROUTE, STUDIO_PAGE_ROUTE,
+    TODO_PAGE_ROUTE,
+};
 
 /// The login page.
 pub const LOGIN_PAGE_ROUTE: &str = "/login";
@@ -36,9 +40,19 @@ const PUBLIC_ROUTES: [&str; 5] = [
 ];
 /// Prefix of the web files, which need no session.
 const WEB_PREFIX: &str = "/web/";
-/// Pages that send a visitor without a session to the login page.
-const PAGES: [&str; 7] = [
-    "/", "/live", "/studio", "/records", "/scripts", "/todo", "/gm",
+/// Pages that send a visitor without a session to the login page (the map and captures pages
+/// too, though they sit among the public web files).
+const PAGES: [&str; 10] = [
+    HOME_PAGE_ROUTE,
+    LIVE_PAGE_ROUTE,
+    LIVE3D_PAGE_ROUTE,
+    STUDIO_PAGE_ROUTE,
+    RECORDS_PAGE_ROUTE,
+    SCRIPTS_PAGE_ROUTE,
+    TODO_PAGE_ROUTE,
+    GM_PAGE_ROUTE,
+    MAP_PAGE_ROUTE,
+    CAPTURES_PAGE_ROUTE,
 ];
 /// Changing routes that only local mode allows: design work and bot batches are for a
 /// team member's own PC (spec section 4).
@@ -96,10 +110,10 @@ pub async fn access_guard(
         }
         None => {
             let public = PUBLIC_ROUTES.contains(&path.as_str()) || path.starts_with(WEB_PREFIX);
-            if public {
-                next.run(request).await
-            } else if !changing && PAGES.contains(&path.as_str()) {
+            if !changing && PAGES.contains(&path.as_str()) {
                 Redirect::to(LOGIN_PAGE_ROUTE).into_response()
+            } else if public {
+                next.run(request).await
             } else {
                 StatusCode::UNAUTHORIZED.into_response()
             }
@@ -417,9 +431,11 @@ mod tests {
     #[tokio::test]
     async fn without_a_session_pages_go_to_login_and_data_is_refused() {
         let fixture = fixture().await;
-        let page = send(&fixture, request(Method::GET, "/live", None, "")).await;
-        assert_eq!(page.status(), StatusCode::SEE_OTHER);
-        assert_eq!(page.headers()[header::LOCATION], LOGIN_PAGE_ROUTE);
+        for path in PAGES {
+            let page = send(&fixture, request(Method::GET, path, None, "")).await;
+            assert_eq!(page.status(), StatusCode::SEE_OTHER, "{path}");
+            assert_eq!(page.headers()[header::LOCATION], LOGIN_PAGE_ROUTE, "{path}");
+        }
         let data = send(&fixture, request(Method::GET, "/api/world/info", None, "")).await;
         assert_eq!(data.status(), StatusCode::UNAUTHORIZED);
         let login_page = send(&fixture, request(Method::GET, LOGIN_PAGE_ROUTE, None, "")).await;
