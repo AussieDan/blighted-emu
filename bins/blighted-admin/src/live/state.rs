@@ -17,8 +17,8 @@ use rep_gateway::server::{
 use serde::Serialize;
 use sim::server::{METRIC_BUNDLE_MEMBERS, METRIC_TICK_SECONDS, ONE_TICK_SECONDS};
 
-/// A sim without a heartbeat for longer than this has left.
-pub const SIM_SILENT_MS: u64 = 3_000;
+use crate::config::SimSilence;
+
 /// Events the log keeps.
 pub const EVENTS_KEPT: usize = 200;
 /// Script run log lines kept for the script editor.
@@ -207,6 +207,8 @@ pub struct LiveState {
     bots: u32,
     events: VecDeque<EventView>,
     bot_prefixes: Vec<String>,
+    /// A sim silent for longer than this has left.
+    silence: SimSilence,
     script_lines: VecDeque<ScriptLineView>,
 }
 
@@ -239,10 +241,12 @@ impl LiveState {
         self.script_lines.iter().cloned().collect()
     }
 
-    /// An empty state that marks players whose names start with one of `bot_prefixes` as bots.
-    pub fn new(bot_prefixes: Vec<String>) -> Self {
+    /// An empty state that marks players whose names start with one of `bot_prefixes` as bots,
+    /// and drops a sim after `silence` without a heartbeat.
+    pub fn new(bot_prefixes: Vec<String>, silence: SimSilence) -> Self {
         Self {
             bot_prefixes,
+            silence,
             ..Self::default()
         }
     }
@@ -417,12 +421,13 @@ impl LiveState {
         self.bots = running;
     }
 
-    /// Sims silent for longer than [`SIM_SILENT_MS`] leave, with one event each.
+    /// Sims silent for longer than the heartbeat silence leave, with one event each.
     pub fn expire(&mut self, now_ms: u64) {
+        let silent_ms = self.silence.ms;
         let silent: Vec<BusId> = self
             .sims
             .iter()
-            .filter(|(_, sim)| now_ms.saturating_sub(sim.last_seen_ms) > SIM_SILENT_MS)
+            .filter(|(_, sim)| now_ms.saturating_sub(sim.last_seen_ms) > silent_ms)
             .map(|(id, _)| id.clone())
             .collect();
         for id in silent {
@@ -759,7 +764,10 @@ mod tests {
 
     #[test]
     fn players_with_a_bot_prefix_are_bots() {
-        let mut state = LiveState::new(vec!["Adminbot".to_owned(), "Swarm".to_owned()]);
+        let mut state = LiveState::new(
+            vec!["Adminbot".to_owned(), "Swarm".to_owned()],
+            SimSilence::default(),
+        );
         let mut snapshot = part(NOW, 0, 1, &[1, 2, 3]);
         snapshot.players[0].name = "Adminbotab".to_owned();
         snapshot.players[1].name = "Swarmxyz".to_owned();
@@ -779,13 +787,16 @@ mod tests {
 
     #[test]
     fn a_silent_sim_leaves_with_one_event() {
-        let mut state = LiveState::default();
+        const INTERVAL_MS: u64 = 500;
+        const MISSES: u32 = 4;
+        let silence = SimSilence::of(INTERVAL_MS, MISSES);
+        let mut state = LiveState::new(Vec::new(), silence);
         state.heartbeat(beat("sim-a", 1, 5), NOW);
         state.snapshot_part(part(NOW, 0, 1, &[1]));
-        state.expire(NOW + SIM_SILENT_MS);
-        assert_eq!(state.view().sims.len(), 1, "3 s is not yet silent");
-        state.expire(NOW + SIM_SILENT_MS + 1);
-        state.expire(NOW + SIM_SILENT_MS + 2);
+        state.expire(NOW + silence.ms);
+        assert_eq!(state.view().sims.len(), 1, "four misses are not yet silent");
+        state.expire(NOW + silence.ms + 1);
+        state.expire(NOW + silence.ms + 2);
         let view = state.view();
         assert!(view.sims.is_empty() && view.players.is_empty());
         let left = texts(&view)

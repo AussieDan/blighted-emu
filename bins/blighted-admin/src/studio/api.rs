@@ -972,6 +972,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn apply_fails_and_restarts_nothing_when_the_world_does_not_read() {
+        let restarts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&restarts);
+        let slot = crate::world::WorldSlot::new(test_layer(CAP));
+        let mut fixture = fixture(true, LONG_TIMEOUT_S);
+        read_control(&fixture.path("control"), move |line| {
+            if line == "restart-world" {
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        fixture.studio = fixture
+            .studio
+            .clone()
+            .with_world_reload(slot, Arc::new(|| Err("bad world".to_owned())));
+        call(&fixture, Method::POST, APPLY_ROUTE).await;
+        let end = finished(&fixture).await;
+        assert_eq!(end["phase"], "failed", "{end}");
+        assert_eq!(end["step"], "write");
+        assert!(
+            end["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("bad world")
+        );
+        assert_eq!(restarts.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn a_stopped_apply_job_ends_failed_at_its_step() {
         let fixture = fixture(false, LONG_TIMEOUT_S);
         let error = tokio::spawn(async { panic!("job") })

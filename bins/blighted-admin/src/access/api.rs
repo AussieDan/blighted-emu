@@ -638,7 +638,13 @@ mod tests {
             rows.iter()
                 .any(|row| row.username.as_deref() == Some(DISCORD_USERNAME))
         );
-        assert!(store.set_banned(DISCORD_USER_ID, true).await.expect("ban"));
+        assert!(
+            store
+                .set_banned(DISCORD_USER_ID, true)
+                .await
+                .expect("ban")
+                .is_some()
+        );
         assert_eq!(
             store
                 .discord_account(DISCORD_USER_ID)
@@ -647,6 +653,12 @@ mod tests {
                 .map(|record| record.banned),
             Some(true)
         );
-        assert!(!store.set_banned("ghost", true).await.expect("unknown"));
+        assert!(
+            store
+                .set_banned("ghost", true)
+                .await
+                .expect("unknown")
+                .is_none()
+        );
     }
 }

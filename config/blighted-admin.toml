@@ -47,6 +47,10 @@ bot_character_prefix = "Adminbot"
 # local test runs); the live page marks players with these names, and the one above, as bots.
 other_bot_prefixes = ["Swarm", "Mobsb"]
 max_bots = 10000
+# A sim silent for heartbeat_interval_ms x heartbeat_misses has left: the same two values as
+# config/world-director.toml.
+heartbeat_interval_ms = 1000
+heartbeat_misses = 3
 
 [studio]
 # The team's design files, the retail files they are merged over (`just bundle`, `just world`),

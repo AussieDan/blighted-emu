@@ -167,7 +167,17 @@ impl Studio {
                 Ok(_) => {}
             }
         }
-        self.reload_world().await;
+        // The map reads the same merged files as the sims: files it cannot read stop the job
+        // before the restart, so the running world keeps the files it started with in memory.
+        if let Err(error) = self.reload_world().await {
+            return ApplyStatus::ended(
+                ApplyPhase::Failed,
+                ApplyStep::Write,
+                format!(
+                    "merged files written, but the world does not read them: {error}; the world was not restarted"
+                ),
+            );
+        }
         self.set_apply(ApplyStatus::running(
             ApplyStep::Restart,
             "restarting the world",

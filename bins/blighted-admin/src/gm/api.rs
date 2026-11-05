@@ -1,8 +1,12 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The GM routes (admin studio spec section 8.2). Each checks the rank on the server, sends the
-//! command to the sim that owns the target, and writes an audit row. Messages to players, mutes
-//! and coin are not here: the server has no chat and no currency yet (their client messages are
-//! Unknown).
+//! command to the sim that owns the target, and writes an audit row. Coins are set here
+//! ([`SET_COINS_ROUTE`]); GM chat commands go through the game's own chat on the sims. Messages
+//! to players and chat mutes are not here: their admin routes are not made.
+//!
+//! A ban is stored in the global database, then every sim saves and closes the account's
+//! players ([`AdminAction::KickAccount`]). `edge-http` ends the account's game sessions at their
+//! next use (queue included), and `world-director` refuses the account's joins.
 
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
@@ -979,19 +983,64 @@ async fn ban(
     let Some(store) = state.access.store() else {
         return (StatusCode::NOT_FOUND, "bans need [access] global_database").into_response();
     };
-    let (status, result) = match store.set_banned(&username, request.banned).await {
-        Ok(true) => (StatusCode::OK, "done".to_owned()),
-        Ok(false) => (
-            StatusCode::NOT_FOUND,
-            "no account has this login name".to_owned(),
-        ),
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("failed: {error}"),
-        ),
+    let account = match store.set_banned(&username, request.banned).await {
+        Ok(Some(account)) => account,
+        Ok(None) => {
+            let result = "no account has this login name".to_owned();
+            gm.audit(&result).await;
+            return (StatusCode::NOT_FOUND, result).into_response();
+        }
+        Err(error) => {
+            let result = format!("failed: {error}");
+            gm.audit(&result).await;
+            return (StatusCode::INTERNAL_SERVER_ERROR, result).into_response();
+        }
+    };
+    let (status, result) = if request.banned {
+        kick_account(&state, &gm, account).await
+    } else {
+        (StatusCode::OK, "done".to_owned())
     };
     gm.audit(&result).await;
     (status, result).into_response()
+}
+
+/// Asks every sim to kick the players of banned `account`. `200` when every sim answered (the
+/// account's players are gone); `502` with the sims that did not, as the ban is stored but a
+/// player may still be in the game there.
+async fn kick_account(state: &AppState, gm: &Gm<'_>, account: Uuid) -> (StatusCode, String) {
+    let (Some(commands), Some(_)) = (&state.commands, &state.live) else {
+        return (
+            StatusCode::BAD_GATEWAY,
+            "banned; no live link to the sims: a player in the game stays until it leaves"
+                .to_owned(),
+        );
+    };
+    let mut kicked = Vec::new();
+    let mut failed = Vec::new();
+    for sim in all_sims(state) {
+        match gm
+            .send_to(commands, &sim, AdminAction::KickAccount { account })
+            .await
+        {
+            Ok(AdminReply::Done) => kicked.push(sim.to_string()),
+            Ok(AdminReply::NotMine) => {}
+            other => failed.push(format!("{sim}: {}", answer(other).1)),
+        }
+    }
+    if failed.is_empty() {
+        let result = if kicked.is_empty() {
+            "done; not in the game".to_owned()
+        } else {
+            format!("done; kicked on {}", kicked.join(", "))
+        };
+        (StatusCode::OK, result)
+    } else {
+        (
+            StatusCode::BAD_GATEWAY,
+            format!("banned; kick not confirmed on {}", failed.join(", ")),
+        )
+    }
 }
 
 async fn ranks(State(state): State<AppState>, Extension(actor): Extension<Actor>) -> Response {
@@ -1459,11 +1508,36 @@ mod tests {
     async fn a_ban_and_a_rank_change_reach_the_store() {
         let fixture = fixture();
         let ban = serde_json::json!({ "username": "ADA", "banned": true });
+        answer_next(&fixture, Some(AdminReply::Done));
         assert_eq!(
             status(&fixture, post(BAN_ROUTE, &ban)).await,
             StatusCode::OK
         );
         assert!(lock_store(&fixture.store).logins[LOGIN].banned);
+        assert_eq!(
+            sent(&fixture),
+            [AdminAction::KickAccount {
+                account: Uuid::from_u128(LOGIN_ACCOUNT)
+            }],
+            "every sim kicks the account's players"
+        );
+        answer_next(&fixture, None);
+        assert_eq!(
+            status(&fixture, post(BAN_ROUTE, &ban)).await,
+            StatusCode::BAD_GATEWAY,
+            "a sim that does not answer may still have the player"
+        );
+        assert!(
+            results(&fixture)
+                .iter()
+                .any(|result| result.starts_with("banned; kick not confirmed"))
+        );
+        let unban = serde_json::json!({ "username": "ADA", "banned": false });
+        assert_eq!(
+            status(&fixture, post(BAN_ROUTE, &unban)).await,
+            StatusCode::OK
+        );
+        assert_eq!(sent(&fixture).len(), 2, "an unban kicks nobody");
         let unknown = serde_json::json!({ "username": "nobody", "banned": true });
         assert_eq!(
             status(&fixture, post(BAN_ROUTE, &unknown)).await,

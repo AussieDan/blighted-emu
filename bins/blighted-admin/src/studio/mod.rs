@@ -115,9 +115,13 @@ impl Studio {
 
     /// Reads the world layer again into the map's slot, off the async threads; a failure keeps
     /// the old layer.
-    async fn reload_world(&self) {
+    ///
+    /// # Errors
+    ///
+    /// Returns the reason when the merged files do not read as a world layer.
+    async fn reload_world(&self) -> Result<(), String> {
         let Some(reload) = self.world.clone() else {
-            return;
+            return Ok(());
         };
         let loaded = tokio::task::spawn_blocking(move || {
             (reload.load)().map(|layer| reload.slot.set(layer))
@@ -125,9 +129,10 @@ impl Studio {
         .await
         .map_err(|error| error.to_string())
         .and_then(|loaded| loaded);
-        if let Err(error) = loaded {
+        if let Err(error) = &loaded {
             tracing::warn!(%error, "the map keeps the old world");
         }
+        loaded
     }
 
     /// The client records; the first call reads the retail bundle, in the work slot, so it

@@ -141,20 +141,21 @@ impl Store {
         .map(|()| true)
     }
 
-    /// Bans or unbans the account named `name` ([`Self::account_by_name`]); `false` when no
-    /// account has that name.
-    pub async fn set_banned(&self, name: &str, banned: bool) -> Result<bool, DbError> {
+    /// Bans or unbans the account named `name` ([`Self::account_by_name`]); the account, or
+    /// `None` when no account has that name.
+    pub async fn set_banned(&self, name: &str, banned: bool) -> Result<Option<Uuid>, DbError> {
         let Some(record) = self.account_by_name(name).await? else {
-            return Ok(false);
+            return Ok(None);
         };
-        match self {
-            Self::Postgres(pool) => nw_db::set_banned(pool, record.account, banned).await,
+        let changed = match self {
+            Self::Postgres(pool) => nw_db::set_banned(pool, record.account, banned).await?,
             #[cfg(test)]
             Self::Memory(memory) => {
                 memory::lock(memory).set_banned(record.account, banned);
-                Ok(true)
+                true
             }
-        }
+        };
+        Ok(changed.then_some(record.account))
     }
 
     /// Adds an audit row.

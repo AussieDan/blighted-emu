@@ -70,7 +70,10 @@ impl Live {
 /// Starts the bus reader and the scraper of `config` on the current runtime; batches start
 /// from the routes. The streams end when `closing` turns `true`.
 pub fn start(config: &LiveConfig, closing: watch::Receiver<bool>) -> Live {
-    let state: SharedState = Arc::new(Mutex::new(LiveState::new(config.bot_prefixes())));
+    let state: SharedState = Arc::new(Mutex::new(LiveState::new(
+        config.bot_prefixes(),
+        config.sim_silence(),
+    )));
     tokio::spawn(bus::run(
         config.nats_url.clone(),
         config.world_id,

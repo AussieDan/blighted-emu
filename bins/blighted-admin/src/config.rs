@@ -191,6 +191,21 @@ fn default_github_api_url() -> String {
     GITHUB_API_URL.to_owned()
 }
 
+/// The sims' heartbeat interval when the live section names none (`heartbeat_interval_ms` of
+/// `config/sim.toml` and `config/world-director.toml`).
+pub const DEFAULT_HEARTBEAT_INTERVAL_MS: u64 = 1000;
+/// Missed heartbeats before a sim has left when the live section names none (`heartbeat_misses`
+/// of `config/world-director.toml` and `config/social.toml`).
+pub const DEFAULT_HEARTBEAT_MISSES: u32 = 3;
+
+const fn default_heartbeat_interval_ms() -> u64 {
+    DEFAULT_HEARTBEAT_INTERVAL_MS
+}
+
+const fn default_heartbeat_misses() -> u32 {
+    DEFAULT_HEARTBEAT_MISSES
+}
+
 /// The live panel part of the configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -222,6 +237,12 @@ pub struct LiveConfig {
     pub other_bot_prefixes: Vec<String>,
     /// Most bots of all batches together.
     pub max_bots: u32,
+    /// Time between two sim heartbeats, as the world director has it.
+    #[serde(default = "default_heartbeat_interval_ms")]
+    pub heartbeat_interval_ms: u64,
+    /// Missed heartbeats before a sim has left, as the world director has it.
+    #[serde(default = "default_heartbeat_misses")]
+    pub heartbeat_misses: u32,
 }
 
 impl LiveConfig {
@@ -230,6 +251,34 @@ impl LiveConfig {
         std::iter::once(self.bot_character_prefix.clone())
             .chain(self.other_bot_prefixes.iter().cloned())
             .collect()
+    }
+
+    /// How long a sim may stay silent before it has left.
+    pub fn sim_silence(&self) -> SimSilence {
+        SimSilence::of(self.heartbeat_interval_ms, self.heartbeat_misses)
+    }
+}
+
+/// How long a sim may stay silent before it has left: the heartbeat interval times the missed
+/// heartbeats (the rule of the world director and the social service).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimSilence {
+    /// Milliseconds.
+    pub ms: u64,
+}
+
+impl SimSilence {
+    /// `misses` missed heartbeats of `interval_ms`.
+    pub fn of(interval_ms: u64, misses: u32) -> Self {
+        Self {
+            ms: interval_ms.saturating_mul(u64::from(misses)),
+        }
+    }
+}
+
+impl Default for SimSilence {
+    fn default() -> Self {
+        Self::of(DEFAULT_HEARTBEAT_INTERVAL_MS, DEFAULT_HEARTBEAT_MISSES)
     }
 }
 
@@ -304,6 +353,12 @@ pub fn load_admin_config(path: &Path) -> Result<AdminConfig, AdminConfigError> {
                 });
             }
         }
+        if live.heartbeat_interval_ms == 0 || live.heartbeat_misses == 0 {
+            return Err(AdminConfigError::Invalid {
+                key: "live.heartbeat_interval_ms",
+                reason: "the interval and the misses must be above 0",
+            });
+        }
         let letters = |prefix: &String| {
             !prefix.is_empty() && prefix.chars().all(|letter| letter.is_ascii_alphabetic())
         };
@@ -359,6 +414,24 @@ mod tests {
         assert!(live.scrape_interval_ms >= MIN_LIVE_INTERVAL_MS);
         assert!(live.state_interval_ms >= MIN_LIVE_INTERVAL_MS);
         assert!(live.max_bots > 0);
+        assert_eq!(live.sim_silence(), SimSilence::default());
+    }
+
+    #[test]
+    fn the_sim_silence_follows_the_heartbeat_settings() {
+        let config = load_changed("heartbeat_misses = 3", "heartbeat_misses = 5").expect("load");
+        let live = config.live.expect("live section");
+        assert_eq!(
+            live.sim_silence(),
+            SimSilence::of(DEFAULT_HEARTBEAT_INTERVAL_MS, 5)
+        );
+        assert!(matches!(
+            load_changed("heartbeat_misses = 3", "heartbeat_misses = 0"),
+            Err(AdminConfigError::Invalid {
+                key: "live.heartbeat_interval_ms",
+                ..
+            })
+        ));
     }
 
     #[test]
