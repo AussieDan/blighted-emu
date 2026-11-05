@@ -240,6 +240,8 @@ mod tests {
                     base_max_health: LEVEL_HEALTH,
                     base_damage: 1.0,
                     physical_armor_rating: 0.0,
+                    elemental_armor_rating: 0.0,
+                    gear_score: 0,
                 },
             )],
             weapons: vec![(
@@ -335,6 +337,8 @@ mod tests {
                         base_max_health: 20_000.0,
                         base_damage: 1.0,
                         physical_armor_rating: 0.0,
+                        elemental_armor_rating: 0.0,
+                        gear_score: 0,
                     },
                 )],
                 ..source()
@@ -364,6 +368,8 @@ mod tests {
                             base_max_health: LEVEL_HEALTH,
                             base_damage: 1.0,
                             physical_armor_rating: 0.0,
+                            elemental_armor_rating: 0.0,
+                            gear_score: 0,
                         },
                     ),
                     (
@@ -372,6 +378,8 @@ mod tests {
                             base_max_health: 3000.0,
                             base_damage: 1.0,
                             physical_armor_rating: 0.0,
+                            elemental_armor_rating: 0.0,
+                            gear_score: 0,
                         },
                     ),
                 ],

@@ -37,6 +37,9 @@ pub enum ToolError {
     /// Reading the install failed.
     #[error(transparent)]
     Source(#[from] SourceError),
+    /// A music chart cannot be read or the chart file written.
+    #[error(transparent)]
+    MusicCharts(#[from] nw_content::music_charts::MusicChartError),
     /// Code generation failed.
     #[error(transparent)]
     Codegen(#[from] CodegenError),

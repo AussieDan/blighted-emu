@@ -12,7 +12,8 @@ use crate::Tables;
 /// What one game event gives.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Reward {
-    /// `CurrencyReward`: coins.
+    /// `CurrencyReward`: coins (a range cell `2000-5000` is rolled each time the reward is
+    /// given, [`Rewards::rolled`]).
     pub coins: u64,
     /// `UniversalExpAmount`: experience points.
     pub experience: u32,
@@ -22,10 +23,16 @@ pub struct Reward {
     pub whisper: Option<String>,
 }
 
-/// Every game event's reward by lowercase event id.
+/// Every game event's reward by lowercase event id, with the low and high end of its coins.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Rewards {
-    by_id: HashMap<String, Reward>,
+    by_id: HashMap<String, (Reward, (u64, u64))>,
+}
+
+/// A coin range rolled: its low end plus `below(n)`, a random number below `n`, of the spread.
+fn rolled_coins((low, high): (u64, u64), below: &mut impl FnMut(u32) -> u32) -> u64 {
+    let spread = u32::try_from(high.saturating_sub(low)).unwrap_or(u32::MAX);
+    low.saturating_add(u64::from(below(spread.saturating_add(1))))
 }
 
 /// A number cell (`"225"`); 0 for an empty or other cell.
@@ -37,7 +44,7 @@ fn number_of<T: std::str::FromStr + Default>(cell: Option<&str>) -> T {
 impl Rewards {
     /// The rewards of `GameEventData` in `tables`.
     pub fn from_tables(tables: &Tables) -> Self {
-        Self::build(
+        Self::of(
             tables
                 .game_event_data
                 .iter()
@@ -55,10 +62,11 @@ impl Rewards {
                                     .unwrap_or(1);
                                 (item, quantity)
                             });
+                    let coins = coin_range(row.currency_reward.as_deref());
                     (
                         row.event_id.clone(),
                         Reward {
-                            coins: number_of(row.currency_reward.as_deref()),
+                            coins: coins.0,
                             experience: number_of(row.universal_exp_amount.as_deref()),
                             item,
                             whisper: row
@@ -67,23 +75,44 @@ impl Rewards {
                                 .or_else(|| row.whisper_id_2.clone())
                                 .filter(|whisper| !whisper.is_empty()),
                         },
+                        coins,
                     )
                 }),
         )
     }
 
-    /// The rewards of `events` (event id, reward); the first row of an id wins.
-    pub fn build(events: impl IntoIterator<Item = (String, Reward)>) -> Self {
+    /// The rewards of `events` (event id, reward, coin range); the first row of an id wins.
+    pub fn of(events: impl IntoIterator<Item = (String, Reward, (u64, u64))>) -> Self {
         let mut by_id = HashMap::new();
-        for (id, reward) in events {
-            by_id.entry(id.to_lowercase()).or_insert(reward);
+        for (id, reward, coins) in events {
+            by_id.entry(id.to_lowercase()).or_insert((reward, coins));
         }
         Self { by_id }
     }
 
-    /// The reward of event `id` (any case).
-    pub fn get(&self, id: &str) -> Option<&Reward> {
-        self.by_id.get(&id.to_lowercase())
+    /// The rewards of `events` (event id, reward), each with its fixed coins.
+    pub fn build(events: impl IntoIterator<Item = (String, Reward)>) -> Self {
+        Self::of(events.into_iter().map(|(id, reward)| {
+            let coins = (reward.coins, reward.coins);
+            (id, reward, coins)
+        }))
+    }
+
+    /// The experience points of event `id` (any case); 0 for an event without a reward.
+    pub fn experience(&self, id: &str) -> u32 {
+        self.by_id
+            .get(&id.to_lowercase())
+            .map_or(0, |(reward, _)| reward.experience)
+    }
+
+    /// The reward of event `id` (any case) as it is given once: its coins rolled in their range
+    /// with `below(n)`, a random number below `n`.
+    pub fn rolled(&self, id: &str, below: &mut impl FnMut(u32) -> u32) -> Option<Reward> {
+        let (reward, coins) = self.by_id.get(&id.to_lowercase())?;
+        Some(Reward {
+            coins: rolled_coins(*coins, below),
+            ..reward.clone()
+        })
     }
 }
 
@@ -123,9 +152,7 @@ pub struct EventGrant {
 impl EventGrant {
     /// Its coins, with `below(n)` a random number below `n`.
     pub fn coins_rolled(&self, below: &mut impl FnMut(u32) -> u32) -> u64 {
-        let (low, high) = self.coins;
-        let spread = u32::try_from(high.saturating_sub(low)).unwrap_or(u32::MAX);
-        low.saturating_add(u64::from(below(spread.saturating_add(1))))
+        rolled_coins(self.coins, below)
     }
 }
 
@@ -260,11 +287,34 @@ mod tests {
                 whisper: None,
             },
         )]);
-        let reward = rewards.get("01_SkinningKnife_Success").expect("reward");
+        let reward = rewards
+            .rolled("01_SkinningKnife_Success", &mut |_| 0)
+            .expect("reward");
         assert_eq!(reward.coins, 225);
         assert_eq!(reward.experience, 275);
         assert_eq!(number_of::<u64>(Some("")), 0);
-        assert!(rewards.get("other").is_none());
+        assert!(rewards.rolled("other", &mut |_| 0).is_none());
+    }
+
+    #[test]
+    fn a_reward_of_a_coin_range_rolls_in_it_each_time() {
+        let rewards = Rewards::of([(
+            "EventBagofJuniperBerriesLVL30".to_owned(),
+            Reward::default(),
+            coin_range(Some("2000-5000")),
+        )]);
+        let mut asked = Vec::new();
+        let low = rewards
+            .rolled("eventbagofjuniperberrieslvl30", &mut |below| {
+                asked.push(below);
+                0
+            })
+            .expect("reward");
+        let high = rewards
+            .rolled("eventbagofjuniperberrieslvl30", &mut |below| below - 1)
+            .expect("reward");
+        assert_eq!((low.coins, high.coins), (2000, 5000));
+        assert_eq!(asked, [3001], "every coin of the range may come");
     }
 
     #[test]

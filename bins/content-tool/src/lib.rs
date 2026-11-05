@@ -22,6 +22,7 @@ pub mod ftue_entities;
 pub mod map_tiles;
 pub mod melee_shapes;
 pub mod mob_prefabs;
+pub mod music_charts;
 #[cfg(all(test, feature = "own-replay"))]
 mod own_replay;
 pub mod player_abilities;

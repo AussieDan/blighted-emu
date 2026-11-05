@@ -38,6 +38,7 @@ use content_tool::mob_prefabs::{
 };
 use content_tool::player_abilities::{PlayerAbilitiesReport, build_abilities};
 use content_tool::player_attacks::{BundleRows, PlayerAttacksReport, build_stances, read_sources};
+use content_tool::music_charts::build_music_charts;
 use content_tool::quick_courses::build_quick_courses;
 use content_tool::roads::{RoadsError, RoadsReport, build_level_roads};
 use content_tool::source::GameSource;
@@ -305,6 +306,12 @@ enum Command {
         /// Content bundle (default: `local-data/content/bundle-<build>.bin`).
         #[arg(long)]
         bundle: Option<PathBuf>,
+    },
+    /// Writes the music chart file: the notes of every music sheet, from the game paks.
+    MusicCharts {
+        /// Output folder for `music-charts-<build>.json`.
+        #[arg(long, default_value = DEFAULT_CONTENT_DIR)]
+        out_dir: PathBuf,
     },
     /// Writes the camp slice file: the spawn group components, asset id and respawn point of
     /// every camp slice, from the game paks.
@@ -674,6 +681,16 @@ fn run(cli: Cli) -> Result<(), ToolError> {
                 &client_build,
                 &out_dir,
             )?);
+        }
+        Command::MusicCharts { out_dir } => {
+            let source = GameSource::open(game_dir(cli.game_dir.as_deref())?)?;
+            let report = build_music_charts(&source, &client_build, &out_dir)?;
+            println!(
+                "{}: {} charts, {} notes",
+                report.path.display(),
+                report.charts,
+                report.notes
+            );
         }
         Command::CampSlices { out_dir } => {
             let source = GameSource::open(game_dir(cli.game_dir.as_deref())?)?;

@@ -43,6 +43,7 @@ pub mod meta_achievements;
 pub mod mob_prefabs;
 pub mod mounts;
 pub mod music;
+pub mod music_charts;
 pub mod mutations;
 pub mod objective_limits;
 pub mod perk_effects;

@@ -74,6 +74,10 @@ const IF_THEN_ELSE_ELEMENT: &str = "IfThenElse";
 const IF_CONDITION_ELEMENT: &str = "IfCondition";
 const THEN_ACTIVITY_ELEMENT: &str = "ThenActivity";
 const CAST_SPELL_ELEMENT: &str = "CastSpell";
+/// The activity that runs a `TriggerEntityComponent` of the character's slice.
+const TRIGGER_ENTITY_ELEMENT: &str = "TriggerEntity";
+/// The trigger name of its `<Default>`.
+const TRIGGER_NAME_ATTRIBUTE: &str = "TriggerName";
 const CAST_RAYCAST_ELEMENT: &str = "CastSpellRaycast";
 const CAST_TARGETING_ELEMENT: &str = "CastSpellTargeting";
 const ELSE_ACTIVITY_ELEMENT: &str = "ElseActivity";
@@ -1312,6 +1316,8 @@ pub struct Action {
     pub fragment: String,
     /// The spells its activities cast, in file order.
     pub casts: Vec<SpellCast>,
+    /// The slice triggers its `TriggerEntity` activities run, in file order.
+    pub triggers: Vec<EntityTrigger>,
     /// Its activation on a status effect: an `<ActivationCondition>` whose `And` holds one test
     /// `<IfHasStatusEffect>` (not under a `Not`), the effect and the rest of the `And`.
     pub on_status_effect: Option<(String, Condition)>,
@@ -1410,6 +1416,16 @@ pub struct SpellCast {
     pub spell: String,
     /// How it aims.
     pub kind: CastKind,
+}
+
+/// One `TriggerEntity` activity: the client runs the slice's `TriggerEntityComponent` of that
+/// name (type 3135).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct EntityTrigger {
+    /// The conditions of the branches it is in; `True` for an unconditional one.
+    pub condition: Condition,
+    /// `Default TriggerName`.
+    pub name: String,
 }
 
 /// The active ability parts of an action (the `playeractions_ability_*` lists).
@@ -1586,6 +1602,30 @@ fn casts(action: &Node) -> Vec<SpellCast> {
     found
 }
 
+/// The `TriggerEntity` activities of `action`, each with the conditions of the branches it is
+/// in, in file order.
+fn entity_triggers(action: &Node) -> Vec<EntityTrigger> {
+    let mut found = Vec::new();
+    walk_activities(action, &mut |activity, condition| {
+        if activity.name != TRIGGER_ENTITY_ELEMENT {
+            return false;
+        }
+        if let Some(name) = activity
+            .children
+            .iter()
+            .find(|child| child.name == DEFAULT_ELEMENT)
+            .and_then(|default| default.attribute(TRIGGER_NAME_ATTRIBUTE))
+        {
+            found.push(EntityTrigger {
+                condition,
+                name: name.to_owned(),
+            });
+        }
+        true
+    });
+    found
+}
+
 /// The spell an activity casts and how: `<CastSpell><Default SpellName>`, or a raycast or
 /// targeting cast that names it.
 fn spell_of(activity: &Node) -> Option<(&str, CastKind)> {
@@ -1749,6 +1789,13 @@ impl ActionList {
                             .map(|cast| SpellCast {
                                 condition: cast.condition.resolved(&conditions, 0),
                                 ..cast
+                            })
+                            .collect(),
+                        triggers: entity_triggers(action)
+                            .into_iter()
+                            .map(|trigger| EntityTrigger {
+                                condition: trigger.condition.resolved(&conditions, 0),
+                                ..trigger
                             })
                             .collect(),
                         on_status_effect: on_status_effect(action)
@@ -2378,6 +2425,38 @@ mod tests {
 
     /// `playeractions_ability_musket.actionlist` and `playeractions_archery.actionlist`: a tag
     /// activity keeps its `OnEnter` and `OnExit`, the branch it is in and its named cases.
+    /// The `TriggerEntity` activities of an action, as the creature lists write them
+    /// (`werewolf_combat.actionlist`: `Disease_On` with no branch; the nameplate lists: a
+    /// `Group` in a marker branch).
+    #[test]
+    fn trigger_activities_keep_their_names_and_branches() {
+        let text = r#"<ActionList><Actions>
+ <Action Name="Combat_Disease_Intro" FragmentName="Disease_Intro"><Activities>
+  <TriggerEntity><Default TriggerName="Disease_On"/></TriggerEntity>
+  <IfThenElse ResetWhenReinstalled="true"><IfCondition><IfMannequinMarker MarkerName="EnableNameplate"/></IfCondition>
+   <ThenActivity><Group><TriggerEntity><Default TriggerName="EnableNameplate"/></TriggerEntity></Group></ThenActivity>
+  </IfThenElse>
+ </Activities></Action>
+</Actions></ActionList>"#;
+        let list = ActionList::parse(text).expect("list");
+        let action = list.action("Combat_Disease_Intro").expect("action");
+        assert_eq!(
+            action.triggers,
+            [
+                EntityTrigger {
+                    condition: Condition::True,
+                    name: "Disease_On".to_owned(),
+                },
+                EntityTrigger {
+                    condition: Condition::All(vec![Condition::All(vec![Condition::Marker(
+                        "EnableNameplate".to_owned(),
+                    )])]),
+                    name: "EnableNameplate".to_owned(),
+                },
+            ]
+        );
+    }
+
     #[test]
     fn tag_activities_keep_their_changes_branches_and_cases() {
         let text = r#"<ActionList><Conditions>
@@ -2428,7 +2507,9 @@ mod tests {
             ..CageState::default()
         };
         assert_eq!(
-            action.tag_activities[0].case_in(&tagged).map(|case| case.tag.as_str()),
+            action.tag_activities[0]
+                .case_in(&tagged)
+                .map(|case| case.tag.as_str()),
             Some("PenetratingAim")
         );
         assert_eq!(

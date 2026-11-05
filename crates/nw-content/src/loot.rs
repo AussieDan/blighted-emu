@@ -45,8 +45,8 @@ use crate::Tables;
 /// The suffixes of a table's quantity and threshold rows.
 const QUANTITY_SUFFIX: &str = "_Qty";
 const THRESHOLD_SUFFIX: &str = "_Probs";
-/// An entry that rolls another loot table.
-const TABLE_PREFIX: &str = "[LTID]";
+/// An entry that rolls another loot table (and an item reward of a game event that rolls one).
+pub const TABLE_PREFIX: &str = "[LTID]";
 /// An entry that drops items of a loot bucket.
 const BUCKET_PREFIX: &str = "[LBID]";
 /// The quantity and level range separator (`1-2`).

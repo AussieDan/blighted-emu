@@ -29,7 +29,7 @@
 use nw_ai::brain::{Brain, Command, MotionOutcome, Runtime, Slot, World};
 use nw_ai::data::{AiData, Grid};
 use nw_ai::keys::EngineKey;
-use nw_ai::node::{EntityQueryParams, PositionType, SelectPositionParams, TrackerParams};
+use nw_ai::node::{EntityQueryParams, NodeKind, PositionType, SelectPositionParams, TrackerParams};
 use nw_ai::value::{Blackboard, NameId, Value};
 
 use crate::ai_trace::{AiTrace, MobTrace};
@@ -171,6 +171,12 @@ impl World for ReplayWorld {
 
     fn entities_with_tag(&self, _tag: &str) -> u32 {
         0
+    }
+
+    fn can_act(&self, _kind: &NodeKind, _target_index: Option<u32>) -> bool {
+        // The replay compares the tree's own choices with a retail capture, where the retail
+        // server ran each action leaf.
+        true
     }
 
     fn has_patrol(&self) -> bool {

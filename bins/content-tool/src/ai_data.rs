@@ -23,9 +23,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use nw_ai::data::{
-    AiData, Archetype, CageAction, CageCondition, Completion, Creature, FacingMode, FragmentLength,
-    FragmentVariant, Grid, NavConfig, ProcWindow, ProjectileSlice, RangedAttack, TagActivity,
-    TagEffect, TreeRef, Vision,
+    AiData, Archetype, CageAction, CageCondition, Completion, Creature, EntityTrigger, FacingMode,
+    FragmentLength, FragmentVariant, Grid, NavConfig, ProcWindow, ProjectileSlice, RangedAttack,
+    SliceTriggerRef, TagActivity, TagEffect, TreeRef, Vision,
 };
 use nw_ai::decode::{DecodeError, ServerPakError, TreeDecoder, decode_entries, server_pak_entries};
 use nw_ai::node::NodeId;
@@ -34,12 +34,13 @@ use nw_content::creature_animations::CreatureRow;
 use nw_formats::azcs::{decode_azcs, is_azcs};
 use nw_formats::datasheet::Datasheet;
 use nw_formats::mannequin::{
-    ActionList, AnimDatabase, CageGrid, Condition, GridList, MannequinError, Node as XmlNode,
-    parse_tree,
+    ActionList, AnimDatabase, CageGrid, Condition, EntityTrigger as NwEntityTrigger, GridList,
+    MannequinError, Node as XmlNode, parse_tree,
 };
 use nw_formats::objectstream::{Element, lowercase_crc32, parse_object_stream};
 use nw_formats::pak::{PakArchive, PakError, find_paks};
 use nw_oodle::KrakenDecompressor;
+use nw_world::slice_triggers::slice_triggers;
 
 use crate::creature_animations::{main_hand_item, read_entries, text_of};
 use crate::error::ToolError;
@@ -256,6 +257,8 @@ struct SliceAi {
     animation_database: Option<String>,
     damage_table: Option<String>,
     main_hand: Option<String>,
+    /// The slice's `TriggerEntityComponent`s: name, child (main `Id` XOR owner `Id`), component.
+    triggers: Vec<(String, u64, u64)>,
 }
 
 fn crc(name: &str) -> u32 {
@@ -526,6 +529,7 @@ struct ListAction {
     tasks: Vec<String>,
     completion: Option<(f32, Vec<(String, f32)>)>,
     tags: Vec<(String, TagEffect, TagEffect, f32)>,
+    triggers: Vec<NwEntityTrigger>,
     motion_multiplier: Option<f32>,
     facing: Option<FacingMode>,
 }
@@ -643,14 +647,20 @@ fn list_actions(text: &str) -> Result<ParsedList, MannequinError> {
             tasks,
             completion,
             tags,
+            triggers: Vec::new(),
             motion_multiplier,
             facing,
         });
     }
-    let conditions = ActionList::parse(text)?.conditions;
+    let parsed = ActionList::parse(text)?;
+    for action in &mut out {
+        if let Some(list_action) = parsed.action(&action.name) {
+            action.triggers.clone_from(&list_action.triggers);
+        }
+    }
     Ok(ParsedList {
         actions: out,
-        conditions,
+        conditions: parsed.conditions,
     })
 }
 
@@ -1150,6 +1160,21 @@ pub fn build_ai_data(
             Ok(root) => {
                 let mut slice = SliceAi::read(&root, &mut decoder, path)?;
                 slice.main_hand = main_hand_item(&root);
+                // A slice without triggers, or with an unreadable one, runs none.
+                slice.triggers = slice_triggers(&root)
+                    .map(|triggers| {
+                        triggers
+                            .into_iter()
+                            .map(|trigger| {
+                                (
+                                    trigger.name,
+                                    trigger.main ^ trigger.owner,
+                                    trigger.component,
+                                )
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 slices.insert(path.clone(), slice);
             }
             Err(reason) => {
@@ -1365,6 +1390,15 @@ pub fn build_ai_data(
             default_tags: row_tags
                 .into_iter()
                 .map(|tag| decoder.intern(tag))
+                .collect(),
+            triggers: slice
+                .triggers
+                .iter()
+                .map(|(name, child, component)| SliceTriggerRef {
+                    name: decoder.intern(name),
+                    child: *child,
+                    component: *component,
+                })
                 .collect(),
         };
         archetype_of_slice.insert(
@@ -1654,6 +1688,14 @@ impl CageBuilder<'_> {
                     on_enter: *on_enter,
                     on_exit: *on_exit,
                     delay_s: *delay_s,
+                })
+                .collect(),
+            triggers: action
+                .triggers
+                .iter()
+                .map(|trigger| EntityTrigger {
+                    trigger: decoder.intern(&trigger.name),
+                    condition: cage_condition(decoder, &trigger.condition),
                 })
                 .collect(),
             motion_multiplier: action.motion_multiplier,

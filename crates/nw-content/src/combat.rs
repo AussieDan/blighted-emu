@@ -104,6 +104,24 @@ pub struct LevelRow {
     pub base_damage: f64,
     /// Physical armor rating of a mob of this level.
     pub physical_armor_rating: f64,
+    /// Elemental armor rating of a mob of this level.
+    pub elemental_armor_rating: f64,
+    /// `GearScore`: the gear score of a mob of this level, against which a player's armor
+    /// mitigates its hits.
+    pub gear_score: u32,
+}
+
+/// The armor of an armor item (`ArmorItemDefinitions`): its share of a full set's rating and the
+/// scale of each kind (the set's physical and elemental scale factors).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArmorRow {
+    /// `ArmorRatingScaleFactor`: the item's share of a full set (the five heavy starter pieces:
+    /// head 0.15, chest 0.35, hands 0.15, legs 0.2, feet 0.15).
+    pub rating_share: f64,
+    /// `PhysicalArmorSetScaleFactor`.
+    pub physical_scale: f64,
+    /// `ElementalArmorSetScaleFactor`.
+    pub elemental_scale: f64,
 }
 
 /// Milliseconds per second.
@@ -267,6 +285,8 @@ pub struct CombatSource {
     pub ranged_profiles: Vec<(String, String)>,
     /// `MasterItemDefinitions`: (item id, `ItemStatsRef`) of the items that have stats.
     pub item_stats: Vec<(String, String)>,
+    /// `ArmorItemDefinitions` by id.
+    pub armors: Vec<(String, ArmorRow)>,
     /// `ConsumableItemDefinitions`: the consumables with a cooldown.
     pub consumables: Vec<ConsumableRow>,
     /// `StatusEffectData`: (status id, health, health share) of the effects that heal.
@@ -354,6 +374,8 @@ impl CombatSource {
                             base_max_health: row.base_max_health,
                             base_damage: row.base_damage,
                             physical_armor_rating: row.physical_armor_rating,
+                            elemental_armor_rating: row.elemental_armor_rating,
+                            gear_score: u32::try_from(row.gear_score).unwrap_or(0),
                         },
                     ))
                 })
@@ -433,6 +455,21 @@ impl CombatSource {
                             row.health_modifier_percent.unwrap_or(0.0),
                         )
                     })
+                })
+                .collect(),
+            armors: tables
+                .armor_item_definitions
+                .iter()
+                .flat_map(|table| &table.rows)
+                .map(|row| {
+                    (
+                        row.weapon_id.clone(),
+                        ArmorRow {
+                            rating_share: row.armor_rating_scale_factor.unwrap_or(0.0),
+                            physical_scale: row.physical_armor_set_scale_factor.unwrap_or(0.0),
+                            elemental_scale: row.elemental_armor_set_scale_factor.unwrap_or(0.0),
+                        },
+                    )
                 })
                 .collect(),
             item_stats: tables
@@ -552,6 +589,8 @@ pub struct CombatData {
     weapon: WeaponRow,
     /// The weapon row of each item that is a weapon, by lower-case item id.
     item_weapons: HashMap<String, WeaponRow>,
+    /// The armor row of each item that is armor, by lower-case item id.
+    item_armors: HashMap<String, ArmorRow>,
     /// The ranged attack profile of each weapon item that has one, by lower-case item id.
     item_ranged_profiles: HashMap<String, String>,
     /// The healing consumable of each item that is one, by lower-case item id.
@@ -639,6 +678,18 @@ impl CombatData {
             .iter()
             .filter_map(|(item, stats)| {
                 Some((item.to_lowercase(), *weapons.get(&stats.to_lowercase())?))
+            })
+            .collect();
+        let armors: HashMap<String, ArmorRow> = source
+            .armors
+            .iter()
+            .map(|(id, armor)| (id.to_lowercase(), *armor))
+            .collect();
+        let item_armors = source
+            .item_stats
+            .iter()
+            .filter_map(|(item, stats)| {
+                Some((item.to_lowercase(), *armors.get(&stats.to_lowercase())?))
             })
             .collect();
         let item_weapon_classes = source
@@ -745,6 +796,7 @@ impl CombatData {
             levels: source.levels.into_iter().collect(),
             weapon,
             item_weapons,
+            item_armors,
             item_ranged_profiles,
             item_heals,
             item_pvp_damage,
@@ -768,6 +820,12 @@ impl CombatData {
     /// weapon. Case does not matter.
     pub fn weapon_of_item(&self, item_id: &str) -> Option<&WeaponRow> {
         self.item_weapons.get(&item_id.to_lowercase())
+    }
+
+    /// The armor row of item `item_id` (its `ItemStatsRef`); `None` for an item that is no armor.
+    /// Case does not matter.
+    pub fn armor_of_item(&self, item_id: &str) -> Option<&ArmorRow> {
+        self.item_armors.get(&item_id.to_lowercase())
     }
 
     /// The ranged attack profile (`RangedAttackProfile`) of weapon item `item_id`; `None` for an
@@ -1036,6 +1094,14 @@ mod tests {
     const LEVEL_DAMAGE: f64 = 686.1;
     const LEVEL_ARMOR: f64 = 109.336;
     const SWORD_ITEM: &str = "1hSwordT1";
+    /// The swordsman's starter chest and its stats row (build 25810808).
+    const CHEST_ITEM: &str = "SwordsmanArchetypeChest";
+    const CHEST_STATS: &str = "HeavyChest_Balanced";
+    const CHEST: ArmorRow = ArmorRow {
+        rating_share: 0.35,
+        physical_scale: 0.874_996_5,
+        elemental_scale: 0.874_996_5,
+    };
     /// A sword's open-world PvP adjustment in the test table.
     const SWORD_PVP_ADJUSTMENT: f64 = -0.1;
     /// The bow's (retail -0.253); no test item is a bow.
@@ -1103,6 +1169,8 @@ mod tests {
                     base_max_health: LEVEL_HEALTH,
                     base_damage: LEVEL_DAMAGE,
                     physical_armor_rating: LEVEL_ARMOR,
+                    elemental_armor_rating: LEVEL_ARMOR,
+                    gear_score: 0,
                 },
             )],
             weapons: vec![
@@ -1137,7 +1205,9 @@ mod tests {
                 (SWORD_ITEM.to_owned(), "SwordT1".to_owned()),
                 ("Shield".to_owned(), "NoWeaponRow".to_owned()),
                 (ICE_GAUNTLET_ITEM.to_owned(), ICE_GAUNTLET_STATS.to_owned()),
+                (CHEST_ITEM.to_owned(), CHEST_STATS.to_owned()),
             ],
+            armors: vec![(CHEST_STATS.to_owned(), CHEST)],
             attacks: [(LIGHT, 1.0, 0), (HEAVY, 1.2, 1), (PELLET, 0.19, 0)]
                 .map(|(id, coefficient, threat)| AttackRow {
                     damage_id: id.to_owned(),
@@ -1230,6 +1300,8 @@ mod tests {
         };
         let data = data().with_player_attacks(PlayerAttacks::of_stances(vec![stance, unarmed]));
         let sword = data.weapon_of_item(SWORD_ITEM).expect("sword");
+        assert_eq!(data.armor_of_item("swordsmanarchetypechest"), Some(&CHEST));
+        assert_eq!(data.armor_of_item(SWORD_ITEM), None, "a weapon is no armor");
         assert_eq!(
             data.stance(sword.stance).map(|stance| stance.tags.as_str()),
             Some("1H_Melee,Sword")

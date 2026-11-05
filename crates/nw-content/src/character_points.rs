@@ -26,6 +26,11 @@ pub const ATTRIBUTE_COUNT: usize = 5;
 pub const CONSTITUTION: u32 = 0;
 /// The `IsAbility` cell of a progression point that is an ability-tree point.
 const IS_ABILITY: &str = "1";
+/// The `Category` of a territory standing bonus pool (`ProgressionPoolData`).
+const TERRITORY_CATEGORY: &str = "Territory";
+/// The start of a territory standing bonus pool id; the territory id follows
+/// (`TerritoryRankBonus_2`).
+const TERRITORY_POOL_PREFIX: &str = "TerritoryRankBonus_";
 
 /// The values one attribute may take: the `Level` rows of its `AttributeDefinition` table.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +59,28 @@ pub struct PointRule {
     pub active: bool,
 }
 
+/// One territory's standing bonus pool (`ProgressionPoolData` of `Category` `Territory`): the
+/// territory standing points a player spends there (4040).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerritoryPool {
+    /// The territory id, the categorical progression of its standing (`2` of
+    /// `TerritoryRankBonus_2`).
+    pub territory: String,
+    /// `PointCap`: the most points the pool holds.
+    pub cap: u32,
+    /// `InitialPoints`: the points it holds before any standing rank.
+    pub initial: u32,
+}
+
+/// One territory standing bonus (`ProgressionPointData` of a territory pool).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerritoryBonus {
+    /// The CRC-32 of the lowercase `PointPoolId`.
+    pub pool: u32,
+    /// `MaxLevel`.
+    pub max_level: u16,
+}
+
 /// The rules of a character's points.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CharacterPoints {
@@ -73,6 +100,10 @@ pub struct CharacterPoints {
     pool_versions: Vec<(u32, u32)>,
     /// The `Health` of each Constitution `Level` row, by value.
     constitution_health: BTreeMap<u32, u32>,
+    /// The territory standing bonus pools, by CRC.
+    territory_pools: BTreeMap<u32, TerritoryPool>,
+    /// The territory standing bonuses, by CRC.
+    territory_bonuses: BTreeMap<u32, TerritoryBonus>,
 }
 
 /// One `ProgressionPointData` row, as [`CharacterPoints::build`] takes it.
@@ -159,6 +190,81 @@ impl CharacterPoints {
         )
         .with_respec_costs(respec_costs)
         .with_constitution_health(constitution_health)
+        .with_territory_pools(
+            tables
+                .progression_pool_data
+                .iter()
+                .flat_map(|table| &table.rows)
+                .filter(|row| row.category == TERRITORY_CATEGORY)
+                .map(|row| {
+                    (
+                        row.progression_pool_id.as_str(),
+                        row.point_cap,
+                        row.initial_points.as_deref(),
+                    )
+                }),
+            tables
+                .progression_point_data
+                .iter()
+                .flat_map(|table| &table.rows)
+                .filter_map(|row| {
+                    Some((
+                        row.progression_point_id.as_str(),
+                        row.point_pool_id.as_deref()?,
+                        row.max_level,
+                    ))
+                }),
+        )
+    }
+
+    /// These rules with the territory standing bonus `pools` (`ProgressionPoolId`, `PointCap`,
+    /// `InitialPoints`) and the bonuses of them among `points` (`ProgressionPointId`,
+    /// `PointPoolId`, `MaxLevel`); a pool id without the territory prefix, or an
+    /// `InitialPoints` cell that is no number, is skipped or 0.
+    #[must_use]
+    pub fn with_territory_pools<'a>(
+        mut self,
+        pools: impl IntoIterator<Item = (&'a str, i64, Option<&'a str>)>,
+        points: impl IntoIterator<Item = (&'a str, &'a str, i64)>,
+    ) -> Self {
+        for (id, cap, initial) in pools {
+            let Some(territory) = id.strip_prefix(TERRITORY_POOL_PREFIX) else {
+                continue;
+            };
+            self.territory_pools.insert(
+                lowercase_crc32(id),
+                TerritoryPool {
+                    territory: territory.to_owned(),
+                    cap: clamp(cap),
+                    initial: initial
+                        .and_then(|cell| cell.trim().parse().ok())
+                        .unwrap_or_default(),
+                },
+            );
+        }
+        for (id, pool, max_level) in points {
+            let pool = lowercase_crc32(pool);
+            if self.territory_pools.contains_key(&pool) {
+                self.territory_bonuses.insert(
+                    lowercase_crc32(id),
+                    TerritoryBonus {
+                        pool,
+                        max_level: small(max_level),
+                    },
+                );
+            }
+        }
+        self
+    }
+
+    /// The territory standing bonus pool whose wire id is `crc`.
+    pub fn territory_pool(&self, crc: u32) -> Option<&TerritoryPool> {
+        self.territory_pools.get(&crc)
+    }
+
+    /// The territory standing bonus whose wire id is `crc`.
+    pub fn territory_bonus(&self, crc: u32) -> Option<&TerritoryBonus> {
+        self.territory_bonuses.get(&crc)
     }
 
     /// These rules with the Constitution `rows` (`Level`, `Health`); a negative cell is 0.
@@ -268,6 +374,8 @@ impl CharacterPoints {
             pool_versions,
             respec_costs: BTreeMap::new(),
             constitution_health: BTreeMap::new(),
+            territory_pools: BTreeMap::new(),
+            territory_bonuses: BTreeMap::new(),
         }
     }
 
@@ -439,4 +547,32 @@ pub(crate) mod tests {
         assert!(rules.point_by_id(COMBO).is_none());
         assert!(rules.ability_tables().is_empty());
     }
+
+    #[test]
+    fn territory_bonuses_belong_to_their_territory_pool() {
+        const POOL: &str = "TerritoryRankBonus_2";
+        const BONUS: &str = "TB_GainStanding_2";
+        let rules = CharacterPoints::default().with_territory_pools(
+            [(POOL, 30, Some("1")), (TABLE, 18, None)],
+            [(BONUS, POOL, 14), (UPGRADE, TABLE, 1)],
+        );
+        assert_eq!(
+            rules.territory_pool(lowercase_crc32(POOL)),
+            Some(&TerritoryPool {
+                territory: "2".to_owned(),
+                cap: 30,
+                initial: 1,
+            })
+        );
+        assert_eq!(
+            rules.territory_bonus(lowercase_crc32(BONUS)),
+            Some(&TerritoryBonus {
+                pool: lowercase_crc32(POOL),
+                max_level: 14,
+            })
+        );
+        assert_eq!(rules.territory_pool(lowercase_crc32(TABLE)), None, "a weapon pool");
+        assert_eq!(rules.territory_bonus(lowercase_crc32(UPGRADE)), None);
+    }
+
 }
