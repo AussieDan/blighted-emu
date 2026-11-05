@@ -13,7 +13,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use nw_formats::mannequin::{AbilityUse, CageWorld, CastKind, Condition};
+use nw_formats::mannequin::{AbilityUse, CageWorld, CastKind, Condition, TagActivity};
 use serde::{Deserialize, Serialize};
 
 use crate::player_attacks::{BasicAttack, Flight};
@@ -179,8 +179,8 @@ pub struct ListAction {
     pub activation: Option<Condition>,
     /// It stops when this holds; `None`: when its fragment is done.
     pub deactivation: Option<Condition>,
-    /// The Mannequin tags it sets while it runs.
-    pub sets_tags: Vec<String>,
+    /// Its tag activities: the Mannequin tags its start, its end and its branches set and unset.
+    pub tag_activities: Vec<TagActivity>,
     /// Its ability parts (the ability it starts, costs, cooldowns, effects).
     pub ability: Option<AbilityUse>,
     /// The spells it casts.
@@ -328,7 +328,7 @@ mod tests {
                 fragment: "Smite".to_owned(),
                 activation: Some(Condition::True),
                 deactivation: None,
-                sets_tags: Vec::new(),
+                tag_activities: Vec::new(),
                 ability: None,
                 casts: vec![AbilityCast {
                     condition: Condition::All(vec![

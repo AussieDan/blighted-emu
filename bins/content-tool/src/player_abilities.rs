@@ -387,7 +387,7 @@ fn list_of(
                 fragment: action.fragment.clone(),
                 activation: action.activation.clone(),
                 deactivation: action.deactivation.clone(),
-                sets_tags: action.sets_tags.clone(),
+                tag_activities: action.tag_activities.clone(),
                 ability: action.ability.clone(),
                 casts: action
                     .casts

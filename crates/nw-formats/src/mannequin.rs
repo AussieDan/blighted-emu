@@ -100,6 +100,7 @@ const STACK_VAR_ATTRIBUTE: &str = "StackVar";
 const CONDITION_NAME_ATTRIBUTE: &str = "ConditionName";
 const ABILITY_MOVE_TEST_ELEMENT: &str = "IfActiveAbilityMoveName";
 const ABILITY_NAME_ATTRIBUTE: &str = "AbilityName";
+const BACK_TICKS_ATTRIBUTE: &str = "BackTicks";
 const MANA_COST_TEST_ELEMENT: &str = "IfManaCost";
 const COMPARISON_ATTRIBUTE: &str = "ComparisonType";
 const LESS_THAN: &str = "LessThan";
@@ -123,6 +124,13 @@ const STATUS_EFFECT_ATTRIBUTE: &str = "StatusEffect";
 const ACTIVATION_CONDITION_ELEMENT: &str = "ActivationCondition";
 const DEACTIVATION_CONDITION_ELEMENT: &str = "DeactivationCondition";
 const SET_TAG_ELEMENT: &str = "SetMannequinTag";
+const ON_ENTER_ATTRIBUTE: &str = "OnEnter";
+const ON_EXIT_ATTRIBUTE: &str = "OnExit";
+const CASE_NAME_ATTRIBUTE: &str = "Name";
+/// The `OnEnter` and `OnExit` values that set and unset a tag (the player lists spell unset two
+/// ways: 1,171 `Unset`, 17 `UnSet`; every other value leaves the tag as it is).
+const SET_VALUE: &str = "Set";
+const UNSET_VALUES: [&str; 2] = ["Unset", "UnSet"];
 const ACTIVITIES_ELEMENT: &str = "Activities";
 const DRIVEN_MOTION_ELEMENT: &str = "AnimationDrivenMotion";
 const CONDITIONAL_ELEMENT: &str = "Conditional";
@@ -876,8 +884,16 @@ pub enum Condition {
         /// `ExitOffsetSeconds`, ms.
         exit_offset_ms: u32,
     },
-    /// `<IfActiveAbilityMoveName AbilityName>`: the key of this mapped ability is pressed.
-    AbilityMove(String),
+    /// `<IfActiveAbilityMoveName AbilityName BackTicks>`: the key of this mapped ability was
+    /// pressed this client frame or up to `BackTicks` frames before. Without the attribute the
+    /// count is 0 (Observed: the client's maker of the test, `FUN_142bec920`, fills the new test
+    /// with zeros before `FUN_142beef00` reads the attributes).
+    AbilityMove {
+        /// `AbilityName`.
+        ability: String,
+        /// `BackTicks`.
+        back_ticks: u32,
+    },
     /// `<IfCooldownTimer AbilityID>`: the ability's cooldown runs.
     Cooldown(String),
     /// `<IfManaCost CostID ComparisonType>`: the mana compares with the cost so.
@@ -952,8 +968,9 @@ pub trait CageWorld {
     fn fragment_done(&self, _fragment: Option<&str>, _exit_offset_ms: u32) -> bool {
         false
     }
-    /// The key of mapped ability `ability` is pressed.
-    fn ability_move(&self, _ability: &str) -> bool {
+    /// The key of mapped ability `ability` was pressed this frame or up to `back_ticks` frames
+    /// before.
+    fn ability_move(&self, _ability: &str, _back_ticks: u32) -> bool {
         false
     }
     /// The cooldown of `ability` runs.
@@ -1062,7 +1079,13 @@ impl Condition {
                     // A fraction of a fragment's length.
                     .map_or(0, |seconds| (seconds * MS_PER_SECOND).round() as u32),
             },
-            ABILITY_MOVE_TEST_ELEMENT => Self::AbilityMove(attribute(ABILITY_NAME_ATTRIBUTE)),
+            ABILITY_MOVE_TEST_ELEMENT => Self::AbilityMove {
+                ability: attribute(ABILITY_NAME_ATTRIBUTE),
+                back_ticks: node
+                    .attribute(BACK_TICKS_ATTRIBUTE)
+                    .and_then(|ticks| ticks.parse().ok())
+                    .unwrap_or_default(),
+            },
             COOLDOWN_TEST_ELEMENT => Self::Cooldown(attribute(ABILITY_ID_ATTRIBUTE)),
             MANA_COST_TEST_ELEMENT => Self::ManaCost {
                 cost: attribute(COST_ID_ATTRIBUTE),
@@ -1113,7 +1136,10 @@ impl Condition {
                 fragment,
                 exit_offset_ms,
             } => world.fragment_done(fragment.as_deref(), *exit_offset_ms),
-            Self::AbilityMove(ability) => world.ability_move(ability),
+            Self::AbilityMove {
+                ability,
+                back_ticks,
+            } => world.ability_move(ability, *back_ticks),
             Self::Cooldown(ability) => world.cooldown(ability),
             Self::ManaCost { cost, compare } => world.mana_cost(cost, *compare),
             Self::StatusEffect(effect) => world.status_effect(effect),
@@ -1166,7 +1192,7 @@ impl Condition {
             Self::ActionStatus { .. } => ACTION_STATUS_TEST_ELEMENT,
             Self::FragmentPlaying(_) => FRAGMENT_PLAYING_TEST_ELEMENT,
             Self::FragmentDone { .. } => FRAGMENT_DONE_TEST_ELEMENT,
-            Self::AbilityMove(_) => ABILITY_MOVE_TEST_ELEMENT,
+            Self::AbilityMove { .. } => ABILITY_MOVE_TEST_ELEMENT,
             Self::Cooldown(_) => COOLDOWN_TEST_ELEMENT,
             Self::ManaCost { .. } => MANA_COST_TEST_ELEMENT,
             Self::StatusEffect(_) => STATUS_EFFECT_TEST_ELEMENT,
@@ -1289,8 +1315,11 @@ pub struct Action {
     /// Its activation on a status effect: an `<ActivationCondition>` whose `And` holds one test
     /// `<IfHasStatusEffect>` (not under a `Not`), the effect and the rest of the `And`.
     pub on_status_effect: Option<(String, Condition)>,
-    /// The Mannequin tags its `SetMannequinTag` activities set while it is active, in file order.
+    /// The Mannequin tags its `SetMannequinTag` activities name, in file order (any `OnEnter`
+    /// and `OnExit`, in any branch).
     pub sets_tags: Vec<String>,
+    /// Its `SetMannequinTag` activities, in file order, with the branches they are in.
+    pub tag_activities: Vec<TagActivity>,
     /// Its `AnimationDrivenMotion` activity, when one is among its activities (not under a
     /// branch).
     pub driven_motion: Option<DrivenMotion>,
@@ -1312,6 +1341,64 @@ pub enum CastKind {
     Raycast,
     /// `CastSpellTargeting`: at the point the player picks with its targeting slice.
     Targeting,
+}
+
+/// What a tag activity does to its tag when it starts or ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TagChange {
+    /// `Set`.
+    Set,
+    /// `Unset` (or `UnSet`).
+    Unset,
+    /// Any other value (`NoEffect`, none): the tag stays as it is.
+    Keep,
+}
+
+impl TagChange {
+    fn of(value: Option<&str>) -> Self {
+        match value {
+            Some(SET_VALUE) => Self::Set,
+            Some(value) if UNSET_VALUES.contains(&value) => Self::Unset,
+            _ => Self::Keep,
+        }
+    }
+}
+
+/// One case of a tag activity: its tag and what its start and end do to it.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TagCase {
+    /// `TagName`.
+    pub tag: String,
+    /// `OnEnter`.
+    pub on_enter: TagChange,
+    /// `OnExit`.
+    pub on_exit: TagChange,
+}
+
+/// A `SetMannequinTag` activity: while the conditions of the branches it is in hold, it is on;
+/// it starts with the case of its first `<Conditional Name>` whose named condition holds, else
+/// with its `<Default>`, and that case's `OnEnter` and `OnExit` change the tag when it starts
+/// and ends (Inferred from the lists: the `Default` and `Conditional` names, and tags set with
+/// `OnExit="NoEffect"` that a later action unsets, as the musket's `ReloadRequired`).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TagActivity {
+    /// The conditions of the branches it is in; `True` for none.
+    pub condition: Condition,
+    /// Its `<Conditional>` cases: the named condition (resolved) and the case.
+    pub cases: Vec<(Condition, TagCase)>,
+    /// Its `<Default>` case; `None` without a tag name.
+    pub default: Option<TagCase>,
+}
+
+impl TagActivity {
+    /// The case it starts with in `world`.
+    pub fn case_in(&self, world: &dyn CageWorld) -> Option<&TagCase> {
+        self.cases
+            .iter()
+            .find(|(condition, _)| condition.holds_in(world))
+            .map(|(_, case)| case)
+            .or(self.default.as_ref())
+    }
 }
 
 /// One spell an action casts.
@@ -1485,13 +1572,17 @@ fn sets_tags(action: &Node) -> Vec<String> {
 /// for an unconditional cast), in file order.
 fn casts(action: &Node) -> Vec<SpellCast> {
     let mut found = Vec::new();
-    for activities in action
-        .children
-        .iter()
-        .filter(|child| child.name == ACTIVITIES_ELEMENT)
-    {
-        branch_casts(activities, &[], &mut found);
-    }
+    walk_activities(action, &mut |activity, condition| {
+        let Some((spell, kind)) = spell_of(activity) else {
+            return false;
+        };
+        found.push(SpellCast {
+            condition,
+            spell: spell.to_owned(),
+            kind,
+        });
+        true
+    });
     found
 }
 
@@ -1518,20 +1609,71 @@ fn spell_of(activity: &Node) -> Option<(&str, CastKind)> {
     }
 }
 
-fn branch_casts(node: &Node, conditions: &[Condition], found: &mut Vec<SpellCast>) {
+/// The `SetMannequinTag` activities of `action` (named cases unresolved), each with the
+/// conditions of the branches it is in, in file order.
+fn tag_activities(action: &Node) -> Vec<TagActivity> {
+    let case = |entry: &Node| {
+        Some(TagCase {
+            tag: entry.attribute(TAG_NAME_ATTRIBUTE)?.to_owned(),
+            on_enter: TagChange::of(entry.attribute(ON_ENTER_ATTRIBUTE)),
+            on_exit: TagChange::of(entry.attribute(ON_EXIT_ATTRIBUTE)),
+        })
+    };
+    let mut found = Vec::new();
+    walk_activities(action, &mut |activity, condition| {
+        if activity.name != SET_TAG_ELEMENT {
+            return false;
+        }
+        found.push(TagActivity {
+            condition,
+            cases: activity
+                .children
+                .iter()
+                .filter(|entry| entry.name == CONDITIONAL_ELEMENT)
+                .filter_map(|entry| {
+                    let name = entry.attribute(CASE_NAME_ATTRIBUTE)?;
+                    Some((Condition::External(name.to_owned()), case(entry)?))
+                })
+                .collect(),
+            default: activity
+                .children
+                .iter()
+                .find(|entry| entry.name == DEFAULT_ELEMENT)
+                .and_then(case),
+        });
+        true
+    });
+    found
+}
+
+/// Visits each activity under the `<Activities>` of `action` with the conditions of the
+/// branches (`IfThenElse`) it is in (`True` for none), in file order; `visit` tells whether it
+/// took the activity, else its children are visited.
+fn walk_activities(action: &Node, visit: &mut dyn FnMut(&Node, Condition) -> bool) {
+    for activities in action
+        .children
+        .iter()
+        .filter(|child| child.name == ACTIVITIES_ELEMENT)
+    {
+        walk_branches(activities, &[], visit);
+    }
+}
+
+fn walk_branches(
+    node: &Node,
+    conditions: &[Condition],
+    visit: &mut dyn FnMut(&Node, Condition) -> bool,
+) {
     for child in &node.children {
-        if let Some((spell, kind)) = spell_of(child) {
-            let condition = if conditions.is_empty() {
-                Condition::True
-            } else {
-                Condition::All(conditions.to_vec())
-            };
-            found.push(SpellCast {
-                condition,
-                spell: spell.to_owned(),
-                kind,
-            });
-        } else if child.name == IF_THEN_ELSE_ELEMENT {
+        let condition = if conditions.is_empty() {
+            Condition::True
+        } else {
+            Condition::All(conditions.to_vec())
+        };
+        if visit(child, condition) {
+            continue;
+        }
+        if child.name == IF_THEN_ELSE_ELEMENT {
             let Some(test) = child
                 .children
                 .iter()
@@ -1551,11 +1693,11 @@ fn branch_casts(node: &Node, conditions: &[Condition], found: &mut Vec<SpellCast
                     } else {
                         Condition::Not(Box::new(test.clone()))
                     });
-                    branch_casts(activity, &inner, found);
+                    walk_branches(activity, &inner, visit);
                 }
             }
         } else {
-            branch_casts(child, conditions, found);
+            walk_branches(child, conditions, visit);
         }
     }
 }
@@ -1612,6 +1754,20 @@ impl ActionList {
                         on_status_effect: on_status_effect(action)
                             .map(|(effect, rest)| (effect, rest.resolved(&conditions, 0))),
                         sets_tags: sets_tags(action),
+                        tag_activities: tag_activities(action)
+                            .into_iter()
+                            .map(|activity| TagActivity {
+                                condition: activity.condition.resolved(&conditions, 0),
+                                cases: activity
+                                    .cases
+                                    .into_iter()
+                                    .map(|(condition, case)| {
+                                        (condition.resolved(&conditions, 0), case)
+                                    })
+                                    .collect(),
+                                default: activity.default,
+                            })
+                            .collect(),
                         driven_motion: driven_motion(action),
                         activation: condition_of(action, ACTIVATION_CONDITION_ELEMENT)
                             .map(|condition| condition.resolved(&conditions, 0)),
@@ -2179,7 +2335,7 @@ mod tests {
             false
         }
 
-        fn ability_move(&self, ability: &str) -> bool {
+        fn ability_move(&self, ability: &str, _: u32) -> bool {
             ability == "Ability_Life_Staff_Smite"
         }
 
@@ -2218,6 +2374,92 @@ mod tests {
                 exit_offset_ms: 250
             }]))
         );
+    }
+
+    /// `playeractions_ability_musket.actionlist` and `playeractions_archery.actionlist`: a tag
+    /// activity keeps its `OnEnter` and `OnExit`, the branch it is in and its named cases.
+    #[test]
+    fn tag_activities_keep_their_changes_branches_and_cases() {
+        let text = r#"<ActionList><Conditions>
+ <And Name="Bow_PenetratingAimActive"><IfMannequinTag TagName="Penetrating"/></And>
+</Conditions><Actions>
+ <Action Name="Aim" FragmentName="Aim"><Activities>
+  <SetMannequinTag><Default TagName="Aim" OnEnter="Set" OnExit="Unset"/>
+   <Conditional Name="Bow_PenetratingAimActive" TagName="PenetratingAim" OnEnter="NoEffect" OnExit="Unset"/></SetMannequinTag>
+  <IfThenElse><IfCondition><IfMannequinMarker MarkerName="ShotFired"/></IfCondition>
+   <ThenActivity><Group><SetMannequinTag><Default TagName="ReloadRequired" OnEnter="Set" OnExit="NoEffect"/></SetMannequinTag></Group></ThenActivity>
+   <ElseActivity><SetMannequinTag><Default TagName="AimDownSights" OnEnter="UnSet" OnExit="Unset"/></SetMannequinTag></ElseActivity>
+  </IfThenElse>
+ </Activities></Action>
+</Actions></ActionList>"#;
+        let list = ActionList::parse(text).expect("list");
+        let action = list.action("Aim").expect("action");
+        let case = |tag: &str, on_enter, on_exit| TagCase {
+            tag: tag.to_owned(),
+            on_enter,
+            on_exit,
+        };
+        let shot = Condition::All(vec![Condition::Marker("ShotFired".to_owned())]);
+        assert_eq!(
+            action.tag_activities,
+            [
+                TagActivity {
+                    condition: Condition::True,
+                    cases: vec![(
+                        Condition::All(vec![Condition::Tag("Penetrating".to_owned())]),
+                        case("PenetratingAim", TagChange::Keep, TagChange::Unset)
+                    )],
+                    default: Some(case("Aim", TagChange::Set, TagChange::Unset)),
+                },
+                TagActivity {
+                    condition: Condition::All(vec![shot.clone()]),
+                    cases: Vec::new(),
+                    default: Some(case("ReloadRequired", TagChange::Set, TagChange::Keep)),
+                },
+                TagActivity {
+                    condition: Condition::All(vec![Condition::Not(Box::new(shot))]),
+                    cases: Vec::new(),
+                    default: Some(case("AimDownSights", TagChange::Unset, TagChange::Unset)),
+                },
+            ]
+        );
+        let tagged = CageState {
+            tags: &["Penetrating"],
+            ..CageState::default()
+        };
+        assert_eq!(
+            action.tag_activities[0].case_in(&tagged).map(|case| case.tag.as_str()),
+            Some("PenetratingAim")
+        );
+        assert_eq!(
+            action.tag_activities[0]
+                .case_in(&CageState::default())
+                .map(|case| case.tag.as_str()),
+            Some("Aim")
+        );
+    }
+
+    /// `playeractions_ability_musket.actionlist`: Shooter's Stance's ready step starts on a press
+    /// that is up to 20 frames old, and its aim step ends on a press of this frame only (the test
+    /// without `BackTicks`).
+    #[test]
+    fn an_ability_move_test_counts_back_its_own_frames() {
+        let text = r#"<ActionList><Actions>
+ <Action Name="Ready" FragmentName="Ready">
+  <ActivationCondition><IfActiveAbilityMoveName AbilityName="Ability_Musket_ShootersStance" BackTicks="20"/></ActivationCondition>
+  <DeactivationCondition><IfActiveAbilityMoveName AbilityName="Ability_Musket_ShootersStance"/></DeactivationCondition>
+ </Action>
+</Actions></ActionList>"#;
+        let list = ActionList::parse(text).expect("list");
+        let action = list.action("Ready").expect("action");
+        let test = |ticks| {
+            Condition::All(vec![Condition::AbilityMove {
+                ability: "Ability_Musket_ShootersStance".to_owned(),
+                back_ticks: ticks,
+            }])
+        };
+        assert_eq!(action.activation, Some(test(20)));
+        assert_eq!(action.deactivation, Some(test(0)));
     }
 
     /// `playeractions_ability_lifemagic.actionlist`: Beacon needs more mana than its cost
