@@ -704,6 +704,16 @@ fn run_actions(
     for action in actions {
         match action {
             StageAction::EntityEvent { entity, event, .. } => {
+                // The event counts for the stage objectives that wait for it
+                // (`EntityActiveStateChanged`). Unknown: what it does to the level entity it names
+                // (a door, a gate, a timeline): the entity is a static entity of the level slice,
+                // and no retail capture holds the message that opens, starts or hides one (dungeon2
+                // report: the door messages are not decoded), so the sim sends nothing for it.
+                tracing::debug!(
+                    entity,
+                    event,
+                    "stage entity event: its world effect is Unknown"
+                );
                 run.entity_events.push((*entity, *event, now_ms));
             }
             StageAction::DestroySlice { target } => {
@@ -900,7 +910,12 @@ impl SimWorld {
             let loot = self.limit_loot(number, rolled);
             self.send_loot_limits(number, LimitsSent::Changed);
             let (items, rolls) = self.roll_drops(number, None, loot, &hints);
-            self.give_drops(number, items.into_iter().zip(rolls).collect(), now_ms);
+            self.give_drops(
+                number,
+                items.into_iter().zip(rolls).collect(),
+                nw_messages::items::SYNC_MOVED,
+                now_ms,
+            );
         }
     }
 }

@@ -498,12 +498,7 @@ impl SimWorld {
                 }
             }
             TravelClientMsg::Unstuck { .. } => self.unstuck_request(entity, number, now_ms),
-            TravelClientMsg::SetCampSkin { skin, .. } => {
-                if let Some(mut player) = self.world.get_mut::<Player>(entity) {
-                    player.travel.saved.camp_skin = Some(skin);
-                    player.travel.due.camping = true;
-                }
-            }
+            TravelClientMsg::SetCampSkin { skin, .. } => self.set_camp_skin(entity, number, skin),
             TravelClientMsg::EnterPlot { id, facet, .. } => {
                 if let Some(mut player) = self.world.get_mut::<Player>(entity)
                     && let Some(plot) = player.travel.plot
@@ -1129,10 +1124,7 @@ impl SimWorld {
             .territory_of(u32::from(area))
             .and_then(|territory| charting.experience(territory))
             .map_or(0, |territory| territory.chart_amount);
-        let per_amount = content
-            .rewards
-            .get(CHART_EVENT)
-            .map_or(0, |reward| reward.experience);
+        let per_amount = content.rewards.experience(CHART_EVENT);
         gain_experience(
             &mut player,
             per_amount.saturating_mul(amount),
@@ -1396,6 +1388,33 @@ impl SimWorld {
     }
 
     /// Player `number` pays the taxes of its home on `plot` (952: paid or not).
+    /// Player `number` (`entity`) picks camp skin `skin` (CRC-32 of the lowercase `CampSkinID`):
+    /// it is kept for its next camp when the skin is enabled and the player holds its
+    /// `RequiredAchievementId`; another skin changes nothing (Inferred: retail's refusal is
+    /// Unknown, no capture picks a skin the player lacks).
+    fn set_camp_skin(&mut self, entity: Entity, number: u64, skin: u32) {
+        let Some(mut player) = self.world.get_mut::<Player>(entity) else {
+            return;
+        };
+        let owned = self.content.camps.skin_of_crc(skin).is_some_and(|row| {
+            row.enabled
+                && row
+                    .required_achievement
+                    .as_deref()
+                    .is_none_or(|achievement| {
+                        player
+                            .flow
+                            .has_achievement(&self.achievement_rules, achievement)
+                    })
+        });
+        if !owned {
+            tracing::debug!(player = number, skin, "camp skin the player does not own");
+            return;
+        }
+        player.travel.saved.camp_skin = Some(skin);
+        player.travel.due.camping = true;
+    }
+
     fn pay_taxes(&mut self, entity: Entity, number: u64, plot: &PlotRef) {
         let unix_ms = self.unix_ms();
         let rules = &self.content.travel;

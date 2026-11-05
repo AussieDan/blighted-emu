@@ -19,6 +19,7 @@ use nw_messages::{
 use nw_sim_core::player_max_health;
 
 use super::attack::Vitals;
+use super::progression::TerritoryRefusal;
 use super::{Player, SimWorld, send_now};
 
 /// The `m_chosenMagnifyBehavior` retail sends (5 for the new character of newchar 2026-09-18
@@ -303,9 +304,31 @@ impl SimWorld {
                 .masteries
                 .assign(progression, pool, point, points)
                 .map_err(|refusal| format!("{refusal:?}")),
+            // The pool holds its `InitialPoints` and one point per standing rank of its
+            // territory (Inferred: the rank table names no points), at most its `PointCap`.
             PointsClientMsg::SpendTerritoryStandingPoint { pool, point, .. } => {
-                player.masteries.spend_territory_point(pool, point);
-                Ok(())
+                let rules = &progression.points;
+                match (rules.territory_pool(pool), rules.territory_bonus(point)) {
+                    (Some(territory), Some(bonus)) if bonus.pool == pool => {
+                        let ranks = progression
+                            .categorical(&territory.territory)
+                            .map_or(0, |standing| {
+                                standing.rank_of(player.masteries.experience(standing)).0
+                            });
+                        let available = territory
+                            .initial
+                            .saturating_add(u32::from(ranks))
+                            .min(territory.cap);
+                        player.masteries.spend_territory_point(
+                            pool,
+                            point,
+                            bonus.max_level,
+                            available,
+                        )
+                    }
+                    _ => Err(TerritoryRefusal::NoSuchBonus),
+                }
+                .map_err(|refusal| format!("{refusal:?}"))
             }
             PointsClientMsg::ApplyAbilityPoints { .. } => {
                 player.masteries.apply();

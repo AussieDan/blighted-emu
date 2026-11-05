@@ -107,8 +107,6 @@ weapon_id = "SwordT1"
 # The player's damage table (the player slice names javelindata_damagetable, unique id DamageTable).
 damage_table = "DamageTable"
 armor_share = 0.35
-# Retail 3601 hits on a new character in starter armor keep 0.6006 of the damage.
-player_armor_share = 0.3994
 # wake_radius_m: absent means interest_radius_m.
 sleep_after_ms = 30000
 # The reach of a player's attack request without a swing: Unknown.
@@ -121,7 +119,9 @@ mob_respawn_ms = 62000
 # Shortest time from a death to a respawn request (the client asks, type 1938): below the
 # lowest captured gap.
 min_respawn_ms = 2000
-seed = 1
+# A fixed dice seed (crits, loot, crafting, gathering) for a replay; without one each start rolls
+# a new seed.
+# seed = 1
 # The u32 of a mob spawn card AssetId (Azoth catalog field note: always 2).
 asset_sub_id = 2
 # Times each mob type's LootDropChance (the share of kills whose loot table rolls), at most a
@@ -140,8 +140,11 @@ idle_interval_ms = 333
 
 # The admin tool's live panel (admin tools spec, section 5). The
 # snapshot of players and awake mobs on the bus is off at 0; at least 100 ms when on.
+# `max_gm_spawn` is our own limit (not retail) on the GM mobs one command, script or event
+# spawns, at least 1: each runs its tree every tick, so a mistyped count must not fill a cell.
 [admin]
 snapshot_interval_ms = 0
+max_gm_spawn = 50
 
 # The trading post (economy note, run 15). Durations 1, 3, 7 and 14 days are every captured
 # order's; a 5 % trading tax was Observed at the settlements of three retail characters; at most

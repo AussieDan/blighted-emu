@@ -28,13 +28,18 @@ use super::slots::Slot;
 use super::statics::object_broken;
 use super::{Body, Player, SimWorld, gather_answer, send_now};
 use crate::objectives::Event;
-use crate::player_content::QuestObjects;
+use crate::player_content::{QuestObjects, lore_title_key};
 use crate::stats::{GAME_EVENT_STAT, ONE_COMPLETION, StatEvent};
 use nw_bus::ConnectionRef;
 
 /// The status of an accepted lore read (retail: 1, with the note's title as its name and no
 /// 3746 after it).
 const LORE_ACCEPTED: u8 = 1;
+/// The status of a refused lore read (Inferred: the refusal of a busy gather, 2).
+const LORE_REFUSED: u8 = 2;
+/// How far from the player a lore note it reads may be, metres, across the ground (Inferred:
+/// the client's interaction reach is Unknown; generous for a position a moment old).
+const LORE_REACH_M: f32 = 15.0;
 /// Starts the achievement id of a lore note; the rest is its title without the
 /// [`LOCALIZED_MARK`] (Inferred: the client names `@00_Aeternum_Title_31_01`, the ship's
 /// manifest task of Lessons of a Pirate's Life waits for `Lore_unlock_00_Aeternum_Title_31_01`,
@@ -186,7 +191,9 @@ impl SimWorld {
 
     /// Player `number` (`entity`) reads the lore note of interaction `request`, whose title the
     /// client names `name`: the read is accepted (3743 kind 47 status 1 with the title, as
-    /// retail) and the note's achievement is set, an event of its quest.
+    /// retail) and the note's achievement is set, an event of its quest. A title that is no
+    /// `LoreData` title, or whose lore point is not within reach of the player, is refused
+    /// (status 2, Inferred as for a busy gather): a client cannot read lore from anywhere.
     pub(super) fn read_lore(
         &mut self,
         entity: Entity,
@@ -195,12 +202,30 @@ impl SimWorld {
         name: &[u8],
         now_ms: u64,
     ) {
+        let title = String::from_utf8_lossy(name);
+        let in_reach = self
+            .world
+            .get::<Body>(entity)
+            .map(|body| body.motion.position())
+            .zip(self.content.lore_by_title.get(&lore_title_key(&title)))
+            .is_some_and(|(at, lore)| {
+                !self
+                    .content
+                    .lore_points
+                    .within(*lore, at, LORE_REACH_M)
+                    .is_empty()
+            });
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
         };
+        if !in_reach {
+            tracing::debug!(player = number, %title, "lore read of no lore in reach");
+            let refusal = gather_answer(number, request, LORE_REFUSED, &[]);
+            send_now(&mut self.combat_messages, &player.connection, &[refusal]);
+            return;
+        }
         let answer = gather_answer(number, request, LORE_ACCEPTED, name);
         send_now(&mut self.combat_messages, &player.connection, &[answer]);
-        let title = String::from_utf8_lossy(name);
         let achievement = format!(
             "{LORE_ACHIEVEMENT_PREFIX}{}",
             title.trim_start_matches(LOCALIZED_MARK)
@@ -217,7 +242,12 @@ impl SimWorld {
     /// its coins, experience, territory standing and item go to the player, it counts on the leaderboards it feeds,
     /// and it is an event of the quest.
     pub(super) fn fire_game_event(&mut self, number: u64, event: &str, now_ms: u64) {
-        let reward = self.content.rewards.get(event).cloned().unwrap_or_default();
+        let dice = &mut self.dice;
+        let reward = self
+            .content
+            .rewards
+            .rolled(event, &mut |below| dice.below(below))
+            .unwrap_or_default();
         if let Some(entity) = self.player_by_number(number)
             && let Some(mut player) = self.world.get_mut::<Player>(entity)
         {

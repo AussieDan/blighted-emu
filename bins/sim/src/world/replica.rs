@@ -353,6 +353,7 @@ impl Replica {
                     first_damage: seen.health == source.max_health,
                     life,
                     max,
+                    incapacitated: None,
                 });
                 (change, seen.blocking != source.blocking, life_ms)
             }

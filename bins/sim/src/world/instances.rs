@@ -121,6 +121,15 @@ pub(super) struct ArenaPlayer {
 }
 
 impl ArenaPlayer {
+    /// The CRC of the expedition it waits for or may enter; `None` in no expedition queue.
+    pub(super) fn queued_game_mode(&self) -> Option<u32> {
+        match &self.reservation {
+            Some(reservation) => Some(reservation.crc),
+            None if self.waiting => self.selected,
+            None => None,
+        }
+    }
+
     /// Its rank (the highest mutation difficulty open to it) of slot `slot` of the week's
     /// mutated expeditions (`dungeonRanks`); `None` when it has none.
     pub(super) fn rank(&self, slot: usize) -> Option<u8> {
@@ -758,8 +767,9 @@ impl SimWorld {
         self.push_arena_change(entity);
     }
 
-    /// 926 or interaction 74: a player in this instance sim goes back to where it entered from.
-    fn exit_instance(&mut self, entity: Entity) {
+    /// 926, 3309 or interaction 74: a player in this instance sim goes back to where it entered
+    /// from.
+    pub(super) fn exit_instance(&mut self, entity: Entity) {
         if !self.instance_sim {
             return;
         }
@@ -1040,6 +1050,11 @@ impl SimWorld {
             self.instance_run = None;
             return Some(InstanceBeat { running: None });
         }
+        let capacity = self
+            .content
+            .instances
+            .by_id(&run.game_mode)
+            .map_or(0, |mode| mode.capacity);
         Some(InstanceBeat {
             running: Some(RunningInstance {
                 instance: run.instance,
@@ -1048,6 +1063,9 @@ impl SimWorld {
                 players,
                 empty_for_ms: run.empty_since_ms.map(|since| now_ms.saturating_sub(since)),
                 open_for_ms: now_ms.saturating_sub(run.opened_ms),
+                phase: run.phase,
+                capacity,
+                ends_at_ms: run.ends_at_ms,
             }),
         })
     }
@@ -1402,6 +1420,34 @@ mod tests {
 
     #[test]
     fn a_player_goes_into_a_solo_trial_and_back_by_the_handoff_path() {
+        trial_round_trip(|inside, who, header| {
+            inside.arena_call(
+                who,
+                ArenaClientMsg::ForfeitArena { header, flag: 0 },
+                crate::world::tests::NOW,
+            );
+        });
+    }
+
+    /// Retail `M1-TEMPEST-HEART` and `CATACOMBS2`: a 3309 leaves the instance as a 926 does (the
+    /// loading screen, then the open world level).
+    #[test]
+    fn a_game_mode_leave_takes_the_player_out_of_its_instance() {
+        trial_round_trip(|inside, who, header| {
+            inside.game_mode_call(
+                who,
+                nw_messages::GameModeClientMsg::LeaveGameMode {
+                    header,
+                    first: [1; nw_messages::RAW_ID_LEN],
+                    second: [2; nw_messages::RAW_ID_LEN],
+                },
+            );
+        });
+    }
+
+    /// A player goes into a solo trial and back by the handoff path; `exit` makes it leave the
+    /// instance.
+    fn trial_round_trip(exit: impl Fn(&mut SimWorld, &ConnectionRef, FacetHeader)) {
         use crate::world::tests::{NOW, SERVER_TIME, connection, join, table, world_with_spawns};
 
         let header = SimWorld::arena_header(PLAYER);
@@ -1529,9 +1575,9 @@ mod tests {
         let beat = inside.instance_beat(NOW).expect("instance role");
         let running = beat.running.expect("running");
         assert_eq!((running.instance, running.players), (instance, 1));
-        // The exit (926): back to the open-world sim of the return spot.
+        // The exit: back to the open-world sim of the return spot.
         inside.set_table(&table(&["sim-a"])).expect("table");
-        inside.arena_call(&who, ArenaClientMsg::ForfeitArena { header, flag: 0 }, NOW);
+        exit(&mut inside, &who, header);
         // After the taker's retry wait of the handoff that brought the player in.
         let exit_ms = NOW + AFTER_RETRY_MS;
         assert!(

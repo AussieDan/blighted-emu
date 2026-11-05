@@ -251,6 +251,10 @@ pub struct GearExtras {
     /// the reason it was emptied with (retail: a craft's 2, a salvage's 24); a slot past its end
     /// is an item moved in, or an empty slot of [`SYNC_LOGIN`].
     pub bag_reasons: Vec<u8>,
+    /// The paperdoll slots whose skin the player hid or showed again (5978), in slot order:
+    /// (slot, hidden). Retail `Hive_Transmog`: a hide of slot 2 sent the entry `2, 1`, the
+    /// show again `2, 0`.
+    pub hidden_skins: Vec<(u32, bool)>,
 }
 
 /// The weapon a player holds and the ammo of its first two main-hand options (client-gates
@@ -449,7 +453,9 @@ impl PlayerGear {
                         .chain(extras.loadouts.iter().cloned())
                         .collect(),
                 )),
-                ..PaperdollOwner::default()
+                // Retail first states carry no `hideSkins` child; it goes once a skin was hidden.
+                hide_skins: (!extras.hidden_skins.is_empty())
+                    .then(|| list(version, extras.hidden_skins.clone())),
             }),
             public: Some(PaperdollPublic::of(
                 &equipped.iter().map(ShownItem::of).collect::<Vec<_>>(),

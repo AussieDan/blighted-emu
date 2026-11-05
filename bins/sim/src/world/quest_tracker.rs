@@ -32,12 +32,15 @@ const ACCEPT_REPEATS: usize = 4;
 const END_REPEATS: usize = 4;
 /// How many bundles in a row carry the lists without it after that (retail: 3).
 const EMPTY_REPEATS: usize = 3;
+/// How many bundles in a row carry the lists without a dropped objective (retail faction
+/// missions: 6, all at one version, for each of 4 drops).
+const ABANDON_REPEATS: usize = 6;
 /// Names the objective instance ids this server makes.
 const INSTANCE_NAMESPACE: u64 = 0x6f62_6a65_6374_6976;
 
 /// The instance id of objective `objective` (its id) for player `player`: the same on every call
 /// and every sim, never 0.
-fn instance_of(objective: &str, player: u64) -> u64 {
+pub(super) fn instance_of(objective: &str, player: u64) -> u64 {
     let namespace = Uuid::from_u64_pair(INSTANCE_NAMESPACE, player);
     let (high, _) = Uuid::new_v5(&namespace, objective.as_bytes()).as_u64_pair();
     high.max(1)
@@ -360,6 +363,21 @@ impl QuestTracker {
             .extend(std::iter::repeat_n(without, EMPTY_REPEATS));
     }
 
+    /// Drops objective `objective` (its id) from the journal (3836): the tracked, active and task
+    /// lists go out without it, and it does not join the completed list (retail faction
+    /// missions). An objective not in the journal changes nothing.
+    pub(super) fn abandon(&mut self, objective: &str) {
+        let crc = lowercase_crc32(objective);
+        let Some(position) = self.entries.iter().position(|entry| entry.key == crc) else {
+            return;
+        };
+        self.entries.remove(position);
+        self.version += 1;
+        let without = self.running_state();
+        self.pending
+            .extend(std::iter::repeat_n(without, ABANDON_REPEATS));
+    }
+
     /// The next state to send, one per bundle.
     pub(super) fn take_change(&mut self) -> Option<ObjectivesState> {
         self.pending.pop_front()
@@ -620,6 +638,36 @@ mod tests {
         tracker.update(SKINNING_KNIFE, done, true);
         let completed = tracker.take_change().expect("completed");
         assert_eq!(added(&completed), [(0, instance(SKINNING_KNIFE))]);
+    }
+
+    #[test]
+    fn a_dropped_quest_leaves_the_lists_without_joining_the_completed_list() {
+        let mut tracker = QuestTracker::new(PLAYER);
+        tracker.update(SKINNING_KNIFE, vec![task(19, 1, false)], false);
+        tracker.update(TRUFFLES, vec![task(3, 0, false)], false);
+        while tracker.take_change().is_some() {}
+        tracker.abandon(SKINNING_KNIFE);
+        for _ in 0..ABANDON_REPEATS {
+            let without = tracker.take_change().expect("the lists without it");
+            let active: Vec<u64> = without
+                .active
+                .expect("active")
+                .elements
+                .iter()
+                .map(|record| record.instance)
+                .collect();
+            assert_eq!(active, [instance(TRUFFLES)]);
+            assert_eq!(without.completed, None);
+        }
+        assert_eq!(tracker.take_change(), None);
+        tracker.abandon(SKINNING_KNIFE);
+        assert_eq!(
+            tracker.take_change(),
+            None,
+            "a quest not running changes nothing"
+        );
+        tracker.update(SKINNING_KNIFE, vec![task(19, 0, false)], false);
+        assert!(tracker.has(SKINNING_KNIFE), "it can be taken again");
     }
 
     #[test]

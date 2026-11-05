@@ -122,7 +122,7 @@ const FIELD: &str = "player component";
 
 /// (component index, class type index) of each replicated component of the player prefab, other
 /// than the spawn card and the position.
-pub const PLAYER_EMPTY_COMPONENTS: [(u64, u64); 57] = [
+pub const PLAYER_EMPTY_COMPONENTS: [(u64, u64); 58] = [
     (1, 6951),
     (2, 5437),
     (4, 2406),
@@ -169,6 +169,7 @@ pub const PLAYER_EMPTY_COMPONENTS: [(u64, u64); 57] = [
     (crate::components::CURRENCY_COMPONENT, CURRENCY_TYPE_INDEX),
     (61, 1755),
     (62, 3183),
+    (INCAPACITATED_COMPONENT, INCAPACITATED_TYPE_INDEX),
     (
         CATEGORICAL_PROGRESSION_COMPONENT,
         CATEGORICAL_PROGRESSION_TYPE_INDEX,
@@ -200,6 +201,12 @@ pub const PLAYER_NAME_TAG_TYPE_INDEX: u64 = 100;
 const CHARGE_TYPE_INDEX: u64 = 5257;
 /// Type index of `MB::AudioProxyComponentReplicatedState` (component 13).
 const AUDIO_PROXY_TYPE_INDEX: u64 = 603;
+/// Type index of `MB::IncapacitatedReplicatedState`: slot 0 child 0 `enabled`.
+const INCAPACITATED_TYPE_INDEX: u64 = 670;
+/// The own player component of the incapacitated state (retail own cards: 64).
+const INCAPACITATED_COMPONENT: u64 = 64;
+/// The child byte bit of the incapacitated state's child 0, `enabled`.
+const INCAPACITATED_ENABLED_CHILD: u8 = 0x01;
 
 /// Type index of `Javelin::PointsAccumulatorComponentReplicatedState` (component 1).
 const POINTS_ACCUMULATOR_TYPE_INDEX: u64 = 6951;
@@ -270,7 +277,7 @@ const NEW_CHARACTER_FIRST_BODIES: [(u64, &[u8]); 8] = [
 /// never picked a lock-on or attack target (Inferred: its relation filter reads the faction).
 /// Classes whose first body names the character (groups, abilities, attributes, status
 /// effects, contribution) are not among them.
-const RETAIL_FIRST_BODIES: [(u64, &[u8]); 5] = [
+const RETAIL_FIRST_BODIES: [(u64, &[u8]); 6] = [
     // Slot 1 children 0 and 6, slot 2 children 1 and 3: all 0.
     (
         FACTION_TYPE_INDEX,
@@ -283,6 +290,8 @@ const RETAIL_FIRST_BODIES: [(u64, &[u8]); 5] = [
     ),
     (CHARGE_TYPE_INDEX, &[0x01, 0x01, 0x00]),
     (AUDIO_PROXY_TYPE_INDEX, &[0x01, 0x01, 0x00]),
+    // Slot 0 child 0 `enabled`: 0 (every retail own card that has it, component 64).
+    (INCAPACITATED_TYPE_INDEX, &[0x01, 0x01, 0x00]),
     (OBJECTIVE_INTERACTOR_TYPE_INDEX, &[0x01, 0x08, 0x00]),
 ];
 
@@ -718,6 +727,10 @@ pub struct HealthChange {
     /// The new max health, when it changed (retail newchar 2026-09-18: `healthMax` and
     /// `maxHealth` after each level up and Constitution spend).
     pub max: Option<u32>,
+    /// The incapacitated state's new `enabled`, when death's door started (true) or ended
+    /// (false). Retail `12a_msq_20_collectcrown`: 1 with the death's door block, 0 with the dead
+    /// block 5 s later, both in the vitals' bundle.
+    pub incapacitated: Option<bool>,
 }
 
 impl HealthChange {
@@ -744,6 +757,21 @@ pub fn player_members(states: PlayerStates<'_>) -> impl Iterator<Item = BundleMe
             component: *component,
             state: player_state(states, *component, *class),
         })
+}
+
+/// The incapacitated state with `enabled`: slot 0, child 0, the flag.
+fn incapacitated_member(enabled: bool) -> BundleMember {
+    BundleMember {
+        component: INCAPACITATED_COMPONENT,
+        state: MemberState::Recorded {
+            class: INCAPACITATED_TYPE_INDEX,
+            body: vec![
+                crate::slots::SLOT_0,
+                INCAPACITATED_ENABLED_CHILD,
+                u8::from(enabled),
+            ],
+        },
+    }
 }
 
 /// The own player component of the vitals.
@@ -790,6 +818,9 @@ pub fn change_members(states: PlayerStates<'_>) -> Vec<BundleMember> {
             component: PLAYER_VITALS_COMPONENT,
             state: MemberState::Vitals(change.vitals()),
         });
+        if let Some(enabled) = change.incapacitated {
+            members.push(incapacitated_member(enabled));
+        }
     }
     if let Some(stamina) = states.stamina {
         members.push(BundleMember {
@@ -1310,6 +1341,7 @@ mod tests {
                 first_damage: false,
                 life: Some(VitalsData::player_dead(SPAWNED_MS)),
                 max: None,
+                incapacitated: None,
             }),
             cooldowns: None,
             stamina: None,
@@ -1330,6 +1362,7 @@ mod tests {
                 first_damage: false,
                 life: Some(VitalsData::player_alive(SPAWNED_MS)),
                 max: None,
+                incapacitated: None,
             }),
             ..death
         };
@@ -1337,6 +1370,30 @@ mod tests {
             change_members(alive).len(),
             1,
             "a respawn sends the vitals only"
+        );
+        // Retail `12a_msq_20_collectcrown`: `40 9e0a 01 01 01` with the death's door block.
+        let door = PlayerStates {
+            health_change: Some(HealthChange {
+                health: 0,
+                first_damage: false,
+                life: Some(VitalsData::player_at_deaths_door(SPAWNED_MS)),
+                max: None,
+                incapacitated: Some(true),
+            }),
+            ..death
+        };
+        let members = change_members(door);
+        assert_eq!(
+            members
+                .last()
+                .map(|member| (member.component, &member.state)),
+            Some((
+                INCAPACITATED_COMPONENT,
+                &MemberState::Recorded {
+                    class: INCAPACITATED_TYPE_INDEX,
+                    body: vec![0x01, 0x01, 0x01],
+                }
+            ))
         );
     }
 
@@ -1403,6 +1460,7 @@ mod tests {
                 first_damage: false,
                 life: None,
                 max: None,
+                incapacitated: None,
             }),
             cooldowns: None,
             stamina: Some(spend),

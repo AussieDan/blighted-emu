@@ -3,24 +3,25 @@
 //! score from its loot entry, the player's level and the killed mob's level
 //! ([`nw_content::drop_rolls`]) and its perks from its perk buckets
 //! ([`nw_content::item_rolls`]); a crafted one comes with its gear score. Each rolled item is a
-//! stack of its own in the bag.
+//! stack of its own in the bag. Every item a player gets goes through [`SimWorld::give_drops`].
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use nw_bus::ItemState;
 use nw_content::item_rolls::RolledItem;
 use nw_content::loot::DropGearScore;
 
-use nw_messages::items::SYNC_MOVED;
-
+use super::gear::MovedStack;
+use super::loot_bag::TakenItem;
 use super::{Player, SimWorld};
 use crate::objectives::Event;
 
-/// One dropped item stack and its rolls (`None`: an item of its data values).
-pub(super) type RolledDrop = ((String, u32), Option<RolledItem>);
+/// One item stack given and its own values (`None`: an item of its data values).
+pub(super) type RolledDrop = TakenItem;
 
-/// A drop's items and the rolls of each entry: (item id, quantity) pairs and their rolls.
-pub(super) type DropEntries = (Vec<(String, u32)>, Vec<Option<RolledItem>>);
+/// A drop's items and the own values of each entry: (item id, quantity) pairs and their values.
+pub(super) type DropEntries = (Vec<(String, u32)>, Vec<Option<ItemState>>);
 
 impl SimWorld {
     /// The rolls of the `items` player `number` gets (from a kill of `mob`, when one), with the
@@ -61,70 +62,86 @@ impl SimWorld {
                     .item_rolls
                     .roll(&item_id, wanted, &hint.perks, &mut below);
                 entries.push((item_id.clone(), 1));
-                rolls.push(Some(rolled));
+                rolls.push(Some(rolled_values(rolled)));
             }
         }
         (entries, rolls)
     }
 
-    /// Player `number` gets the dropped `items` at `now_ms`: the items without rolls as loot
-    /// ([`SimWorld::give_loot`]), each rolled one as a stack of its own.
-    pub(super) fn give_drops(&mut self, number: u64, items: Vec<RolledDrop>, now_ms: u64) {
-        let mut plain = Vec::new();
-        let mut rolled: BTreeMap<String, Vec<RolledItem>> = BTreeMap::new();
-        for ((item_id, quantity), roll) in items {
-            match roll {
-                Some(roll) => rolled.entry(item_id).or_default().push(roll),
-                None => plain.push((item_id, quantity)),
-            }
-        }
-        self.give_loot(number, plain, now_ms);
-        for (item_id, rolls) in rolled {
-            self.give_rolled(number, &item_id, rolls, SYNC_MOVED, now_ms);
-        }
-    }
-
-    /// Player `number` gets one item `item_id` per entry of `rolled`, each with its gear score
-    /// and perks, in a bag change of sync reason `reason`, at `now_ms`; its quest counts the
-    /// items that fit its bag.
-    pub(super) fn give_rolled(
+    /// Player `number` gets `items`, each with its own values (`None`: a plain item), in a bag
+    /// change of sync reason `reason`, at `now_ms`: each into its bag, and its quest counts the
+    /// items that fit. What does not fit (a full bag) is not lost: it drops in a bag of dropped
+    /// items at the player's feet, which it takes when it has room (Inferred: what retail does
+    /// with a full bag is Unknown). Whether every item went into the bag (an item without a
+    /// master row is never given).
+    pub(super) fn give_drops(
         &mut self,
         number: u64,
-        item_id: &str,
-        rolled: Vec<RolledItem>,
+        items: Vec<RolledDrop>,
         reason: u8,
         now_ms: u64,
-    ) {
+    ) -> bool {
         let Some(entity) = self.player_by_number(number) else {
-            return;
+            return false;
         };
         let content = Arc::clone(&self.content);
-        let Some(item) = content.kits.item(item_id) else {
-            tracing::debug!(item = %item_id, "rolled item without a master row");
-            return;
-        };
-        let mut gained = 0_u32;
-        if let Some(mut player) = self.world.get_mut::<Player>(entity)
-            && let Some(gear) = player.gear.as_mut()
-        {
-            for roll in &rolled {
-                if gear.add_rolled(&content.kits, item, 1, roll, reason) {
-                    gained += 1;
+        let mut gained: Vec<(String, u32)> = Vec::new();
+        let mut left: Vec<MovedStack> = Vec::new();
+        let mut unknown = false;
+        if let Some(mut player) = self.world.get_mut::<Player>(entity) {
+            for ((item_id, quantity), values) in items {
+                let Some(item) = content.kits.item(&item_id) else {
+                    tracing::warn!(item = %item_id, "an item without a master row is not given");
+                    unknown = true;
+                    continue;
+                };
+                let added = player.gear.as_mut().is_some_and(|gear| {
+                    gear.put_moved(&content.kits, item, quantity, values.as_ref(), reason)
+                });
+                if added {
+                    match gained.iter_mut().find(|(gained, _)| *gained == item_id) {
+                        Some((_, total)) => *total = total.saturating_add(quantity),
+                        None => gained.push((item_id, quantity)),
+                    }
                 } else {
-                    tracing::info!(player = number, item = %item_id, "rolled item lost: a full bag");
+                    left.push(MovedStack {
+                        item_id,
+                        quantity,
+                        values,
+                    });
                 }
             }
         }
-        if gained > 0 {
-            tracing::debug!(player = number, item = %item_id, gained, "rolled items gained");
+        let all = left.is_empty() && !unknown;
+        if !all {
+            tracing::info!(
+                player = number,
+                items = left.len(),
+                "a full bag: items dropped at the player's feet"
+            );
+            self.drop_items(entity, number, left, now_ms);
+        }
+        for (item, quantity) in &gained {
+            tracing::debug!(player = number, item = %item, quantity, "items gained");
             self.quest_event(
                 number,
                 Event::ItemGained {
-                    item: item_id,
-                    quantity: gained,
+                    item,
+                    quantity: *quantity,
                 },
                 now_ms,
             );
         }
+        all
+    }
+}
+
+/// The own values of a newly rolled item: its gear score and perks; its other values are the
+/// item's data values.
+pub(super) fn rolled_values(rolled: RolledItem) -> ItemState {
+    ItemState {
+        gear_score: Some(rolled.gear_score),
+        perks: Some(rolled.perks),
+        ..ItemState::default()
     }
 }

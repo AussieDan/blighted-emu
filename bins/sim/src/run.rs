@@ -10,6 +10,7 @@ use nw_ai::AiData;
 use nw_bus::{Bus, BusError};
 use nw_common::config::ConfigError;
 use nw_common::logging::{LoggingError, init_logging};
+use nw_content::music_charts::MusicCharts;
 use nw_content::ContentBundle;
 use nw_content::bundle::bundle_path;
 use nw_content::client_build::load_client_build;
@@ -321,6 +322,16 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
         Err(error) => {
             tracing::warn!(%error, "no camp slices: no camp can be placed");
             CampSlices::default()
+        }
+    };
+    content.music_charts = match MusicCharts::load(&config.content_dir, &build) {
+        Ok(charts) => {
+            tracing::info!(charts = charts.len(), "music charts");
+            charts
+        }
+        Err(error) => {
+            tracing::warn!(%error, "no music charts: each played note counts as missed");
+            MusicCharts::default()
         }
     };
     content.quick_course_paths =

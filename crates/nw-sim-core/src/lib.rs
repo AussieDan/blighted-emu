@@ -29,8 +29,8 @@ pub use cells::{
 };
 pub use character::{Character, CharacterInput, Intent, MountPace, MountPaces, Posture};
 pub use combat::{
-    Damage, Dice, Health, Hit, MIN_HIT, MobAttack, PlayerAttack, Threat, mob_hit, mob_max_health,
-    player_hit, player_max_health,
+    Damage, Dice, Health, Hit, MIN_HIT, MobAttack, PlayerAttack, Threat, armor_rating, armor_share,
+    mob_hit, mob_max_health, player_hit, player_max_health, weapon_damage_scale,
 };
 pub use equip_load::{EquipLoad, EquipLoadLimits};
 pub use footing::{Footing, WaterDepth};

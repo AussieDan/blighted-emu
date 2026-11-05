@@ -35,6 +35,17 @@ const NO_LEVELS: &str = "the content has no level table";
 /// hold up to 14).
 const TERRITORY_POINT_MAX: u16 = 14;
 
+/// Why a territory standing point was not spent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TerritoryRefusal {
+    /// The bonus is not one of the pool's, or the pool is no territory's.
+    NoSuchBonus,
+    /// Every point the pool holds is spent.
+    NoPointLeft,
+    /// The bonus holds its most points.
+    AtMaxLevel,
+}
+
 /// One weapon progression point a player assigned points to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WeaponPoint {
@@ -508,18 +519,37 @@ impl Masteries {
             .collect()
     }
 
-    /// Spends one territory standing point (4040) on `point` of `pool`: a point holds at
-    /// most [`TERRITORY_POINT_MAX`] points (3681 note); a spend at the most changes
-    /// nothing. `true` when the point list changed: its state goes out with the next
-    /// bundle's whole point list.
-    pub(super) fn spend_territory_point(&mut self, pool: u32, point: u32) -> bool {
+    /// Spends one territory standing point (4040) on bonus `point` of `pool`, whose `MaxLevel`
+    /// is `max_level`, while the pool holds `available` points in all: the bonus holds at most
+    /// `max_level` and [`TERRITORY_POINT_MAX`] points (3681 note), and the points spent in the
+    /// pool stay at most `available`. A spent point's state goes out with the next bundle's
+    /// whole point list.
+    pub(super) fn spend_territory_point(
+        &mut self,
+        pool: u32,
+        point: u32,
+        max_level: u16,
+        available: u32,
+    ) -> Result<(), TerritoryRefusal> {
+        let spent = self
+            .territory_points
+            .iter()
+            .filter(|entry| entry.pool == pool)
+            .fold(0_u32, |sum, entry| {
+                sum.saturating_add(u32::from(entry.level))
+            });
+        if spent >= available {
+            return Err(TerritoryRefusal::NoPointLeft);
+        }
+        let most = max_level.min(TERRITORY_POINT_MAX);
         match self
             .territory_points
             .iter_mut()
             .find(|entry| entry.pool == pool && entry.point == point)
         {
-            Some(entry) if entry.level >= TERRITORY_POINT_MAX => return false,
-            Some(entry) => entry.level = entry.level.saturating_add(1).min(TERRITORY_POINT_MAX),
+            Some(entry) if entry.level >= most => return Err(TerritoryRefusal::AtMaxLevel),
+            Some(entry) => entry.level += 1,
+            None if most == 0 => return Err(TerritoryRefusal::AtMaxLevel),
             None => self.territory_points.push(PointEntry {
                 pool,
                 point,
@@ -527,7 +557,7 @@ impl Masteries {
             }),
         }
         self.territory_changed = true;
-        true
+        Ok(())
     }
 
     /// These masteries with the saved territory points `saved` (pool, point, level, in
@@ -915,8 +945,12 @@ mod tests {
         const POOL: u32 = 0xd65a_1577;
         const POINT: u32 = 0x1234_5678;
         let progression = progression();
+        const AVAILABLE: u32 = 30;
         let mut masteries = Masteries::default();
-        assert!(masteries.spend_territory_point(POOL, POINT));
+        assert_eq!(
+            masteries.spend_territory_point(POOL, POINT, TERRITORY_POINT_MAX, AVAILABLE),
+            Ok(())
+        );
         let (_, pools) = masteries.take_change(&progression);
         let pools = pools.expect("a point change");
         assert_eq!(
@@ -934,9 +968,16 @@ mod tests {
         );
         assert_eq!(masteries.take_change(&progression), (None, None));
         for _ in 1..TERRITORY_POINT_MAX {
-            assert!(masteries.spend_territory_point(POOL, POINT));
+            assert_eq!(
+                masteries.spend_territory_point(POOL, POINT, TERRITORY_POINT_MAX, AVAILABLE),
+                Ok(())
+            );
         }
-        assert!(!masteries.spend_territory_point(POOL, POINT), "at the cap");
+        assert_eq!(
+            masteries.spend_territory_point(POOL, POINT, TERRITORY_POINT_MAX, AVAILABLE),
+            Err(TerritoryRefusal::AtMaxLevel),
+            "at the cap"
+        );
         assert!(masteries.take_change(&progression).1.is_some());
         assert_eq!(
             masteries.carried_territory_points(),
@@ -966,6 +1007,31 @@ mod tests {
             )
             .point_entries
         );
+    }
+
+    #[test]
+    fn a_territory_point_needs_an_unspent_point_of_its_pool() {
+        const POOL: u32 = 0xd65a_1577;
+        const OTHER_POOL: u32 = 0x0bad_cafe;
+        const POINT: u32 = 0x1234_5678;
+        const OTHER_POINT: u32 = 0x8765_4321;
+        const MAX_LEVEL: u16 = 5;
+        let mut masteries = Masteries::default();
+        assert_eq!(
+            masteries.spend_territory_point(POOL, POINT, MAX_LEVEL, 1),
+            Ok(())
+        );
+        assert_eq!(
+            masteries.spend_territory_point(POOL, OTHER_POINT, MAX_LEVEL, 1),
+            Err(TerritoryRefusal::NoPointLeft),
+            "the pool's one point is spent"
+        );
+        assert_eq!(
+            masteries.spend_territory_point(OTHER_POOL, POINT, MAX_LEVEL, 0),
+            Err(TerritoryRefusal::NoPointLeft),
+            "a pool without standing holds none"
+        );
+        assert_eq!(masteries.carried_territory_points(), [(POOL, POINT, 1)]);
     }
 
     #[test]

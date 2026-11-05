@@ -1151,6 +1151,7 @@ impl Tutorial {
             | ClientFacetMsg::TogglePvpFlag { .. }
             | ClientFacetMsg::SetFaction { .. }
             | ClientFacetMsg::UpdateTrackedObjectives { .. }
+            | ClientFacetMsg::AbandonObjective { .. }
             | ClientFacetMsg::SetInputsThrottled { .. }
             | ClientFacetMsg::SetObjectiveAutoPin { .. } => {
                 return;
@@ -1553,12 +1554,12 @@ impl Tutorial {
         }
     }
 
-    /// The quest's task list for the quest tracker.
     /// Whether the player took the beach bag's items.
     pub(super) const fn bag_taken(&self) -> bool {
         self.bag_taken
     }
 
+    /// The quest's task list for the quest tracker.
     pub(super) fn progress(&self) -> Vec<TaskProgress> {
         self.run.progress()
     }
@@ -1629,6 +1630,8 @@ pub(crate) mod tests {
                 base_max_health: TEST_LEVEL_HEALTH,
                 base_damage: TEST_LEVEL_DAMAGE,
                 physical_armor_rating: 0.0,
+                elemental_armor_rating: 0.0,
+                gear_score: 0,
             },
         ));
         let data = CombatData::build(source, &CombatRows::default()).expect("rows");

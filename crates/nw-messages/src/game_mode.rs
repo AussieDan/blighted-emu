@@ -19,8 +19,14 @@
 //!   Unknown), then a character reference (tag 5 and 16 bytes, or tag 0 and an empty text).
 //! - 6824: the same `u32` as 6414 and one ready byte (1 ready).
 //! - 6970: a text, the cutscene name (empty in the one capture).
+//! - 1066: the CRC of the game mode (big-endian `u32`) and one byte (1 for a group queue; 4
+//!   retail calls, both values).
+//! - 3309: two 16-byte values (meaning Unknown; 4 retail calls, each an expedition or arena
+//!   left).
+//! - 2385: one big-endian `u16` (1 in the one retail call; meaning Unknown).
 
 use crate::combat::{read_string, write_string};
+use crate::entity_ids::RAW_ID_LEN;
 use crate::facet::FacetHeader;
 use crate::social::CharacterRef;
 use crate::wire::{MessageError, Reader, Writer};
@@ -49,6 +55,12 @@ pub const START_MATCHMAKING_ROLE_SELECTION_TYPE_INDEX: u64 = 6295;
 pub const GAME_MODE_PLAYER_REMOVED_TYPE_INDEX: u64 = 6414;
 /// Type index of `GameModeParticipantComponentServerFacet_SetReadiedUpStatus`.
 pub const SET_READIED_UP_STATUS_TYPE_INDEX: u64 = 6824;
+/// Type index of `GameModeParticipantComponentServerFacet_RequestLeaveQueueForGameMode`.
+pub const LEAVE_QUEUE_FOR_GAME_MODE_TYPE_INDEX: u64 = 1066;
+/// Type index of `GameModeParticipantComponentServerFacet_RequestLeaveGameMode`.
+pub const LEAVE_GAME_MODE_TYPE_INDEX: u64 = 3309;
+/// Type index of `GameModeParticipantComponentServerFacet_RequestLeaveQueueForAllGameModes`.
+pub const LEAVE_QUEUE_FOR_ALL_GAME_MODES_TYPE_INDEX: u64 = 2385;
 
 /// The most activities of one 6254 (a body is at most `0x30000` bytes and an entry 5).
 const MAX_ACTIVITIES: usize = 0x1_0000;
@@ -120,6 +132,31 @@ pub enum GameModeClientMsg {
         /// Whether the player is ready.
         ready: bool,
     },
+    /// 1066: leave the queue of one game mode.
+    LeaveQueueForGameMode {
+        /// The header.
+        header: FacetHeader,
+        /// The CRC of the game mode.
+        game_mode: u32,
+        /// Whether the player queued with its group.
+        group: bool,
+    },
+    /// 3309: leave the game mode (expedition, trial or arena) the player is in.
+    LeaveGameMode {
+        /// The header.
+        header: FacetHeader,
+        /// The first 16 bytes (meaning Unknown).
+        first: [u8; RAW_ID_LEN],
+        /// The second 16 bytes (meaning Unknown).
+        second: [u8; RAW_ID_LEN],
+    },
+    /// 2385: leave every queue (retail: as the group enters its expedition).
+    LeaveQueueForAllGameModes {
+        /// The header.
+        header: FacetHeader,
+        /// One value (1 in the one retail call; meaning Unknown).
+        flags: u16,
+    },
 }
 
 impl GameModeClientMsg {
@@ -186,6 +223,26 @@ impl GameModeClientMsg {
                     ready: reader.boolean()?,
                 })
             }),
+            LEAVE_QUEUE_FOR_GAME_MODE_TYPE_INDEX => read(|header, reader| {
+                Ok(Self::LeaveQueueForGameMode {
+                    header,
+                    game_mode: reader.u32()?,
+                    group: reader.boolean()?,
+                })
+            }),
+            LEAVE_GAME_MODE_TYPE_INDEX => read(|header, reader| {
+                Ok(Self::LeaveGameMode {
+                    header,
+                    first: reader.raw_id()?,
+                    second: reader.raw_id()?,
+                })
+            }),
+            LEAVE_QUEUE_FOR_ALL_GAME_MODES_TYPE_INDEX => read(|header, reader| {
+                Ok(Self::LeaveQueueForAllGameModes {
+                    header,
+                    flags: reader.u16()?,
+                })
+            }),
             _ => return None,
         })
     }
@@ -202,6 +259,9 @@ impl GameModeClientMsg {
             Self::MatchmakingLoginConfirmed { .. } => MATCHMAKING_LOGIN_CONFIRMED_TYPE_INDEX,
             Self::JoinQueueForActivities { .. } => JOIN_QUEUE_FOR_ACTIVITIES_TYPE_INDEX,
             Self::SetReadiedUpStatus { .. } => SET_READIED_UP_STATUS_TYPE_INDEX,
+            Self::LeaveQueueForGameMode { .. } => LEAVE_QUEUE_FOR_GAME_MODE_TYPE_INDEX,
+            Self::LeaveGameMode { .. } => LEAVE_GAME_MODE_TYPE_INDEX,
+            Self::LeaveQueueForAllGameModes { .. } => LEAVE_QUEUE_FOR_ALL_GAME_MODES_TYPE_INDEX,
         }
     }
 
@@ -214,7 +274,10 @@ impl GameModeClientMsg {
             | Self::AcceptMatch { header, .. }
             | Self::MatchmakingLoginConfirmed { header }
             | Self::JoinQueueForActivities { header, .. }
-            | Self::SetReadiedUpStatus { header, .. } => *header,
+            | Self::SetReadiedUpStatus { header, .. }
+            | Self::LeaveQueueForGameMode { header, .. }
+            | Self::LeaveGameMode { header, .. }
+            | Self::LeaveQueueForAllGameModes { header, .. } => *header,
         }
     }
 
@@ -259,6 +322,17 @@ impl GameModeClientMsg {
                 match_id, ready, ..
             } => {
                 writer.u32(*match_id).boolean(*ready);
+            }
+            Self::LeaveQueueForGameMode {
+                game_mode, group, ..
+            } => {
+                writer.u32(*game_mode).boolean(*group);
+            }
+            Self::LeaveGameMode { first, second, .. } => {
+                writer.bytes(first).bytes(second);
+            }
+            Self::LeaveQueueForAllGameModes { flags, .. } => {
+                writer.u16(*flags);
             }
         }
         Ok(writer.finish())
@@ -440,8 +514,15 @@ mod tests {
 
     #[test]
     fn the_retail_client_calls_read_and_write_back() {
-        let cases: [(u64, &str); 7] = [
+        let cases: [(u64, &str); 10] = [
             (MODIFY_GROUP_ELIGIBILITY_SUBSCRIPTION_TYPE_INDEX, "01"),
+            // Retail 3v3 arena group and expedition runs.
+            (LEAVE_QUEUE_FOR_GAME_MODE_TYPE_INDEX, "1fad9d4201"),
+            (
+                LEAVE_GAME_MODE_TYPE_INDEX,
+                "1b3c2283eb3fbd0840a1a96ab8bb2c8b08bd3feb83223c1bb8b056cd19007cc8",
+            ),
+            (LEAVE_QUEUE_FOR_ALL_GAME_MODES_TYPE_INDEX, "0001"),
             (SET_MATCHMAKING_ROLE_TYPE_INDEX, "03"),
             (RECEIVED_CLIENT_EVENT_TYPE_INDEX, "9bb080d0"),
             (MATCHMAKING_LOGIN_CONFIRMED_TYPE_INDEX, ""),

@@ -17,14 +17,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use bevy_ecs::entity::Entity;
+use nw_bus::ItemState;
 use nw_bus::LootLimitCount;
-use nw_content::item_rolls::RolledItem;
 use nw_content::loot::LootRoll;
 use nw_content::loot_limits::{LimitCount, LootLimitCounts, LootLimitRules};
 use nw_content::perks::{chance_hit, rarity};
 use nw_content::starter::KitItem;
 use nw_messages::gde::AssetId;
-use nw_messages::items::{ITEM_BOUND, SYNC_OWNED};
+use nw_messages::items::{ITEM_BOUND, SYNC_MOVED, SYNC_OWNED};
 use nw_messages::loot::{
     GLOBAL_STORAGE_COMPONENT, GlobalStorageState, LOOT_CREATURE, LOOT_DROPPED, LOOT_POI,
     LOOT_QUEST_OBJECT, LOOT_ROLLED, LOOT_TAKEN, LOOT_TRACKER_COMPONENT, LootLimitEntry,
@@ -40,7 +40,7 @@ use nw_sim_core::Position;
 use uuid::Uuid;
 
 use super::gathering::{GATHER_ACCEPTED, GATHER_BUSY};
-use super::gear::unix_ns;
+use super::gear::{BagEntry, unix_ns};
 use super::slots::Slot;
 use super::statics::interactor_target;
 use super::{Player, SimWorld, gather_answer, send_now};
@@ -128,8 +128,9 @@ struct LootBag {
     /// The player whose loot it holds; `None` when nobody may loot it.
     owner: Option<u64>,
     items: Vec<(String, u32)>,
-    /// The rolls of each entry of `items` (one item each); `None`: an item of its data values.
-    rolls: Vec<Option<RolledItem>>,
+    /// The own values of each entry of `items` (one item each: its rolls, or a dropped stack's
+    /// values); `None`: an item of its data values.
+    values: Vec<Option<ItemState>>,
     spawned_ms: u64,
     stage: Stage,
     /// When the current stage started.
@@ -229,27 +230,28 @@ pub(super) struct LootBags {
 pub(super) struct Takeable {
     pub(super) id: [u8; RAW_ID_LEN],
     pub(super) items: Vec<(String, u32)>,
-    /// The rolls of each entry of `items`.
-    pub(super) rolls: Vec<Option<RolledItem>>,
+    /// The own values of each entry of `items`.
+    pub(super) values: Vec<Option<ItemState>>,
 }
 
-/// One item stack taken from a bag: (item id, count) and its roll, when it was rolled.
-type TakenItem = ((String, u32), Option<RolledItem>);
+/// One item stack taken from a bag: (item id, count) and its own values, when it has them.
+pub(super) type TakenItem = ((String, u32), Option<ItemState>);
 
 impl LootBags {
-    /// Drops a bag of `items` for `owner` at `position` at `now_ms`, with the `rolls` of each
-    /// entry (`None`: the item's data values; a missing entry is `None`); a bag without items is
-    /// nobody's. `sim` names the sim, so its bag ids differ from other sims'. Returns its id.
-    pub(super) fn drop_rolled_bag(
+    /// Drops a bag of `items` for `owner` at `position` at `now_ms`, with the own `values` of
+    /// each entry (`None`: the item's data values; a missing entry is `None`); a bag without
+    /// items is nobody's. `sim` names the sim, so its bag ids differ from other sims'. Returns
+    /// its id.
+    pub(super) fn drop_bag(
         &mut self,
         sim: Uuid,
         position: Position,
         owner: u64,
         items: Vec<(String, u32)>,
-        mut rolls: Vec<Option<RolledItem>>,
+        mut values: Vec<Option<ItemState>>,
         now_ms: u64,
     ) -> [u8; RAW_ID_LEN] {
-        rolls.resize(items.len(), None);
+        values.resize(items.len(), None);
         let serial = self.next;
         self.next += 1;
         // A dynamic spawn: retail gives dynamic entities an even first id byte (GDE id note).
@@ -262,7 +264,7 @@ impl LootBags {
                 position,
                 owner: (!items.is_empty()).then_some(owner),
                 items,
-                rolls,
+                values,
                 spawned_ms: now_ms,
                 stage: Stage::Lying,
                 stage_ms: now_ms,
@@ -281,43 +283,32 @@ impl LootBags {
             .map(|bag| Takeable {
                 id: bag.id,
                 items: bag.items.clone(),
-                rolls: bag.rolls.clone(),
+                values: bag.values.clone(),
             })
     }
 
-    /// Player `player` takes bag `id` at `now_ms`: it starts to fade. Returns its items, or
-    /// `None` when it may not.
+    /// Player `player` takes bag `id` at `now_ms`: it starts to fade. Returns its items with
+    /// their own values, or `None` when it may not.
     pub(super) fn take(
         &mut self,
         id: &[u8; RAW_ID_LEN],
         player: u64,
         now_ms: u64,
-    ) -> Option<Vec<(String, u32)>> {
+    ) -> Option<Vec<TakenItem>> {
         let bag = self
             .bags
             .values_mut()
             .find(|bag| bag.id == *id && bag.owner == Some(player) && bag.stage == Stage::Lying)?;
         bag.enter(Stage::Taken, now_ms);
-        bag.rolls.clear();
-        Some(std::mem::take(&mut bag.items))
-    }
-
-    /// [`Self::take`] with the rolls of each entry.
-    pub(super) fn take_rolled(
-        &mut self,
-        id: &[u8; RAW_ID_LEN],
-        player: u64,
-        now_ms: u64,
-    ) -> Option<Vec<TakenItem>> {
-        let rolls = self
-            .bags
-            .values()
-            .find(|bag| bag.id == *id)
-            .map(|bag| bag.rolls.clone())
-            .unwrap_or_default();
-        let items = self.take(id, player, now_ms)?;
-        let rolls = rolls.into_iter().chain(std::iter::repeat(None));
-        Some(items.into_iter().zip(rolls).collect())
+        let values = std::mem::take(&mut bag.values)
+            .into_iter()
+            .chain(std::iter::repeat(None));
+        Some(
+            std::mem::take(&mut bag.items)
+                .into_iter()
+                .zip(values)
+                .collect(),
+        )
     }
 
     /// Whether a bag of id `id` is here.
@@ -333,8 +324,8 @@ impl LootBags {
     }
 
     /// Player `player` takes `quantity` (0 or more than it: all) of item `index` of bag `id` at
-    /// `now_ms`: the item id and the quantity taken, with the item's rolls; the bag starts to
-    /// fade when nothing is left in it. `None` when it may not.
+    /// `now_ms`: the item id and the quantity taken, with the item's own values; the bag starts
+    /// to fade when nothing is left in it. `None` when it may not.
     pub(super) fn take_part(
         &mut self,
         id: &[u8; RAW_ID_LEN],
@@ -342,12 +333,12 @@ impl LootBags {
         index: usize,
         quantity: u32,
         now_ms: u64,
-    ) -> Option<((String, u32), Option<RolledItem>)> {
+    ) -> Option<TakenItem> {
         let bag = self
             .bags
             .values_mut()
             .find(|bag| bag.id == *id && bag.owner == Some(player) && bag.stage == Stage::Lying)?;
-        let rolled = bag.rolls.get(index).cloned().flatten();
+        let values = bag.values.get(index).cloned().flatten();
         let (item_id, held) = bag.items.get_mut(index)?;
         let taken = if quantity == 0 || quantity >= *held {
             *held
@@ -356,16 +347,16 @@ impl LootBags {
         };
         *held -= taken;
         let item_id = item_id.clone();
-        bag.rolls.resize(bag.items.len(), None);
+        bag.values.resize(bag.items.len(), None);
         let kept: Vec<bool> = bag.items.iter().map(|(_, left)| *left > 0).collect();
         let mut keep = kept.iter();
-        bag.rolls
+        bag.values
             .retain(|_| keep.next().copied().unwrap_or_default());
         bag.items.retain(|(_, left)| *left > 0);
         if bag.items.is_empty() {
             bag.enter(Stage::Taken, now_ms);
         }
-        Some(((item_id, taken), rolled))
+        Some(((item_id, taken), values))
     }
 
     /// The bags' stages move on at `now_ms`, and faded bags go.
@@ -730,19 +721,21 @@ impl PlayerLoot {
     }
 }
 
-/// A listed item's rolls as its record carries them.
+/// A listed item's own values as its record carries them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct RolledRecord {
     /// Its gear score.
     pub(super) gear_score: u32,
     /// Its perks as wire slots.
     pub(super) perks: [u32; nw_messages::items::PERK_SLOTS],
+    /// Its durability; `None`: full.
+    pub(super) durability: Option<u32>,
 }
 
 /// The global storage member with version `version` that lists bag `bag`'s `items` (retail: one
 /// record per item, sync reason 17, in no container, counter 0, with a new instance id).
-/// `items` holds the master rows of the items, their quantities and their rolls (gear score
-/// and perks as wire slots; `None`: the item's data values).
+/// `items` holds the master rows of the items, their quantities and their own values (gear
+/// score, perks as wire slots and durability; `None`: the item's data values).
 pub(super) fn storage_of(
     bag: [u8; RAW_ID_LEN],
     items: &[(&KitItem, u32, Option<RolledRecord>)],
@@ -756,7 +749,11 @@ pub(super) fn storage_of(
             sync_reason: SYNC_OWNED,
             container_slot: None,
             item_index: item.item_index,
-            durability: item.durability,
+            durability: rolled
+                .and_then(|rolled| rolled.durability)
+                .map_or(item.durability, |durability| {
+                    durability.min(item.durability)
+                }),
             max_durability: item.durability,
             counter: STORED_COUNTER,
             gear_score: rolled.map_or(item.gear_score, |rolled| rolled.gear_score),
@@ -916,18 +913,18 @@ impl SimWorld {
         let mut items = self.limit_loot(killer, rolled);
         items.extend(self.mutation_kill_loot(killer, mob));
         let rolled = !items.is_empty();
-        let (items, rolls) = self.roll_drops(killer, Some(mob), items, &hints);
-        let rarity = rolls
+        let (items, values) = self.roll_drops(killer, Some(mob), items, &hints);
+        let rarity = values
             .iter()
             .flatten()
-            .map(|item| rarity(item.perks.len()))
+            .map(|item| rarity(item.perks.as_ref().map_or(0, Vec::len)))
             .max()
             .and_then(|rarity| u8::try_from(rarity).ok())
             .unwrap_or(NO_PERK_RARITY);
         let namespace = bag_namespace(self.me.generation);
         let bag = self
             .bags
-            .drop_rolled_bag(namespace, corpse, killer, items, rolls, now_ms);
+            .drop_bag(namespace, corpse, killer, items, values, now_ms);
         let server_ms = self.server_ms;
         let Some(mut player) = self
             .player_by_number(killer)
@@ -966,17 +963,22 @@ impl SimWorld {
             return;
         };
         let content = Arc::clone(&self.content);
-        let rolls = bag.rolls.iter().chain(std::iter::repeat(&None));
+        let values = bag.values.iter().chain(std::iter::repeat(&None));
         let items: Vec<(&KitItem, u32, Option<RolledRecord>)> = bag
             .items
             .iter()
-            .zip(rolls)
-            .filter_map(|((item, quantity), rolled)| {
-                let rolled = rolled.as_ref().map(|rolled| RolledRecord {
-                    gear_score: rolled.gear_score,
-                    perks: content.kits.perk_slots(&rolled.perks),
+            .zip(values)
+            .filter_map(|((item, quantity), values)| {
+                let kit = content.kits.item(item)?;
+                let rolled = values.as_ref().map(|values| RolledRecord {
+                    gear_score: values.gear_score.unwrap_or(kit.gear_score),
+                    perks: values
+                        .perks
+                        .as_ref()
+                        .map_or(kit.perks, |perks| content.kits.perk_slots(perks)),
+                    durability: values.durability,
                 });
-                Some((content.kits.item(item)?, *quantity, rolled))
+                Some((kit, *quantity, rolled))
             })
             .collect();
         if let Some(mut player) = self.world.get_mut::<Player>(entity) {
@@ -991,7 +993,9 @@ impl SimWorld {
     /// Player `number` (`entity`) uses loot bag `request` at `now_ms` (kind 28): its own bag
     /// that it did not take is taken (3743 named `@inv_DroppedItems`, the bag as its interaction
     /// target, the tracker's entry looted, the storage emptied, the items into its bag); another
-    /// is refused (status 2, Inferred as for a busy gather).
+    /// is refused (status 2, Inferred as for a busy gather), and so is its own while its bag has
+    /// no room for the items (the loot stays in the bag; Inferred: retail's answer to a full
+    /// bag is Unknown).
     pub(super) fn take_loot_bag(
         &mut self,
         entity: Entity,
@@ -999,7 +1003,27 @@ impl SimWorld {
         request: InteractionRequest,
         now_ms: u64,
     ) {
-        let items = self.bags.take_rolled(&request.target, number, now_ms);
+        let fits = self
+            .bags
+            .takeable(&request.target, number)
+            .is_none_or(|bag| {
+                let content = Arc::clone(&self.content);
+                let entries: Vec<BagEntry<'_>> = bag
+                    .items
+                    .iter()
+                    .zip(bag.values.iter().chain(std::iter::repeat(&None)))
+                    .filter_map(|((item, quantity), values)| {
+                        Some((content.kits.item(item)?, *quantity, values.is_some()))
+                    })
+                    .collect();
+                self.world
+                    .get::<Player>(entity)
+                    .and_then(|player| player.gear.as_ref())
+                    .is_some_and(|gear| gear.has_room_for(&entries))
+            });
+        let items = fits
+            .then(|| self.bags.take(&request.target, number, now_ms))
+            .flatten();
         let server_ms = self.server_ms;
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
@@ -1020,7 +1044,7 @@ impl SimWorld {
             taken,
             storage_emptied(version),
         ]);
-        self.give_drops(number, items, now_ms);
+        self.give_drops(number, items, SYNC_MOVED, now_ms);
     }
 
     /// The loot tracker entries whose reset time came at server time `server_ms` leave their
@@ -1055,7 +1079,7 @@ mod tests {
 
     fn bags_with(items: Vec<(String, u32)>) -> (LootBags, [u8; RAW_ID_LEN]) {
         let mut bags = LootBags::default();
-        let id = bags.drop_rolled_bag(bag_namespace(1), AT, KILLER, items, Vec::new(), NOW);
+        let id = bags.drop_bag(bag_namespace(1), AT, KILLER, items, Vec::new(), NOW);
         (bags, id)
     }
 
@@ -1113,11 +1137,13 @@ mod tests {
     }
 
     #[test]
-    fn a_bag_keeps_the_rolls_of_its_items_through_takes() {
+    fn a_bag_keeps_the_values_of_its_items_through_takes() {
         const SWORD: &str = "1hSwordT5";
-        let sword = RolledItem {
-            gear_score: 610,
-            perks: vec!["PerkID_A".to_owned()],
+        let sword = ItemState {
+            gear_score: Some(610),
+            durability: Some(12),
+            perks: Some(vec!["PerkID_A".to_owned()]),
+            ..ItemState::default()
         };
         let mut bags = LootBags::default();
         let items = vec![
@@ -1126,15 +1152,15 @@ mod tests {
             (SWORD.to_owned(), 1),
         ];
         let rolls = vec![Some(sword.clone()), None, Some(sword.clone())];
-        let id = bags.drop_rolled_bag(bag_namespace(1), AT, KILLER, items, rolls, NOW);
+        let id = bags.drop_bag(bag_namespace(1), AT, KILLER, items, rolls, NOW);
         assert_eq!(
             bags.take_part(&id, KILLER, 0, 0, NOW),
             Some(((SWORD.to_owned(), 1), Some(sword.clone())))
         );
         let left = bags.takeable(&id, KILLER).expect("left");
         assert_eq!(left.items.len(), 2);
-        assert_eq!(left.rolls, [None, Some(sword.clone())]);
-        let taken = bags.take_rolled(&id, KILLER, NOW).expect("taken");
+        assert_eq!(left.values, [None, Some(sword.clone())]);
+        let taken = bags.take(&id, KILLER, NOW).expect("taken");
         assert_eq!(
             taken,
             [
@@ -1142,10 +1168,10 @@ mod tests {
                 ((SWORD.to_owned(), 1), Some(sword))
             ]
         );
-        assert_eq!(bags.take_rolled(&id, KILLER, NOW), None, "taken once");
+        assert_eq!(bags.take(&id, KILLER, NOW), None, "taken once");
         let (mut plain, plain_id) = bags_with(pork());
         assert_eq!(
-            plain.take_rolled(&plain_id, KILLER, NOW),
+            plain.take(&plain_id, KILLER, NOW),
             Some(vec![(("PorkT1".to_owned(), 2), None)])
         );
     }
@@ -1157,7 +1183,10 @@ mod tests {
         let mut sent = HashMap::new();
         bags.group(number, NEW, &mut sent);
         assert_eq!(bags.take(&id, KILLER + 1, NOW), None, "not the owner's");
-        assert_eq!(bags.take(&id, KILLER, NOW), Some(pork()));
+        assert_eq!(
+            bags.take(&id, KILLER, NOW),
+            Some(pork().into_iter().map(|item| (item, None)).collect())
+        );
         assert_eq!(bags.take(&id, KILLER, NOW), None, "taken once");
         let taken = bags.group(number, KEPT, &mut sent).expect("take");
         // Retail group 52 at the take (+4291 ms): c2 0 s, c3 1.25 s, c5 one interactor.

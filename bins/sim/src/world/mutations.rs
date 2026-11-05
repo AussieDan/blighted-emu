@@ -67,6 +67,9 @@ pub(super) struct ScheduleView {
 pub(crate) struct InstanceMutation {
     /// The week's set and the difficulty.
     pub(crate) context: MutationContext,
+    /// The set's slot among the sets of the week of the activation: the rank a completion
+    /// raises, also when the run ends in the next week.
+    slot: Option<usize>,
     /// The scaled maximum health of each mutated mob, by entity: a mob whose maximum differs
     /// (it respawned) is mutated again.
     mutated: HashMap<u64, u32>,
@@ -75,10 +78,11 @@ pub(crate) struct InstanceMutation {
 }
 
 impl InstanceMutation {
-    /// The mutation `context`, no mob mutated yet.
-    pub(crate) fn new(context: MutationContext) -> Self {
+    /// The mutation `context` of slot `slot` of its week, no mob mutated yet.
+    pub(crate) fn new(context: MutationContext, slot: Option<usize>) -> Self {
         Self {
             context,
+            slot,
             mutated: HashMap::new(),
             effects: Vec::new(),
         }
@@ -215,7 +219,13 @@ impl SimWorld {
                 curse = %context.set.curse,
                 "mutated instance"
             );
-            run.set_mutation(InstanceMutation::new(context));
+            let slot = content
+                .mutations
+                .week_at(activated_s)
+                .sets
+                .iter()
+                .position(|set| set.game_mode.eq_ignore_ascii_case(&context.set.game_mode));
+            run.set_mutation(InstanceMutation::new(context, slot));
         }
         if let Some(mutation) = run.mutation_mut()
             && let Some(affliction) = content.mutations.player_affliction(&mutation.context)
@@ -335,23 +345,27 @@ impl SimWorld {
 
     /// The mutated run is complete (the encounter runtime calls it at the last boss): every
     /// player in the instance gets the difficulty's completion event (its coins, experience and
-    /// item) and the next difficulty of the week's slot.
+    /// item) and the next difficulty of the slot of the week it was activated in.
     pub fn complete_mutated_instance(&mut self, now_ms: u64) {
-        let Some(context) = self.instance_mutation().cloned() else {
+        let Some((context, slot)) = self
+            .instance_run
+            .as_ref()
+            .and_then(|run| run.mutation())
+            .map(|mutation| (mutation.context.clone(), mutation.slot))
+        else {
             return;
         };
         let content = Arc::clone(&self.content);
         let mutations = &content.mutations;
         let reward = mutations
             .completion_event(&context)
-            .and_then(|event| content.rewards.get(event))
-            .cloned()
+            .and_then(|event| {
+                let dice = &mut self.dice;
+                content
+                    .rewards
+                    .rolled(event, &mut |below| dice.below(below))
+            })
             .unwrap_or_default();
-        let slot = mutations
-            .week_at(self.unix_s())
-            .sets
-            .iter()
-            .position(|set| set.game_mode.eq_ignore_ascii_case(&context.set.game_mode));
         let next_rank = mutations
             .highest_difficulty()
             .map_or(context.difficulty, |highest| {

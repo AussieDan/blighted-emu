@@ -618,8 +618,15 @@ enum TaskKind {
     /// representative, `9814_Beyza`, whose `Faction_Selection` service sends the pick; retail
     /// `Hive_join_yellow_faction_quest` completed the objective in the bundle after the 3161).
     ChooseFaction,
-    /// A task type this server does not run: done at once, so the tree goes on.
-    Unsupported,
+    /// Done after the player dies `count` times (`TaskDie`).
+    Die { count: u32 },
+    /// A task whose row names nothing to wait for (an empty cell its type needs: the item of
+    /// `01_SoleSurvivor_GiveItem1`, the place of ten `TaskGoToPOITag` rows): done at once, as
+    /// retail runs `01_SoleSurvivor_GiveItem1` (the real tutorial run test below).
+    Empty,
+    /// A task type this server does not run yet (puzzle slayer scripts, emotes, PvP control
+    /// points): never done, so its quest waits and pays no reward; its start logs it.
+    NotRun(String),
 }
 
 /// A step of fishing that a fishing task counts.
@@ -1059,7 +1066,7 @@ fn kind_of(row: &TaskRow) -> TaskKind {
             place: place(),
         },
         "taskhaveandreturnitems" if row.returned_on_turn_in => {
-            have_item_of(row).map_or(TaskKind::Unsupported, |item| TaskKind::HaveItems {
+            have_item_of(row).map_or(TaskKind::Empty, |item| TaskKind::HaveItems {
                 item,
                 count,
                 returned: true,
@@ -1083,7 +1090,7 @@ fn kind_of(row: &TaskRow) -> TaskKind {
         "taskcraftmultiplerecipes" => {
             let recipes = categories_of(row.item_drop_vc.as_deref().unwrap_or_default());
             if recipes.is_empty() {
-                TaskKind::Unsupported
+                TaskKind::Empty
             } else {
                 TaskKind::CraftAnyRecipe { recipes, count }
             }
@@ -1092,7 +1099,7 @@ fn kind_of(row: &TaskRow) -> TaskKind {
             TaskKind::GameEvent { event, count }
         }),
         "tasktriggergameevent" => {
-            filled(&row.kill_enemy_type).map_or(TaskKind::Unsupported, TaskKind::TriggerGameEvent)
+            filled(&row.kill_enemy_type).map_or(TaskKind::Empty, TaskKind::TriggerGameEvent)
         }
         // A go-to with only a location (`03_SQ_04_WulfstanGlyphs_GoToKazu`) is done near it.
         "taskgotopoitag" => match (
@@ -1111,12 +1118,12 @@ fn kind_of(row: &TaskRow) -> TaskKind {
                 leave: false,
                 place: None,
             },
-            (None, None) => TaskKind::Unsupported,
+            (None, None) => TaskKind::Empty,
         },
-        "taskexitpoitag" => filled(&row.poi_tag).map_or(TaskKind::Unsupported, TaskKind::ExitPoi),
+        "taskexitpoitag" => filled(&row.poi_tag).map_or(TaskKind::Empty, TaskKind::ExitPoi),
         "taskequipitem" => TaskKind::EquipItem(item()),
         "taskgamemode" => {
-            filled(&row.game_mode_id).map_or(TaskKind::Unsupported, TaskKind::GameMode)
+            filled(&row.game_mode_id).map_or(TaskKind::Empty, TaskKind::GameMode)
         }
         "taskconversationstate" => filled(&row.item_name)
             .or_else(|| {
@@ -1126,10 +1133,10 @@ fn kind_of(row: &TaskRow) -> TaskKind {
                         .map(|(npc, _)| npc.to_owned())
                 })
             })
-            .map_or(TaskKind::Unsupported, TaskKind::ConversationState),
+            .map_or(TaskKind::Empty, TaskKind::ConversationState),
         "taskgototerritory" => {
             row.territory_id
-                .map_or(TaskKind::Unsupported, |territory| TaskKind::GoToTerritory {
+                .map_or(TaskKind::Empty, |territory| TaskKind::GoToTerritory {
                     territory,
                     poi: None,
                 })
@@ -1139,20 +1146,20 @@ fn kind_of(row: &TaskRow) -> TaskKind {
                 territory,
                 poi: Some(poi),
             },
-            _ => TaskKind::Unsupported,
+            _ => TaskKind::Empty,
         },
-        "taskuseitems" => filled(&row.item_name).map_or(TaskKind::Unsupported, |item| {
+        "taskuseitems" => filled(&row.item_name).map_or(TaskKind::Empty, |item| {
             TaskKind::UseItems { item, count }
         }),
         "taskobjective" => {
-            filled(&row.item_name).map_or(TaskKind::Unsupported, TaskKind::Objective)
+            filled(&row.item_name).map_or(TaskKind::Empty, TaskKind::Objective)
         }
         "taskrequiregatheritems" => TaskKind::RequireGather {
             item: item(),
             count,
         },
         "taskgathercyclicstate" => {
-            filled(&row.item_name).map_or(TaskKind::Unsupported, |cyclic| TaskKind::CyclicState {
+            filled(&row.item_name).map_or(TaskKind::Empty, |cyclic| TaskKind::CyclicState {
                 cyclic,
                 state: row
                     .item_drop_probability
@@ -1169,7 +1176,8 @@ fn kind_of(row: &TaskRow) -> TaskKind {
                 .unwrap_or_default(),
             points: row.should_check_points,
         },
-        "patroltask" => filled(&row.poi_tag).map_or(TaskKind::Unsupported, |place| {
+        // A patrol without its place is a PvP mission template (`PVP_task_patrol`): not run.
+        "patroltask" => filled(&row.poi_tag).map_or(TaskKind::NotRun(row.kind.clone()), |place| {
             TaskKind::Patrol {
                 place,
                 // Durations are whole minutes or less: the cast cannot overflow.
@@ -1185,12 +1193,12 @@ fn kind_of(row: &TaskRow) -> TaskKind {
                 taken: false,
             },
             (None, Some(tag)) => TaskKind::Interact { tag, count },
-            (None, None) => TaskKind::Unsupported,
+            (None, None) => TaskKind::Empty,
         },
         // A carried item that a container or a mob drops is waited for as an item task; one
         // without a drop is given at the start. Both go back when the quest ends.
         "taskgiveandtakeitem" => match filled(&row.item_name) {
-            None => TaskKind::Unsupported,
+            None => TaskKind::Empty,
             Some(item) if chest().is_some() || drop().is_some() => TaskKind::HaveItems {
                 item,
                 count,
@@ -1204,7 +1212,7 @@ fn kind_of(row: &TaskRow) -> TaskKind {
                 taken: true,
             },
         },
-        "taskinteract" => filled(&row.interact_tag).map_or(TaskKind::Unsupported, |tag| {
+        "taskinteract" => filled(&row.interact_tag).map_or(TaskKind::Empty, |tag| {
             TaskKind::Interact { tag, count }
         }),
         "taskconversationtopic" => {
@@ -1244,22 +1252,22 @@ fn kind_of(row: &TaskRow) -> TaskKind {
             hotspot: true,
             ..FishCatchRule::ANY
         }),
-        "tasksalvageitem" => filled(&row.item_name).map_or(TaskKind::Unsupported, |item| {
+        "tasksalvageitem" => filled(&row.item_name).map_or(TaskKind::Empty, |item| {
             TaskKind::Salvage { item, count }
         }),
         "taskcraftweaponfamily" => {
-            filled(&row.crafting_recipe_id).map_or(TaskKind::Unsupported, |family| {
+            filled(&row.crafting_recipe_id).map_or(TaskKind::Empty, |family| {
                 TaskKind::CraftFamily { family, count }
             })
         }
         "taskhaveitemswithweaponfamily" | "taskhaveitemswithitemfamily" => filled(&row.item_name)
-            .map_or(TaskKind::Unsupported, |family| TaskKind::HaveFamily {
+            .map_or(TaskKind::Empty, |family| TaskKind::HaveFamily {
                 family,
                 count,
             }),
         "taskchoosefaction" => TaskKind::ChooseFaction,
         "taskquickcourse" => {
-            filled(&row.item_name).map_or(TaskKind::Unsupported, TaskKind::QuickCourse)
+            filled(&row.item_name).map_or(TaskKind::Empty, TaskKind::QuickCourse)
         }
         "taskquickcoursecheckpoint" => match (
             filled(&row.item_name),
@@ -1267,14 +1275,15 @@ fn kind_of(row: &TaskRow) -> TaskKind {
                 .and_then(|section| u32::try_from(section).ok()),
         ) {
             (Some(course), Some(section)) => TaskKind::QuickCourseSection { course, section },
-            _ => TaskKind::Unsupported,
+            _ => TaskKind::Empty,
         },
         "taskhousescore" => TaskKind::OwnHouses(count),
+        "taskdie" => TaskKind::Die { count },
         "taskcompletedungeon" => {
-            filled(&row.game_mode_id).map_or(TaskKind::Unsupported, TaskKind::CompleteGameMode)
+            filled(&row.game_mode_id).map_or(TaskKind::Empty, TaskKind::CompleteGameMode)
         }
         "taskperformsong" => {
-            filled(&row.item_name).map_or(TaskKind::Unsupported, |song| TaskKind::PerformSong {
+            filled(&row.item_name).map_or(TaskKind::Empty, |song| TaskKind::PerformSong {
                 song,
                 near: row
                     .override_location
@@ -1286,9 +1295,9 @@ fn kind_of(row: &TaskRow) -> TaskKind {
         }
         // A refining recipe is a crafting recipe of a refining station (`GypsumOrb` at the kiln).
         "taskrefinerecipe" => {
-            filled(&row.crafting_recipe_id).map_or(TaskKind::Unsupported, TaskKind::CraftRecipe)
+            filled(&row.crafting_recipe_id).map_or(TaskKind::Empty, TaskKind::CraftRecipe)
         }
-        _ => TaskKind::Unsupported,
+        _ => TaskKind::NotRun(row.kind.clone()),
     }
 }
 
@@ -1399,6 +1408,8 @@ impl ObjectiveTree {
 /// A game event that can complete tasks.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Event<'a> {
+    /// The player died.
+    Died,
     /// A cinematic video started (CRC-32 of its lowercase id).
     CinematicStarted(u32),
     /// A cinematic video ended.
@@ -1895,7 +1906,8 @@ impl ObjectiveRun {
                         | TaskKind::RequireGather { count, .. }
                         | TaskKind::CyclicState { count, .. }
                         | TaskKind::CraftAnyRecipe { count, .. }
-                        | TaskKind::UseItems { count, .. },
+                        | TaskKind::UseItems { count, .. }
+                        | TaskKind::Die { count },
                         TaskState::Done,
                     ) => *count,
                     (TaskKind::QuickCourse(_), TaskState::Done) => self
@@ -2259,6 +2271,7 @@ impl ObjectiveRun {
                     Event::ItemGained { item, quantity },
                 ) => (wanted.eq_ignore_ascii_case(item), quantity, *count),
                 (TaskKind::HaveItem(None), Event::ContainerLooted { .. }) => (true, 1, 1),
+                (TaskKind::Die { count }, Event::Died) => (true, 1, *count),
                 (TaskKind::HasAchievement(wanted), Event::AchievementSet(set)) => {
                     (wanted.eq_ignore_ascii_case(set), 1, 1)
                 }
@@ -2482,7 +2495,10 @@ impl ObjectiveRun {
                 effects.push(Effect::GiveItem(item.clone(), *count));
                 self.complete(index, now_ms, effects);
             }
-            TaskKind::Unsupported => self.complete(index, now_ms, effects),
+            TaskKind::Empty => self.complete(index, now_ms, effects),
+            TaskKind::NotRun(kind) => {
+                tracing::info!(task = index, kind = %kind, "a quest waits on a task type the server does not run");
+            }
             _ => {}
         }
     }
@@ -3541,6 +3557,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_task_type_the_server_does_not_run_holds_its_quest() {
+        let rows = vec![
+            container("Root", "ConsecutiveTaskContainer", &["Puzzle"]),
+            with_item("Puzzle", "TaskSlayerScript", "PuzzleMSQGong"),
+        ];
+        assert_eq!(
+            kind_of(&rows[1]),
+            TaskKind::NotRun("TaskSlayerScript".to_owned())
+        );
+        let tree = Arc::new(ObjectiveTree::build(&rows, "Root").expect("tree"));
+        let (mut run, _) = ObjectiveRun::start(tree, NOW);
+        run.event(Event::Died, NOW);
+        assert!(!run.finished(), "no fake success: the quest waits");
+    }
+
+    #[test]
+    fn a_die_task_counts_the_player_s_deaths() {
+        let rows = vec![
+            container("Root", "ConsecutiveTaskContainer", &["Die"]),
+            TaskRow {
+                target_qty: Some(2),
+                ..row("Die", "TaskDie")
+            },
+        ];
+        let tree = Arc::new(ObjectiveTree::build(&rows, "Root").expect("tree"));
+        let (mut run, _) = ObjectiveRun::start(tree, NOW);
+        run.event(Event::Died, NOW);
+        assert!(!run.finished(), "one of two deaths");
+        run.event(Event::Died, NOW);
+        assert!(run.finished());
+    }
+
+    #[test]
     fn a_conversation_topic_task_ends_when_its_topic_is_finished() {
         const TOPIC: &str = "12A_MSQ_17_LochnirsNotes_TalkLochnir";
         let rows = vec![
@@ -4150,6 +4199,43 @@ pub(crate) mod tests {
 
     #[test]
     #[ignore = "needs the build 25810808 content bundle in NW_CONTENT_DIR"]
+    fn the_real_task_rows_the_server_does_not_run_are_the_known_ones() {
+        const BUILD: &str = "25810808";
+        let dir = std::env::var("NW_CONTENT_DIR").expect("NW_CONTENT_DIR");
+        let path = nw_content::bundle::bundle_path(std::path::Path::new(&dir), BUILD);
+        let bundle = nw_content::ContentBundle::load(&path, BUILD).expect("bundle");
+        let mut unsupported: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for row in task_rows(&bundle.tables) {
+            if let TaskKind::NotRun(_) = kind_of(&row) {
+                unsupported
+                    .entry(row.kind.to_lowercase())
+                    .or_default()
+                    .push(row.task_id.clone());
+            }
+        }
+        let counts: Vec<(String, usize, Vec<String>)> = unsupported
+            .into_iter()
+            .map(|(kind, rows)| {
+                let count = rows.len();
+                (kind, count, rows.into_iter().take(3).collect())
+            })
+            .collect();
+        let kinds: Vec<&str> = counts.iter().map(|(kind, _, _)| kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "patroltask",
+                "taskcontrolpoint",
+                "taskperformemote",
+                "taskslayerscript"
+            ],
+            "{counts:#?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "needs the build 25810808 content bundle in NW_CONTENT_DIR"]
     fn the_real_open_world_quest_starts_as_retail() {
         const BUILD: &str = "25810808";
         /// The open-world start: the client spawns inside the start trigger.
@@ -4341,8 +4427,8 @@ pub(crate) mod tests {
         let rewards = nw_content::rewards::Rewards::from_tables(&bundle.tables);
         assert_eq!(
             rewards
-                .get(SUCCESS_EVENT)
-                .and_then(|reward| reward.item.clone()),
+                .rolled(SUCCESS_EVENT, &mut |_| 0)
+                .and_then(|reward| reward.item),
             Some((BOX.to_owned(), 1))
         );
         let grants = nw_content::rewards::EventGrants::from_tables(&bundle.tables);
@@ -4872,11 +4958,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_place_or_event_task_without_its_cell_is_not_run() {
+    fn a_place_or_event_task_without_its_cell_is_empty() {
         for kind in ["TaskGoToPOITag", "TaskExitPOITag", "TaskTriggerGameEvent"] {
             assert_eq!(
                 kind_of(&row("Empty", kind)),
-                TaskKind::Unsupported,
+                TaskKind::Empty,
                 "{kind}"
             );
         }

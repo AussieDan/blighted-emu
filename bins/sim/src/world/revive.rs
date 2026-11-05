@@ -121,15 +121,28 @@ impl SimWorld {
             .world
             .get_mut::<Vitals>(target_entity)
             .ok_or(ReviveRefusal::NoTarget)?;
-        let dead = vitals.dead_since_ms.is_some() && vitals.health.is_dead();
-        if !dead && !vitals.downed() {
+        if !(vitals.fallen() && vitals.health.is_dead()) {
             return Err(ReviveRefusal::NotDead);
         }
         vitals.health.heal(REVIVED_HEALTH);
-        vitals.dead_since_ms = None;
-        vitals.deaths_door_since_ms = None;
+        vitals.rise();
         self.mobs.forget(target);
         Ok(target)
+    }
+}
+
+impl Vitals {
+    /// It is back in life, from death or from death's door (a revive, a GM heal): it is not dead
+    /// and its death's door ends, so the door's end kills it no more. Its health is the caller's;
+    /// the next own state sends the alive vitals (health above 0 after 0).
+    pub(super) const fn rise(&mut self) {
+        self.dead_since_ms = None;
+        self.deaths_door_since_ms = None;
+    }
+
+    /// Whether it is dead or down at death's door.
+    pub(super) const fn fallen(&self) -> bool {
+        self.dead_since_ms.is_some() || self.downed()
     }
 }
 

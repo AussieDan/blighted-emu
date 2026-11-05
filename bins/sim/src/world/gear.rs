@@ -28,7 +28,8 @@ mod rolls;
 pub(super) use charms::{CharmRefusal, CharmTarget};
 pub(super) use durability::RepairPick;
 use holdings::Holdings;
-pub(super) use holdings::{DroppedStack, ItemRefusal, MAX_CONTAINER_SLOTS};
+pub(super) use holdings::{ItemRefusal, MAX_CONTAINER_SLOTS, MovedStack};
+pub(super) use rolls::BagEntry;
 
 /// The version of the first gear states (retail value).
 const FIRST_GEAR_VERSION: u64 = 3;
@@ -1272,7 +1273,12 @@ pub(crate) mod tests {
             row(SWORD, "Weapon+EquippableMainHand+Sword+Melee"),
             row(STAFF, "Weapon+EquippableTwoHand+LifeStaff+Magic"),
             row(POTION, "Consumable+Potion"),
-            row(FLINT, "Resource"),
+            // A resource as the data has it (`FlintT1`): no durability, not bound, it stacks.
+            ItemRow {
+                durability: None,
+                bind_on_pickup: false,
+                ..row(FLINT, "Resource")
+            },
         ];
         rows.extend(
             extra

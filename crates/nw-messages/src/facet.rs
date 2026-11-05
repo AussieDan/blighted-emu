@@ -83,6 +83,8 @@ pub const CUTSCENE_ENDED_TYPE_INDEX: u64 = 6705;
 pub const CUTSCENE_STARTED_TYPE_INDEX: u64 = 6706;
 /// Type index of `ObjectivesComponentServerFacet_UpdateTrackedObjectives`.
 pub const UPDATE_TRACKED_OBJECTIVES_TYPE_INDEX: u64 = 1458;
+/// Type index of `ObjectivesComponentServerFacet_AbandonSingleObjective`.
+pub const ABANDON_SINGLE_OBJECTIVE_TYPE_INDEX: u64 = 3836;
 /// Type index of `ObjectivesComponentServerFacet_SetObjectiveAutoPinning`.
 pub const SET_OBJECTIVE_AUTO_PIN_TYPE_INDEX: u64 = 2709;
 /// Type index of `ActionListComponentServerFacet_SetInputsThrottled`.
@@ -95,8 +97,11 @@ pub const HOMING_OVERRIDE_TYPE_INDEX: u64 = 1790;
 pub const LEFT_GAME_MODE_QUEUE_TYPE_INDEX: u64 = 4970;
 /// The 1790 word retail sends when a mob picks the player and no homing target is set.
 pub const NO_HOMING_OVERRIDE: u32 = u32::MAX;
-/// The 4970 value retail sends as the player enters the tutorial (one left the queue).
-pub const LEFT_QUEUE_ONCE: u64 = 1;
+/// The last 4970 word: 1 in all 2,207 retail bodies (meaning Unknown).
+pub const LEFT_QUEUE_ONCE: u32 = 1;
+/// The 4970 game mode of a level arrival that left no named queue (retail newchar 2026-09-18 and
+/// every open world arrival: 0).
+pub const NO_GAME_MODE: u32 = 0;
 /// Type index of `PaperdollComponentServerFacet_ServerUnequipItem`.
 pub const UNEQUIP_ITEM_TYPE_INDEX: u64 = 3896;
 /// Type index of `InteractorComponentServerFacet_RequestCancelCommittedInteractionFromClient`.
@@ -304,6 +309,14 @@ pub enum ClientFacetMsg {
         header: FacetHeader,
         /// The pinned objective instances, in the client's order.
         objectives: Vec<u64>,
+    },
+    /// 3836: drop a running objective from the journal (retail faction and town board missions:
+    /// the instance of a tracked one).
+    AbandonObjective {
+        /// The header.
+        header: FacetHeader,
+        /// The objective's instance.
+        instance: u64,
     },
     /// 2709: which objective kinds the client pins on its own. Retail newchar sends a count
     /// then that many flags (`24` and 36 bytes, one of them 0).
@@ -712,6 +725,12 @@ impl ClientFacetMsg {
                     .map(|_| reader.u64())
                     .collect::<Result<_, MessageError>>()?;
                 Ok(Self::UpdateTrackedObjectives { header, objectives })
+            }),
+            ABANDON_SINGLE_OBJECTIVE_TYPE_INDEX => read(|header, reader| {
+                Ok(Self::AbandonObjective {
+                    header,
+                    instance: reader.u64()?,
+                })
             }),
             SET_OBJECTIVE_AUTO_PIN_TYPE_INDEX => read(|header, reader| {
                 let count = usize::from(reader.u8()?);
@@ -1497,21 +1516,34 @@ impl BodyCodec for HomingOverrideMsg {
     }
 }
 
-/// 4970: the player left a game-mode queue (retail newchar 2026-09-18: one `u64` of 1,
-/// 24 ms after the level info).
+/// 4970: the player left a game-mode queue: the game mode's CRC and [`LEFT_QUEUE_ONCE`]. Retail
+/// sends it 24 ms after the level info of a login ([`NO_GAME_MODE`]), and after a queue leave
+/// with the game mode of the leave (1066 `RequestLeaveQueueForGameMode`: its own CRC; 2385
+/// `RequestLeaveQueueForAllGameModes`: the CRC of the queued expedition).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeftGameModeQueueMsg {
     /// The header (the player's `GameModeParticipantComponent`).
     pub header: FacetHeader,
-    /// How the player left. Retail's tutorial value is [`LEFT_QUEUE_ONCE`].
-    pub left: u64,
+    /// The CRC of the game mode whose queue the player left.
+    pub game_mode: u32,
+    /// [`LEFT_QUEUE_ONCE`] in every retail body.
+    pub left: u32,
 }
 
 impl LeftGameModeQueueMsg {
     /// Player `player` left the queue the way the tutorial login does.
     pub fn tutorial(player: u64) -> Self {
+        Self::of(
+            FacetHeader::of(component::GAME_MODE_PARTICIPANT, player),
+            NO_GAME_MODE,
+        )
+    }
+
+    /// The answer with `header` to a leave of the queue of game mode `game_mode`.
+    pub const fn of(header: FacetHeader, game_mode: u32) -> Self {
         Self {
-            header: FacetHeader::of(component::GAME_MODE_PARTICIPANT, player),
+            header,
+            game_mode,
             left: LEFT_QUEUE_ONCE,
         }
     }
@@ -1523,14 +1555,15 @@ impl BodyCodec for LeftGameModeQueueMsg {
     fn encode(&self) -> Result<Vec<u8>, MessageError> {
         let mut writer = Writer::new();
         self.header.write(&mut writer);
-        Ok(writer.u64(self.left).finish())
+        Ok(writer.u32(self.game_mode).u32(self.left).finish())
     }
 
     fn decode(body: &[u8]) -> Result<Self, MessageError> {
         let mut reader = Reader::new(body);
         let message = Self {
             header: FacetHeader::read(&mut reader)?,
-            left: reader.u64()?,
+            game_mode: reader.u32()?,
+            left: reader.u32()?,
         };
         reader.finish()?;
         Ok(message)
@@ -1977,6 +2010,8 @@ mod tests {
         const STARTED: &str = "fbaf2b0dafadb10d2715f9bca18fdecea81bd1af";
         const EMPTY_PIN: &str = "7fa055bf3c7be17a2715f9bca18fdece00";
         const ONE_PIN: &str = "7fa055bf3c7be17a2715f9bca18fdece014445f704683ebc78";
+        // Retail faction missions: the drop of the tracked mission 0x4846a68b74f8f9ee.
+        const ABANDON: &str = "3bd870f5df957778e34e14f344a974cc4846a68b74f8f9ee";
         let started = ClientFacetMsg::decode(CUTSCENE_STARTED_TYPE_INDEX, &hex(STARTED))
             .expect("type")
             .expect("body");
@@ -2002,6 +2037,13 @@ mod tests {
             ClientFacetMsg::UpdateTrackedObjectives { objectives, .. }
                 if objectives == [0x4445_f704_683e_bc78]
         ));
+        assert!(matches!(
+            ClientFacetMsg::decode(ABANDON_SINGLE_OBJECTIVE_TYPE_INDEX, &hex(ABANDON)),
+            Some(Ok(ClientFacetMsg::AbandonObjective {
+                instance: 0x4846_a68b_74f8_f9ee,
+                ..
+            }))
+        ));
     }
 
     #[test]
@@ -2009,6 +2051,9 @@ mod tests {
         // newchar-retail-2026-09-18: 1790 with the 2415, and 4970 after the level info.
         const HOMING: &str = "d4b00cff3ead1b6a2715f9bca18fdece0000000000000000000000000000000000000000ffffffff0000000000000000";
         const LEFT: &str = "b4fc2d15ad1f9dae2715f9bca18fdece0000000000000001";
+        // Retail amrine group run: the answer to a 2385 with the queued expedition's CRC.
+        const LEFT_EXPEDITION: &str = "419277862fc04f6cb3ac442d2430908c3ffa1f9000000001";
+        const EXPEDITION_CRC: u32 = 0x3ffa_1f90;
         const THROTTLE: &str = "636f140b45528c432715f9bca18fdece01";
         const WHISPER: &str = "7b5857d7549305052715f9bca18fdece52f36e05";
         let homing = HomingOverrideMsg::decode(&hex(HOMING)).expect("homing");
@@ -2019,7 +2064,13 @@ mod tests {
             Ok(homing)
         );
         let left = LeftGameModeQueueMsg::decode(&hex(LEFT)).expect("left");
-        assert_eq!(left.left, LEFT_QUEUE_ONCE);
+        assert_eq!((left.game_mode, left.left), (NO_GAME_MODE, LEFT_QUEUE_ONCE));
+        let expedition = LeftGameModeQueueMsg::decode(&hex(LEFT_EXPEDITION)).expect("left");
+        assert_eq!(
+            expedition,
+            LeftGameModeQueueMsg::of(expedition.header, EXPEDITION_CRC)
+        );
+        assert_eq!(expedition.encode().expect("encode"), hex(LEFT_EXPEDITION));
         assert_eq!(
             LeftGameModeQueueMsg::decode(&left.encode().expect("encode")),
             Ok(left)

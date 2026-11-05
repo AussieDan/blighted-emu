@@ -40,15 +40,19 @@ use std::path::Path;
 use std::sync::Arc;
 
 use nw_ai::brain::{Brain, Command, Destination, MotionOutcome, Runtime, Slot, World};
-use nw_ai::data::{AiData, Archetype, CageAction, FacingMode, NavConfig, ProcWindow};
+use nw_ai::data::{
+    AiData, Archetype, CageAction, FacingMode, NavConfig, ProcWindow, SliceTriggerRef,
+};
 use nw_ai::keys::EngineKey;
 use nw_ai::node::{
-    EntityQueryParams, NodeId, NodeKind, PositionType, SelectPositionParams, TrackerParams,
+    ActionTarget, EntityQueryParams, NodeId, NodeKind, PositionType, SelectPositionParams,
+    TagOperation, TrackerParams,
 };
 use nw_ai::rng::Rng48;
 use nw_ai::value::{Blackboard, KeyId, NameId, Param, Value};
 use nw_content::container::ContainerError;
 use nw_content::mob_prefabs::ASSET_ID_LEN;
+use nw_content::status_effects::Control;
 use nw_sim_core::character::STEP_UP_M;
 use nw_sim_core::{Ground, Mover, Position, Seen, Steering, Threat, yaw_gap, yaw_toward};
 use nw_world::WorldFile;
@@ -159,6 +163,9 @@ pub(crate) const COMBAT_LEASH_KEY: &str = "CombatLeashDistance";
 /// The attack cooldown of the base trees (Observed: `AttackCooldown` in boar_base and the
 /// legion and damned trees).
 const ATTACK_COOLDOWN: &str = "AttackCooldown";
+/// The networked tag of the players (Observed: 12 `TargetTagFilter`s of the Server.pak trees
+/// name it; Inferred: every player carries it, so a filter of it takes the players the mob sees).
+const PLAYER_TAG: &str = "Player";
 
 /// `[mob_ai]`: how often a mob's tree runs, by what it does and how near the nearest player is
 /// (trace finding c, `local-data/scratch-work/btree/trace/findings.txt`: the retail ALC state
@@ -914,6 +921,69 @@ pub struct Thought {
     pub encounter_events: Vec<NameId>,
     /// The mobs its tree spawned (`ExecuteSpawn`).
     pub summons: Vec<Summon>,
+    /// The slice triggers its tree and its CAGE actions ran (`TriggerEntity`): each goes to
+    /// its clients as a 3135 (oquests triggers note, section 1.3).
+    pub triggers: Vec<SliceTriggerRef>,
+    /// The triggers its tree ran on other mobs (`TriggerRemoteEntity`): (mob, trigger name).
+    pub remote_triggers: Vec<(u64, NameId)>,
+    /// The facts its tree set on other mobs (`SetBlackboardFactOnRemoteEntityAction`).
+    pub remote_facts: Vec<RemoteFact>,
+    /// The orders its tree gave other mobs (`AssignOrder`): (mob, order CRC32).
+    pub orders: Vec<(u64, u32)>,
+}
+
+/// A fact a mob's tree sets on another mob's tree.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RemoteFact {
+    /// The mob.
+    pub mob: u64,
+    /// The fact.
+    pub key: KeyId,
+    /// Its value.
+    pub value: Value,
+    /// `OverwriteTargetFact`: it replaces a value the mob already has (else only a fact the mob
+    /// does not have is set; Inferred from the name).
+    pub overwrite: bool,
+}
+
+/// A mob whose tree gave it networked tags (`UpdateNWTags`), as the other trees see it in one
+/// tick. The slices' own `NWTags` are not in the AI data (Unknown), so only these tags exist.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaggedMob {
+    /// The mob.
+    pub entity: u64,
+    /// Where it is.
+    pub position: Position,
+    /// Its tags.
+    pub tags: Vec<NameId>,
+}
+
+/// The status effects the sim holds on a mob (put there by players, by its tree and by the
+/// instance's mutation), as its tree and its body read them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct HeldEffects {
+    /// The effect ids.
+    pub effects: Vec<String>,
+    /// Their `EffectCategories` (lower case).
+    pub categories: Vec<String>,
+    /// What they keep the mob from doing.
+    pub control: Control,
+}
+
+/// The other mobs a tree's remote actions reach in one step: the mob's own entity and the
+/// tagged mobs.
+#[derive(Debug, Clone, Copy)]
+struct Others<'a> {
+    entity: u64,
+    tagged: &'a [TaggedMob],
+}
+
+impl Others<'_> {
+    /// No other mob (a step of the engine's own actions, the reaction and the death).
+    const NONE: Others<'static> = Others {
+        entity: 0,
+        tagged: &[],
+    };
 }
 
 /// A tree's `ExecuteSpawn`: `count` mobs of creature slice `asset` at `at` (the node's
@@ -938,6 +1008,12 @@ pub struct Surroundings<'a> {
     pub ground: &'a (dyn Ground + Sync),
     /// Its health, 0 to 1.
     pub health_share: f32,
+    /// Its own entity.
+    pub entity: u64,
+    /// The mobs of the sim with networked tags.
+    pub tagged: &'a [TaggedMob],
+    /// The status effects the sim holds on it.
+    pub held: Option<&'a HeldEffects>,
 }
 
 /// One mob's mind: its tree's brain and what the engine keeps for it.
@@ -981,6 +1057,17 @@ struct MindState {
     picks: Rng48,
     run_speed_mps: Option<f32>,
     sight_m: Option<f32>,
+    /// Its networked tags (`UpdateNWTags`).
+    nw_tags: Vec<NameId>,
+    /// The order another mob gave it (`AssignOrder`), the CRC32 the engine key `AI_Order`
+    /// holds until it completes it (`CompleteOrder`; Inferred from the trees, which test
+    /// `AI_Order` against the CRC of the order an `AssignOrder` gives).
+    order: Option<u32>,
+    /// The action target trackers it runs, the innermost last (`ActionTargetTrackerDecorator`).
+    trackers: Vec<NodeId>,
+    /// The status effects its tree put on it (`true`) or took off it since the last
+    /// [`TreeMind::take_status_changes`] (`StatusEffectDecorator`).
+    status_changes: Vec<(NameId, bool)>,
 }
 
 /// The last reach check of a mob: where it and its target stood, and the answer.
@@ -1176,7 +1263,97 @@ impl MindState {
             health_share: 1.0,
             ground: None,
             picks: Cell::new(self.picks),
+            others: Others::NONE,
+            held: None,
         }
+    }
+
+    /// The tag filter of the innermost action target tracker it runs: the tracker's
+    /// `TargetTagFilter`, else that of its `ActionTarget`.
+    fn tracker_filter(&self, ai: &MobAi) -> Option<NameId> {
+        let node = *self.trackers.last()?;
+        let NodeKind::ActionTargetTracker { params, .. } = &ai.data().node(node).kind else {
+            return None;
+        };
+        [params.tag_filter, params.target.tag_filter]
+            .into_iter()
+            .find(|tag| !ai.name(*tag).is_empty())
+    }
+
+    /// The other mobs a remote action of the mob at `at` acts on: the tagged mobs of `others`
+    /// (but itself) with the tag of `target`'s `TargetTagFilter`, else of the innermost tracker's,
+    /// nearest first and at most `m_maxTargets` of them when set; target `index` of them inside a
+    /// `ForEachTargetDecorator`, else all of them with `all`, else the nearest. Inferred: the
+    /// targeting profile's curves are Unknown, so the nearest go first; an action with no tag
+    /// takes the mob's players, on which the sim runs no remote action (a player's slice
+    /// triggers and blackboard are Unknown), so it has none.
+    fn remote_targets(
+        &self,
+        ai: &MobAi,
+        at: Position,
+        others: Others<'_>,
+        target: Option<&ActionTarget>,
+        all: bool,
+        index: Option<u32>,
+    ) -> Vec<u64> {
+        let own = target
+            .map(|target| target.tag_filter)
+            .filter(|tag| !ai.name(*tag).is_empty());
+        let Some(tag) = own.or_else(|| self.tracker_filter(ai)) else {
+            return Vec::new();
+        };
+        let mut found: Vec<&TaggedMob> = others
+            .tagged
+            .iter()
+            .filter(|mob| mob.entity != others.entity && mob.tags.contains(&tag))
+            .collect();
+        found.sort_by(|a, b| {
+            let (da, db) = (
+                a.position.horizontal_distance(at),
+                b.position.horizontal_distance(at),
+            );
+            da.total_cmp(&db).then(a.entity.cmp(&b.entity))
+        });
+        let max = target
+            .and_then(|target| target.limits.max_targets.number(&NoBoard))
+            .filter(|max| *max > 0.0);
+        if let Some(max) = max {
+            // A handful of targets.
+            #[allow(
+                clippy::cast_possible_truncation,
+                clippy::cast_sign_loss,
+                reason = "a handful of targets"
+            )]
+            found.truncate(max as usize);
+        }
+        let entities = found.into_iter().map(|mob| mob.entity);
+        match index {
+            Some(index) => entities.skip(index as usize).take(1).collect(),
+            None if all => entities.collect(),
+            None => entities.take(1).collect(),
+        }
+    }
+
+    /// The tags after `operations` (`UpdateNWTags`: add or remove each tag); `None` when a
+    /// strict operation changes nothing (Inferred from `PerformStrictOperation`: a strict add of a
+    /// tag the mob has, or a strict remove of one it lacks, fails the node).
+    fn tags_after<'a>(
+        &self,
+        operations: impl IntoIterator<Item = &'a TagOperation>,
+    ) -> Option<Vec<NameId>> {
+        let mut tags = self.nw_tags.clone();
+        for operation in operations {
+            let has = tags.contains(&operation.tag);
+            if operation.strict && has == operation.add {
+                return None;
+            }
+            if operation.add && !has {
+                tags.push(operation.tag);
+            } else if !operation.add {
+                tags.retain(|tag| *tag != operation.tag);
+            }
+        }
+        Some(tags)
     }
 
     fn fire_windows(&mut self, ai: &MobAi, now_ms: u64, thought: &mut Thought) {
@@ -1563,6 +1740,10 @@ impl TreeMind {
                 picks: Rng48::new(seed.rotate_left(1)),
                 run_speed_mps: spawn_ai.and_then(|overrides| overrides.run_speed_mps),
                 sight_m: spawn_ai.and_then(|overrides| overrides.sight_m),
+                nw_tags: Vec::new(),
+                order: None,
+                trackers: Vec::new(),
+                status_changes: Vec::new(),
             },
         })
     }
@@ -1606,6 +1787,32 @@ impl TreeMind {
     /// The brain.
     pub const fn brain(&self) -> &Brain {
         &self.brain
+    }
+
+    /// Its networked tags (`UpdateNWTags`).
+    pub fn nw_tags(&self) -> &[NameId] {
+        &self.state.nw_tags
+    }
+
+    /// Another mob's tree sets `fact` on its tree ([`RemoteFact`]); its tree runs at once.
+    pub fn set_remote_fact(&mut self, fact: &RemoteFact) {
+        if fact.overwrite || self.brain.fact(fact.key).is_none() {
+            self.brain.set_fact(fact.key, fact.value);
+            self.state.next_tick_ms = 0;
+        }
+    }
+
+    /// The status effects its tree put on it (`true`) or took off it since the last call, by
+    /// id: the sim holds them with the effects players put on it, so that they change its
+    /// damage and show to the clients.
+    pub fn take_status_changes(&mut self) -> Vec<(NameId, bool)> {
+        std::mem::take(&mut self.state.status_changes)
+    }
+
+    /// Another mob's tree gives it `order` (`AssignOrder`); its tree runs at once.
+    pub const fn assign_order(&mut self, order: u32) {
+        self.state.order = Some(order);
+        self.state.next_tick_ms = 0;
     }
 
     /// Whether it walks home in a leash reset: the tree applied `ResetAI` or `ResetAINoHeal`
@@ -1693,7 +1900,7 @@ impl TreeMind {
                     .engine_action_end(&ai.runtime, &view, action, &mut out);
             }
         }
-        self.apply(ai, at, now_ms, out, &mut Thought::default());
+        self.apply(ai, at, now_ms, out, &mut Thought::default(), Others::NONE);
     }
 
     /// The mob died at `at`: the engine's `Death` action cancels the plan.
@@ -1711,6 +1918,7 @@ impl TreeMind {
         state.shown = None;
         state.target = None;
         state.threat.clear();
+        state.trackers.clear();
     }
 
     /// Whether the mind has work at `now_ms`: its tick, a damage window or the end of a
@@ -1736,6 +1944,17 @@ impl TreeMind {
             self.state.reaction_until_ms = None;
             self.reaction(ai, *at, now_ms, false);
         }
+        let control = around
+            .held
+            .map_or_else(Control::default, |held| held.control);
+        if !control.may_fight() {
+            // Inferred: a stunned mob (`Stunned`, `AI_Stun_2sec`) stands, its swing is lost as in
+            // a hit reaction, and its tree waits until the stun ends, as a stunned player can
+            // neither move nor attack.
+            self.state.stop_moving();
+            self.state.windows.clear();
+            return thought;
+        }
         let had = self.state.target;
         let passive = self.passive(ai);
         let perceived = self.state.perceive(ai, *at, passive, around);
@@ -1756,8 +1975,18 @@ impl TreeMind {
         // A step below a second.
         #[allow(clippy::cast_precision_loss, reason = "a step below a second")]
         let dt_s = dt_ms as f32 / MS_PER_S;
-        self.state
-            .move_and_turn(ai, &mut self.brain, at, perceived.target, around, dt_s);
+        // Inferred: a root (`NoDodge`: the roots and tethers) holds the mob where it stands; it
+        // still turns and attacks.
+        if control.may_dodge() {
+            self.state
+                .move_and_turn(ai, &mut self.brain, at, perceived.target, around, dt_s);
+        } else {
+            self.state.speed_mps = 0.0;
+        }
+        let others = Others {
+            entity: around.entity,
+            tagged: around.tagged,
+        };
         let mut out = Vec::new();
         let picks = {
             let mut view = self.state.view(ai, *at, now_ms, passive);
@@ -1765,12 +1994,14 @@ impl TreeMind {
             view.candidates = perceived.candidates;
             view.health_share = around.health_share;
             view.ground = Some(around.ground);
+            view.others = others;
+            view.held = around.held;
             self.brain.tick(&ai.runtime, &view, &mut out);
             view.picks.get()
         };
         self.state.picks = picks;
         thought.ticked = true;
-        self.apply(ai, *at, now_ms, out, &mut thought);
+        self.apply(ai, *at, now_ms, out, &mut thought, others);
         self.log_target_change(ai, perceived_target, *at);
         let activity = if self.state.target.is_some() {
             Activity::Combat
@@ -1845,7 +2076,8 @@ impl TreeMind {
         }
     }
 
-    /// Applies the tree's commands at `now_ms` to the mob at `at`.
+    /// Applies the tree's commands at `now_ms` to the mob at `at`; its remote actions reach
+    /// `others`.
     fn apply(
         &mut self,
         ai: &MobAi,
@@ -1853,6 +2085,7 @@ impl TreeMind {
         now_ms: u64,
         out: Vec<Command>,
         thought: &mut Thought,
+        others: Others<'_>,
     ) {
         let passive = self.passive(ai);
         for command in out {
@@ -1867,6 +2100,16 @@ impl TreeMind {
                     let tags = self.brain.tags();
                     self.state
                         .play(ai, tags, slot, task, action, done_at_ms, now_ms);
+                    // The action's `TriggerEntity` activities run as it starts, each when the
+                    // conditions of its branches hold.
+                    if let Some(cage) = ai.data().cage_actions.get(action as usize) {
+                        let has_tag = |tag| tags.contains(&tag);
+                        for trigger in &cage.triggers {
+                            if trigger.condition.holds(&has_tag) {
+                                self.trigger(ai, trigger.trigger, thought);
+                            }
+                        }
+                    }
                 }
                 Command::EndTask { slot } => {
                     if self.state.task_slot == Some(slot) {
@@ -1984,7 +2227,7 @@ impl TreeMind {
                 }
                 Command::LockTarget(locked) => self.state.locked = locked,
                 Command::ManualTarget(point) => self.state.manual = point.map(position_of),
-                Command::Action { node, .. } => match &ai.data().node(node).kind {
+                Command::Action { node, target_index } => match &ai.data().node(node).kind {
                     NodeKind::ExecuteSpawn {
                         slice,
                         count,
@@ -2015,10 +2258,80 @@ impl TreeMind {
                             route.visit(self.state.picks.unit());
                         }
                     }
-                    other => tracing::debug!(
+                    NodeKind::TriggerEntity { trigger } => self.trigger(ai, *trigger, thought),
+                    NodeKind::TriggerRemoteEntity {
+                        trigger,
+                        all_targets,
+                        target,
+                    } => {
+                        let targets = self.state.remote_targets(
+                            ai,
+                            at,
+                            others,
+                            Some(target),
+                            *all_targets,
+                            target_index,
+                        );
+                        thought
+                            .remote_triggers
+                            .extend(targets.into_iter().map(|mob| (mob, *trigger)));
+                    }
+                    NodeKind::SetRemoteFact {
+                        fact,
+                        value,
+                        overwrite,
+                        target,
+                    } => {
+                        let value = {
+                            let view = self.state.view(ai, at, now_ms, passive);
+                            self.brain.resolve(&ai.runtime, &view, value)
+                        };
+                        let (Some(key), Some(value)) = (ai.data().key(ai.name(*fact)), value)
+                        else {
+                            continue;
+                        };
+                        // Inferred: the node names no `UseAllAvailableTargets`; it sets the fact
+                        // on every target.
+                        let targets = self.state.remote_targets(
+                            ai,
+                            at,
+                            others,
+                            Some(target),
+                            true,
+                            target_index,
+                        );
+                        thought
+                            .remote_facts
+                            .extend(targets.into_iter().map(|mob| RemoteFact {
+                                mob,
+                                key,
+                                value,
+                                overwrite: *overwrite,
+                            }));
+                    }
+                    NodeKind::AssignOrder { order } => {
+                        // Inferred: the node names no target; the order goes to every action
+                        // target of its tracker.
+                        let targets =
+                            self.state
+                                .remote_targets(ai, at, others, None, true, target_index);
+                        thought
+                            .orders
+                            .extend(targets.into_iter().map(|mob| (mob, *order)));
+                    }
+                    NodeKind::CompleteOrder => self.state.order = None,
+                    NodeKind::UpdateNwTags { main, operations } => {
+                        if let Some(tags) = self
+                            .state
+                            .tags_after(std::iter::once(main).chain(operations))
+                        {
+                            self.state.nw_tags = tags;
+                        }
+                    }
+                    other => tracing::warn!(
                         archetype = self.state.archetype,
                         node = ?std::mem::discriminant(other),
-                        "tree action the sim does not run"
+                        "tree action the sim does not run went out"
                     ),
                 },
                 Command::EncounterEvent(event) => {
@@ -2029,10 +2342,32 @@ impl TreeMind {
                     );
                     thought.encounter_events.push(event);
                 }
-                // The tags stay in the brain (the replicated tag state reads them); action
-                // targets are the mob's candidates (see `World::action_targets`).
-                Command::Tag { .. } | Command::TrackActionTargets(_) => {}
+                Command::TrackActionTargets(Some(tracker)) => self.state.trackers.push(tracker),
+                Command::TrackActionTargets(None) => {
+                    self.state.trackers.pop();
+                }
+                // The tags stay in the brain (the replicated tag state reads them).
+                Command::Tag { .. } => {}
             }
+        }
+    }
+
+    /// Runs the slice triggers named `trigger` of the mob's archetype: each joins `thought`.
+    fn trigger(&self, ai: &MobAi, trigger: NameId, thought: &mut Thought) {
+        let name = ai.name(trigger);
+        let Some(arch) = ai.arch(self.state.archetype) else {
+            return;
+        };
+        let before = thought.triggers.len();
+        thought
+            .triggers
+            .extend(arch.triggers_named(name, |id| ai.name(id)).copied());
+        if thought.triggers.len() == before {
+            tracing::debug!(
+                archetype = self.state.archetype,
+                trigger = name,
+                "trigger of no slice component"
+            );
         }
     }
 
@@ -2070,6 +2405,7 @@ impl TreeMind {
     /// end of `ResetAI` heals (see [`Thought::healed`]).
     fn status_effect(&mut self, ai: &MobAi, effect: NameId, apply: bool, thought: &mut Thought) {
         let state = &mut self.state;
+        state.status_changes.push((effect, apply));
         if apply {
             if !state.statuses.contains(&effect) {
                 state.statuses.push(effect);
@@ -2174,6 +2510,10 @@ struct View<'a> {
     ground: Option<&'a (dyn Ground + Sync)>,
     /// The random numbers of position picks (the tree's own draws are in its brain).
     picks: Cell<Rng48>,
+    /// The other mobs its remote actions reach.
+    others: Others<'a>,
+    /// The status effects the sim holds on it.
+    held: Option<&'a HeldEffects>,
 }
 
 impl View<'_> {
@@ -2252,6 +2592,7 @@ impl World for View<'_> {
                 #[allow(clippy::cast_possible_truncation, reason = "a tier of 0 to 3")]
                 Value::Int(tier.round() as i64)
             }
+            EngineKey::AiOrder => Value::Int(i64::from(state.order?)),
             _ => return None,
         })
     }
@@ -2261,12 +2602,19 @@ impl World for View<'_> {
             .statuses
             .iter()
             .any(|status| self.ai.name(*status) == effect)
+            || self.held.is_some_and(|held| {
+                held.effects
+                    .iter()
+                    .any(|held| held.eq_ignore_ascii_case(effect))
+            })
     }
 
-    fn has_status_category(&self, _category: &str) -> bool {
-        // The sim reads no `EffectCategories` of the status effect rows: no category is
-        // active.
-        false
+    fn has_status_category(&self, category: &str) -> bool {
+        self.held.is_some_and(|held| {
+            held.categories
+                .iter()
+                .any(|held| held.eq_ignore_ascii_case(category))
+        })
     }
 
     fn position(&self, of: PositionType) -> Option<[f32; 3]> {
@@ -2291,10 +2639,25 @@ impl World for View<'_> {
         Some([at.x, at.y, at.z])
     }
 
-    fn action_targets(&self, _params: &TrackerParams) -> u32 {
-        // Inferred: the players the mob could take as targets within its combat vision (the
-        // targeting profile's curves are Unknown).
-        self.candidates
+    fn action_targets(&self, params: &TrackerParams) -> u32 {
+        // Inferred: without a tag (or with `Player`), the players the mob could take as targets
+        // within its combat vision (the targeting profile's curves are Unknown); with another
+        // tag, the other mobs that carry it.
+        let tag = [params.tag_filter, params.target.tag_filter]
+            .into_iter()
+            .find(|tag| !self.ai.name(*tag).is_empty());
+        match tag {
+            Some(tag) if self.ai.name(tag) != PLAYER_TAG => {
+                let others = self.others;
+                let tagged = others
+                    .tagged
+                    .iter()
+                    .filter(|mob| mob.entity != others.entity && mob.tags.contains(&tag))
+                    .count();
+                u32::try_from(tagged).unwrap_or(u32::MAX)
+            }
+            _ => self.candidates,
+        }
     }
 
     fn entity_query(&self, _params: &EntityQueryParams, _board: &dyn Blackboard) -> bool {
@@ -2302,9 +2665,44 @@ impl World for View<'_> {
         false
     }
 
-    fn entities_with_tag(&self, _tag: &str) -> u32 {
-        // The sim gives its entities no `NWTags`: no entity has one.
-        0
+    fn entities_with_tag(&self, tag: &str) -> u32 {
+        // Only the tags trees gave (`UpdateNWTags`) are known: the slices' own `NWTags` are not
+        // in the AI data (Unknown).
+        let tagged = self
+            .others
+            .tagged
+            .iter()
+            .filter(|mob| mob.tags.iter().any(|own| self.ai.name(*own) == tag))
+            .count();
+        u32::try_from(tagged).unwrap_or(u32::MAX)
+    }
+
+    fn can_act(&self, kind: &NodeKind, target_index: Option<u32>) -> bool {
+        let state = self.state;
+        let reaches = |target: Option<&ActionTarget>| {
+            !state
+                .remote_targets(self.ai, self.at, self.others, target, true, target_index)
+                .is_empty()
+        };
+        match kind {
+            NodeKind::ExecuteSpawn { .. }
+            | NodeKind::TriggerEntity { .. }
+            | NodeKind::SelectWaypoint => true,
+            NodeKind::TriggerRemoteEntity { target, .. } => reaches(Some(target)),
+            NodeKind::SetRemoteFact { fact, target, .. } => {
+                self.ai.data().key(self.ai.name(*fact)).is_some() && reaches(Some(target))
+            }
+            NodeKind::AssignOrder { .. } => reaches(None),
+            NodeKind::CompleteOrder => state.order.is_some(),
+            NodeKind::UpdateNwTags { main, operations } => state
+                .tags_after(std::iter::once(main).chain(operations))
+                .is_some(),
+            // Unknown: the node names no projectile and no beam; they are components of the
+            // mob's slice (`ProjectileSpawner`, the beam attack of `BeamName`), which the AI data
+            // does not hold, so the sim fires neither and the node fails.
+            NodeKind::SpawnProjectile(_) | NodeKind::SetBeam { .. } => false,
+            _ => false,
+        }
     }
 
     fn has_patrol(&self) -> bool {
@@ -3059,6 +3457,375 @@ mod tests {
         assert_eq!((still.lunge_max_m, still.lunge_turn_rad), (0.0, 0.0));
     }
 
+    /// A tree's `TriggerEntity` node runs the slice components of that trigger name (any case),
+    /// and a name the slice lacks runs none (oquests triggers note: the relic spear's
+    /// `DeactivateVisibility`).
+    #[test]
+    fn a_trigger_entity_node_runs_the_slice_components_of_its_name() {
+        const CHILD: u64 = 0x0000_0174_1dcf_e452;
+        const COMPONENT: u64 = 0x1f2e_3d4c_5b6a_7988;
+        let mut data = test_ai_data();
+        let name = u32::try_from(data.names.len()).expect("name id");
+        data.names.push("DeactivateVisibility".into());
+        let other = name + 1;
+        data.names.push("NoSuchTrigger".into());
+        data.archetypes[0].triggers.push(SliceTriggerRef {
+            name,
+            child: CHILD,
+            component: COMPONENT,
+        });
+        let node = u32::try_from(data.nodes.len()).expect("node id");
+        for trigger in [name, other] {
+            data.nodes.push(nw_ai::node::Node {
+                name: 0,
+                utility: 1.0,
+                interruptable: true,
+                kind: NodeKind::TriggerEntity { trigger },
+            });
+        }
+        let ai = MobAi::new(data, AiRates::default(), LookAssets::new());
+        let mut mind = TreeMind::new(&ai, 0, START, 0.0, 1, None).expect("a tree");
+        let mut thought = Thought::default();
+        mind.apply(
+            &ai,
+            START,
+            0,
+            vec![
+                Command::Action {
+                    node,
+                    target_index: None,
+                },
+                Command::Action {
+                    node: node + 1,
+                    target_index: None,
+                },
+            ],
+            &mut thought,
+            Others::NONE,
+        );
+        assert_eq!(
+            thought.triggers,
+            [SliceTriggerRef {
+                name,
+                child: CHILD,
+                component: COMPONENT,
+            }]
+        );
+    }
+
+    /// A name id of `data`, added when it lacks the text.
+    fn name_in(data: &mut AiData, text: &str) -> NameId {
+        data.name_id(text).unwrap_or_else(|| {
+            data.names.push(text.to_owned());
+            NameId::try_from(data.names.len() - 1).expect("name id")
+        })
+    }
+
+    /// A node of `kind` added to `data`.
+    fn node_in(data: &mut AiData, kind: NodeKind) -> NodeId {
+        data.nodes.push(nw_ai::node::Node {
+            name: 0,
+            utility: 1.0,
+            interruptable: true,
+            kind,
+        });
+        NodeId::try_from(data.nodes.len() - 1).expect("node id")
+    }
+
+    /// An `ActionTarget` of tag `tag` and no limits.
+    fn tagged_target(tag: NameId) -> ActionTarget {
+        let unset = Param::literal(Value::Int(-1));
+        ActionTarget {
+            profile: None,
+            tag_filter: tag,
+            limits: nw_ai::node::TargetLimits {
+                min_targets: unset,
+                max_targets: unset,
+                top_exclude: unset,
+                range_behavior: Param::literal(Value::Int(0)),
+            },
+        }
+    }
+
+    /// The mob of entity `entity` at `metres` east of `START` with tag `tag`.
+    fn tagged_mob(entity: u64, metres: f32, tag: NameId) -> TaggedMob {
+        TaggedMob {
+            entity,
+            position: east(metres),
+            tags: vec![tag],
+        }
+    }
+
+    /// A `TriggerRemoteEntity` (retail `tendril_leviathan_base` `TurnOnMarker`) runs the slice
+    /// trigger on the tagged mobs, the nearest alone without `UseAllAvailableTargets`; with no
+    /// tagged mob the sim cannot run it, so the node fails.
+    #[test]
+    fn a_remote_trigger_goes_to_the_tagged_mobs_and_fails_without_one() {
+        const OWN: u64 = 1;
+        let mut data = test_ai_data();
+        let trigger = name_in(&mut data, "TurnOnMarker");
+        let tag = name_in(&mut data, "Tendril");
+        let kind = |all_targets| NodeKind::TriggerRemoteEntity {
+            trigger,
+            all_targets,
+            target: tagged_target(tag),
+        };
+        let one = node_in(&mut data, kind(false));
+        let all = node_in(&mut data, kind(true));
+        let ai = MobAi::new(data, AiRates::default(), LookAssets::new());
+        let mut mind = TreeMind::new(&ai, 0, START, 0.0, 1, None).expect("a tree");
+        let tagged = [
+            tagged_mob(OWN, 0.0, tag),
+            tagged_mob(8, 9.0, tag),
+            tagged_mob(9, 3.0, tag),
+        ];
+        let others = Others {
+            entity: OWN,
+            tagged: &tagged,
+        };
+        {
+            let mut view = mind.state.view(&ai, START, 0, false);
+            assert!(
+                !view.can_act(&ai.data().node(one).kind, None),
+                "no mob near"
+            );
+            view.others = others;
+            assert!(view.can_act(&ai.data().node(one).kind, None));
+        }
+        let mut thought = Thought::default();
+        let action = |node| Command::Action {
+            node,
+            target_index: None,
+        };
+        mind.apply(
+            &ai,
+            START,
+            0,
+            vec![action(one), action(all)],
+            &mut thought,
+            others,
+        );
+        assert_eq!(
+            thought.remote_triggers,
+            [(9, trigger), (9, trigger), (8, trigger)],
+            "the nearest, then every tagged mob but itself"
+        );
+    }
+
+    /// `UpdateNWTags` gives the mob its tags, which a tracker's tag filter and
+    /// `CountEntitiesWithTag` of another mob then see (retail `hercyne_reindeer_turret`
+    /// `BurstReady`); a strict add of a tag it has fails.
+    #[test]
+    fn tags_a_tree_gives_are_seen_by_other_trees() {
+        let mut data = test_ai_data();
+        let ready = name_in(&mut data, "BurstReady");
+        let add = |strict| nw_ai::node::TagOperation {
+            tag: ready,
+            add: true,
+            strict,
+        };
+        let update = node_in(
+            &mut data,
+            NodeKind::UpdateNwTags {
+                main: add(false),
+                operations: Vec::new(),
+            },
+        );
+        let strict_kind = NodeKind::UpdateNwTags {
+            main: add(true),
+            operations: Vec::new(),
+        };
+        let ai = MobAi::new(data, AiRates::default(), LookAssets::new());
+        let mut mind = TreeMind::new(&ai, 0, START, 0.0, 1, None).expect("a tree");
+        mind.apply(
+            &ai,
+            START,
+            0,
+            vec![Command::Action {
+                node: update,
+                target_index: None,
+            }],
+            &mut Thought::default(),
+            Others::NONE,
+        );
+        assert_eq!(mind.nw_tags(), [ready]);
+        let view = mind.state.view(&ai, START, 0, false);
+        assert!(
+            !view.can_act(&strict_kind, None),
+            "a strict add of a held tag"
+        );
+        let tagged = [tagged_mob(5, 2.0, ready)];
+        let other = TreeMind::new(&ai, 0, START, 0.0, 2, None).expect("a tree");
+        let mut view = other.state.view(&ai, START, 0, false);
+        view.others = Others {
+            entity: 6,
+            tagged: &tagged,
+        };
+        assert_eq!(view.entities_with_tag("BurstReady"), 1);
+        let unset = Param::literal(Value::Int(-1));
+        let tracker = TrackerParams {
+            target: tagged_target(0),
+            evaluation_ms: unset,
+            profile: None,
+            tag_filter: ready,
+            min_targets: unset,
+            max_targets: unset,
+            top_exclude: unset,
+            all_valid_targets: false,
+            range_behavior: unset,
+        };
+        assert_eq!(view.action_targets(&tracker), 1);
+    }
+
+    /// An order another tree gives (`AssignOrder`) is the `AI_Order` engine key until the mob
+    /// completes it (`CompleteOrder`, which fails without one); a remote fact replaces a value
+    /// only with `OverwriteTargetFact`.
+    #[test]
+    fn orders_and_remote_facts_reach_the_tree() {
+        const DESPAWN: u32 = 3_967_816_091;
+        let mut data = test_ai_data();
+        let complete = node_in(&mut data, NodeKind::CompleteOrder);
+        let ai = MobAi::new(data, AiRates::default(), LookAssets::new());
+        let mut mind = TreeMind::new(&ai, 0, START, 0.0, 1, None).expect("a tree");
+        let order = |mind: &TreeMind| {
+            mind.state
+                .view(&ai, START, 0, false)
+                .engine_value(EngineKey::AiOrder)
+        };
+        assert_eq!(order(&mind), None);
+        assert!(
+            !mind
+                .state
+                .view(&ai, START, 0, false)
+                .can_act(&NodeKind::CompleteOrder, None)
+        );
+        mind.assign_order(DESPAWN);
+        assert_eq!(order(&mind), Some(Value::Int(i64::from(DESPAWN))));
+        mind.apply(
+            &ai,
+            START,
+            0,
+            vec![Command::Action {
+                node: complete,
+                target_index: None,
+            }],
+            &mut Thought::default(),
+            Others::NONE,
+        );
+        assert_eq!(order(&mind), None);
+        let key = ai.data().key(COMBAT_LEASH_KEY).expect("key");
+        let fact = |value: f32, overwrite| RemoteFact {
+            mob: 1,
+            key,
+            value: Value::Float(value),
+            overwrite,
+        };
+        mind.set_remote_fact(&fact(1.0, false));
+        mind.set_remote_fact(&fact(2.0, false));
+        assert_eq!(mind.brain().fact(key), Some(Value::Float(1.0)), "kept");
+        mind.set_remote_fact(&fact(3.0, true));
+        assert_eq!(
+            mind.brain().fact(key),
+            Some(Value::Float(3.0)),
+            "overwritten"
+        );
+    }
+
+    /// The sim has no projectile or beam of a tree node (Unknown in the AI data): those nodes
+    /// fail.
+    #[test]
+    fn a_tree_projectile_or_beam_fails() {
+        let ai = test_ai(&[]);
+        let mind = TreeMind::new(&ai, 0, START, 0.0, 1, None).expect("a tree");
+        let view = mind.state.view(&ai, START, 0, false);
+        let unset = Param::literal(Value::Int(-1));
+        let projectile = NodeKind::SpawnProjectile(Box::new(nw_ai::node::ProjectileParams {
+            target: tagged_target(0),
+            target_pos: unset,
+            use_all_available_targets: true,
+            min_targets_per_shot: unset,
+            max_targets_per_shot: unset,
+            min_seconds_between_shots: unset,
+            max_seconds_between_shots: unset,
+        }));
+        let beam = NodeKind::SetBeam {
+            beam: 0,
+            active: true,
+            aim_mode: unset,
+            lock_target: false,
+        };
+        assert!(!view.can_act(&projectile, None));
+        assert!(!view.can_act(&beam, None));
+    }
+
+    /// The tree reads the effects the sim holds on the mob (a player's stun), and the effects
+    /// the tree puts on the mob go to the sim.
+    #[test]
+    fn the_tree_sees_held_effects_and_hands_its_own_to_the_sim() {
+        const STUN: &str = "AI_Stun_2sec";
+        let mut data = test_ai_data();
+        let empower = name_in(&mut data, "Empower");
+        let ai = MobAi::new(data, AiRates::default(), LookAssets::new());
+        let mut mind = TreeMind::new(&ai, 0, START, 0.0, 1, None).expect("a tree");
+        let held = HeldEffects {
+            effects: vec![STUN.to_owned()],
+            categories: vec!["stun".to_owned()],
+            control: Control {
+                stunned: true,
+                ..Control::default()
+            },
+        };
+        {
+            let mut view = mind.state.view(&ai, START, 0, false);
+            assert!(!view.has_status_effect(STUN));
+            view.held = Some(&held);
+            assert!(view.has_status_effect(STUN));
+            assert!(view.has_status_category("Stun"));
+        }
+        let mut thought = Thought::default();
+        mind.status_effect(&ai, empower, true, &mut thought);
+        mind.status_effect(&ai, empower, false, &mut thought);
+        assert_eq!(
+            mind.take_status_changes(),
+            [(empower, true), (empower, false)]
+        );
+        assert!(mind.take_status_changes().is_empty());
+    }
+
+    /// A stunned mob neither perceives, moves nor thinks; a root holds it in place while it
+    /// thinks.
+    #[test]
+    fn a_stun_holds_the_tree_and_a_root_holds_the_body() {
+        let ai = test_ai(&[]);
+        let ground = FlatGround(GROUND_Z);
+        let seen = [Seen {
+            entity: 7,
+            position: east(1.0),
+        }];
+        let around = |held| Surroundings {
+            now_ms: 0,
+            seen: &seen,
+            ground: &ground,
+            health_share: 1.0,
+            entity: 1,
+            tagged: &[],
+            held,
+        };
+        let stunned = HeldEffects {
+            control: Control {
+                stunned: true,
+                ..Control::default()
+            },
+            ..HeldEffects::default()
+        };
+        let mut mind = TreeMind::new(&ai, 0, START, 0.0, 1, None).expect("a tree");
+        let mut at = START;
+        let thought = mind.step(&ai, &mut at, &around(Some(&stunned)));
+        assert!(!thought.ticked && thought.acquired.is_none(), "{thought:?}");
+        let thought = mind.step(&ai, &mut at, &around(None));
+        assert!(thought.ticked && thought.acquired == Some(7));
+    }
+
     /// A tree's `ExecuteSpawn` (retail `medusa_minionsummon_attackbehavior` `Spawn_Boar`:
     /// `Count` 1, `TargetPosBlackboardKey` unset) gives the sim a summon of its slice at the
     /// mob.
@@ -3095,6 +3862,7 @@ mod tests {
                 target_index: None,
             }],
             &mut thought,
+            Others::NONE,
         );
         assert_eq!(
             thought.summons,

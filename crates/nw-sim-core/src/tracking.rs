@@ -354,6 +354,11 @@ impl TrackedBody {
         self.character.set_equip_load(load);
     }
 
+    /// A held `NoSprint` effect keeps it from sprinting ([`Character::set_no_sprint`]).
+    pub const fn set_no_sprint(&mut self, no_sprint: bool) {
+        self.character.set_no_sprint(no_sprint);
+    }
+
     /// Whether the road boost speeds up its sprint.
     pub fn has_road_boost(&self) -> bool {
         self.character.has_road_boost()

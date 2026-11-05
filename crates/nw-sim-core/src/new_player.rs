@@ -28,14 +28,18 @@ pub const TUTORIAL_START_FLOOR: Position = Position {
 };
 
 /// The tutorial's end: the client's last position before the server changed the level to the
-/// open world. Until quests run, reaching it ends the tutorial.
+/// open world. Retail ends the tutorial by its quest (the client asks to leave after the last
+/// video); reaching this point ends it only for a player whose tutorial quest does not run (the
+/// content has no tutorial quest).
 pub const TUTORIAL_EXIT: Position = Position {
     x: 491.63,
     y: 210.79,
     z: 25.45,
 };
 
-/// How close (horizontally, in metres) a player must come to [`TUTORIAL_EXIT`] to leave.
+/// How close (horizontally, in metres) a player must come to [`TUTORIAL_EXIT`] to leave. Our
+/// engineering limit, not a retail value: retail has no exit area (Unknown), and 20 m is a
+/// margin around the one exit point the capture holds.
 pub const TUTORIAL_EXIT_RADIUS_M: f32 = 20.0;
 
 /// Where a player appears in the open world after the tutorial (the beach start): retail's

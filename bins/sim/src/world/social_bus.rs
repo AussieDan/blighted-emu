@@ -16,6 +16,10 @@ use uuid::Uuid;
 
 use super::{Body, MESSAGE_CHANNEL, Outgoing, Player, SimWorld};
 
+/// How long a done coin move is remembered: well past the social service's repeats of an
+/// unanswered move (Inferred: its attempts times its coin timeout are seconds).
+pub(super) const COIN_MOVE_MEMORY_MS: u64 = 600_000;
+
 /// The component of a bus facet kind.
 const fn facet_of(kind: SocialFacetKind) -> SocialFacet {
     match kind {
@@ -101,9 +105,23 @@ impl SimWorld {
         outgoing
     }
 
-    /// Moves the coins of `transfer` (the company treasury): the player's coins change and its
-    /// client gets them with the next own state.
-    pub fn move_coins(&mut self, transfer: &CoinTransfer) -> CoinReply {
+    /// Moves the coins of `transfer` (the company treasury) at sim ms `now_ms`: the player's
+    /// coins change and its client gets them with the next own state. A move of an id done in
+    /// the last [`COIN_MOVE_MEMORY_MS`] gets its first answer again and moves nothing.
+    pub fn move_coins(&mut self, transfer: &CoinTransfer, now_ms: u64) -> CoinReply {
+        self.coin_moves
+            .retain(|_, (_, done_ms)| now_ms.saturating_sub(*done_ms) < COIN_MOVE_MEMORY_MS);
+        if let Some((reply, _)) = self.coin_moves.get(&transfer.id) {
+            return *reply;
+        }
+        let reply = self.apply_coin_move(transfer);
+        if matches!(reply, CoinReply::Done { .. }) {
+            self.coin_moves.insert(transfer.id, (reply, now_ms));
+        }
+        reply
+    }
+
+    fn apply_coin_move(&mut self, transfer: &CoinTransfer) -> CoinReply {
         let Some(entity) = self.by_connection.values().copied().find(|entity| {
             self.world
                 .get::<Player>(*entity)
@@ -170,38 +188,58 @@ mod tests {
         assert_eq!(envelope.body.last(), Some(&7));
     }
 
+    fn transfer(id: u128, character: Uuid, change: i64) -> CoinTransfer {
+        CoinTransfer {
+            id: Uuid::from_u128(id),
+            character,
+            change,
+        }
+    }
+
     #[test]
     fn coins_move_and_never_below_zero() {
         let (mut world, character) = admitted();
-        let before = match world.move_coins(&CoinTransfer {
-            character,
-            change: 0,
-        }) {
+        let before = match world.move_coins(&transfer(1, character, 0), NOW) {
             CoinReply::Done { coins } => coins,
             other => panic!("done: {other:?}"),
         };
         assert_eq!(
-            world.move_coins(&CoinTransfer {
-                character,
-                change: 500,
-            }),
+            world.move_coins(&transfer(2, character, 500), NOW),
             CoinReply::Done {
                 coins: before + 500
             }
         );
         assert_eq!(
-            world.move_coins(&CoinTransfer {
-                character,
-                change: -i64::try_from(before + 501).expect("small"),
-            }),
+            world.move_coins(
+                &transfer(3, character, -i64::try_from(before + 501).expect("small")),
+                NOW
+            ),
             CoinReply::TooFew
         );
         assert_eq!(
-            world.move_coins(&CoinTransfer {
-                character: Uuid::from_u128(999),
-                change: 1,
-            }),
+            world.move_coins(&transfer(4, Uuid::from_u128(999), 1), NOW),
             CoinReply::NotHere
+        );
+    }
+
+    #[test]
+    fn a_repeated_move_is_answered_again_and_moves_once() {
+        let (mut world, character) = admitted();
+        let first = world.move_coins(&transfer(1, character, 500), NOW);
+        assert_eq!(
+            world.move_coins(&transfer(1, character, 500), NOW + 1),
+            first
+        );
+        assert_eq!(
+            world.move_coins(&transfer(2, character, 0), NOW + 1),
+            first,
+            "the coins moved once"
+        );
+        let later = NOW + COIN_MOVE_MEMORY_MS;
+        assert_ne!(
+            world.move_coins(&transfer(1, character, 500), later),
+            first,
+            "a forgotten id is a new move"
         );
     }
 }

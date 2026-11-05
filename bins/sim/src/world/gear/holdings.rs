@@ -13,7 +13,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use nw_bus::{ItemLookState, ItemState, PlayerInventory, SavedLoadout, StoredItem};
-use nw_content::item_rolls::RolledItem;
 use nw_content::starter::{KitItem, StarterKits};
 use nw_messages::item_calls::{LOCATION_BAG, LOCATIONS_BY_KEY, loadout_status};
 use nw_messages::items::{SYNC_LOGIN, SYNC_MOVED};
@@ -47,6 +46,8 @@ pub(in crate::world) enum ItemRefusal {
     NoSuchItem,
     /// Its owner locked it.
     Locked,
+    /// It is bound to its owner: it does not go to another player.
+    Bound,
     /// No container is open, or the open one takes no items.
     NoContainer,
     /// The container has no free slot.
@@ -55,16 +56,17 @@ pub(in crate::world) enum ItemRefusal {
     WrongSlot,
 }
 
-/// A stack the player dropped (1838, 826, 3938): its item, quantity and, for gear, its own
-/// gear score and perks, which the bag of dropped items keeps for the take.
+/// A stack that leaves the player's items whole (a drop 1838, 826, 3938, a trade, a sale): its
+/// item, quantity and, for gear, its own values, which the place it goes to keeps.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::world) struct DroppedStack {
+pub(in crate::world) struct MovedStack {
     /// The item id.
     pub(in crate::world) item_id: String,
-    /// The quantity dropped.
+    /// The quantity moved.
     pub(in crate::world) quantity: u32,
-    /// Its rolls; `None` for an item without durability or perks (a resource keeps stacking).
-    pub(in crate::world) rolled: Option<RolledItem>,
+    /// Its own values ([`Stack::own_values`]); `None` for an item without durability or perks
+    /// (a resource keeps stacking).
+    pub(in crate::world) values: Option<ItemState>,
 }
 
 /// A saved loadout.
@@ -105,6 +107,8 @@ pub(super) struct Holdings {
     loadouts: Vec<SavedSet>,
     /// Whether the loadout panel is open.
     panel_open: bool,
+    /// The paperdoll slots whose skin the player hid (true) or showed again (false), 5978.
+    hidden_skins: BTreeMap<u32, bool>,
     /// What the second container shows; `None` before anything was opened.
     opened: Option<Opened>,
 }
@@ -171,22 +175,49 @@ impl Stack {
         }
     }
 
-    /// Its gear score and perks when it is gear (it has durability or perks); `None` for an
-    /// item that stacks with any other of its kind.
-    pub(super) fn rolled(&self) -> Option<RolledItem> {
-        (self.item.max_durability > 0 || !self.perks.is_empty()).then(|| RolledItem {
-            gear_score: self.item.gear_score,
-            perks: self.perks.clone(),
+    /// What it keeps of its own when it is gear (it has durability or perks): its instance id,
+    /// gear score, durability, perks, bind state and look, unlocked (a locked stack does not
+    /// leave its owner). `None` for an item that stacks with any other of its kind.
+    pub(super) fn own_values(&self) -> Option<ItemState> {
+        (self.item.max_durability > 0 || !self.perks.is_empty()).then(|| ItemState {
+            locked: false,
+            ..self.state()
         })
     }
 
-    /// The stack as dropped: its item, quantity and rolls.
-    fn dropped(&self) -> DroppedStack {
-        DroppedStack {
+    /// The stack as it leaves: its item, quantity and own values.
+    fn moved(&self) -> MovedStack {
+        MovedStack {
             item_id: self.item_id.clone(),
             quantity: self.item.quantity,
-            rolled: self.rolled(),
+            values: self.own_values(),
         }
+    }
+
+    /// Takes the saved or moved `values` over: its instance id, lock, gear score, durability (at
+    /// most full), perks and bind state when they are kept, and its look.
+    fn take_values(&mut self, kits: &StarterKits, values: &ItemState) {
+        if let Some(instance) = values.instance {
+            self.item.instance = instance;
+        }
+        self.item.locked = values.locked;
+        if let Some(gear_score) = values.gear_score {
+            self.item.gear_score = gear_score;
+        }
+        if let Some(durability) = values.durability {
+            self.item.durability = durability.min(self.item.max_durability);
+        }
+        if let Some(perks) = &values.perks {
+            self.set_perks(kits, perks.clone());
+        }
+        if let Some(bound) = values.bound {
+            self.item.bound = bound;
+        }
+        self.item.look = ItemLook {
+            dye: values.look.dye,
+            appearance: values.look.appearance,
+            skin_dye: values.look.skin_dye,
+        };
     }
 
     /// Sets its perks (ids in slot order) and their wire indexes.
@@ -217,27 +248,7 @@ impl Gear {
         state: &ItemState,
     ) -> Stack {
         let mut restored = self.new_stack(item, quantity);
-        if let Some(instance) = state.instance {
-            restored.item.instance = instance;
-        }
-        restored.item.locked = state.locked;
-        if let Some(gear_score) = state.gear_score {
-            restored.item.gear_score = gear_score;
-        }
-        if let Some(durability) = state.durability {
-            restored.item.durability = durability.min(restored.item.max_durability);
-        }
-        if let Some(perks) = &state.perks {
-            restored.set_perks(kits, perks.clone());
-        }
-        if let Some(bound) = state.bound {
-            restored.item.bound = bound;
-        }
-        restored.item.look = ItemLook {
-            dye: state.look.dye,
-            appearance: state.look.appearance,
-            skin_dye: state.look.skin_dye,
-        };
+        restored.take_values(kits, state);
         restored
     }
 
@@ -393,6 +404,12 @@ impl Gear {
             loadouts,
             loadout_panel_open: self.holdings.panel_open,
             open_container: self.open_container(),
+            hidden_skins: self
+                .holdings
+                .hidden_skins
+                .iter()
+                .map(|(slot, hidden)| (*slot, *hidden))
+                .collect(),
             bag_reasons: self
                 .bag
                 .iter()
@@ -519,6 +536,12 @@ impl Gear {
                     attributes: set.attributes.clone(),
                 })
                 .collect(),
+            hidden_skins: self
+                .holdings
+                .hidden_skins
+                .iter()
+                .map(|(slot, hidden)| (*slot, *hidden))
+                .collect(),
         }
     }
 
@@ -558,6 +581,7 @@ impl Gear {
                 };
             }
         }
+        self.holdings.hidden_skins = inventory.hidden_skins.iter().copied().collect();
         self.settle_keys();
     }
 
@@ -577,14 +601,14 @@ impl Gear {
     }
 
     /// Takes `quantity` (0 or more than the stack: all of it) of the stack of instance
-    /// `instance` in bag slot `bag_slot` out of the bag to drop it (1838): what was dropped. A
-    /// locked stack stays.
-    pub(in crate::world) fn drop_from_bag(
+    /// `instance` in bag slot `bag_slot` out of the bag to drop, trade or sell it (1838): what
+    /// left, with its own values. A locked stack stays.
+    pub(in crate::world) fn take_moved(
         &mut self,
         bag_slot: u32,
         instance: [u8; RAW_ID_LEN],
         quantity: u32,
-    ) -> Result<DroppedStack, ItemRefusal> {
+    ) -> Result<MovedStack, ItemRefusal> {
         let index = usize::try_from(bag_slot).map_err(|_| ItemRefusal::NoSuchItem)?;
         let stack = self
             .bag
@@ -595,9 +619,135 @@ impl Gear {
         if stack.item.locked {
             return Err(ItemRefusal::Locked);
         }
-        let dropped = take_out(&mut self.bag[index..=index], instance, quantity)?;
+        let moved = take_out(&mut self.bag[index..=index], instance, quantity)?;
         self.touched();
-        Ok(dropped.dropped())
+        Ok(moved.moved())
+    }
+
+    /// Takes `quantity` of `item_id` (any case) out of the bag to go to another player (a trade,
+    /// a sale on the trading post), in a change of sync reason `reason` when there is one: the
+    /// stack of instance `instance` when it names one, else the first stack that may go; a plain
+    /// item (no values of its own) may come from several stacks. What left, with its own
+    /// values. A locked or bound stack stays, and so does a stack that holds fewer.
+    pub(in crate::world) fn take_offered(
+        &mut self,
+        item_id: &str,
+        instance: Option<[u8; RAW_ID_LEN]>,
+        quantity: u32,
+        reason: Option<u8>,
+    ) -> Result<MovedStack, ItemRefusal> {
+        let named = |stack: &Stack| {
+            stack.item_id.eq_ignore_ascii_case(item_id)
+                && instance.is_none_or(|instance| stack.item.instance == instance)
+        };
+        let refusal = |stack: &Stack| {
+            if stack.item.locked {
+                Some(ItemRefusal::Locked)
+            } else if stack.item.bound {
+                Some(ItemRefusal::Bound)
+            } else {
+                None
+            }
+        };
+        let plain = instance.is_none()
+            && self
+                .bag
+                .iter()
+                .flatten()
+                .find(|stack| named(stack))
+                .is_some_and(|stack| stack.own_values().is_none());
+        if plain {
+            let free: u32 = self
+                .bag
+                .iter()
+                .flatten()
+                .filter(|stack| named(stack) && refusal(stack).is_none())
+                .map(|stack| stack.item.quantity)
+                .fold(0, u32::saturating_add);
+            if free < quantity || quantity == 0 {
+                return Err(ItemRefusal::NoSuchItem);
+            }
+            let mut left = quantity;
+            for (index, entry) in self.bag.iter_mut().enumerate() {
+                let Some(stack) = entry
+                    .as_mut()
+                    .filter(|stack| named(stack) && refusal(stack).is_none() && left > 0)
+                else {
+                    continue;
+                };
+                let taken = left.min(stack.item.quantity);
+                stack.item.quantity -= taken;
+                left -= taken;
+                if let Some(reason) = reason {
+                    stack.reason = reason;
+                }
+                if stack.item.quantity == 0 {
+                    *entry = None;
+                    if let Some(reason) = reason {
+                        self.emptied.insert(index, reason);
+                    }
+                }
+            }
+            self.touched();
+            return Ok(MovedStack {
+                item_id: item_id.to_owned(),
+                quantity,
+                values: None,
+            });
+        }
+        let candidates: Vec<(usize, Option<ItemRefusal>)> = self
+            .bag
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let stack = entry.as_ref().filter(|stack| named(stack))?;
+                let refused = refusal(stack).or_else(|| {
+                    (quantity == 0 || stack.item.quantity < quantity)
+                        .then_some(ItemRefusal::NoSuchItem)
+                });
+                Some((index, refused))
+            })
+            .collect();
+        let index = match candidates.iter().find(|(_, refused)| refused.is_none()) {
+            Some((index, _)) => *index,
+            None => {
+                return Err(candidates
+                    .first()
+                    .and_then(|(_, refused)| *refused)
+                    .unwrap_or(ItemRefusal::NoSuchItem));
+            }
+        };
+        let mut moved = self.bag[index]
+            .as_ref()
+            .map(Stack::moved)
+            .ok_or(ItemRefusal::NoSuchItem)?;
+        moved.quantity = quantity;
+        let bag_slot = u32::try_from(index).map_err(|_| ItemRefusal::NoSuchItem)?;
+        let taken = match reason {
+            Some(reason) => self.take_from_slot_as(bag_slot, quantity, reason),
+            None => self.take_from_slot(bag_slot, quantity),
+        };
+        if !taken {
+            return Err(ItemRefusal::NoSuchItem);
+        }
+        Ok(moved)
+    }
+
+    /// Puts `quantity` of `item` with its own `values` (a moved or rolled stack, `None` for a
+    /// plain one) into the bag in a change of sync reason `reason`: a stack with values of its
+    /// own is a stack of its own, a plain one stacks; whether it all fit.
+    pub(in crate::world) fn put_moved(
+        &mut self,
+        kits: &StarterKits,
+        item: &KitItem,
+        quantity: u32,
+        values: Option<&ItemState>,
+        reason: u8,
+    ) -> bool {
+        match values {
+            Some(values) => self.add_with_values(kits, item, quantity, values, reason),
+            None => self.add_as(item, quantity, reason),
+        }
     }
 
     /// Takes `quantity` (0 or more than the stack: all of it) of the item worn in paperdoll slot
@@ -608,7 +758,7 @@ impl Gear {
         slot_id: u32,
         quantity: u32,
         time_ns: u64,
-    ) -> Result<DroppedStack, ItemRefusal> {
+    ) -> Result<MovedStack, ItemRefusal> {
         let index = self
             .worn
             .iter()
@@ -618,7 +768,7 @@ impl Gear {
         if stack.item.locked {
             return Err(ItemRefusal::Locked);
         }
-        let mut dropped = stack.dropped();
+        let mut dropped = stack.moved();
         let held = stack.item.quantity;
         if quantity > 0 && quantity < held {
             stack.item.quantity -= quantity;
@@ -649,25 +799,24 @@ impl Gear {
         }
     }
 
-    /// The player opened bag `bag` of dropped items, which holds `items` with their rolls: they
-    /// show in the second container, each with its rolls and the instance id its global storage
-    /// record has (the bag's id and its place, as `loot_bag::storage_of`).
+    /// The player opened bag `bag` of dropped items, which holds `items` with their own values:
+    /// they show in the second container, each with its values and the instance id its global
+    /// storage record has (the bag's id and its place, as `loot_bag::storage_of`).
     pub(in crate::world) fn open_dropped(
         &mut self,
         kits: &StarterKits,
         bag: [u8; RAW_ID_LEN],
-        items: &[(&KitItem, u32, Option<RolledItem>)],
+        items: &[(&KitItem, u32, Option<ItemState>)],
     ) {
         let namespace = Uuid::from_bytes(bag);
         let stacks = (0_u64..)
             .zip(items)
-            .map(|(index, (item, quantity, rolled))| {
+            .map(|(index, (item, quantity, values))| {
                 let mut shown = stack(self.character, item, *quantity);
-                shown.item.instance = *Uuid::new_v5(&namespace, &index.to_be_bytes()).as_bytes();
-                if let Some(rolled) = rolled {
-                    shown.item.gear_score = rolled.gear_score;
-                    shown.set_perks(kits, rolled.perks.clone());
+                if let Some(values) = values {
+                    shown.take_values(kits, values);
                 }
+                shown.item.instance = *Uuid::new_v5(&namespace, &index.to_be_bytes()).as_bytes();
                 Some(shown)
             })
             .collect();
@@ -868,6 +1017,29 @@ impl Gear {
         true
     }
 
+    /// Stores one new stack of `quantity` of `item` with its own `values` in storage chest
+    /// `storage` (a trading post delivery to the settlement's storage), in a change of sync
+    /// reason `reason`; whether the storage had a slot for it.
+    pub(in crate::world) fn store_with_values(
+        &mut self,
+        storage: [u8; RAW_ID_LEN],
+        kits: &StarterKits,
+        item: &KitItem,
+        quantity: u32,
+        values: &ItemState,
+        reason: u8,
+    ) -> bool {
+        if quantity == 0 || !has_room(self.holdings.storages.entry(storage).or_default()) {
+            return false;
+        }
+        let restored = self.restored_stack(kits, item, quantity.min(MAX_STACK_QUANTITY), values);
+        let mut stack = self.own_instance(restored);
+        stack.reason = reason;
+        put_in(self.holdings.storages.entry(storage).or_default(), stack);
+        self.touched();
+        true
+    }
+
     /// Puts `quantity` of the open storage's stack of instance `instance` on in paperdoll slot
     /// `slot_id` (1461); an item worn there goes into the storage. The id of the equipped item.
     pub(in crate::world) fn equip_from_storage(
@@ -938,19 +1110,17 @@ impl Gear {
         off
     }
 
-    /// The items `taken` of the opened bag of dropped items go into the bag, each with its
-    /// rolls, and the view shows it empty; whether all of them fit.
+    /// The items `taken` of the opened bag of dropped items go into the bag, each with its own
+    /// values, and the view shows it empty. The caller checks [`Gear::has_room_for`] first;
+    /// whether all of them fit.
     pub(in crate::world) fn take_dropped(
         &mut self,
         kits: &StarterKits,
-        taken: &[(&KitItem, u32, Option<RolledItem>)],
+        taken: &[(&KitItem, u32, Option<ItemState>)],
     ) -> bool {
         let mut all = true;
-        for (item, quantity, rolled) in taken {
-            all &= match rolled {
-                Some(rolled) => self.add_rolled(kits, item, *quantity, rolled, SYNC_MOVED),
-                None => self.add(item, *quantity),
-            };
+        for (item, quantity, values) in taken {
+            all &= self.put_moved(kits, item, *quantity, values.as_ref(), SYNC_MOVED);
         }
         if let Some(Opened::Dropped { items, .. }) = &mut self.holdings.opened {
             items.iter_mut().for_each(|entry| *entry = None);
@@ -1004,6 +1174,14 @@ impl Gear {
         found
             .filter(|stack| matches(stack))
             .ok_or(ItemRefusal::NoSuchItem)
+    }
+
+    /// Hides (`hidden`) or shows again the skin of paperdoll slot `slot` (5978): the paperdoll's
+    /// `hideSkins` list holds the slot with its state.
+    pub(in crate::world) fn set_hiding_skin(&mut self, slot: u32, hidden: bool) {
+        if self.holdings.hidden_skins.insert(slot, hidden) != Some(hidden) {
+            self.changed = true;
+        }
     }
 
     /// Opens or closes the loadout panel (5578).
@@ -1412,41 +1590,73 @@ mod tests {
         let bag_slot = 1;
         assert_eq!(gear.set_locked(LOCATION_BAG, bag_slot, flint, true), Ok(()));
         assert_eq!(
-            gear.drop_from_bag(bag_slot, flint, 1),
+            gear.take_moved(bag_slot, flint, 1),
             Err(ItemRefusal::Locked)
         );
         assert_eq!(
             gear.set_locked(LOCATION_BAG, bag_slot, flint, false),
             Ok(())
         );
-        let dropped = |item_id: &str, quantity, rolled| DroppedStack {
+        let dropped = |item_id: &str, quantity, values| MovedStack {
             item_id: item_id.to_owned(),
             quantity,
-            rolled,
+            values,
         };
-        // The test kit gives every item a durability: each drop is gear with its rolls.
-        let flint_rolls = gear
-            .bag
-            .iter()
-            .flatten()
-            .find(|stack| stack.item.instance == flint)
-            .and_then(Stack::rolled);
-        assert!(flint_rolls.is_some());
+        // Flint is a plain resource: it leaves without values of its own and keeps stacking.
         assert_eq!(
-            gear.drop_from_bag(bag_slot, flint, 5),
-            Ok(dropped(FLINT, 5, flint_rolls.clone()))
+            gear.take_moved(bag_slot, flint, 5),
+            Ok(dropped(FLINT, 5, None))
         );
         assert_eq!(gear.bag_count(FLINT), FLINTS - 5);
         assert_eq!(
-            gear.drop_from_bag(bag_slot, flint, 0),
-            Ok(dropped(FLINT, FLINTS - 5, flint_rolls)),
+            gear.take_moved(bag_slot, flint, 0),
+            Ok(dropped(FLINT, FLINTS - 5, None)),
             "0: the whole stack"
+        );
+        // The sword is gear: it leaves with its own values, its durability among them.
+        let sword_values = gear
+            .worn
+            .iter()
+            .filter_map(|(slot_id, stack)| (*slot_id == slot::MAIN_HAND_OPTION_1).then_some(stack))
+            .flatten()
+            .find_map(Stack::own_values);
+        assert!(
+            sword_values
+                .as_ref()
+                .is_some_and(|values| values.durability.is_some())
         );
         let sword = gear
             .drop_worn(slot::MAIN_HAND_OPTION_1, 0, 0)
             .expect("sword");
-        assert_eq!((sword.item_id.as_str(), sword.quantity), (SWORD, 1));
+        assert_eq!(sword, dropped(SWORD, 1, sword_values));
         assert_eq!(gear.worn_item(slot::MAIN_HAND_OPTION_1), None);
+    }
+
+    #[test]
+    fn an_offered_stack_leaves_unless_it_is_bound_or_locked() {
+        let mut gear = gear();
+        assert_eq!(
+            gear.take_offered(FLINT, None, 3, None),
+            Ok(MovedStack {
+                item_id: FLINT.to_owned(),
+                quantity: 3,
+                values: None,
+            }),
+            "a plain resource leaves without values"
+        );
+        assert_eq!(gear.bag_count(FLINT), FLINTS - 3);
+        assert_eq!(
+            gear.take_offered(STAFF, None, 1, None),
+            Err(ItemRefusal::Bound),
+            "the kit binds its staff on pickup"
+        );
+        let flint = bag_instance(&gear, FLINT);
+        assert_eq!(gear.set_locked(LOCATION_BAG, 1, flint, true), Ok(()));
+        assert_eq!(
+            gear.take_offered(FLINT, Some(flint), 1, None),
+            Err(ItemRefusal::Locked)
+        );
+        assert_eq!(gear.bag_count(FLINT), FLINTS - 3, "a refusal takes nothing");
     }
 
     #[test]

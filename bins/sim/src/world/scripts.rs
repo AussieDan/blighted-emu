@@ -34,6 +34,9 @@ const PERCENT: u32 = 100;
 const NO_PLAYER: &str = "no player: nothing done";
 /// The note of a block whose point is in another sim's cells.
 const OTHER_SIM: &str = "the point is another sim's: nothing done";
+/// The note of a `give_item` whose item did not all go into the player's bag (an unknown item,
+/// no bag, or a full one: what did not fit drops at the player's feet).
+const NOT_ALL_GIVEN: &str = "not all in the bag";
 
 /// The state of an objective a `quest_state` block asks for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -682,8 +685,8 @@ impl SimWorld {
             Block::GiveItem { item, quantity } => {
                 match run.player {
                     Some(number) => {
-                        self.give_loot(number, vec![(item.clone(), *quantity)], now_ms);
-                        engine.note(run, "");
+                        let given = self.give_loot(number, vec![(item.clone(), *quantity)], now_ms);
+                        engine.note(run, if given { "" } else { NOT_ALL_GIVEN });
                     }
                     None => engine.note(run, NO_PLAYER),
                 }
@@ -904,6 +907,42 @@ mod tests {
                 "set_flag"
             ]
         );
+    }
+
+    /// A `give_item` whose item does not reach the bag (a player without a bag) says so in the
+    /// run log, not "passed".
+    #[test]
+    fn an_item_not_given_is_noted_as_not_given() {
+        let gift = ScriptGraph {
+            nodes: vec![
+                node("enter", "player_enters_area", &area_values()),
+                node(
+                    "give",
+                    "give_item",
+                    &[(
+                        "item",
+                        ScriptValue::Text(super::super::gear::tests::FLINT.to_owned()),
+                    )],
+                ),
+            ],
+            links: vec![link("enter", NEXT, "give")],
+        };
+        let mut world = script_world(vec![("gift", gift)]);
+        std::sync::Arc::make_mut(&mut world.content).kits = super::super::gear::tests::kits();
+        let entity = world.player_by_number(PLAYER).expect("player");
+        world.world.get_mut::<Player>(entity).expect("player").gear = None;
+        world.tick_scripts(NOW);
+        teleport(&mut world, PLAYER_X + 50.0);
+        world.tick_scripts(NOW + TICK_MS);
+        teleport(&mut world, PLAYER_X);
+        world.tick_scripts(NOW + 2 * TICK_MS);
+        let notes: Vec<String> = world
+            .take_script_log()
+            .into_iter()
+            .filter(|line| line.block == "give_item")
+            .map(|line| line.note)
+            .collect();
+        assert_eq!(notes, [NOT_ALL_GIVEN]);
     }
 
     #[test]

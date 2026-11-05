@@ -210,6 +210,70 @@ pub struct MobAttack {
     pub factor: f64,
 }
 
+/// `Armor Set Rating Exponent` of `playerbaseattributes.pbadb` (field `armor set rating
+/// exponent`): a full armor set of gear score `gs` rates `gs ^ 1.2`. Observed: the
+/// `VitalsLevelData` armor ratings are exactly their gear score to this power (level 1, gear score
+/// 50: 109.3362; level 60, gear score 600: 2156.659).
+pub const ARMOR_SET_RATING_EXPONENT: f64 = 1.2;
+/// `Armor Mitigation Exponent` of `playerbaseattributes.pbadb`: the attacker's gear score enters
+/// the mitigation at this power ([`armor_share`]).
+pub const ARMOR_MITIGATION_EXPONENT: f64 = 1.2;
+/// The scale of the attacker's gear score in the mitigation ([`armor_share`]). Observed: the
+/// retail tutorial hits of gear score 60 and 75 weapons on level 1 mobs (armor 109.3362) kept
+/// 0.70114803 and 0.7540894 of their damage (newchar-retail-2026-09-18, 2071 scale); both give
+/// this value to 8 digits with the exponent 1.2. How it comes from the file's `Physical Armor
+/// Scale Factor` 1850 is Unknown.
+pub const ARMOR_MITIGATION_SCALE: f64 = 1.885_107_35;
+/// `Min Possible Weapon Gear Score` of `playerbaseattributes.pbadb`: the gear score from which a
+/// weapon's base damage compounds ([`weapon_damage_scale`]).
+pub const MIN_WEAPON_GEAR_SCORE: u32 = 100;
+/// `Base Damage Compound Increase` of `playerbaseattributes.pbadb`: the base damage grows by this
+/// share per `Base Damage Gear Score Interval`.
+pub const BASE_DAMAGE_COMPOUND_INCREASE: f64 = 0.0112;
+/// `Base Damage Gear Score Interval` of `playerbaseattributes.pbadb`.
+pub const BASE_DAMAGE_GEAR_SCORE_INTERVAL: u32 = 5;
+/// `Diminishing Gear Score Threshold` of `playerbaseattributes.pbadb`: above it each interval adds
+/// the increase times [`COMPOUND_DIMINISHING_MULTIPLIER`].
+pub const DIMINISHING_GEAR_SCORE_THRESHOLD: u32 = 500;
+/// `Compound Increase Diminishing Multiplier` of `playerbaseattributes.pbadb`.
+pub const COMPOUND_DIMINISHING_MULTIPLIER: f64 = 0.6667;
+
+/// The armor rating of a full set of gear score `gear_score` ([`ARMOR_SET_RATING_EXPONENT`]).
+pub fn armor_rating(gear_score: u32) -> f64 {
+    f64::from(gear_score).powf(ARMOR_SET_RATING_EXPONENT)
+}
+
+/// The share of a hit that `armor` (a rating) takes off an attacker of gear score `gear_score`:
+/// `armor / (armor + scale × gear score ^ 1.2)` ([`ARMOR_MITIGATION_SCALE`],
+/// [`ARMOR_MITIGATION_EXPONENT`]). The form is Inferred from the two retail points it fits; the
+/// file's `Min Armor Mitigation` 0 and `Max Armor Mitigation` 2 are not applied (their use is
+/// Unknown; 2 is no share).
+pub fn armor_share(armor: f64, gear_score: u32) -> f64 {
+    let against = ARMOR_MITIGATION_SCALE * f64::from(gear_score).powf(ARMOR_MITIGATION_EXPONENT);
+    if armor <= 0.0 || against <= 0.0 {
+        return 0.0;
+    }
+    armor / (armor + against)
+}
+
+/// The multiple of a weapon's `BaseDamage` at gear score `gear_score`: 1 at and below
+/// [`MIN_WEAPON_GEAR_SCORE`], then compounding by [`BASE_DAMAGE_COMPOUND_INCREASE`] per
+/// [`BASE_DAMAGE_GEAR_SCORE_INTERVAL`], by the diminished increase above
+/// [`DIMINISHING_GEAR_SCORE_THRESHOLD`]. Inferred from the file's field names; the floor at the
+/// minimum fits the retail tutorial hits of gear score 60 and 75 weapons (`1hSwordT2_FTUE`, base
+/// 80: 68.000 before armor, a whole share of its base); the compound above 100 is not checked
+/// against a capture.
+pub fn weapon_damage_scale(gear_score: u32) -> f64 {
+    let interval = f64::from(BASE_DAMAGE_GEAR_SCORE_INTERVAL);
+    let full = gear_score
+        .clamp(MIN_WEAPON_GEAR_SCORE, DIMINISHING_GEAR_SCORE_THRESHOLD)
+        .saturating_sub(MIN_WEAPON_GEAR_SCORE);
+    let diminished = gear_score.saturating_sub(DIMINISHING_GEAR_SCORE_THRESHOLD);
+    (1.0 + BASE_DAMAGE_COMPOUND_INCREASE).powf(f64::from(full) / interval)
+        * (1.0 + BASE_DAMAGE_COMPOUND_INCREASE * COMPOUND_DIMINISHING_MULTIPLIER)
+            .powf(f64::from(diminished) / interval)
+}
+
 /// A player's hit on a target with `armor_share` of the damage taken off.
 pub fn player_hit(attack: &PlayerAttack, armor_share: f64, dice: &mut Dice) -> Hit {
     let crit = attack.can_crit && dice.chance(attack.crit_chance);
@@ -283,6 +347,30 @@ mod tests {
             crit_chance,
             crit_multiplier: CRIT_MULTIPLIER,
         }
+    }
+
+    /// The armor rules give the retail tutorial shares: gear score 60 and 75 weapons on a level 1
+    /// mob (armor 50 ^ 1.2) keep 0.70114803 and 0.7540894 (newchar-retail-2026-09-18).
+    #[test]
+    fn armor_takes_the_retail_tutorial_shares() {
+        const MOB_GEAR_SCORE: u32 = 50;
+        const MOB_ARMOR: f64 = 109.336_207;
+        assert!((armor_rating(MOB_GEAR_SCORE) - MOB_ARMOR).abs() < 1e-3);
+        for (gear_score, kept) in [(60, 0.701_148_03), (75, 0.754_089_4)] {
+            let share = armor_share(armor_rating(MOB_GEAR_SCORE), gear_score);
+            assert!((1.0 - share - kept).abs() < 1e-6, "{gear_score}: {share}");
+        }
+        assert_eq!(armor_share(0.0, 60), 0.0, "no armor");
+    }
+
+    #[test]
+    fn a_weapon_compounds_its_damage_from_gear_score_100() {
+        assert_eq!(weapon_damage_scale(60), 1.0, "below the minimum");
+        assert_eq!(weapon_damage_scale(MIN_WEAPON_GEAR_SCORE), 1.0);
+        let at_500 = 1.0112_f64.powi(80);
+        assert!((weapon_damage_scale(500) - at_500).abs() < 1e-9);
+        let at_600 = at_500 * (1.0 + 0.0112 * 0.6667_f64).powi(20);
+        assert!((weapon_damage_scale(600) - at_600).abs() < 1e-9);
     }
 
     #[test]

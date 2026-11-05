@@ -23,9 +23,7 @@ use nw_content::attribute_bonuses::AbilityStats;
 use nw_content::player_abilities::{AbilityList, ListAction, SpellProjectile, SpellRow};
 use nw_content::player_attacks::stance_tags;
 use nw_content::status_effects::StatusEffectRules;
-#[cfg(test)]
-use nw_formats::mannequin::Condition;
-use nw_formats::mannequin::{CageWorld, CastKind, ManaCompare, TagCase, TagChange};
+use nw_formats::mannequin::{CageWorld, CastKind, Condition, ManaCompare, TagCase, TagChange};
 use nw_formats::objectstream::lowercase_crc32;
 use nw_messages::paperdoll::slot;
 use nw_messages::{AbilityCooldown, InputRecord, LookDir};
@@ -81,6 +79,9 @@ const CLIENT_SETTINGS_ON: [&str; 4] = [
 ];
 /// The slot alias of the weapon in the hand.
 const ACTIVE_MAIN_HAND: &str = "ACTIVE_MAIN_HAND_WEAPON";
+/// The slot alias of the off-hand item worn with it (Observed: 19 `IfItemInSlot` tests of the
+/// player ability lists name it).
+const ACTIVE_OFF_HAND: &str = "ACTIVE_OFF_HAND_WEAPON";
 /// The slot aliases of the main-hand options, with their paperdoll slots.
 const MAIN_HAND_OPTIONS: [(&str, u32); 3] = [
     ("MAIN_HAND_OPTION_1", slot::MAIN_HAND_OPTION_1),
@@ -574,6 +575,14 @@ impl AbilityRun {
             if !activation.holds_in(&self.world(lists, list, holder, &tags, Some(index), now_ms)) {
                 continue;
             }
+            let starts_cooldowns = action
+                .ability
+                .as_ref()
+                .is_some_and(|ability| !ability.starts_cooldowns.is_empty());
+            if starts_cooldowns && self.mana.current < chain_cost(list, index) {
+                // Too little mana for the spells it starts: no cooldown and no spell.
+                continue;
+            }
             if starts_chain {
                 self.chain = chain;
                 self.chain_cast.clear();
@@ -836,7 +845,8 @@ struct PlayerHolder<'a> {
     option_tags: Vec<(&'static str, Vec<String>)>,
     effects: &'a super::status_effects::StatusEffects,
     rules: &'a StatusEffectRules,
-    weapon: bool,
+    /// The slot aliases that hold an item ([`filled_slots`]).
+    filled_slots: Vec<&'static str>,
     abilities_on: Vec<&'a str>,
     stats: AbilityStats,
 }
@@ -852,8 +862,8 @@ impl Holder for PlayerHolder<'_> {
             .is_some_and(|rule| self.effects.holds(rule.crc))
     }
 
-    fn item_in_slot(&self, _slot: &str) -> bool {
-        self.weapon
+    fn item_in_slot(&self, slot: &str) -> bool {
+        self.filled_slots.contains(&slot)
     }
 
     fn tags_in_slot(&self, slot: &str) -> Vec<&str> {
@@ -876,6 +886,66 @@ impl Holder for PlayerHolder<'_> {
     fn stats(&self) -> AbilityStats {
         self.stats
     }
+}
+
+/// The mana action `index` of `list` needs to start: the highest of its activation's
+/// `IfManaCost` cost, the spell costs of its own casts and those of the casts of the actions that
+/// run while its fragment plays (`IfFragmentPlaying`: the follow-ups that cast its spells).
+/// Inferred: retail's own check is the activation's `IfManaCost`, which 89 of the 111 actions
+/// that start a cooldown lack; without this check such an action started its cooldown and its
+/// cast was then refused for the mana.
+fn chain_cost(list: &AbilityList, index: usize) -> f32 {
+    let action = &list.actions[index];
+    let own = action
+        .ability
+        .as_ref()
+        .and_then(|ability| ability.mana_cost.as_deref())
+        .and_then(|cost| list.mana_cost(cost));
+    let follow_ups = list.actions.iter().filter(|other| {
+        !action.fragment.is_empty()
+            && other
+                .activation
+                .as_ref()
+                .is_some_and(|activation| tests_fragment(activation, &action.fragment))
+    });
+    std::iter::once(action)
+        .chain(follow_ups)
+        .flat_map(|action| &action.casts)
+        .filter_map(|cast| cast.spell.mana_cost)
+        .chain(own)
+        .fold(0.0, f32::max)
+}
+
+/// Whether `condition` tests that `fragment` plays (`IfFragmentPlaying`), outside a `Not`.
+fn tests_fragment(condition: &Condition, fragment: &str) -> bool {
+    match condition {
+        Condition::All(parts) | Condition::Any(parts) => {
+            parts.iter().any(|part| tests_fragment(part, fragment))
+        }
+        Condition::FragmentPlaying(Some(name)) => name.eq_ignore_ascii_case(fragment),
+        _ => false,
+    }
+}
+
+/// The slot aliases that `IfItemInSlot` tests (Observed in the player ability lists:
+/// `MAIN_HAND_OPTION_1` and `_2` 762 times each, `ACTIVE_MAIN_HAND_WEAPON` 39,
+/// `ACTIVE_OFF_HAND_WEAPON` 19) that hold an item of `gear`: the weapon in the hand, the off-hand
+/// item worn with it, and each main-hand option slot with a weapon.
+fn filled_slots(gear: &Gear) -> Vec<&'static str> {
+    let mut filled = Vec::new();
+    if gear.main_weapon().is_some() {
+        filled.push(ACTIVE_MAIN_HAND);
+    }
+    if gear.off_hand_weapon().is_some() {
+        filled.push(ACTIVE_OFF_HAND);
+    }
+    filled.extend(
+        MAIN_HAND_OPTIONS
+            .iter()
+            .filter(|(_, slot_id)| gear.worn_item(*slot_id).is_some())
+            .map(|(alias, _)| *alias),
+    );
+    filled
 }
 
 /// A player that casts a spell.
@@ -989,7 +1059,7 @@ impl SimWorld {
                 option_tags,
                 effects: &player.status_effects,
                 rules,
-                weapon: true,
+                filled_slots: player.gear.as_ref().map_or_else(Vec::new, filled_slots),
                 abilities_on,
                 stats,
             };
@@ -1104,11 +1174,14 @@ impl SimWorld {
             })
             .with_splash(splash_m);
         let targets = spell.target_types.as_deref().unwrap_or_default();
-        let enemy_row = spell
-            .damage_row
-            .as_deref()
-            .filter(|_| ENEMY_TARGETS.contains(&targets));
-        let met_mob = enemy_row.and_then(|_| first_on_line(&shot, caster.from, aim, &places));
+        let takes_enemies = ENEMY_TARGETS.contains(&targets);
+        let enemy_row = spell.damage_row.as_deref().filter(|_| takes_enemies);
+        // A spell on enemies with status effects and no damage row puts its effects on them.
+        let reaches_enemies =
+            takes_enemies && (enemy_row.is_some() || !spell.status_effects.is_empty());
+        let met_mob = reaches_enemies
+            .then(|| first_on_line(&shot, caster.from, aim, &places))
+            .flatten();
         let met_friend = (!spell.status_effects.is_empty() && FRIEND_TARGETS.contains(&targets))
             .then(|| {
                 let friends = self.friend_places(caster.entity);
@@ -1116,18 +1189,18 @@ impl SimWorld {
             })
             .flatten();
         let mut results = Vec::new();
-        match (enemy_row, met_mob) {
-            (Some(row), Some((mob, flight_s))) => {
+        match (reaches_enemies, met_mob) {
+            (true, Some((mob, flight_s))) => {
                 let effects = (!spell.status_effects.is_empty())
                     .then_some((spell.status_effects.as_slice(), caster.number));
                 let hit = ShotHit {
-                    damage_id: row,
+                    damage_id: enemy_row,
                     effects,
                 };
                 self.launch(&caster.connection, (shot, hit), mob, flight_s, now_ms);
             }
-            (Some(_), None) => results.push(Ok(AttackOutcome::Missed)),
-            (None, _) => {}
+            (true, None) => results.push(Ok(AttackOutcome::Missed)),
+            (false, _) => {}
         }
         if let Some((met, flight_s)) = met_friend {
             self.effect_flights.push(EffectFlight {
@@ -1653,6 +1726,49 @@ mod tests {
         assert_eq!(run.tick(&[&list], &Staff, 5_000, SERVER_MS).len(), 1);
     }
 
+    /// An ability whose start does not test the mana itself (89 of the 111 retail starts that set
+    /// a cooldown lack `IfManaCost`) does not start with too little mana for the spell its
+    /// follow-up casts: no cooldown, no effect; with the mana it starts.
+    #[test]
+    fn too_little_mana_starts_no_cooldown_and_no_spell() {
+        let mut list = list();
+        let start = &mut list.actions[0];
+        if let Some(Condition::All(parts)) = start.activation.as_mut() {
+            parts.retain(|part| !matches!(part, Condition::ManaCost { .. }));
+        }
+        if let Some(ability) = start.ability.as_mut() {
+            ability.mana_cost = None;
+        }
+        assert!(
+            (chain_cost(&list, 0) - COST).abs() < f32::EPSILON,
+            "the follow-up's spell"
+        );
+        let mut run = AbilityRun::default();
+        run.mana.current = COST - 1.0;
+        run.press(&[key_1(10)], mapped, no_inputs, 0);
+        assert!(run.tick(&[&list], &Staff, 0, SERVER_MS).is_empty());
+        assert!(run.take_cooldown_changes().is_empty(), "no cooldown");
+        run.mana.current = MANA_MAX;
+        run.press(&[key_1(11)], mapped, no_inputs, 100);
+        assert_eq!(run.tick(&[&list], &Staff, 100, SERVER_MS).len(), 1);
+        assert_eq!(run.take_cooldown_changes().len(), 1);
+    }
+
+    /// `IfItemInSlot` holds for the slots of the gear that hold an item: the weapon in the hand
+    /// and the main-hand options with a weapon, not an empty option.
+    #[test]
+    fn the_filled_slots_are_those_of_the_worn_weapons() {
+        let gear = super::super::gear::tests::gear_with_staff();
+        let filled = filled_slots(&gear);
+        assert!(filled.contains(&ACTIVE_MAIN_HAND));
+        assert!(filled.contains(&"MAIN_HAND_OPTION_1") && filled.contains(&"MAIN_HAND_OPTION_2"));
+        assert!(!filled.contains(&"MAIN_HAND_OPTION_3"), "an empty option");
+        assert_eq!(
+            filled.contains(&ACTIVE_OFF_HAND),
+            gear.off_hand_weapon().is_some()
+        );
+    }
+
     /// The test staff holder with the shares of Focus 250 (`Foc_Bonus_25_1`, `Foc_Bonus_100_1`).
     struct FocusedStaff;
 
@@ -1807,6 +1923,27 @@ mod tests {
             vec![mob_entity(0), mob_entity(1)],
             "the splash takes the one behind"
         );
+    }
+
+    /// A projectile spell on enemies with status effects and no damage row puts its effects on
+    /// the mob it meets and hurts it not.
+    #[test]
+    fn an_effect_spell_without_a_damage_row_puts_its_effects_on_the_mob() {
+        let (mut world, caster) = spell_fight(&[MOB_X]);
+        with_ground_effect(&mut world);
+        let curse = SpellRow {
+            damage_row: None,
+            status_effects: vec![GROUND.to_owned()],
+            ..bolt(None)
+        };
+        let fired = world.cast_ability_spell(caster, "Test", &curse, CastKind::Plain, NOW);
+        assert!(fired.is_empty(), "on its way: {fired:?}");
+        assert!(
+            hit_mobs(world.player_swings_due(NOW + LATER_MS)).is_empty(),
+            "no hit"
+        );
+        let held = world.mob_effects.get(&mob_entity(0)).expect("effects");
+        assert!(holds_effect(held, &world.content.status_effects, GROUND));
     }
 
     #[test]

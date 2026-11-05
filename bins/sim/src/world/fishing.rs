@@ -47,7 +47,7 @@ use nw_sim_core::{Ground, Position};
 
 use super::attack::counter_is_newer;
 use super::quest_objects::grant;
-use super::tradeskill::progression_gain;
+use super::tradeskill::{gain_progression, progression_gain};
 use super::{Body, Player, SimWorld, send_now, unix_ns};
 use crate::objectives::{Event, FishCaught, FishingStep};
 
@@ -100,8 +100,6 @@ const FISH_SIZE: (&str, u8) = ("FishSize", 0);
 const FISH_RARITY: (&str, u8) = ("FishRarity", 1);
 const SUMMER_FISH_RARITY: (&str, u8) = ("SummerFishRarity", 2);
 const LOOT_TABLE_DIVERTED: (&str, u8) = ("LootTableDiverted", 3);
-/// An item reward that rolls a loot table.
-const TABLE_REWARD_PREFIX: &str = "[LTID]";
 /// Milliseconds per second.
 const MS_PER_S: f64 = 1_000.0;
 /// One firing of a game event.
@@ -1274,8 +1272,7 @@ impl SimWorld {
                 ONCE,
                 content.gameplay.xp.progression(FISHING_TRADESKILL),
             );
-            let experience = player.masteries.experience(mastery).saturating_add(gain);
-            player.masteries.set(mastery, experience);
+            gain_progression(&mut player, &content, mastery, gain);
         }
         tracing::debug!(player = number, item = %fight.item, "fish caught");
         self.give_loot(number, vec![(fight.item.clone(), ONCE)], now_ms);
@@ -1306,7 +1303,11 @@ impl SimWorld {
         if event.eq_ignore_ascii_case(FISHING_DATA.hook_event) {
             self.grant_event(number, event, ONCE, now_ms);
         }
-        if let Some(reward) = content.rewards.get(event) {
+        let dice = &mut self.dice;
+        if let Some(reward) = content
+            .rewards
+            .rolled(event, &mut |below| dice.below(below))
+        {
             if let Some(mut player) = self
                 .player_by_number(number)
                 .and_then(|entity| self.world.get_mut::<Player>(entity))
@@ -1320,20 +1321,8 @@ impl SimWorld {
                     &content.gameplay,
                 );
             }
-            if let Some((item, quantity)) = &reward.item {
-                let items = match item.strip_prefix(TABLE_REWARD_PREFIX) {
-                    Some(table) => {
-                        let reached = self.reached_loot_limits(number);
-                        let context = self.loot_context(number, None, &reached);
-                        let dice = &mut self.dice;
-                        let rolled = content
-                            .loot
-                            .roll(table, context, &mut |below| dice.below(below));
-                        self.limit_loot(number, rolled)
-                    }
-                    None => vec![(item.clone(), *quantity)],
-                };
-                self.give_loot(number, items, now_ms);
+            if let Some(item) = reward.item.clone() {
+                self.give_loot(number, vec![item], now_ms);
             }
         }
         self.quest_event(number, Event::GameEvent(event), now_ms);

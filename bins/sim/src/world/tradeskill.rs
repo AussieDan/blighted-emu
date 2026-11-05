@@ -25,7 +25,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bevy_ecs::entity::Entity;
-use nw_content::progression::RankPerks;
+use nw_content::progression::{Mastery, RankPerks};
 use nw_content::rewards::Reward;
 use nw_content::tradeskill_xp::{NEUTRAL_MODIFIER, gather_reward};
 
@@ -247,30 +247,8 @@ impl SimWorld {
             return;
         };
         let gain = event_gain(per_firing, times, content.gameplay.xp.progression(id));
-        let (rank_before, _) = mastery.rank_of(player.masteries.experience(mastery));
-        player.masteries.gain(mastery, gain);
-        let (rank_after, _) = mastery.rank_of(player.masteries.experience(mastery));
         tracing::debug!(player = number, event, progression = %id, gain, "progression gained");
-        // Each rank reached is a rank up event: its `XPReward`, times the territory's standing
-        // modifier for a territory's standing ([`crate::charting`]: 100 x 1.25 = 125 at
-        // Windsward's rank 1), is the event's amount.
-        let standing_modifier = id
-            .parse()
-            .ok()
-            .and_then(|territory| content.charting.experience(territory))
-            .map_or(NEUTRAL_STANDING_MODIFIER, |territory| {
-                territory.standing_modifier
-            });
-        let per_amount = content
-            .rewards
-            .get(RANK_UP_EVENT)
-            .map_or(0, |reward| reward.experience);
-        for rank in rank_before.saturating_add(1)..=rank_after {
-            let amount = f64::from(mastery.rank_reward(rank)) * standing_modifier;
-            let points = progression_gain(amount, ONE_FIRING, f64::from(per_amount));
-            gain_experience(&mut player, points, &content.gameplay.xp);
-            tracing::debug!(player = number, progression = %id, rank, points, "rank up");
-        }
+        gain_progression(&mut player, &content, mastery, gain);
     }
 
     /// The territory player `number` is in: the latest territory it entered whose id is a
@@ -331,6 +309,37 @@ pub(super) fn arrival_masteries(
             Some((mastery.id.clone(), mastery.experience_for_rank(*rank)))
         })
         .collect()
+}
+
+/// `player`'s progression `mastery` gains `gain` points. Each rank it reaches is a rank up event:
+/// its `XPReward`, times the territory's standing modifier for a territory's standing
+/// ([`crate::charting`]: 100 x 1.25 = 125 at Windsward's rank 1), is the event's amount of
+/// character experience. Every progression gain goes through here (tradeskills, fishing, music,
+/// standing).
+pub(super) fn gain_progression(
+    player: &mut Player,
+    content: &PlayerContent,
+    mastery: &Mastery,
+    gain: u32,
+) {
+    let (rank_before, _) = mastery.rank_of(player.masteries.experience(mastery));
+    player.masteries.gain(mastery, gain);
+    let (rank_after, _) = mastery.rank_of(player.masteries.experience(mastery));
+    let standing_modifier = mastery
+        .id
+        .parse()
+        .ok()
+        .and_then(|territory| content.charting.experience(territory))
+        .map_or(NEUTRAL_STANDING_MODIFIER, |territory| {
+            territory.standing_modifier
+        });
+    let per_amount = content.rewards.experience(RANK_UP_EVENT);
+    for rank in rank_before.saturating_add(1)..=rank_after {
+        let amount = f64::from(mastery.rank_reward(rank)) * standing_modifier;
+        let points = progression_gain(amount, ONE_FIRING, f64::from(per_amount));
+        gain_experience(player, points, &content.gameplay.xp);
+        tracing::debug!(progression = %mastery.id, rank, points, "rank up");
+    }
 }
 
 #[cfg(test)]

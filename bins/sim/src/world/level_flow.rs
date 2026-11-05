@@ -410,7 +410,8 @@ impl LevelFlow {
                 }
                 answers
             }
-            ClientFacetMsg::UpdateTrackedObjectives { .. } => Vec::new(),
+            ClientFacetMsg::UpdateTrackedObjectives { .. }
+            | ClientFacetMsg::AbandonObjective { .. } => Vec::new(),
             ClientFacetMsg::CinematicStarted { cinematic, .. } => {
                 self.cinematic = Some(cinematic);
                 Vec::new()

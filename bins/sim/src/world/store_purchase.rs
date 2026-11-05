@@ -143,7 +143,6 @@ impl SimWorld {
         let started =
             ServerMessage::RequestInitialized(RequestInitializedMsg(grant.answer(Vec::new())));
         send_now(&mut self.combat_messages, &connection, &[started]);
-        count_call("store_purchase", true);
         self.economy.grants.push(grant);
     }
 
@@ -153,15 +152,17 @@ impl SimWorld {
     }
 
     /// The loop ran `grant` (`answer`): when the account holds the entitlement now, the buyer,
-    /// if it is still on this sim, may use the mount and gets 1285 with it and the wallet. A
-    /// wallet below the price or a failed save only logs: the buyer holds nothing new, and its
-    /// client waits.
+    /// if it is still on this sim, may use the mount and gets 1285 with it and the wallet, and
+    /// the call counts as accepted. A wallet below the price or a failed save counts as refused
+    /// and logs: the buyer holds nothing new, and its client waits (retail's refusal of a store
+    /// purchase is Unknown: no capture has one).
     pub fn store_granted(&mut self, grant: &StoreGrant, answer: Result<Purchase, DbError>) {
         let (held, wallet) = match answer {
             Ok(Purchase::Bought { held, wallet } | Purchase::AlreadyHeld { held, wallet }) => {
                 (held, wallet)
             }
             Ok(Purchase::TooPoor { wallet }) => {
+                count_call("store_purchase", false);
                 tracing::info!(
                     entitlement = grant.entitlement,
                     price = grant.price,
@@ -171,10 +172,12 @@ impl SimWorld {
                 return;
             }
             Err(error) => {
+                count_call("store_purchase", false);
                 tracing::error!(%error, entitlement = grant.entitlement, account = %grant.account, "store purchase not saved");
                 return;
             }
         };
+        count_call("store_purchase", true);
         let Some(entity) = self.player_by_number(grant.number) else {
             return;
         };

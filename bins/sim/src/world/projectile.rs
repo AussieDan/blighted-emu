@@ -78,8 +78,9 @@ impl Shot {
 /// What a shot does to the mobs it hits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct ShotHit<'a> {
-    /// The `DamageData` row of the hit.
-    pub(super) damage_id: &'a str,
+    /// The `DamageData` row of the hit; `None` for a spell of status effects alone, which hurts
+    /// no one.
+    pub(super) damage_id: Option<&'a str>,
     /// The status effects it puts on a mob it hurts, with the number of the player they come
     /// from (an ability spell's `StatusEffects`).
     pub(super) effects: Option<(&'a [String], u64)>,
@@ -89,7 +90,7 @@ impl<'a> ShotHit<'a> {
     /// A hit of the row `damage_id` and nothing more.
     pub(super) const fn plain(damage_id: &'a str) -> Self {
         Self {
-            damage_id,
+            damage_id: Some(damage_id),
             effects: None,
         }
     }
@@ -100,7 +101,8 @@ impl<'a> ShotHit<'a> {
 pub(super) struct ProjectileFlight {
     attacker: ConnectionRef,
     target: u64,
-    damage_id: String,
+    /// [`ShotHit::damage_id`].
+    damage_id: Option<String>,
     /// When it gets there.
     land_ms: u64,
     /// [`Shot::with_splash`].
@@ -185,7 +187,7 @@ impl SimWorld {
         now_ms: u64,
     ) -> Vec<Result<AttackOutcome, AttackRefusal>> {
         let met = first_on_line(&shot, position, aim, places);
-        tracing::debug!(attacker = ?attacker, damage_id = hit.damage_id, ?aim, met = ?met, "player cast");
+        tracing::debug!(attacker = ?attacker, damage_id = ?hit.damage_id, ?aim, met = ?met, "player cast");
         let Some((target, flight_s)) = met else {
             return vec![Ok(AttackOutcome::Missed)];
         };
@@ -206,7 +208,7 @@ impl SimWorld {
         self.projectile_flights.push(ProjectileFlight {
             attacker: attacker.clone(),
             target,
-            damage_id: hit.damage_id.to_owned(),
+            damage_id: hit.damage_id.map(str::to_owned),
             land_ms: now_ms.saturating_add(flight_ms(flight_s)),
             splash_m: shot.splash_m,
             effects: hit
@@ -234,7 +236,8 @@ impl SimWorld {
     }
 
     /// Lands the projectiles that got to their mob at `now_ms`: a splash also hits the other
-    /// living mobs within its radius of that mob, and each mob it hurts takes its effects.
+    /// living mobs within its radius of that mob, and each mob it hurts takes its effects; a
+    /// projectile of effects alone puts them on each living mob it reaches.
     pub(super) fn projectile_flights_due(
         &mut self,
         now_ms: u64,
@@ -265,14 +268,16 @@ impl SimWorld {
             };
             let first = std::iter::once((flight.target, true));
             for (mob, paced) in first.chain(splashed.into_iter().map(|mob| (mob, false))) {
-                let result = self.hit_paced(
-                    &flight.attacker,
-                    mob,
-                    &flight.damage_id,
-                    None,
-                    paced,
-                    now_ms,
-                );
+                let Some(damage_id) = &flight.damage_id else {
+                    let alive = self
+                        .mob_states()
+                        .any(|(own, _, state)| own == mob && state.health > 0);
+                    if let (true, Some((effects, source))) = (alive, &flight.effects) {
+                        self.spell_effects_on_mob(mob, effects, *source, false);
+                    }
+                    continue;
+                };
+                let result = self.hit_paced(&flight.attacker, mob, damage_id, None, paced, now_ms);
                 if let (Ok(AttackOutcome::Hit { target, .. }), Some((effects, source))) =
                     (&result, &flight.effects)
                 {

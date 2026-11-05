@@ -14,7 +14,9 @@
 //! 5985 (skin, slot), then the paperdoll change; a disable (5693) with a 5771 (the pool entry's
 //! emptied `SkinSlot` link and the skin's entry, gone) and 5985 (0, slot). A dye (2224) takes
 //! the dye items of its listed bag slots and answers, per dyed skin, a 5771 and 6147 (skin,
-//! true). The screen flags (5302, 5978, 6105, 6463, 6486) had no answer in any capture.
+//! true). The screen flags (5302, 6105, 6463, 6486) had no answer in any capture. A skin hide
+//! (5978) has no answer message either; the paperdoll's `hideSkins` list carries it (retail
+//! `Hive_Transmog`: the slot's entry in the paperdoll change after each 5978).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -418,7 +420,12 @@ impl SimWorld {
                 Ok(Vec::new())
             }
             TransmogClientMsg::SetHidingSkinOnSlot { slot, hide, .. } => {
-                tracing::trace!(player = number, slot, hide, "skin hidden on slot");
+                if let Some(mut player) = self.world.get_mut::<Player>(entity)
+                    && let Some(gear) = player.gear.as_mut()
+                {
+                    gear.set_hiding_skin(slot, hide);
+                }
+                tracing::debug!(player = number, slot, hide, "skin hidden on slot");
                 Ok(Vec::new())
             }
             TransmogClientMsg::TransmogScreenOpen { open, .. }

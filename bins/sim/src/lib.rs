@@ -16,6 +16,7 @@ pub mod login;
 pub mod mob_ai;
 pub mod mobs;
 pub mod objectives;
+pub mod placed_points;
 pub mod player_content;
 pub mod run;
 pub mod saves;

@@ -722,6 +722,8 @@ pub struct Character {
     posture_change_s: f32,
     /// Its equip load category.
     equip_load: EquipLoad,
+    /// A held status effect keeps it from sprinting (`NoSprint`).
+    no_sprint: bool,
     /// Seconds left of the road boost.
     road_haste_s: f32,
     /// The road boost's action is on (`Traversal_Road_Sprint_Speed_Boost` installed): the
@@ -834,6 +836,7 @@ impl Character {
             sprint_s: 0.0,
             posture_change_s: 0.0,
             equip_load: EquipLoad::Normal,
+            no_sprint: false,
             road_haste_s: 0.0,
             road_boost_on: false,
             combat_s: 0.0,
@@ -933,6 +936,17 @@ impl Character {
     /// Its equip load category changes to `load` (the server weighed its equipped items).
     pub const fn set_equip_load(&mut self, load: EquipLoad) {
         self.equip_load = load;
+    }
+
+    /// A held status effect keeps it from sprinting (`NoSprint`), or no longer does.
+    pub const fn set_no_sprint(&mut self, no_sprint: bool) {
+        self.no_sprint = no_sprint;
+    }
+
+    /// Whether it may sprint: neither overburdened (`SprintDisabled`: `Overburdened`) nor held
+    /// by a `NoSprint` effect.
+    fn may_sprint(&self) -> bool {
+        self.equip_load != EquipLoad::Overburdened && !self.no_sprint
     }
 
     /// Whether the road boost speeds up its sprint.
@@ -1238,7 +1252,7 @@ impl Character {
             && self.posture == Posture::Stand
             && !(dashing || self.swimming || wading || intent.block || intent.walk)
             && !self.walking
-            && self.equip_load != EquipLoad::Overburdened
+            && self.may_sprint()
             && intent.forward >= 0;
         if travel_sprint {
             self.sprint_s += dt_s;
@@ -1256,8 +1270,8 @@ impl Character {
             return mounted.pace(intent);
         }
         let back = intent.forward < 0;
-        // An overburdened body does not sprint (`SprintDisabled`: `Overburdened`): it runs.
-        let running = self.walking || self.equip_load == EquipLoad::Overburdened;
+        // A body that may not sprint ([`Self::may_sprint`]) runs.
+        let running = self.walking || !self.may_sprint();
         let slow = back || running || intent.walk || intent.block;
         if dashing {
             return Pace::even(SWIM_DASH_SPEED_MPS, SWIM_DECELERATION_MPS2);
@@ -1935,6 +1949,15 @@ mod tests {
         assert!((settle(&mut heavy, input(1, 0)) - RUN_SPEED_MPS).abs() < CLOSE);
         heavy.step(keyed(1, 0, |keys| keys.dodge = true), &Flat, SEA);
         assert!((speed(&heavy) - RUN_SPEED_MPS).abs() < CLOSE, "no dodge");
+    }
+
+    #[test]
+    fn a_no_sprint_effect_makes_the_sprint_a_run_until_it_ends() {
+        let mut slowed = Character::new(origin());
+        slowed.set_no_sprint(true);
+        assert!((settle(&mut slowed, input(1, 0)) - RUN_SPEED_MPS).abs() < CLOSE);
+        slowed.set_no_sprint(false);
+        assert!((settle(&mut slowed, input(1, 0)) - SPRINT_SPEED_MPS).abs() < CLOSE);
     }
 
     #[test]

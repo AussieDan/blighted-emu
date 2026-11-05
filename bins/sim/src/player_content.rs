@@ -29,6 +29,7 @@ use nw_content::loot::{LootTables, MobLoot, PlayerLootLevels};
 use nw_content::loot_limits::{LootLimitRules, LootLimits, ResetClock};
 use nw_content::meta_achievements::MetaAchievementRules;
 use nw_content::mounts::MountRules;
+use nw_content::music_charts::MusicCharts;
 use nw_content::music::MusicRules;
 use nw_content::mutations::MutationCatalog;
 use nw_content::objective_limits::ObjectiveLimitGroup;
@@ -66,6 +67,7 @@ use nw_messages::{AlcState, AssetId, BundleMember, MemberState, VitalsState};
 
 use crate::asset_solids::AssetSolids;
 use crate::charting::ChartRules;
+use crate::placed_points::PlacedPoints;
 use crate::invite_rules::InviteRules;
 use crate::objectives::{
     KillTypes, ObjectiveTree, TaskBook, TaskRow, counted_game_events, task_rows,
@@ -661,6 +663,17 @@ impl MobLooks {
     }
 }
 
+/// The key of a lore title in [`PlayerContent::lore_by_title`]: lowercase, without the
+/// localized mark `@` the client and `LoreData` start it with.
+pub fn lore_title_key(title: &str) -> String {
+    title.trim_start_matches('@').to_lowercase()
+}
+
+/// A level record's position (x, y, z metres).
+const fn point_position([x, y, z]: nw_world::records::Position) -> Position {
+    Position { x, y, z }
+}
+
 /// The player content of one content bundle and mob prefab table.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlayerContent {
@@ -686,6 +699,13 @@ pub struct PlayerContent {
     pub tutorial_level: FtueLevel,
     /// The gatherables.
     pub gatherables: Gatherables,
+    /// The gatherable points of the sim's level, by gatherable: a gather needs one in reach.
+    pub gather_points: PlacedPoints,
+    /// The lore points of the sim's level, by lore id: a lore read needs one in reach.
+    pub lore_points: PlacedPoints,
+    /// The lore id (CRC-32 of the lowercase `LoreID`) of each `LoreData` title, by the title
+    /// in lowercase without its localized mark (`00_aeternum_title_31_01`).
+    pub lore_by_title: HashMap<String, u32>,
     /// The crafting recipes.
     pub recipes: Recipes,
     /// The reward of each game event, for quest completions.
@@ -754,6 +774,9 @@ pub struct PlayerContent {
     pub fishing: FishingRules,
     /// The musical performance rules: songs, sheets, rewards and grades.
     pub music: MusicRules,
+    /// The note chart of each music sheet (`content-tool music-charts`): a played note is a hit
+    /// only when it fits its chart note.
+    pub music_charts: MusicCharts,
     /// The item weights and the player's equip load limits.
     pub equip_loads: EquipLoads,
     /// The status effects worn perks hold ([`nw_content::perk_effects`]).
@@ -1162,6 +1185,23 @@ impl PlayerContent {
             quests: QuestBook::from_tables(tables, rows),
             tutorial_level,
             gatherables,
+            gather_points: PlacedPoints::of(
+                level_gatherables
+                    .iter()
+                    .map(|point| (point.gatherable_id, point_position(point.position))),
+            ),
+            lore_points: PlacedPoints::of(
+                level
+                    .lore
+                    .iter()
+                    .map(|point| (point.lore_id, point_position(point.position))),
+            ),
+            lore_by_title: tables
+                .lore_data
+                .iter()
+                .flat_map(|table| &table.rows)
+                .map(|row| (lore_title_key(&row.title), lowercase_crc32(&row.lore_id)))
+                .collect(),
             recipes: Recipes::from_tables(tables),
             rewards: Rewards::from_tables(tables),
             loot: LootTables::from_tables(tables),
@@ -1248,6 +1288,8 @@ impl PlayerContent {
                     .map(|slice| (slice.slice.as_str(), slice.position)),
             ),
             music: MusicRules::from_tables(tables),
+            // The chart file comes apart from the tables: the run loads it.
+            music_charts: MusicCharts::default(),
             instances: InstanceCatalog::from_tables(tables),
             mutations: MutationCatalog::from_tables(tables),
             entrances: dungeon_entrances(level),

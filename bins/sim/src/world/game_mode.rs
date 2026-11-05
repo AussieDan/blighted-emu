@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Matchmaking queue calls (6211, 6272, 1980, 5741, 5450, 6254, 6824), war board calls
 //! (3206, 5953, 6845) and territory war sign-up calls (2767, 2772, 2791, 2771, 2762, 2784)
-//! of a player, with the server answers the retail captures show (5449, 6295, 1234, 3530,
-//! 2726, 2729, 2169).
+//! of a player, with the server answers the retail captures show (1234, 4970, 2726, 2729,
+//! 2169).
 //!
-//! Retail flow of a queue join (`opr_que_and_lost`): the client joins a queue (6254), the
-//! server asks for a matchmaking login (5449), the client confirms (5450) and the server
-//! opens role selection for the first queued activity (6295). A role pick (6272) makes the
-//! match here: this server has no matchmaking service, so the match is local to the sim.
-//! A ready (6824) and an accept (5741) of that match end it: the queue group goes away
-//! (1234), as at a match start. An empty 6254 leaves the queue the same way.
+//! The queued activities are the PvP game modes and the catacombs (6254 activity values
+//! 0x3116 Outpost Rush, 0x3316 3v3 arena, 0x4316 capture the flag, 0x3016 and 0x0c16
+//! catacombs, in 29 retail queue joins). Retail matched the queued players and moved them into
+//! an instance of the game mode: in `opr_que_and_lost` the accept (5741 at 1781894841233) is
+//! followed by the loading screen (3951) and the Outpost Rush level (1635
+//! `NW_OPR_005_Vertical` at 1781894842131). This server runs none of these modes: their rows
+//! are not instances of the game data catalog (`nw_content::instances`: PvP rows are left
+//! out, a catacombs map is generated), and their rules (Outpost Rush scoring and waves, arena
+//! rounds, flag carrying) are not made. So a queue join is refused at once: the queue group
+//! goes away (1234), and no role selection, ready or accept follows. Inferred: retail's own
+//! answer to a mode that cannot run is `OnQueueForGameModeFailedMsg` (3310), which no capture
+//! holds (its layout is Unknown); 1234 is the captured message that ends a queue. The role,
+//! ready and accept calls (6272, 6824, 5741) and the login confirm (5450) then name no queue
+//! and change nothing.
 //!
 //! Three calls have no server answer in any capture and change no state here: the group
 //! eligibility subscription (6211, a subscription to replicated group data, which the
@@ -18,126 +26,44 @@
 //! and the spectator stop (6845, a client camera call; this server has no spectator
 //! state). Their arms only take the call.
 //!
-//! War sign-ups are kept per war on the sim. A sign-up (2762) is answered with a 2169 of
-//! result [`SIGNUP_RESULT_OK`] and value [`SIGNUP_SUCCESS_VALUE`] (the one retail success;
-//! the retail failures of a closed war are result 1 and value 0, and this server holds no
-//! war schedule, so every sign-up succeeds). The list (2767, and the roster 2772) is
-//! answered with a 2726 and the count (2771) with a 2729, as in the captures.
-
-use std::collections::HashMap;
+//! A queue leave (1066, and 2385 for every queue) is answered with a 4970 of the left game mode
+//! (retail 3v3 and expedition group runs: the 1066's own CRC; for a 2385, the CRC of the
+//! expedition the group waits for, else 0). A group queue (1066 group byte 1, and every 2385)
+//! gets the 1234 first. Retail then sends a second 4970 of a group mate's leave, which this sim
+//! does not hold (Inferred from the two group ledgers). A game mode leave (3309) takes the player
+//! out of its instance as a 926 does (retail: 3951, the open world level, then 4970).
+//!
+//! No territory war is scheduled on this server (no war board or territory owner data drives
+//! one), so every sign-up (2762) is refused with the retail answer of a closed war: a 2169 of
+//! result [`SIGNUP_RESULT_CLOSED`] and value [`SIGNUP_CLOSED_VALUE`]. No sign-up is kept: the
+//! list (2767, and the roster 2772) is answered with an empty 2726 and the count (2771) with a
+//! 2729 of 0, in the retail layouts; the war board (3206) lists no participant.
 
 use nw_bus::ConnectionRef;
-use nw_messages::social::CharacterRef;
+use nw_messages::facet::NO_GAME_MODE;
 use nw_messages::{
-    GameModeClientMsg, GameModeServerMsg, QueueActivity, SIGNUP_LIST_TRAILER, ServerMessage,
-    SignupEntry, WarClientMsg, WarServerMsg, WarSignupClientMsg, WarSignupServerMsg,
-    WarboardManifest,
+    GameModeClientMsg, GameModeServerMsg, LeftGameModeQueueMsg, SIGNUP_LIST_TRAILER, ServerMessage,
+    WarClientMsg, WarServerMsg, WarSignupClientMsg, WarSignupServerMsg, WarboardManifest,
 };
-use uuid::Uuid;
 
 use super::{Player, SimWorld, send_now};
 
-/// The 2169 result of a sign-up that went through (0 in the retail success).
-const SIGNUP_RESULT_OK: u8 = 0;
-/// The 2169 value of a sign-up that went through (12 after the retail sign-up for
-/// territory 11; meaning Unknown).
-const SIGNUP_SUCCESS_VALUE: u32 = 12;
+/// The 2169 result of a sign-up for a war that is not open (retail failure).
+const SIGNUP_RESULT_CLOSED: u8 = 1;
+/// The 2169 value of a sign-up for a war that is not open (retail failure).
+const SIGNUP_CLOSED_VALUE: u32 = 0;
 /// The second `u32` of every retail 2726 (1; meaning Unknown).
 const SIGNUP_LIST_EXTRA: u32 = 1;
-/// The byte after the name of every retail 2726 entry (2; meaning Unknown).
-const SIGNUP_ENTRY_FLAG: u8 = 2;
-/// The first byte of every retail 6295 (1; meaning Unknown).
-const ROLE_SELECTION_FLAG: u8 = 1;
-/// The last `u16` of every retail 6295 (0; meaning Unknown).
-const ROLE_SELECTION_EXTRA: u16 = 0;
+/// The sign-ups of a war: none, as no war is scheduled.
+const NO_SIGNUPS: u32 = 0;
+/// Metric: queue joins refused because the game mode does not run here.
+const METRIC_REFUSED_QUEUES: &str = "sim_game_mode_queue_refused_total";
 
-/// A player's matchmaking and war sign-up state.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// A player's war sign-up view.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct GameModePlayer {
-    /// The activities of its newest queue join (6254); empty in no queue.
-    queued: Vec<QueueActivity>,
-    /// The role it picked (6272); a ready counts only with a role, as in retail order.
-    role: Option<u8>,
-    /// The match this server made at its role pick: the 6824/6414 value and the 5741 text.
-    match_id: Option<(u32, Uuid)>,
-    /// Whether it readied up for the match (6824).
-    ready: bool,
-    /// Whether it accepted the match (5741).
-    accepted: bool,
     /// The war of its newest sign-up or list call, for the roster (2772).
     war_last: Option<u32>,
-}
-
-impl GameModePlayer {
-    /// Ends the match when it is readied and accepted: the queue and the match clear.
-    /// `true` when the match ended (the queue group goes away, 1234).
-    fn finish_match(&mut self) -> bool {
-        if !self.ready || !self.accepted || self.match_id.is_none() {
-            return false;
-        }
-        self.queued.clear();
-        self.match_id = None;
-        self.role = None;
-        self.ready = false;
-        self.accepted = false;
-        true
-    }
-}
-
-/// One signed-up player of a war.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Signup {
-    /// The character.
-    character: Uuid,
-    /// Its name.
-    name: String,
-    /// The territory it signed up at.
-    territory: u16,
-}
-
-/// The war sign-ups of this sim, by war.
-#[derive(Debug, Default)]
-pub(super) struct WarSignups {
-    /// The sign-ups of each war, in sign-up order.
-    by_war: HashMap<u32, Vec<Signup>>,
-    /// The value of the newest match made (6824/6414 values are `u32`).
-    next_match: u32,
-}
-
-impl WarSignups {
-    /// The entries of war `war` as a 2726 lists them.
-    fn entries(&self, war: u32) -> Vec<SignupEntry> {
-        self.by_war
-            .get(&war)
-            .map(|signups| {
-                signups
-                    .iter()
-                    .map(|signup| SignupEntry {
-                        character: signup.character.hyphenated().to_string(),
-                        name: signup.name.clone(),
-                        flag: SIGNUP_ENTRY_FLAG,
-                        id: *signup.character.as_bytes(),
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    /// The lowest war `character` signed up for, if any.
-    fn war_of(&self, character: Uuid) -> Option<u32> {
-        let mut wars: Vec<u32> = self.by_war.keys().copied().collect();
-        wars.sort_unstable();
-        wars.into_iter().find(|war| {
-            self.by_war
-                .get(war)
-                .is_some_and(|signups| signups.iter().any(|signup| signup.character == character))
-        })
-    }
-
-    /// How many signed up for war `war`.
-    fn count(&self, war: u32) -> u32 {
-        u32::try_from(self.by_war.get(&war).map_or(0, Vec::len)).unwrap_or(u32::MAX)
-    }
 }
 
 impl SimWorld {
@@ -148,108 +74,73 @@ impl SimWorld {
         };
         let header = call.header();
         let mut answers: Vec<ServerMessage> = Vec::new();
-        let Some(mut player) = self.world.get_mut::<Player>(entity) else {
+        let Some((number, queued_game_mode)) = self
+            .world
+            .get::<Player>(entity)
+            .map(|player| (player.number, player.arena.queued_game_mode()))
+        else {
             return;
         };
-        let mode = &mut player.game_mode;
         match call {
             // No answer in any capture; see the module text.
             GameModeClientMsg::ModifyGroupEligibilitySubscription { .. }
             | GameModeClientMsg::ReceivedClientEvent { .. } => {}
             GameModeClientMsg::JoinQueueForActivities { activities, .. } => {
-                mode.queued = activities;
-                mode.ready = false;
-                mode.accepted = false;
-                if mode.queued.is_empty() {
-                    mode.match_id = None;
-                    answers.push(ServerMessage::GameMode(
-                        GameModeServerMsg::QueueGroupRemoved { header },
-                    ));
-                } else {
-                    answers.push(ServerMessage::GameMode(
-                        GameModeServerMsg::MatchmakingLoginRequested { header },
-                    ));
+                if !activities.is_empty() {
+                    metrics::counter!(METRIC_REFUSED_QUEUES).increment(1);
+                    tracing::info!(
+                        player = number,
+                        ?activities,
+                        "queue join refused: the game mode does not run here"
+                    );
                 }
+                answers.push(ServerMessage::GameMode(
+                    GameModeServerMsg::QueueGroupRemoved { header },
+                ));
             }
-            GameModeClientMsg::MatchmakingLoginConfirmed { .. } => {
-                if let Some(activity) = mode.queued.first() {
-                    answers.push(ServerMessage::GameMode(
-                        GameModeServerMsg::StartMatchmakingRoleSelection {
-                            header,
-                            flag: ROLE_SELECTION_FLAG,
-                            activity: activity.activity,
-                            extra: ROLE_SELECTION_EXTRA,
-                        },
-                    ));
-                }
-            }
-            GameModeClientMsg::SetMatchmakingRole { role, .. } => {
-                mode.role = Some(role);
-                if mode.match_id.is_none() && !mode.queued.is_empty() {
-                    self.war_signups.next_match = self.war_signups.next_match.wrapping_add(1);
-                    mode.match_id = Some((self.war_signups.next_match, Uuid::new_v4()));
-                }
-            }
-            GameModeClientMsg::SetReadiedUpStatus {
-                match_id, ready, ..
+            // No queue: nothing to confirm, pick, ready or accept (see the module text).
+            GameModeClientMsg::MatchmakingLoginConfirmed { .. }
+            | GameModeClientMsg::SetMatchmakingRole { .. }
+            | GameModeClientMsg::SetReadiedUpStatus { .. }
+            | GameModeClientMsg::AcceptMatch { .. } => {}
+            GameModeClientMsg::LeaveQueueForGameMode {
+                game_mode, group, ..
             } => {
-                if mode.match_id.is_none() {
-                    mode.match_id = Some((match_id, Uuid::new_v4()));
-                }
-                if mode.role.is_some() && mode.match_id.is_some_and(|(known, _)| known == match_id)
-                {
-                    mode.ready = ready;
-                }
-                if mode.finish_match() {
+                if group {
                     answers.push(ServerMessage::GameMode(
                         GameModeServerMsg::QueueGroupRemoved { header },
                     ));
                 }
+                answers.push(ServerMessage::LeftGameModeQueue(LeftGameModeQueueMsg::of(
+                    header, game_mode,
+                )));
             }
-            GameModeClientMsg::AcceptMatch { match_id, flag, .. } => {
-                let known = mode
-                    .match_id
-                    .is_some_and(|(_, text)| text.hyphenated().to_string() == match_id);
-                mode.accepted = known && flag != 0;
-                if mode.finish_match() {
-                    answers.push(ServerMessage::GameMode(
-                        GameModeServerMsg::QueueGroupRemoved { header },
-                    ));
-                }
+            GameModeClientMsg::LeaveQueueForAllGameModes { .. } => {
+                let game_mode = queued_game_mode.unwrap_or(NO_GAME_MODE);
+                answers.push(ServerMessage::GameMode(
+                    GameModeServerMsg::QueueGroupRemoved { header },
+                ));
+                answers.push(ServerMessage::LeftGameModeQueue(LeftGameModeQueueMsg::of(
+                    header, game_mode,
+                )));
             }
+            GameModeClientMsg::LeaveGameMode { .. } => self.exit_instance(entity),
         }
         send_now(&mut self.combat_messages, connection, &answers);
     }
 
     /// Carries out the war board call `call` of the client of `connection`.
     pub fn war_call(&mut self, connection: &ConnectionRef, call: WarClientMsg) {
-        let Some(&entity) = self.by_connection.get(connection) else {
+        if !self.by_connection.contains_key(connection) {
             return;
-        };
+        }
         let header = call.header();
         let mut answers: Vec<ServerMessage> = Vec::new();
         match call {
             WarClientMsg::WarboardEnabled { .. } => {
-                let participants: Vec<CharacterRef> = self
-                    .world
-                    .get::<Player>(entity)
-                    .and_then(|player| player.game_mode.war_last)
-                    .map(|war| {
-                        self.war_signups
-                            .by_war
-                            .get(&war)
-                            .map(|signups| {
-                                signups
-                                    .iter()
-                                    .map(|signup| CharacterRef(Some(*signup.character.as_bytes())))
-                                    .collect()
-                            })
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
                 match WarServerMsg::full_manifest(
                     header,
-                    &WarboardManifest::of_participants(participants),
+                    &WarboardManifest::of_participants(Vec::new()),
                 ) {
                     Ok(manifest) => answers.push(ServerMessage::War(manifest)),
                     Err(error) => {
@@ -270,72 +161,39 @@ impl SimWorld {
             return;
         };
         let header = call.header();
-        let Some((character, name)) = self
-            .world
-            .get::<Player>(entity)
-            .map(|player| (player.character, player.name.clone()))
-        else {
+        let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
+        };
+        let empty_list = |war| {
+            ServerMessage::WarSignup(WarSignupServerMsg::SignupListReceived {
+                header,
+                war,
+                extra: SIGNUP_LIST_EXTRA,
+                entries: Vec::new(),
+                trailer: SIGNUP_LIST_TRAILER,
+            })
         };
         let mut answers: Vec<ServerMessage> = Vec::new();
         match call {
-            WarSignupClientMsg::RequestSignup { war, territory, .. } => {
-                let signups = self.war_signups.by_war.entry(war).or_default();
-                if !signups.iter().any(|signup| signup.character == character) {
-                    signups.push(Signup {
-                        character,
-                        name,
-                        territory,
-                    });
-                }
-                if let Some(mut player) = self.world.get_mut::<Player>(entity) {
-                    player.game_mode.war_last = Some(war);
-                }
+            WarSignupClientMsg::RequestSignup { war, .. } => {
+                player.game_mode.war_last = Some(war);
                 answers.push(ServerMessage::WarSignup(
                     WarSignupServerMsg::SignupResponseReceived {
                         header,
-                        result: SIGNUP_RESULT_OK,
-                        value: SIGNUP_SUCCESS_VALUE,
+                        result: SIGNUP_RESULT_CLOSED,
+                        value: SIGNUP_CLOSED_VALUE,
                     },
                 ));
             }
-            WarSignupClientMsg::RequestLeave { territory, .. } => {
-                for signups in self.war_signups.by_war.values_mut() {
-                    signups.retain(|signup| {
-                        signup.character != character || signup.territory != territory
-                    });
-                }
-            }
+            // Nothing to leave: no sign-up is kept.
+            WarSignupClientMsg::RequestLeave { .. } => {}
             WarSignupClientMsg::RequestSignupList { war, .. } => {
-                if let Some(mut player) = self.world.get_mut::<Player>(entity) {
-                    player.game_mode.war_last = Some(war);
-                }
-                answers.push(ServerMessage::WarSignup(
-                    WarSignupServerMsg::SignupListReceived {
-                        header,
-                        war,
-                        extra: SIGNUP_LIST_EXTRA,
-                        entries: self.war_signups.entries(war),
-                        trailer: SIGNUP_LIST_TRAILER,
-                    },
-                ));
+                player.game_mode.war_last = Some(war);
+                answers.push(empty_list(war));
             }
             WarSignupClientMsg::RequestRoster { .. } => {
-                let war = self.war_signups.war_of(character).or_else(|| {
-                    self.world
-                        .get::<Player>(entity)
-                        .and_then(|player| player.game_mode.war_last)
-                });
-                if let Some(war) = war {
-                    answers.push(ServerMessage::WarSignup(
-                        WarSignupServerMsg::SignupListReceived {
-                            header,
-                            war,
-                            extra: SIGNUP_LIST_EXTRA,
-                            entries: self.war_signups.entries(war),
-                            trailer: SIGNUP_LIST_TRAILER,
-                        },
-                    ));
+                if let Some(war) = player.game_mode.war_last {
+                    answers.push(empty_list(war));
                 }
             }
             WarSignupClientMsg::RequestSignupCount { war, .. } => {
@@ -343,7 +201,7 @@ impl SimWorld {
                     WarSignupServerMsg::SignupCountReceived {
                         header,
                         war,
-                        count: self.war_signups.count(war),
+                        count: NO_SIGNUPS,
                     },
                 ));
             }
@@ -356,7 +214,8 @@ impl SimWorld {
 
 #[cfg(test)]
 mod tests {
-    use nw_messages::FacetHeader;
+    use nw_messages::{FacetHeader, QueueActivity};
+    use uuid::Uuid;
 
     use super::*;
     use crate::world::tests::{
@@ -383,61 +242,85 @@ mod tests {
         world
     }
 
+    /// Retail 3v3 arena group and expedition runs: a 1066 is answered with a 4970 of its own
+    /// game mode (a group queue gets the 1234 first), a 2385 with the 1234 and a 4970 of no
+    /// queued expedition, and both clear the queue.
     #[test]
-    fn a_queue_join_asks_for_a_login_and_a_confirm_opens_role_selection() {
+    fn a_queue_leave_answers_with_the_left_game_mode_and_clears_the_queue() {
+        const ARENA_CRC: u32 = 0x1fad_9d42;
         let mut world = world();
+        let join = GameModeClientMsg::JoinQueueForActivities {
+            header: HEADER,
+            activities: vec![QueueActivity {
+                activity: ACTIVITY,
+                extra: 0,
+                flag: 1,
+            }],
+        };
+        world.game_mode_call(&connection(PLAYER), join.clone());
+        let _ = world.take_messages();
         world.game_mode_call(
             &connection(PLAYER),
-            GameModeClientMsg::JoinQueueForActivities {
+            GameModeClientMsg::LeaveQueueForGameMode {
                 header: HEADER,
-                activities: vec![QueueActivity {
-                    activity: ACTIVITY,
-                    extra: 0,
-                    flag: 1,
-                }],
+                game_mode: ARENA_CRC,
+                group: false,
             },
         );
         let sent = world.take_messages();
         assert_eq!(
             messages_to(&sent, PLAYER),
-            [ServerMessage::GameMode(
-                GameModeServerMsg::MatchmakingLoginRequested { header: HEADER }
-            )]
+            [ServerMessage::LeftGameModeQueue(LeftGameModeQueueMsg::of(
+                HEADER, ARENA_CRC
+            ))]
         );
         world.game_mode_call(
             &connection(PLAYER),
             GameModeClientMsg::MatchmakingLoginConfirmed { header: HEADER },
         );
-        let sent = world.take_messages();
-        assert_eq!(
-            messages_to(&sent, PLAYER),
-            [ServerMessage::GameMode(
-                GameModeServerMsg::StartMatchmakingRoleSelection {
-                    header: HEADER,
-                    flag: ROLE_SELECTION_FLAG,
-                    activity: ACTIVITY,
-                    extra: ROLE_SELECTION_EXTRA,
-                }
-            )]
+        assert!(
+            messages_to(&world.take_messages(), PLAYER).is_empty(),
+            "no queue left to open roles for"
         );
+        world.game_mode_call(&connection(PLAYER), join);
+        let _ = world.take_messages();
         world.game_mode_call(
             &connection(PLAYER),
-            GameModeClientMsg::JoinQueueForActivities {
+            GameModeClientMsg::LeaveQueueForGameMode {
                 header: HEADER,
-                activities: Vec::new(),
+                game_mode: ARENA_CRC,
+                group: true,
             },
         );
         let sent = world.take_messages();
         assert_eq!(
             messages_to(&sent, PLAYER),
-            [ServerMessage::GameMode(
-                GameModeServerMsg::QueueGroupRemoved { header: HEADER }
-            )]
+            [
+                ServerMessage::GameMode(GameModeServerMsg::QueueGroupRemoved { header: HEADER }),
+                ServerMessage::LeftGameModeQueue(LeftGameModeQueueMsg::of(HEADER, ARENA_CRC)),
+            ]
+        );
+        world.game_mode_call(
+            &connection(PLAYER),
+            GameModeClientMsg::LeaveQueueForAllGameModes {
+                header: HEADER,
+                flags: 1,
+            },
+        );
+        let sent = world.take_messages();
+        assert_eq!(
+            messages_to(&sent, PLAYER),
+            [
+                ServerMessage::GameMode(GameModeServerMsg::QueueGroupRemoved { header: HEADER }),
+                ServerMessage::LeftGameModeQueue(LeftGameModeQueueMsg::of(HEADER, NO_GAME_MODE)),
+            ]
         );
     }
 
+    /// No game mode of a queue runs here: a join is refused with the 1234 at once, and the
+    /// later queue calls name no match.
     #[test]
-    fn a_readied_and_accepted_match_ends_the_queue() {
+    fn a_queue_join_is_refused_and_no_match_follows() {
         let mut world = world();
         world.game_mode_call(
             &connection(PLAYER),
@@ -450,122 +333,103 @@ mod tests {
                 }],
             },
         );
-        world.game_mode_call(
-            &connection(PLAYER),
-            GameModeClientMsg::SetMatchmakingRole {
-                header: HEADER,
-                role: 1,
-            },
-        );
-        world.take_messages();
-        let entity = world.player_by_number(PLAYER).expect("player");
-        let (match_value, match_text) = world
-            .world
-            .get::<Player>(entity)
-            .expect("player")
-            .game_mode
-            .match_id
-            .expect("a match");
-        world.game_mode_call(
-            &connection(PLAYER),
-            GameModeClientMsg::SetReadiedUpStatus {
-                header: HEADER,
-                match_id: match_value,
-                ready: true,
-            },
-        );
-        assert!(
-            world.take_messages().is_empty(),
-            "no answer before the accept"
-        );
-        world.game_mode_call(
-            &connection(PLAYER),
-            GameModeClientMsg::AcceptMatch {
-                header: HEADER,
-                match_id: match_text.hyphenated().to_string(),
-                flag: 1,
-            },
-        );
-        let sent = world.take_messages();
         assert_eq!(
-            messages_to(&sent, PLAYER),
+            messages_to(&world.take_messages(), PLAYER),
             [ServerMessage::GameMode(
                 GameModeServerMsg::QueueGroupRemoved { header: HEADER }
             )]
         );
-        let mode = &world.world.get::<Player>(entity).expect("player").game_mode;
-        assert!(mode.queued.is_empty() && mode.match_id.is_none());
+        for call in [
+            GameModeClientMsg::MatchmakingLoginConfirmed { header: HEADER },
+            GameModeClientMsg::SetMatchmakingRole {
+                header: HEADER,
+                role: 1,
+            },
+            GameModeClientMsg::SetReadiedUpStatus {
+                header: HEADER,
+                match_id: 1,
+                ready: true,
+            },
+            GameModeClientMsg::AcceptMatch {
+                header: HEADER,
+                match_id: Uuid::nil().hyphenated().to_string(),
+                flag: 1,
+            },
+        ] {
+            world.game_mode_call(&connection(PLAYER), call);
+            assert!(
+                messages_to(&world.take_messages(), PLAYER).is_empty(),
+                "no role selection, no match"
+            );
+        }
     }
 
+    /// No war is scheduled: a sign-up gets the retail closed-war answer, and nothing is kept.
     #[test]
-    fn a_sign_up_is_answered_and_listed_and_counted() {
+    fn a_sign_up_is_refused_and_nothing_is_listed() {
         let mut world = world();
-        world.war_signup_call(
-            &connection(PLAYER),
-            WarSignupClientMsg::RequestSignup {
-                header: HEADER,
-                war: WAR,
-                territory: TERRITORY,
-            },
-        );
-        let sent = world.take_messages();
+        let call = |world: &mut SimWorld, call| {
+            world.war_signup_call(&connection(PLAYER), call);
+            messages_to(&world.take_messages(), PLAYER)
+        };
         assert_eq!(
-            messages_to(&sent, PLAYER),
+            call(
+                &mut world,
+                WarSignupClientMsg::RequestSignup {
+                    header: HEADER,
+                    war: WAR,
+                    territory: TERRITORY,
+                }
+            ),
             [ServerMessage::WarSignup(
                 WarSignupServerMsg::SignupResponseReceived {
                     header: HEADER,
-                    result: SIGNUP_RESULT_OK,
-                    value: SIGNUP_SUCCESS_VALUE,
+                    result: SIGNUP_RESULT_CLOSED,
+                    value: SIGNUP_CLOSED_VALUE,
                 }
             )]
         );
-        world.war_signup_call(
-            &connection(PLAYER),
-            WarSignupClientMsg::RequestSignupCount {
-                header: HEADER,
-                war: WAR,
-            },
-        );
-        let sent = world.take_messages();
         assert_eq!(
-            messages_to(&sent, PLAYER),
+            call(
+                &mut world,
+                WarSignupClientMsg::RequestSignupCount {
+                    header: HEADER,
+                    war: WAR,
+                }
+            ),
             [ServerMessage::WarSignup(
                 WarSignupServerMsg::SignupCountReceived {
                     header: HEADER,
                     war: WAR,
-                    count: 1,
+                    count: NO_SIGNUPS,
                 }
             )]
         );
-        world.war_signup_call(
-            &connection(PLAYER),
-            WarSignupClientMsg::RequestSignupList {
+        let empty = [ServerMessage::WarSignup(
+            WarSignupServerMsg::SignupListReceived {
                 header: HEADER,
                 war: WAR,
+                extra: SIGNUP_LIST_EXTRA,
+                entries: Vec::new(),
+                trailer: SIGNUP_LIST_TRAILER,
             },
+        )];
+        assert_eq!(
+            call(
+                &mut world,
+                WarSignupClientMsg::RequestSignupList {
+                    header: HEADER,
+                    war: WAR,
+                }
+            ),
+            empty
         );
-        let sent = world.take_messages();
-        let listed = messages_to(&sent, PLAYER);
-        let [
-            ServerMessage::WarSignup(WarSignupServerMsg::SignupListReceived {
-                entries,
-                trailer,
-                ..
-            }),
-        ] = listed.as_slice()
-        else {
-            panic!("a sign-up list");
-        };
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].flag, SIGNUP_ENTRY_FLAG);
-        assert_eq!(*trailer, SIGNUP_LIST_TRAILER);
-        world.war_signup_call(
-            &connection(PLAYER),
-            WarSignupClientMsg::RequestLeave {
-                header: HEADER,
-                territory: TERRITORY,
-            },
+        assert_eq!(
+            call(
+                &mut world,
+                WarSignupClientMsg::RequestRoster { header: HEADER }
+            ),
+            empty
         );
-        assert_eq!(world.war_signups.count(WAR), 0);
     }
 }

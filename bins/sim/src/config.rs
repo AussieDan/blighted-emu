@@ -42,10 +42,6 @@ pub const TICK_MS: u64 = 1000_u64.div_ceil(TICKS_PER_SECOND);
 
 /// Default share of a player's damage that mob armor takes off (nwdb, M6-A spec F7).
 pub const DEFAULT_ARMOR_SHARE: f64 = 0.35;
-/// Default share of a mob's damage that a player's armor takes off: retail 3601 hits on a new
-/// character in the tutorial's starter armor keep 0.6006 of the damage (live capture
-/// 2026-09-12, all 2 ship hits and the first island hits).
-pub const DEFAULT_PLAYER_ARMOR_SHARE: f64 = 0.3994;
 /// Default quiet time before an awake mob without a target sleeps (our engineering choice: a
 /// sleeping mob costs nothing).
 pub const DEFAULT_SLEEP_AFTER_MS: u64 = 30_000;
@@ -64,8 +60,6 @@ pub const DEFAULT_MOB_RESPAWN_MS: u64 = 62_000;
 /// Default shortest time from a death to a respawn request: below the lowest captured gap
 /// (M6-B spec F7).
 pub const DEFAULT_MIN_RESPAWN_MS: u64 = 2_000;
-/// Default seed of the combat dice.
-pub const DEFAULT_COMBAT_SEED: u64 = 1;
 /// Default `u32` of a spawn card's `AssetId` (always 2 per the Azoth catalog field note).
 pub const DEFAULT_ASSET_SUB_ID: u32 = 2;
 /// Default loot drop multiplier: the game data's drop chance, as retail.
@@ -83,8 +77,6 @@ pub struct CombatConfig {
     pub damage_table: String,
     /// Share of a player's damage that mob armor takes off, 0 to below 1.
     pub armor_share: f64,
-    /// Share of a mob's damage that player armor takes off, 0 to below 1.
-    pub player_armor_share: f64,
     /// A player this near wakes a mob; absent means `interest_radius_m`.
     pub wake_radius_m: Option<f32>,
     /// Quiet time before an awake mob without a target sleeps.
@@ -99,8 +91,10 @@ pub struct CombatConfig {
     pub mob_respawn_ms: u64,
     /// Shortest time from a player's death to a respawn on its request.
     pub min_respawn_ms: u64,
-    /// Seed of the combat dice.
-    pub seed: u64,
+    /// A fixed seed of the dice (crits, loot, crafting, salvage, fishing, gathering): a replay
+    /// or a test. `None`: each start rolls a new seed, so no two starts and no two sims roll
+    /// the same sequence.
+    pub seed: Option<u64>,
     /// The `u32` of a mob's spawn card `AssetId`.
     pub asset_sub_id: u32,
     /// Times a mob type's `LootDropChance` (at most a sure drop): 1.0 is the game data's chance,
@@ -116,7 +110,6 @@ impl Default for CombatConfig {
             weapon_id: rows.weapon_id,
             damage_table: rows.damage_table,
             armor_share: DEFAULT_ARMOR_SHARE,
-            player_armor_share: DEFAULT_PLAYER_ARMOR_SHARE,
             wake_radius_m: None,
             sleep_after_ms: DEFAULT_SLEEP_AFTER_MS,
             attack_reach_m: DEFAULT_ATTACK_REACH_M,
@@ -124,7 +117,7 @@ impl Default for CombatConfig {
             min_attack_interval_ms: DEFAULT_MIN_ATTACK_INTERVAL_MS,
             mob_respawn_ms: DEFAULT_MOB_RESPAWN_MS,
             min_respawn_ms: DEFAULT_MIN_RESPAWN_MS,
-            seed: DEFAULT_COMBAT_SEED,
+            seed: None,
             asset_sub_id: DEFAULT_ASSET_SUB_ID,
             loot_drop_multiplier: DEFAULT_LOOT_DROP_MULTIPLIER,
         }
@@ -165,12 +158,6 @@ impl CombatConfig {
         let share = |value: f64| (0.0..1.0).contains(&value);
         if !share(self.armor_share) {
             return invalid("combat.armor_share", "must be at least 0 and below 1");
-        }
-        if !share(self.player_armor_share) {
-            return invalid(
-                "combat.player_armor_share",
-                "must be at least 0 and below 1",
-            );
         }
         if !positive(self.wake_radius_m.unwrap_or(interest_radius_m)) {
             return invalid("combat.wake_radius_m", "must be a finite number above 0");
@@ -308,12 +295,34 @@ const fn default_instance_request_timeout_ms() -> u64 {
 }
 
 /// `[admin]` (admin tools spec section 5).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AdminSection {
     /// Time between two admin snapshots on the bus; 0 is off, and then the sim does no snapshot
     /// work.
     pub snapshot_interval_ms: u64,
+    /// Most GM mobs one command (GM tool, script or event) spawns, at least 1. Our own limit, not
+    /// a retail one: each GM mob runs its tree on every tick, so a mistyped count must not fill
+    /// a cell.
+    #[serde(default = "default_max_gm_spawn")]
+    pub max_gm_spawn: u32,
+}
+
+impl Default for AdminSection {
+    fn default() -> Self {
+        Self {
+            snapshot_interval_ms: 0,
+            max_gm_spawn: DEFAULT_MAX_GM_SPAWN,
+        }
+    }
+}
+
+/// [`AdminSection::max_gm_spawn`] of a file that names none: a ring of 50 mobs, 2 m apart
+/// (`SPAWN_SPACING_M`), is about 32 m across, one fight's worth.
+const DEFAULT_MAX_GM_SPAWN: u32 = 50;
+
+const fn default_max_gm_spawn() -> u32 {
+    DEFAULT_MAX_GM_SPAWN
 }
 
 /// `[leaderboards]`: the rotation keys the config layers give the client, so the sim names the
@@ -403,6 +412,9 @@ impl SimConfig {
                 "max_visible_players",
                 "must be at least 1 and at most 500 (the slot and card-refresh budget)",
             );
+        }
+        if self.admin.max_gm_spawn == 0 {
+            return invalid("admin.max_gm_spawn", "must be at least 1");
         }
         let snapshot = self.admin.snapshot_interval_ms;
         if snapshot != 0 && snapshot < MIN_SNAPSHOT_INTERVAL_MS {
@@ -508,6 +520,7 @@ impl SimConfig {
             ocean_level_m,
             instance_role: self.role == SimRole::Instance,
             instance_request_timeout_ms: self.instance_request_timeout_ms,
+            max_gm_spawn: self.admin.max_gm_spawn,
         })
     }
 
@@ -578,11 +591,10 @@ impl SimConfig {
             attack_reach_m: combat.attack_reach_m,
             mob_respawn_ms: combat.mob_respawn_ms,
             armor_share: combat.armor_share,
-            player_armor_share: combat.player_armor_share,
             reach_margin_m: combat.reach_margin_m,
             min_attack_interval_ms: combat.min_attack_interval_ms,
             min_respawn_ms: combat.min_respawn_ms,
-            seed: combat.seed,
+            seed: combat.seed.unwrap_or_else(random_seed),
             asset_sub_id: combat.asset_sub_id,
             loot_drop_multiplier: combat.loot_drop_multiplier,
         }
@@ -613,6 +625,14 @@ impl SimConfig {
     }
 }
 
+/// A new dice seed from the system's random bytes; the time of day when it has none.
+fn random_seed() -> u64 {
+    getrandom::u64().unwrap_or_else(|error| {
+        tracing::warn!(%error, "no random bytes: the dice seed is the time");
+        nw_common::time::unix_ms()
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -628,10 +648,16 @@ pub(crate) mod tests {
     const COMMITTED_VISIBLE_PLAYERS: usize = 200;
 
     /// The committed example configuration.
+    /// The committed config, with the tests' fixed dice seed: the same rolls on every run.
     pub(crate) fn committed() -> SimConfig {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(COMMITTED_CONFIG);
-        load_sim_config(&path).expect("committed config")
+        let mut config = load_sim_config(&path).expect("committed config");
+        config.combat.seed = Some(TEST_SEED);
+        config
     }
+
+    /// The fixed dice seed of the tests.
+    const TEST_SEED: u64 = 1;
 
     #[test]
     fn start_tools_are_off_and_only_go_in_tool_slots() {
@@ -703,6 +729,14 @@ pub(crate) mod tests {
     #[test]
     fn the_committed_config_has_no_snapshot() {
         assert_eq!(committed().admin.snapshot_interval_ms, 0);
+    }
+
+    #[test]
+    fn a_gm_spawn_limit_of_0_is_refused() {
+        let mut config = committed();
+        assert_eq!(config.admin.max_gm_spawn, DEFAULT_MAX_GM_SPAWN);
+        config.admin.max_gm_spawn = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]
@@ -788,7 +822,14 @@ pub(crate) mod tests {
     #[test]
     fn the_combat_section_has_its_defaults() {
         let config = committed();
-        assert_eq!(config.combat, CombatConfig::default());
+        assert_eq!(
+            config.combat,
+            CombatConfig {
+                seed: Some(TEST_SEED),
+                ..CombatConfig::default()
+            },
+            "the committed file sets no seed: each start rolls one"
+        );
         assert_eq!(
             config.combat.rows(),
             nw_content::combat::CombatRows::default()
@@ -819,11 +860,10 @@ pub(crate) mod tests {
 
     #[test]
     fn bad_combat_values_are_refused() {
-        let cases: [CombatFault; 5] = [
+        let cases: [CombatFault; 4] = [
             ("combat.attack_reach_m", |c| c.attack_reach_m = 0.0),
             ("combat.times", |c| c.mob_respawn_ms = 0),
             ("combat.armor_share", |c| c.armor_share = 1.5),
-            ("combat.player_armor_share", |c| c.player_armor_share = -0.1),
             ("combat.wake_radius_m", |c| c.wake_radius_m = Some(f32::NAN)),
         ];
         for (key, fault) in cases {

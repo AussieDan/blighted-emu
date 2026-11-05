@@ -135,6 +135,7 @@ impl Build {
                 conditional: Vec::new(),
             }),
             tags,
+            triggers: Vec::new(),
             motion_multiplier: None,
             facing: None,
             variants: vec![FragmentVariant {
@@ -399,6 +400,7 @@ impl Build {
             damage_table_id: None,
             main_hand_item: None,
             default_tags: Vec::new(),
+            triggers: Vec::new(),
         });
         self.data
     }

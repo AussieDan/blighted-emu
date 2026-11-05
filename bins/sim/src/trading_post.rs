@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 
 use nw_content::Tables;
-use nw_db::{Order, OrderEnd, OrderItem, OrderKind, OrderStatus};
+use nw_db::{Order, OrderEnd, OrderItem, OrderKind, OrderStatus, SavedItemRolls};
 use nw_formats::objectstream::lowercase_crc32;
 use nw_messages::contracts::{
     CONTRACT_ENTITY_IDS, Contract, ContractItemData, ContractKind, INVALID_ENTITY_ID, Participant,
@@ -197,8 +197,16 @@ pub struct TradeItem {
 }
 
 impl TradeItem {
-    /// The order item of this item at `gear_score`.
-    pub fn order_item(&self, gear_score: u32) -> OrderItem {
+    /// The order item of a stack of this item at `gear_score`, with the CRC-32 of each of its
+    /// lowercase perk ids `perks`, `gem_perks` of them gems (`PerkType` `Gem`), and the stack's
+    /// own values `rolls` (a buy order's are the data values).
+    pub fn order_item(
+        &self,
+        gear_score: u32,
+        perks: Vec<u32>,
+        gem_perks: u32,
+        rolls: SavedItemRolls,
+    ) -> OrderItem {
         OrderItem {
             item_id: self.item_id.clone(),
             item_crc: lowercase_crc32(&self.item_id),
@@ -208,8 +216,9 @@ impl TradeItem {
             tier: self.tier,
             gear_score,
             required_level: self.required_level,
-            perks: Vec::new(),
-            gem_perk_count: 0,
+            perks,
+            gem_perk_count: gem_perks,
+            rolls,
         }
     }
 }
@@ -334,6 +343,10 @@ pub fn settlement_storage(outpost: u64) -> [u8; nw_messages::wire::RAW_ID_LEN] {
     storage
 }
 
+/// How far from a settlement's capital its trading post and storage may be used, metres
+/// (Inferred: retail uses lay 10 to 46 m from it, 4 of 4; a settlement's radius is Unknown).
+pub const SETTLEMENT_REACH_M: f32 = 100.0;
+
 /// A settlement or outpost of the level: its wire id and its capital's place.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Settlement {
@@ -381,17 +394,17 @@ impl Settlements {
         self.all.iter().any(|settlement| settlement.id == outpost)
     }
 
-    /// The wire id of the settlement whose capital is nearest to `(x, y)`; `None` for a level
-    /// without one. Retail: a trading post's orders and a used storage name the nearest
-    /// settlement's capital (the player 21 m from the Morrowtide capital, 46 m from Ebonscale
-    /// Reach, 15 m from North Windsward, 10 m from the Brimstone outpost; 4 of 4).
+    /// The wire id of the settlement whose capital is nearest to `(x, y)`, within
+    /// [`SETTLEMENT_REACH_M`]; `None` far from every one. Retail: a trading post's orders and a
+    /// used storage name the nearest settlement's capital (the player 21 m from the Morrowtide
+    /// capital, 46 m from Ebonscale Reach, 15 m from North Windsward, 10 m from the Brimstone
+    /// outpost; 4 of 4).
     pub fn nearest(&self, x: f32, y: f32) -> Option<u64> {
+        let distance = |s: &Settlement| (s.x - x).hypot(s.y - y);
         self.all
             .iter()
-            .min_by(|a, b| {
-                let distance = |s: &Settlement| (s.x - x).powi(2) + (s.y - y).powi(2);
-                distance(a).total_cmp(&distance(b))
-            })
+            .filter(|settlement| distance(settlement) <= SETTLEMENT_REACH_M)
+            .min_by(|a, b| distance(a).total_cmp(&distance(b)))
             .map(|settlement| settlement.id)
     }
 }
@@ -592,7 +605,7 @@ mod tests {
             version: 1,
             creator,
             outpost: 0xb325_909b_3cc6_434f,
-            item: beeswax().order_item(0),
+            item: beeswax().order_item(0, Vec::new(), 0, SavedItemRolls::default()),
             price: 10_000,
             posted: 1,
             open: 1,
@@ -832,6 +845,11 @@ mod tests {
         );
         assert!(settlements.contains(EBONSCALE) && !settlements.contains(2));
         assert_eq!(Settlements::default().nearest(0.0, 0.0), None);
+        assert_eq!(
+            settlements.nearest(7252.04 + SETTLEMENT_REACH_M * 2.0, 5396.73),
+            None,
+            "far from every settlement"
+        );
         assert_eq!(settlement_wire_id(0x4f43_c63c_9b90_25b3), EBONSCALE);
         let mut storage = [0; nw_messages::wire::RAW_ID_LEN];
         storage[..8].copy_from_slice(&[0x6b, 0xbf, 0x90, 0xec, 0x53, 0xd9, 0xf3, 0x5f]);

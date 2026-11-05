@@ -23,7 +23,7 @@ pub const AI_DATA_SPEC: ContainerSpec = ContainerSpec {
     schema_hash: SCHEMA_VERSION,
 };
 /// Raised when the body layout changes.
-const SCHEMA_VERSION: u32 = 4;
+const SCHEMA_VERSION: u32 = 5;
 const FILE_PREFIX: &str = "ai-data-";
 const FILE_SUFFIX: &str = ".bin";
 
@@ -140,6 +140,34 @@ pub struct Archetype {
     /// The Mannequin tags the creature always has (slice default tags and main-hand weapon
     /// tags, as the creature animation table).
     pub default_tags: Vec<NameId>,
+    /// The slice's `TriggerEntityComponent`s, in stream order.
+    pub triggers: Vec<SliceTriggerRef>,
+}
+
+/// Where one `TriggerEntityComponent` of an archetype's slice sits: what a 3135 to it needs
+/// (`nw_messages::trigger_entity::TriggerAddress`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SliceTriggerRef {
+    /// `m_triggerName`.
+    pub name: NameId,
+    /// The XOR of the slice's main entity `Id` and the `Id` of the entity that owns it.
+    pub child: u64,
+    /// The component `Id`.
+    pub component: u64,
+}
+
+impl Archetype {
+    /// The slice triggers named `name` (`names` gives a name id's text; names compare without
+    /// case, Inferred: the client's own compare is Unknown).
+    pub fn triggers_named<'a>(
+        &'a self,
+        name: &'a str,
+        names: impl Fn(NameId) -> &'a str + 'a,
+    ) -> impl Iterator<Item = &'a SliceTriggerRef> + 'a {
+        self.triggers
+            .iter()
+            .filter(move |trigger| names(trigger.name).eq_ignore_ascii_case(name))
+    }
 }
 
 impl Archetype {
@@ -201,6 +229,16 @@ pub struct Completion {
     pub default_offset_s: f32,
     /// `Conditional` entries: the named condition and its offset, in file order.
     pub conditional: Vec<(CageCondition, f32)>,
+}
+
+/// A `TriggerEntity` activity of a CAGE action: it runs when the action starts and its branch
+/// conditions hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EntityTrigger {
+    /// `TriggerName`.
+    pub trigger: NameId,
+    /// The conditions of the branches it is in; `True` for none.
+    pub condition: CageCondition,
 }
 
 /// The `Default` of a `SetMannequinTag` activity.
@@ -300,6 +338,8 @@ pub struct CageAction {
     pub completion: Option<Completion>,
     /// Its `SetMannequinTag` activities.
     pub tags: Vec<TagActivity>,
+    /// Its `TriggerEntity` activities, in file order.
+    pub triggers: Vec<EntityTrigger>,
     /// `AnimationDrivenMotion Default MotionMultiplier`.
     pub motion_multiplier: Option<f32>,
     /// `SetDesiredFacingBlendParam Default FacingMode`: where the action turns the body.
@@ -598,6 +638,7 @@ mod tests {
                 conditional: vec![(CageCondition::Tag(CHAIN_TAG), CHAINED_OFFSET_S)],
             }),
             tags: Vec::new(),
+            triggers: Vec::new(),
             motion_multiplier: Some(1.0),
             facing: None,
             variants: vec![
@@ -676,6 +717,7 @@ mod tests {
                 damage_table_id: None,
                 main_hand_item: None,
                 default_tags: Vec::new(),
+                triggers: Vec::new(),
             }],
             grids: vec![Grid {
                 path: 0,

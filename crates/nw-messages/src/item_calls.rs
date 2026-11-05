@@ -575,15 +575,10 @@ impl ItemCallMsg {
                 })
             }),
             SLOT_ITEM_WITH_CHARM_TYPE_INDEX => read(|header, reader| {
-                // Each item reference is followed by a u32 that is 0 in the retail MSQ15 body.
-                let target = ItemRef::read(reader)?;
-                let _ = reader.u32()?;
-                let charm = ItemRef::read(reader)?;
-                let _ = reader.u32()?;
                 Ok(Self::SlotItemWithCharm {
                     header,
-                    target,
-                    charm,
+                    target: ItemRef::read(reader)?,
+                    charm: ItemRef::read(reader)?,
                     perk_index: reader.u32()?,
                     extra: reader.u32()?,
                 })
@@ -785,9 +780,16 @@ mod tests {
     /// Retail MSQ15: a gem from bag slot 120 into perk index 0 of the main-hand item.
     const RETAIL_SLOT_CHARM: &str = concat!(
         "40c610f1baaa2cb75ad5e1c8869e39e2",
-        "0000000200000018000000000000000000000000000000000000000000000000",
-        "0000000100000078000000000000000000000000000000000000000000000000",
+        "00000002000000180000000000000000000000000000000000000000",
+        "00000001000000780000000000000000000000000000000000000000",
         "0000000000000001"
+    );
+    /// Retail MSQ15, 5 s later: the same bag slot into perk index 1 of paperdoll slot 25.
+    const RETAIL_SLOT_CHARM_SECOND_PERK: &str = concat!(
+        "40c610f1baaa2cb75ad5e1c8869e39e2",
+        "00000002000000190000000000000000000000000000000000000000",
+        "00000001000000780000000000000000000000000000000000000000",
+        "0000000100000001"
     );
     /// Retail: drop every `UI_Refining` (90) stack.
     const RETAIL_DROP_BY_CLASS: &str = "c4cbfad59c1a4a47e131d651bfc7f132000000000000005a01";
@@ -826,6 +828,16 @@ mod tests {
         );
         assert_eq!((charm.location, charm.slot), (LOCATION_BAG, 120));
         assert_eq!((perk_index, extra), (0, 1));
+        let ItemCallMsg::SlotItemWithCharm {
+            target, perk_index, ..
+        } = decode(
+            SLOT_ITEM_WITH_CHARM_TYPE_INDEX,
+            RETAIL_SLOT_CHARM_SECOND_PERK,
+        )
+        else {
+            panic!("a charm");
+        };
+        assert_eq!((target.slot, perk_index), (25, 1));
         assert!(matches!(
             decode(CLEAR_CHARM_REQUESTS_TYPE_INDEX, RETAIL_REPLICATE),
             ItemCallMsg::ClearCharmRequests { .. }

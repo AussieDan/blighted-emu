@@ -16,7 +16,6 @@ use std::time::{Duration, Instant};
 use crate::world::store_purchase::StoreGrant;
 use crate::world::transmog::SkinJob;
 use nw_bus::InstanceCommand;
-use nw_bus::ItemState;
 use nw_bus::{
     AdminAction, AdminCommand, AdminReply, Admit, AdmitReply, Bus, BusError, BusId, CarriedItem,
     CellTable, ConnectionRef, GatewayOutput, Ghost, Ghosts, HandoffMessage, HandoffReply,
@@ -26,6 +25,7 @@ use nw_bus::{
 };
 use nw_bus::{CoinTransfer, LeaveReason, SocialBatch, SocialDeliveries, SocialInput};
 use nw_bus::{GhostAssembly, ghost_parts};
+use nw_bus::{ItemLookState, ItemState};
 use nw_common::time::{unix_ms, unix_seconds};
 use nw_content::leaderboards::RotationCalendar;
 use nw_db::{AccountSkins, collect_account_skins};
@@ -591,6 +591,7 @@ impl Loop {
     fn admin(&mut self, command: Incoming<AdminCommand>) {
         let reply = match &command.message.action {
             AdminAction::Kick { entity } => self.kick(*entity),
+            AdminAction::KickAccount { account } => self.kick_account(*account),
             _ => self.world.admin(&command.message, self.now_ms()),
         };
         tracing::info!(request = %command.message.request, ?reply, "admin command");
@@ -1411,6 +1412,20 @@ impl Loop {
         AdminReply::Done
     }
 
+    /// Kicks every player of account `account` on this sim (a ban, [`Self::kick`] each):
+    /// [`AdminReply::Done`] when one was here, [`AdminReply::NotMine`] when none was.
+    fn kick_account(&mut self, account: Uuid) -> AdminReply {
+        let numbers = self.world.numbers_of_account(account);
+        if numbers.is_empty() {
+            return AdminReply::NotMine;
+        }
+        for number in numbers {
+            self.kick(number);
+        }
+        tracing::info!(%account, "account kicked");
+        AdminReply::Done
+    }
+
     /// Saves and removes every player of `gateway`, and tells the gateway to close them.
     fn drop_gateway(&mut self, gateway: &BusId) {
         for departure in self.world.leave_gateway(gateway) {
@@ -1763,8 +1778,8 @@ impl Loop {
 
     /// Moves a player's coins for the social service and answers it.
     fn move_coins(&mut self, transfer: Incoming<CoinTransfer>) {
-        let reply = self.world.move_coins(&transfer.message);
-        tracing::info!(character = %transfer.message.character, change = transfer.message.change, ?reply, "treasury coins");
+        let reply = self.world.move_coins(&transfer.message, self.now_ms());
+        tracing::info!(id = %transfer.message.id, character = %transfer.message.character, change = transfer.message.change, ?reply, "treasury coins");
         self.reply(transfer, reply);
     }
 
@@ -2166,7 +2181,7 @@ fn saved_items(items: &[CarriedItem]) -> Vec<SavedItem> {
 }
 
 /// The rolls and look of a carried item as the database stores them.
-fn saved_rolls(state: &ItemState) -> SavedItemRolls {
+pub(crate) fn saved_rolls(state: &ItemState) -> SavedItemRolls {
     SavedItemRolls {
         gear_score: state.gear_score,
         durability: state.durability,
@@ -2175,6 +2190,24 @@ fn saved_rolls(state: &ItemState) -> SavedItemRolls {
         dye: state.look.dye,
         appearance: state.look.appearance,
         skin_dye: state.look.skin_dye,
+    }
+}
+
+/// The own values of an item the database stored with `rolls` (a trading post delivery): its
+/// rolls and look, with no instance id of its own and unlocked.
+pub(crate) fn stored_values(rolls: &SavedItemRolls) -> ItemState {
+    ItemState {
+        instance: None,
+        locked: false,
+        gear_score: rolls.gear_score,
+        durability: rolls.durability,
+        perks: rolls.perks.clone(),
+        bound: rolls.bound,
+        look: ItemLookState {
+            dye: rolls.dye,
+            appearance: rolls.appearance,
+            skin_dye: rolls.skin_dye,
+        },
     }
 }
 

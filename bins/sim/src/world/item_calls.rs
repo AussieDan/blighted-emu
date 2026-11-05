@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use bevy_ecs::entity::Entity;
 use nw_bus::ConnectionRef;
-use nw_content::item_rolls::RolledItem;
+use nw_bus::ItemState;
 use nw_content::item_rules::VitalsEffect;
 use nw_content::starter::{KitItem, StarterKits};
 use nw_formats::objectstream::lowercase_crc32;
@@ -30,7 +30,7 @@ use nw_messages::{
 
 use super::attack::Vitals;
 use super::gathering::{GATHER_ACCEPTED, GATHER_BUSY};
-use super::gear::{DroppedStack, ItemRefusal};
+use super::gear::{ItemRefusal, MovedStack};
 use super::loot_bag::{bag_namespace, storage_emptied, storage_member};
 use super::stamina::Stamina;
 use super::statics::interactor_target;
@@ -157,17 +157,30 @@ fn apply(
     vitals.health.heal(amount)
 }
 
-/// The master rows of `items` with their quantities and the `rolls` of each (an item `kits`
-/// does not know is left out; a missing roll is `None`).
-fn rolled_kit_items<'a>(
-    kits: &'a StarterKits,
-    items: &[(String, u32)],
-    rolls: &[Option<RolledItem>],
-) -> Vec<(&'a KitItem, u32, Option<RolledItem>)> {
+/// `items` with the own `values` of each as stacks that move (a missing entry is `None`).
+fn moved_stacks(items: &[(String, u32)], values: &[Option<ItemState>]) -> Vec<MovedStack> {
     items
         .iter()
-        .zip(rolls.iter().cloned().chain(std::iter::repeat(None)))
-        .filter_map(|((item_id, quantity), rolled)| Some((kits.item(item_id)?, *quantity, rolled)))
+        .zip(values.iter().cloned().chain(std::iter::repeat(None)))
+        .map(|((item_id, quantity), values)| MovedStack {
+            item_id: item_id.clone(),
+            quantity: *quantity,
+            values,
+        })
+        .collect()
+}
+
+/// The master rows of `items` with their quantities and the own `values` of each (an item
+/// `kits` does not know is left out; a missing entry is `None`).
+fn valued_kit_items<'a>(
+    kits: &'a StarterKits,
+    items: &[(String, u32)],
+    values: &[Option<ItemState>],
+) -> Vec<(&'a KitItem, u32, Option<ItemState>)> {
+    items
+        .iter()
+        .zip(values.iter().cloned().chain(std::iter::repeat(None)))
+        .filter_map(|((item_id, quantity), values)| Some((kits.item(item_id)?, *quantity, values)))
         .collect()
 }
 
@@ -189,7 +202,7 @@ impl SimWorld {
                     entries
                         .iter()
                         .filter_map(|entry| {
-                            gear.drop_from_bag(entry.bag_slot, entry.instance, entry.quantity)
+                            gear.take_moved(entry.bag_slot, entry.instance, entry.quantity)
                                 .inspect_err(|refusal| tracing::debug!(?refusal, "drop refused"))
                                 .ok()
                         })
@@ -315,7 +328,7 @@ impl SimWorld {
                             !locked && content.is_of_ui_class(item_id, class)
                         })
                         .filter_map(|(bag_slot, _, instance, _)| {
-                            gear.drop_from_bag(bag_slot, instance, ALL_OF_THE_STACK)
+                            gear.take_moved(bag_slot, instance, ALL_OF_THE_STACK)
                                 .inspect_err(|refusal| tracing::debug!(?refusal, "drop refused"))
                                 .ok()
                         })
@@ -585,10 +598,16 @@ impl SimWorld {
         }
     }
 
-    /// Player `number` (`entity`) dropped `dropped` at `now_ms`: a bag of them, with their
-    /// rolls, lies at its feet, and its loot tracker lists the bag as dropped items. Nothing
-    /// dropped drops no bag.
-    fn drop_items(&mut self, entity: Entity, number: u64, dropped: Vec<DroppedStack>, now_ms: u64) {
+    /// Player `number` (`entity`) dropped `dropped` at `now_ms` (or got items its bag had no
+    /// room for): a bag of them, with their own values, lies at its feet, and its loot tracker
+    /// lists the bag as dropped items. Nothing dropped drops no bag.
+    pub(super) fn drop_items(
+        &mut self,
+        entity: Entity,
+        number: u64,
+        dropped: Vec<MovedStack>,
+        now_ms: u64,
+    ) {
         if dropped.is_empty() {
             return;
         }
@@ -600,13 +619,13 @@ impl SimWorld {
             return;
         };
         let namespace = bag_namespace(self.me.generation);
-        let (items, rolls) = dropped
+        let (items, values) = dropped
             .into_iter()
-            .map(|stack| ((stack.item_id, stack.quantity), stack.rolled))
+            .map(|stack| ((stack.item_id, stack.quantity), stack.values))
             .unzip();
         let bag = self
             .bags
-            .drop_rolled_bag(namespace, at, number, items, rolls, now_ms);
+            .drop_bag(namespace, at, number, items, values, now_ms);
         let server_ms = self.server_ms;
         if let Some(mut player) = self.world.get_mut::<Player>(entity) {
             player.list_version += 1;
@@ -638,7 +657,7 @@ impl SimWorld {
         };
         let answer = match bag {
             Some(bag) => {
-                let items = rolled_kit_items(&content.kits, &bag.items, &bag.rolls);
+                let items = valued_kit_items(&content.kits, &bag.items, &bag.values);
                 gear.open_dropped(&content.kits, bag.id, &items);
                 gather_answer(number, request, GATHER_ACCEPTED, DROPPED_ITEMS_NAME)
             }
@@ -662,7 +681,8 @@ impl SimWorld {
 
     /// Player `number` (`entity`) takes every item of the bag of dropped items it has open
     /// (2939) at `now_ms`: the items into its bag, the tracker's entry looted, its global
-    /// storage emptied, the view emptied. Whether it had one open.
+    /// storage emptied, the view emptied. A bag with no room for them all takes nothing (the
+    /// items stay; Inferred: retail's answer to a full bag is Unknown). Whether it had one open.
     pub(super) fn take_all_open(&mut self, entity: Entity, number: u64, now_ms: u64) -> bool {
         let Some(bag) = self
             .world
@@ -671,13 +691,17 @@ impl SimWorld {
         else {
             return false;
         };
-        let taken = self
-            .bags
-            .take_rolled(&bag, number, now_ms)
-            .unwrap_or_default();
-        let (items, rolls): (Vec<(String, u32)>, Vec<Option<RolledItem>>) =
+        let left = self.bags.takeable(&bag, number);
+        let fits =
+            left.is_none_or(|left| self.has_room(entity, &moved_stacks(&left.items, &left.values)));
+        if !fits {
+            tracing::info!(player = number, "a full bag: the dropped items stay");
+            return true;
+        }
+        let taken = self.bags.take(&bag, number, now_ms).unwrap_or_default();
+        let (items, values): (Vec<(String, u32)>, Vec<Option<ItemState>>) =
             taken.into_iter().unzip();
-        self.take_from_bag(entity, number, bag, &items, &rolls);
+        self.take_from_bag(entity, number, bag, &items, &values);
         true
     }
 
@@ -698,27 +722,51 @@ impl SimWorld {
         });
         match open {
             Some((Some(bag), Some(index))) => {
-                let (items, rolls): (Vec<(String, u32)>, Vec<Option<RolledItem>>) = self
+                let wanted = self.bags.takeable(&bag, number).and_then(|left| {
+                    let (item, held) = left.items.get(index)?.clone();
+                    let values = left.values.get(index).cloned().flatten();
+                    let count = if quantity == 0 {
+                        held
+                    } else {
+                        quantity.min(held)
+                    };
+                    Some(((item, count), values))
+                });
+                if let Some(((item_id, quantity), values)) = wanted
+                    && !self.has_room(
+                        entity,
+                        &[MovedStack {
+                            item_id,
+                            quantity,
+                            values,
+                        }],
+                    )
+                {
+                    tracing::info!(player = number, "a full bag: the dropped item stays");
+                    return;
+                }
+                let (items, values): (Vec<(String, u32)>, Vec<Option<ItemState>>) = self
                     .bags
                     .take_part(&bag, number, index, quantity, now_ms)
                     .into_iter()
                     .unzip();
-                self.take_from_bag(entity, number, bag, &items, &rolls);
+                self.take_from_bag(entity, number, bag, &items, &values);
             }
             _ => self.refused(entity, "withdraw", |gear| gear.withdraw(instance, quantity)),
         }
     }
 
-    /// `items` of bag `bag` of dropped items, with the `rolls` of each, go into the bag of
-    /// player `number` (`entity`); the view shows what is left, and a bag left empty leaves the
-    /// tracker as looted, with the global storage emptied (retail at the take).
+    /// `items` of bag `bag` of dropped items, with the own `values` of each, go into the bag of
+    /// player `number` (`entity`), which has room for them (`SimWorld::has_room`); the view
+    /// shows what is left, and a bag left empty leaves the tracker as looted, with the global
+    /// storage emptied (retail at the take).
     fn take_from_bag(
         &mut self,
         entity: Entity,
         number: u64,
         bag: [u8; RAW_ID_LEN],
         items: &[(String, u32)],
-        rolls: &[Option<RolledItem>],
+        values: &[Option<ItemState>],
     ) {
         let content = Arc::clone(&self.content);
         let emptied = !self.bags.lying(&bag);
@@ -728,14 +776,14 @@ impl SimWorld {
             return;
         };
         let player = &mut *player;
-        let kit_items = rolled_kit_items(&content.kits, items, rolls);
+        let kit_items = valued_kit_items(&content.kits, items, values);
         if let Some(gear) = player.gear.as_mut() {
             if !gear.take_dropped(&content.kits, &kit_items) {
-                tracing::info!(?items, "dropped items lost: a full bag");
+                tracing::error!(?items, "dropped items did not fit after the room check");
             }
             match left {
                 Some(left) => {
-                    let shown = rolled_kit_items(&content.kits, &left.items, &left.rolls);
+                    let shown = valued_kit_items(&content.kits, &left.items, &left.values);
                     gear.open_dropped(&content.kits, bag, &shown);
                 }
                 None => {
@@ -1516,6 +1564,12 @@ mod tests {
                 tail: 0,
                 refresh,
             };
+            // A resource stored gets a new instance id (retail, module notes): the take names it.
+            let stored = gear_of(&world)
+                .open_stacks()
+                .first()
+                .map(|(_, instance)| *instance)
+                .expect("stored flint");
             world.item_call(&connection(1), search(false), NOW);
             world.item_call(&connection(1), search(true), NOW);
             world.item_call(
@@ -1528,7 +1582,7 @@ mod tests {
                 ItemCallMsg::TakeItem {
                     header: header(),
                     container: own_container(),
-                    instance: flint,
+                    instance: stored,
                     quantity: 1,
                 },
                 NOW,

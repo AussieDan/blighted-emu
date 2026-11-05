@@ -202,6 +202,10 @@ pub trait World {
     fn entity_query(&self, params: &EntityQueryParams, board: &dyn Blackboard) -> bool;
     /// How many entities have the tag.
     fn entities_with_tag(&self, tag: &str) -> u32;
+    /// Whether the sim runs the action leaf `kind` now (a leaf that acts on other entities or
+    /// spawns, on target `target_index` of an enclosing `ForEachTargetDecorator`): a leaf it
+    /// cannot run fails, so that no tree goes on as if it had run.
+    fn can_act(&self, kind: &NodeKind, target_index: Option<u32>) -> bool;
     /// Whether the mob follows a patrol path (`SelectWaypointAction` advances it; Inferred: the
     /// action cannot plan without one, or every mob's Patrol sub-tree would take it).
     fn has_patrol(&self) -> bool;
@@ -1708,7 +1712,8 @@ impl<'a, W: World> Ctx<'a, '_, W> {
     /// once.
     fn start_leaf(&mut self, slot: Slot, id: NodeId, target: Option<u32>) -> LeafStart {
         let data = self.rt.data();
-        match &data.node(id).kind {
+        let kind = &data.node(id).kind;
+        match kind {
             NodeKind::Cage(cage) => {
                 if cage.nav_ray_cast.check_at_execution && !self.clearance(&cage.nav_ray_cast) {
                     return LeafStart::Done(Status::Failure);
@@ -1872,6 +1877,13 @@ impl<'a, W: World> Ctx<'a, '_, W> {
             | NodeKind::SelectWaypoint
             | NodeKind::SpawnProjectile(_)
             | NodeKind::UpdateNwTags { .. } => {
+                let unset_value = match kind {
+                    NodeKind::SetRemoteFact { value, .. } => self.resolve(value).is_none(),
+                    _ => false,
+                };
+                if unset_value || !self.world.can_act(kind, target) {
+                    return LeafStart::Done(Status::Failure);
+                }
                 self.out.push(Command::Action {
                     node: id,
                     target_index: target,
@@ -2084,6 +2096,8 @@ mod tests {
         now: u64,
         engine: Vec<(EngineKey, Value)>,
         effects: Vec<String>,
+        /// The sim runs no action leaf.
+        refuses_actions: bool,
     }
 
     impl TestWorld {
@@ -2130,6 +2144,10 @@ mod tests {
 
         fn entities_with_tag(&self, _tag: &str) -> u32 {
             2
+        }
+
+        fn can_act(&self, _kind: &NodeKind, _target_index: Option<u32>) -> bool {
+            !self.refuses_actions
         }
 
         fn has_patrol(&self) -> bool {
@@ -2205,6 +2223,36 @@ mod tests {
             ["Idle"],
             "an interruptable gore gives way to the new plan at once"
         );
+    }
+
+    /// An action leaf the sim cannot run fails: its sequence does not go on, and no
+    /// `Command::Action` goes out; one it runs goes out and the sequence goes on.
+    #[test]
+    fn an_action_the_sim_cannot_run_fails_its_sequence() {
+        let mut build = Build::default();
+        let order = build.node(NodeKind::CompleteOrder);
+        let gore = build.gore("Gore");
+        let root = build.sequence(&[order, gore]);
+        let data = build.finish(root);
+        let runtime = Runtime::new(data.clone());
+        let acted = |out: &[Command]| {
+            out.iter()
+                .any(|command| matches!(command, Command::Action { node, .. } if *node == order))
+        };
+        let refusing = TestWorld {
+            refuses_actions: true,
+            ..TestWorld::default()
+        };
+        let mut mob = brain(&data);
+        let mut out = Vec::new();
+        mob.tick(&runtime, &refusing, &mut out);
+        assert!(!acted(&out));
+        assert!(played(&out, &data).is_empty(), "the sequence stops");
+        let mut mob = brain(&data);
+        out.clear();
+        mob.tick(&runtime, &TestWorld::default(), &mut out);
+        assert!(acted(&out));
+        assert_eq!(played(&out, &data), ["Gore"]);
     }
 
     #[test]
@@ -2836,6 +2884,10 @@ mod scale_tests {
 
         fn entities_with_tag(&self, _tag: &str) -> u32 {
             0
+        }
+
+        fn can_act(&self, _kind: &NodeKind, _target_index: Option<u32>) -> bool {
+            true
         }
 
         fn has_patrol(&self) -> bool {

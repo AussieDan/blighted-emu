@@ -205,8 +205,8 @@ pub(super) enum SearchFor {
     /// The ingredients of the recipes of the station whose lowercase name without tier digits
     /// has this CRC-32.
     Station(u32),
-    /// Housing items: the item catalog leaves `HousingItem` rows out (the client's item index
-    /// skips them), so no storage of this server holds one and the results are empty.
+    /// Housing items: every stored item that is furniture of the housing tables (Inferred from
+    /// the filter's name: no retail capture has a housing search).
     Housing,
     /// A filter whose meaning is Unknown: no results.
     Unknown,
@@ -319,7 +319,13 @@ impl SimWorld {
                         .any(|ingredient| content.recipes.fits(ingredient, item_id))
                 })
             }
-            SearchFor::Housing | SearchFor::Unknown => Vec::new(),
+            SearchFor::Housing => search_results(&totals, |item_id| {
+                content
+                    .kits
+                    .item(item_id)
+                    .is_some_and(|item| content.travel.furniture(item.item_index).is_some())
+            }),
+            SearchFor::Unknown => Vec::new(),
         };
         let state = StorageSearch {
             search,

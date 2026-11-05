@@ -276,14 +276,24 @@ impl MemberState {
         TypeId::FileSlot(self.type_index())
     }
 
-    /// The state of class `class` in the body bytes `body`, which it must use up.
+    /// The state of class `class` in the body bytes `body`, which it must use up. A class without
+    /// a reader here, or a body its reader leaves unsized, is passed by its wire layout as its
+    /// recorded bytes, as in a bundle walk ([`BundlePayload::decode_known`]).
     ///
     /// # Errors
     ///
-    /// Returns [`MessageError`] when the class has no reader here or the body does not match it.
+    /// Returns [`MessageError`] when the class has neither a reader nor a layout, or the body does
+    /// not match it.
     pub fn decode(class: u64, body: &[u8]) -> Result<Self, MessageError> {
         let mut reader = Reader::new(body);
-        let state = Self::read(TypeId::FileSlot(class), &mut reader)?;
+        let state = match Self::read(TypeId::FileSlot(class), &mut reader) {
+            Ok(state) => state,
+            Err(MessageError::Unsized { .. } | MessageError::UnknownMemberClass { .. }) => {
+                reader = Reader::new(body);
+                recorded(TypeId::FileSlot(class), &mut reader)?
+            }
+            Err(other) => return Err(other),
+        };
         reader.finish()?;
         Ok(state)
     }
@@ -854,6 +864,25 @@ mod tests {
         };
         let bytes = mixed.encode().expect("encode");
         assert_eq!(BundlePayload::decode(&bytes), Ok(mixed));
+    }
+
+    /// A body of a class without a reader decodes alone by its layout, as in a bundle walk (the
+    /// retail mob copies: `AlignToTerrain` `01 01 01` on 782 creatures), and a body longer than
+    /// its layout does not.
+    #[test]
+    fn a_body_of_a_class_without_a_reader_decodes_by_its_layout() {
+        const ALIGN_TO_TERRAIN_TYPE_INDEX: u64 = 2850;
+        const RETAIL_BODY: [u8; 3] = [0x01, 0x01, 0x01];
+        assert_eq!(
+            MemberState::decode(ALIGN_TO_TERRAIN_TYPE_INDEX, &RETAIL_BODY),
+            Ok(MemberState::Recorded {
+                class: ALIGN_TO_TERRAIN_TYPE_INDEX,
+                body: RETAIL_BODY.to_vec(),
+            })
+        );
+        assert!(
+            MemberState::decode(ALIGN_TO_TERRAIN_TYPE_INDEX, &[0x01, 0x01, 0x01, 0x00]).is_err()
+        );
     }
 
     #[test]

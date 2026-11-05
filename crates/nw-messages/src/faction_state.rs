@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Changes of the faction component's state, `MB::FactionComponentReplicatedState` (3152, own
-//! component 49): slot 2 child 0 `faction`, slot 1 children 3 `lastFactionChangeTimepoint`
-//! (u64 unix ns) and 4 `factionChangeCount` (u16).
+//! component 49): slot 1 children 0 `pvpFlagPending`, 1 `notifyPending`, 2
+//! `pvpFlagPendingEndTime` (u64 unix ns), 3 `lastFactionChangeTimepoint` (u64 unix ns) and 4
+//! `factionChangeCount` (u16); slot 2 children 0 `faction`, 1 `pvpFlag` and 2 `hasSanctuary`
+//! (member layout table; one byte each for the flags).
 //!
 //! **Observed**: the first join sets the faction alone (`Hive_join_yellow_faction_quest`, the
 //! bundle after the 3161: `04 01 03`); a change from one faction to another sets the time and the
@@ -25,63 +27,115 @@ const PUBLIC_SLOT: u8 = 0x04;
 /// Children of slot 1 and slot 2.
 const OWNER_CHILDREN: u8 = 7;
 const PUBLIC_CHILDREN: u8 = 5;
-/// `lastFactionChangeTimepoint` and `factionChangeCount` (slot 1).
-const CHANGED_AT_CHILD: usize = 3;
-const CHANGES_CHILD: usize = 4;
-/// `faction` (slot 2).
-const FACTION_CHILD: usize = 0;
+/// `pvpFlagPending`, `notifyPending`, `pvpFlagPendingEndTime` (u64 unix ns),
+/// `lastFactionChangeTimepoint` (u64 unix ns) and `factionChangeCount` (u16) (slot 1).
+const PVP_PENDING_CHILD: u8 = 0;
+const NOTIFY_PENDING_CHILD: u8 = 1;
+const PVP_PENDING_END_CHILD: u8 = 2;
+const CHANGED_AT_CHILD: u8 = 3;
+const CHANGES_CHILD: u8 = 4;
+/// `faction`, `pvpFlag` and `hasSanctuary` (slot 2).
+const FACTION_CHILD: u8 = 0;
+const PVP_FLAG_CHILD: u8 = 1;
+const SANCTUARY_CHILD: u8 = 2;
 
-/// One change of the faction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FactionChange {
-    /// The faction now.
-    pub faction: u8,
-    /// For a change from one faction to another: the change's unix ns and the changes so far.
-    pub switched: Option<(u64, u16)>,
+/// A change of some children of the faction state; `None` children stay as they are.
+///
+/// **Observed** (`Hive_flag_pvp_on_and_off`, every 3152 of the own component): a PvP toggle on
+/// sets `pvpFlagPending` and `notifyPending` (`02 03 01 01`), a toggle off clears the pending
+/// flag (`02 03 00 01`); leaving a sanctuary with the flag pending sets
+/// `pvpFlagPendingEndTime` and clears `hasSanctuary` (`06 04 <time> 04 00`); at the end time
+/// the three pending children clear and `pvpFlag` is set (`06 07 00 00 <0> 02 01`); entering a
+/// sanctuary with the flag on clears `pvpFlag` and makes it pending again (`06 01 01 06 00 01`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FactionStateChange {
+    /// `pvpFlagPending`: the flag waits (in a sanctuary, or for its countdown).
+    pub pvp_flag_pending: Option<bool>,
+    /// `notifyPending`.
+    pub notify_pending: Option<bool>,
+    /// `pvpFlagPendingEndTime`: unix ns when the flag goes on; 0 for none.
+    pub pvp_flag_pending_end_ns: Option<u64>,
+    /// `lastFactionChangeTimepoint`: unix ns.
+    pub last_faction_change_ns: Option<u64>,
+    /// `factionChangeCount`.
+    pub faction_change_count: Option<u16>,
+    /// `faction`.
+    pub faction: Option<u8>,
+    /// `pvpFlag`: the player is flagged for PvP.
+    pub pvp_flag: Option<bool>,
+    /// `hasSanctuary`: the player is in a sanctuary.
+    pub has_sanctuary: Option<bool>,
 }
 
-impl FactionChange {
+impl FactionStateChange {
     /// The change's body bytes.
     ///
     /// # Errors
     ///
     /// Never fails today; the child writer's form keeps the signature of the other states.
     pub fn body(&self) -> Result<Vec<u8>, MessageError> {
+        let owner = [
+            self.pvp_flag_pending.is_some(),
+            self.notify_pending.is_some(),
+            self.pvp_flag_pending_end_ns.is_some(),
+            self.last_faction_change_ns.is_some(),
+            self.faction_change_count.is_some(),
+        ];
+        let public = [
+            self.faction.is_some(),
+            self.pvp_flag.is_some(),
+            self.has_sanctuary.is_some(),
+        ];
+        let mut slots = 0;
+        if owner.contains(&true) {
+            slots |= OWNER_SLOT;
+        }
+        if public.contains(&true) {
+            slots |= PUBLIC_SLOT;
+        }
         let mut writer = Writer::new();
-        let mut owner = [false; OWNER_CHILDREN as usize];
-        owner[CHANGED_AT_CHILD] = self.switched.is_some();
-        owner[CHANGES_CHILD] = self.switched.is_some();
-        let mut public = [false; PUBLIC_CHILDREN as usize];
-        public[FACTION_CHILD] = true;
-        let slots = if self.switched.is_some() {
-            OWNER_SLOT | PUBLIC_SLOT
-        } else {
-            PUBLIC_SLOT
-        };
         writer.u8(slots);
-        if let Some((changed_ns, changes)) = self.switched {
+        let flag = |value: Option<bool>| u8::from(value.unwrap_or_default());
+        if owner.contains(&true) {
             write_children(
                 &mut writer,
                 children_mask(&owner),
                 OWNER_CHILDREN,
                 |writer, child| {
-                    match usize::from(child) {
-                        CHANGED_AT_CHILD => writer.u64(changed_ns),
-                        _ => writer.u16(changes),
+                    match child {
+                        PVP_PENDING_CHILD => writer.u8(flag(self.pvp_flag_pending)),
+                        NOTIFY_PENDING_CHILD => writer.u8(flag(self.notify_pending)),
+                        PVP_PENDING_END_CHILD => {
+                            writer.u64(self.pvp_flag_pending_end_ns.unwrap_or_default())
+                        }
+                        CHANGED_AT_CHILD => {
+                            writer.u64(self.last_faction_change_ns.unwrap_or_default())
+                        }
+                        CHANGES_CHILD => writer.u16(self.faction_change_count.unwrap_or_default()),
+                        // The mask holds no other child.
+                        _ => writer,
                     };
                     Ok::<(), MessageError>(())
                 },
             )?;
         }
-        write_children(
-            &mut writer,
-            children_mask(&public),
-            PUBLIC_CHILDREN,
-            |writer, _| {
-                writer.u8(self.faction);
-                Ok::<(), MessageError>(())
-            },
-        )?;
+        if public.contains(&true) {
+            write_children(
+                &mut writer,
+                children_mask(&public),
+                PUBLIC_CHILDREN,
+                |writer, child| {
+                    match child {
+                        FACTION_CHILD => writer.u8(self.faction.unwrap_or_default()),
+                        PVP_FLAG_CHILD => writer.u8(flag(self.pvp_flag)),
+                        SANCTUARY_CHILD => writer.u8(flag(self.has_sanctuary)),
+                        // The mask holds no other child.
+                        _ => writer,
+                    };
+                    Ok::<(), MessageError>(())
+                },
+            )?;
+        }
         Ok(writer.finish())
     }
 
@@ -98,6 +152,44 @@ impl FactionChange {
                 body: self.body()?,
             },
         })
+    }
+}
+
+/// One change of the faction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FactionChange {
+    /// The faction now.
+    pub faction: u8,
+    /// For a change from one faction to another: the change's unix ns and the changes so far.
+    pub switched: Option<(u64, u16)>,
+}
+
+impl FactionChange {
+    fn state(&self) -> FactionStateChange {
+        FactionStateChange {
+            faction: Some(self.faction),
+            last_faction_change_ns: self.switched.map(|(changed_ns, _)| changed_ns),
+            faction_change_count: self.switched.map(|(_, changes)| changes),
+            ..FactionStateChange::default()
+        }
+    }
+
+    /// The change's body bytes.
+    ///
+    /// # Errors
+    ///
+    /// As [`FactionStateChange::body`].
+    pub fn body(&self) -> Result<Vec<u8>, MessageError> {
+        self.state().body()
+    }
+
+    /// The own member of the change.
+    ///
+    /// # Errors
+    ///
+    /// As [`FactionStateChange::body`].
+    pub fn member(&self) -> Result<BundleMember, MessageError> {
+        self.state().member()
     }
 }
 
@@ -121,7 +213,70 @@ mod tests {
             [6, 24, 24, 225, 187, 105, 224, 79, 186, 100, 0, 1, 1, 1]
         );
         let member = join.member().expect("member");
+        assert_eq!(
+            member,
+            FactionStateChange {
+                faction: Some(3),
+                ..FactionStateChange::default()
+            }
+            .member()
+            .expect("same member")
+        );
         assert_eq!(member.component, FACTION_COMPONENT);
         assert_eq!(member.state.type_index(), FACTION_TYPE_INDEX);
+    }
+
+    /// The PvP flag bodies of `Hive_flag_pvp_on_and_off` (own component 49), in ledger order.
+    #[test]
+    fn the_pvp_flag_changes_are_the_retail_bodies() {
+        const END_NS: u64 = 0x18bd_da4c_f21c_6278;
+        let change = FactionStateChange::default;
+        let toggle_on = FactionStateChange {
+            pvp_flag_pending: Some(true),
+            notify_pending: Some(true),
+            ..change()
+        };
+        assert_eq!(toggle_on.body().expect("on"), [0x02, 0x03, 0x01, 0x01]);
+        let entered = FactionStateChange {
+            has_sanctuary: Some(true),
+            ..change()
+        };
+        assert_eq!(entered.body().expect("entered"), [0x04, 0x04, 0x01]);
+        let left = FactionStateChange {
+            pvp_flag_pending_end_ns: Some(END_NS),
+            has_sanctuary: Some(false),
+            ..change()
+        };
+        let mut expected = vec![0x06, 0x04];
+        expected.extend(END_NS.to_be_bytes());
+        expected.extend([0x04, 0x00]);
+        assert_eq!(left.body().expect("left"), expected);
+        let flagged = FactionStateChange {
+            pvp_flag_pending: Some(false),
+            notify_pending: Some(false),
+            pvp_flag_pending_end_ns: Some(0),
+            pvp_flag: Some(true),
+            ..change()
+        };
+        assert_eq!(
+            flagged.body().expect("flagged"),
+            [0x06, 0x07, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x01]
+        );
+        let back_in = FactionStateChange {
+            pvp_flag_pending: Some(true),
+            pvp_flag: Some(false),
+            has_sanctuary: Some(true),
+            ..change()
+        };
+        assert_eq!(
+            back_in.body().expect("back in"),
+            [0x06, 0x01, 0x01, 0x06, 0x00, 0x01]
+        );
+        let toggle_off = FactionStateChange {
+            pvp_flag_pending: Some(false),
+            notify_pending: Some(true),
+            ..change()
+        };
+        assert_eq!(toggle_off.body().expect("off"), [0x02, 0x03, 0x00, 0x01]);
     }
 }

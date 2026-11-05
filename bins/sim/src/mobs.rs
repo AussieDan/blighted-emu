@@ -28,6 +28,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+use nw_ai::data::SliceTriggerRef;
 use nw_ai::value::NameId;
 use nw_bus::{MOB_ENTITY_BASE, MOB_STATES, MobGhost, SnapMob};
 use nw_content::combat::CombatData;
@@ -41,8 +42,8 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::combat::CombatSettings;
 use crate::mob_ai::{
-    COMBAT_LEASH_KEY, MobAi, Shown, SpawnAi, Strike, Summon, Surroundings, TreeMind, floor_line,
-    height_after_move,
+    COMBAT_LEASH_KEY, HeldEffects, MobAi, RemoteFact, Shown, SpawnAi, Strike, Summon, Surroundings,
+    TaggedMob, TreeMind, floor_line, height_after_move,
 };
 use crate::objectives::KillTypes;
 
@@ -417,6 +418,13 @@ pub struct Mobs {
     /// The encounter events the mobs' trees sent since the last
     /// [`Mobs::take_encounter_events`]: (mob, event id).
     encounter_events: Vec<(u64, String)>,
+    /// The slice triggers the mobs ran since the last [`Mobs::take_triggers`]: (mob, trigger).
+    triggers: Vec<(u64, SliceTriggerRef)>,
+    /// The status effects the sim holds on each mob ([`Mobs::set_held_effects`]).
+    held: FxHashMap<u64, HeldEffects>,
+    /// The status effects the mobs' trees put on them (`true`) or took off since the last
+    /// [`Mobs::take_status_changes`]: (mob, effect id, put on).
+    status_changes: Vec<(u64, String, bool)>,
 }
 
 /// Metres between mobs spawned together (a GM command, a tree's summon), on a ring around the
@@ -545,6 +553,16 @@ struct Step {
     encounter_events: Vec<NameId>,
     /// The mobs its tree spawned.
     summons: Vec<Summon>,
+    /// The slice triggers it ran.
+    triggers: Vec<SliceTriggerRef>,
+    /// The triggers it ran on other mobs: (mob, trigger name).
+    remote_triggers: Vec<(u64, NameId)>,
+    /// The facts it set on other mobs.
+    remote_facts: Vec<RemoteFact>,
+    /// The orders it gave other mobs: (mob, order).
+    orders: Vec<(u64, u32)>,
+    /// The status effects its tree put on it or took off.
+    status_changes: Vec<(NameId, bool)>,
 }
 
 /// A mob that a tree spawned.
@@ -563,6 +581,10 @@ struct TickView<'a> {
     ground: &'a (dyn Ground + Sync),
     wake_m: f32,
     now_ms: u64,
+    /// The mobs with networked tags.
+    tagged: &'a [TaggedMob],
+    /// The status effects on the mobs.
+    held: &'a FxHashMap<u64, HeldEffects>,
 }
 
 impl TickView<'_> {
@@ -588,6 +610,11 @@ impl TickView<'_> {
             ticked: false,
             encounter_events: Vec::new(),
             summons: Vec::new(),
+            triggers: Vec::new(),
+            remote_triggers: Vec::new(),
+            remote_facts: Vec::new(),
+            orders: Vec::new(),
+            status_changes: Vec::new(),
         };
         if let Mind::Tree(mind) = &mob.mind
             && !mind.due(self.now_ms)
@@ -612,6 +639,9 @@ impl TickView<'_> {
             // A share of a health bar.
             #[allow(clippy::cast_precision_loss, reason = "a share of a health bar")]
             health_share: mob.health.current() as f32 / mob.health.max().max(1) as f32,
+            entity: mob_entity(index),
+            tagged: self.tagged,
+            held: self.held.get(&mob_entity(index)),
         };
         if !mob.grounded {
             mob.position.z = height_after_move(self.ground, mob.position);
@@ -626,6 +656,11 @@ impl TickView<'_> {
         step.ticked = thought.ticked;
         step.encounter_events = thought.encounter_events;
         step.summons = thought.summons;
+        step.triggers = thought.triggers;
+        step.remote_triggers = thought.remote_triggers;
+        step.remote_facts = thought.remote_facts;
+        step.orders = thought.orders;
+        step.status_changes = mind.take_status_changes();
         step.hits = thought
             .hits
             .into_iter()
@@ -670,6 +705,9 @@ impl Mobs {
             respawned: Vec::new(),
             slept: Vec::new(),
             encounter_events: Vec::new(),
+            triggers: Vec::new(),
+            held: FxHashMap::default(),
+            status_changes: Vec::new(),
         }
     }
 
@@ -701,6 +739,11 @@ impl Mobs {
     /// The encounter events the mobs' trees sent since the last call: (mob, event id).
     pub fn take_encounter_events(&mut self) -> Vec<(u64, String)> {
         std::mem::take(&mut self.encounter_events)
+    }
+
+    /// The slice triggers the mobs ran since the last call: (mob, trigger).
+    pub fn take_triggers(&mut self) -> Vec<(u64, SliceTriggerRef)> {
+        std::mem::take(&mut self.triggers)
     }
 
     /// The archetype of a mob of `spawn` shown with slice asset `asset` (else its vitals id's
@@ -1245,6 +1288,7 @@ impl Mobs {
         }
         self.respawn_due(now_ms);
         self.wake_near(players);
+        let tagged = self.tagged_mobs();
         let mut chasers: Vec<u32> = Vec::new();
         let steps: Vec<Step> = {
             let mut trees: Vec<(u32, &mut Mob)> = Vec::new();
@@ -1252,10 +1296,18 @@ impl Mobs {
                 if !mob.awake || mob.dead_since_ms.is_some() || mob.health.is_dead() {
                     continue;
                 }
-                if self
-                    .personal
-                    .get(index)
-                    .is_some_and(|personal| now_ms < personal.frozen_until_ms)
+                // A stunned paced mob waits as a frozen one (a tree mob's own step holds it,
+                // [`TreeMind::step`]).
+                let stunned = matches!(mob.mind, Mind::Chase(_))
+                    && self
+                        .held
+                        .get(&mob_entity(*index))
+                        .is_some_and(|held| !held.control.may_fight());
+                if stunned
+                    || self
+                        .personal
+                        .get(index)
+                        .is_some_and(|personal| now_ms < personal.frozen_until_ms)
                 {
                     if let Mind::Chase(brain) = &mut mob.mind {
                         // A frozen mob's step clock waits with it (live 2026-09-14: each sailor
@@ -1277,6 +1329,8 @@ impl Mobs {
                 ground,
                 wake_m,
                 now_ms,
+                tagged: &tagged,
+                held: &self.held,
             };
             let threads = threads.min(trees.len() / MIN_MOBS_PER_THREAD).max(1);
             if threads == 1 {
@@ -1320,6 +1374,26 @@ impl Mobs {
             for summon in step.summons {
                 self.summon(step.index, summon);
             }
+            let mob = mob_entity(step.index);
+            self.triggers
+                .extend(step.triggers.into_iter().map(|trigger| (mob, trigger)));
+            for (target, trigger) in step.remote_triggers {
+                self.trigger_remote(target, trigger);
+            }
+            for fact in step.remote_facts {
+                if let Some(mind) = self.tree_mut(fact.mob) {
+                    mind.set_remote_fact(&fact);
+                }
+            }
+            for (target, order) in step.orders {
+                if let Some(mind) = self.tree_mut(target) {
+                    mind.assign_order(order);
+                }
+            }
+            for (effect, on) in step.status_changes {
+                let effect = self.ai.name(effect).to_owned();
+                self.status_changes.push((mob, effect, on));
+            }
             intents.extend(step.hits);
             if let Some(target) = step.acquired {
                 acquired.push((step.index, target));
@@ -1333,6 +1407,71 @@ impl Mobs {
             intents.extend(self.chase(index, &player_grid, wake_m, now_ms));
         }
         intents
+    }
+
+    /// The awake living tree mobs whose trees gave them networked tags.
+    fn tagged_mobs(&self) -> Vec<TaggedMob> {
+        self.awake
+            .iter()
+            .filter_map(|index| {
+                let mob = self.live.get(index)?;
+                let mind = mob.tree().filter(|mind| !mind.nw_tags().is_empty())?;
+                (mob.dead_since_ms.is_none() && !mob.health.is_dead()).then(|| TaggedMob {
+                    entity: mob_entity(*index),
+                    position: mob.position,
+                    tags: mind.nw_tags().to_vec(),
+                })
+            })
+            .collect()
+    }
+
+    /// The tree of living mob `entity`.
+    fn tree_mut(&mut self, entity: u64) -> Option<&mut TreeMind> {
+        let mob = self.live.get_mut(&spawn_index(entity)?)?;
+        if mob.dead_since_ms.is_some() || mob.health.is_dead() {
+            return None;
+        }
+        match &mut mob.mind {
+            Mind::Tree(mind) => Some(mind),
+            Mind::Chase(_) | Mind::Still => None,
+        }
+    }
+
+    /// Another mob's tree runs the slice triggers named `trigger` on mob `target`
+    /// (`TriggerRemoteEntity`): each goes to the clients that show `target` as a 3135.
+    fn trigger_remote(&mut self, target: u64, trigger: NameId) {
+        let name = self.ai.name(trigger);
+        let found: Vec<SliceTriggerRef> = self
+            .live
+            .get(&spawn_index(target).unwrap_or(u32::MAX))
+            .and_then(Mob::tree)
+            .and_then(|mind| self.ai.arch(mind.archetype()))
+            .map(|arch| {
+                arch.triggers_named(name, |id| self.ai.name(id))
+                    .copied()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if found.is_empty() {
+            tracing::debug!(
+                target,
+                trigger = name,
+                "remote trigger of no slice component"
+            );
+        }
+        self.triggers
+            .extend(found.into_iter().map(|trigger| (target, trigger)));
+    }
+
+    /// The status effects the sim holds on each mob, for the mobs' next tick.
+    pub fn set_held_effects(&mut self, held: FxHashMap<u64, HeldEffects>) {
+        self.held = held;
+    }
+
+    /// The status effects the mobs' trees put on them (`true`) or took off since the last call:
+    /// (mob, effect id, put on).
+    pub fn take_status_changes(&mut self) -> Vec<(u64, String, bool)> {
+        std::mem::take(&mut self.status_changes)
     }
 
     /// Respawns the dead world and GM mobs whose respawn time came.
@@ -1820,6 +1959,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::{Duration, Instant};
 
+    use nw_content::status_effects::Control;
     use nw_formats::objectstream::lowercase_crc32;
     use nw_sim_core::{Ground, MobState};
     use nw_world::WorldFile;
@@ -2132,6 +2272,54 @@ mod tests {
         );
         assert_eq!(at(&mobs, 0).z, HEIGHT, "it stands on the ground");
         assert!(at(&mobs, 0).horizontal_distance(player.position) <= TEST_REACH_M);
+    }
+
+    /// A stun the sim holds on a tree mob keeps it where it stands and its tree still; a root
+    /// keeps it in place while its tree runs; once they end it runs to its target.
+    #[test]
+    fn a_stunned_or_rooted_tree_mob_stays_where_it_stands() {
+        const START_M: f32 = 15.0;
+        const STEPS: u64 = 30;
+        let mut spawn = spawn_at(SPAWN_X, TEST_MOB, TEST_LEVEL);
+        spawn.position[2] = 0.0;
+        let mut mobs = mobs(vec![spawn]);
+        mobs.set_cells(every);
+        let player = player_at(SPAWN_X + START_M);
+        let held = |control| {
+            FxHashMap::from_iter([(
+                mob_entity(0),
+                HeldEffects {
+                    control,
+                    ..HeldEffects::default()
+                },
+            )])
+        };
+        let start = at(&mobs, 0);
+        let mut now = 0;
+        let mut steps = |mobs: &mut Mobs| {
+            for _ in 0..STEPS {
+                tick(mobs, &[player], now);
+                now += TICK_MS;
+            }
+        };
+        mobs.set_held_effects(held(Control {
+            stunned: true,
+            ..Control::default()
+        }));
+        steps(&mut mobs);
+        let moved = |mobs: &Mobs| at(mobs, 0).horizontal_distance(start);
+        assert!(moved(&mobs) < f32::EPSILON, "stunned");
+        assert_eq!(mobs.target(mob_entity(0)), None, "its tree waits");
+        mobs.set_held_effects(held(Control {
+            no_dodge: true,
+            ..Control::default()
+        }));
+        steps(&mut mobs);
+        assert!(moved(&mobs) < f32::EPSILON, "rooted");
+        assert_eq!(mobs.target(mob_entity(0)), Some(PLAYER), "it thinks");
+        mobs.set_held_effects(FxHashMap::default());
+        steps(&mut mobs);
+        assert!(moved(&mobs) > 0.0, "free, it runs");
     }
 
     #[test]
@@ -3671,7 +3859,10 @@ mod retail_tests {
                 &mut trace,
             );
             if mobs.target(mob_entity(0)) != Some(PLAYER) {
-                stuck.push(format!("bearing {bearing}, player stays {stay}: no aggro {:?}", trace.1));
+                stuck.push(format!(
+                    "bearing {bearing}, player stays {stay}: no aggro {:?}",
+                    trace.1
+                ));
                 continue;
             }
             let walk_ms = (OUT_M / WALK_MPS * 1_000.0) as u64;
@@ -3714,7 +3905,11 @@ mod retail_tests {
                         },
                     }
                 };
-                let seen: Vec<Seen> = if stay { vec![beside(&mobs)] } else { Vec::new() };
+                let seen: Vec<Seen> = if stay {
+                    vec![beside(&mobs)]
+                } else {
+                    Vec::new()
+                };
                 if stay && later % HIT_EVERY_MS < TICK_MS {
                     mobs.provoke(mob_entity(0), PLAYER, later);
                 }

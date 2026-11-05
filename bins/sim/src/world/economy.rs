@@ -24,12 +24,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use bevy_ecs::entity::Entity;
-use nw_bus::ConnectionRef;
+use nw_bus::{ConnectionRef, ItemState};
 use nw_common::time::unix_ms;
 use nw_content::progression::Mastery;
 use nw_db::{
     CharacterOrders, Completed, DbError, Delivery, DeliveryNotice, NewOrder, Order, OrderKind,
-    OrderPage, OrderRefusal, OrderSearch, OrderStatus, PgPool, TakenDelivery, TradeSide,
+    OrderPage, OrderRefusal, OrderSearch, OrderStatus, PgPool, SavedItemRolls, TakenDelivery,
+    TradeSide,
 };
 use nw_formats::objectstream::lowercase_crc32;
 use nw_messages::contracts::{
@@ -41,8 +42,8 @@ use nw_messages::contracts::{
 };
 use nw_messages::gear::record;
 use nw_messages::items::{
-    FullList, ItemRecord, SYNC_OWNED, SYNC_TRADING_POST_BOUGHT, SYNC_TRADING_POST_RETURNED,
-    SYNC_TRADING_POST_TAKEN,
+    FullList, ItemRecord, SYNC_MOVED, SYNC_OWNED, SYNC_TRADING_POST_BOUGHT,
+    SYNC_TRADING_POST_RETURNED, SYNC_TRADING_POST_TAKEN,
 };
 use nw_messages::p2p_trade::{
     OfferedStack, P2P_TRADE_COMPONENT, P2P_TRADE_STATE_KEY, P2PTradeState, TradeCall, TradeMessage,
@@ -58,9 +59,10 @@ use nw_messages::{
 };
 use uuid::Uuid;
 
-use super::gear::{Gear, MAX_CONTAINER_SLOTS};
+use super::gear::{BagEntry, Gear, ItemRefusal, MAX_CONTAINER_SLOTS, MovedStack};
 use super::quest_objects::with_coins;
 use super::{Body, Player, SimWorld, gather_answer, send_now};
+use crate::server::{saved_rolls, stored_values};
 use crate::shop::ShopOffer;
 use crate::trading_post::{
     ContractView, MS_PER_DAY, TradeItem, completion_cost, contract_of, next_page_token, order_kind,
@@ -71,6 +73,8 @@ use crate::trading_post::{
 pub(super) const TRADING_POST_KIND: u8 = 21;
 /// The status of an accepted interaction.
 const INTERACTION_ACCEPTED: u8 = 1;
+/// The status of a refused use of the trading post (Inferred: the refusal of a busy gather, 2).
+const INTERACTION_REFUSED: u8 = 2;
 /// The unnamed `u32` of retail's answer to a trading post interaction (Observed: all 14 answers
 /// of 5 captures, at T3 and T5 trading posts).
 const TRADING_POST_ANSWER_EXTRA: u32 = 0x5a3f_1797;
@@ -85,6 +89,8 @@ const MAX_PAGE: u32 = 100;
 const SEARCH_INTERVAL_MS: u64 = 1_000;
 /// The `ContractType` value of a make-good contract, which this server has none of.
 const MAKE_GOOD_KIND: u32 = 2;
+/// The `PerkType` of a gem perk; an order item counts its gems (`m_gemPerkCount`).
+const GEM_PERK_TYPE: &str = "Gem";
 /// Metric: economy calls by `call` and `result`.
 pub const METRIC_ECONOMY_CALLS: &str = "sim_economy_calls_total";
 /// Metric: deliveries given to players.
@@ -103,6 +109,8 @@ pub struct Refund {
     pub coins: u64,
     /// Items: id and quantity.
     pub items: Option<(String, u32)>,
+    /// The own values of the stack taken ([`MovedStack::values`]); `None` for a plain item.
+    pub values: Option<ItemState>,
 }
 
 impl Refund {
@@ -120,7 +128,13 @@ impl Refund {
             item: self.items.clone(),
             completed_count: 0,
             request: None,
+            rolls: self.rolls(),
         }
+    }
+
+    /// The own values of the stack taken as the database stores them.
+    fn rolls(&self) -> SavedItemRolls {
+        self.values.as_ref().map(saved_rolls).unwrap_or_default()
     }
 }
 
@@ -166,7 +180,7 @@ pub enum EconomyJob {
         /// Who posts.
         caller: Caller,
         /// The order.
-        order: NewOrder,
+        order: Box<NewOrder>,
         /// What the sim took for it.
         refund: Refund,
     },
@@ -430,6 +444,7 @@ pub async fn run_job(world: &PgPool, job: EconomyJob) -> Option<EconomyResult> {
                 units,
                 tax_rate,
                 Uuid::from_bytes(caller.request),
+                &refund.rolls(),
                 unix_ms(),
             )
             .await,
@@ -890,9 +905,9 @@ impl SimWorld {
     /// Player `number` (`entity`) opens the trading post of `request`, whose name its client
     /// sends (`@TradingPostT5_MasterName`): accepted with the name and retail's `u32`
     /// ([`TRADING_POST_ANSWER_EXTRA`]); the post's settlement is the one whose capital is
-    /// nearest to the player ([`crate::trading_post::Settlements::nearest`]). Without one (a
-    /// level without settlements) the post is opened without a settlement, and a create is
-    /// refused with `InvalidOutpost`.
+    /// nearest to the player ([`crate::trading_post::Settlements::nearest`]). Far from every
+    /// settlement the use is refused (status 2, Inferred as for a busy gather): a client cannot
+    /// open the trading post from anywhere.
     pub(super) fn open_trading_post(
         &mut self,
         entity: Entity,
@@ -909,20 +924,20 @@ impl SimWorld {
             return;
         };
         let connection = player.connection.clone();
-        match outpost {
-            Some(outpost) => {
-                self.economy.posts.insert(number, outpost);
-            }
-            None => {
-                self.economy.posts.remove(&number);
-            }
-        }
+        let Some(outpost) = outpost else {
+            self.economy.posts.remove(&number);
+            tracing::debug!(player = number, "trading post far from every settlement");
+            let refusal = gather_answer(number, request, INTERACTION_REFUSED, &[]);
+            send_now(&mut self.combat_messages, &connection, &[refusal]);
+            return;
+        };
+        self.economy.posts.insert(number, outpost);
         let mut answer = gather_answer(number, request, INTERACTION_ACCEPTED, name);
         if let ServerMessage::InteractionValidated(validated) = &mut answer {
             validated.extra = TRADING_POST_ANSWER_EXTRA;
         }
         send_now(&mut self.combat_messages, &connection, &[answer]);
-        tracing::debug!(player = number, ?outpost, "trading post opened");
+        tracing::debug!(player = number, outpost, "trading post opened");
     }
 
     /// A create call (2972) of player `entity`: checked here, its coins and items taken, then
@@ -971,25 +986,54 @@ impl SimWorld {
         };
         let tax_rate = rules.tax_at(outpost);
         let max_open = rules.max_open_orders;
-        let gear_score = match kind {
-            OrderKind::Sell => content
-                .kits
-                .item(&item.item_id)
-                .map_or(0, |kit| kit.gear_score),
-            OrderKind::Buy => 0,
-        };
-        let refund = match self.take_for_order(entity, kind, &item, order.count, total, fee) {
+        let named = Some(order.instance()).filter(|instance| *instance != [0; RAW_ID_LEN]);
+        let refund = match self.take_for_order(entity, kind, &item, named, order.count, total, fee)
+        {
             Ok(refund) => refund,
             Err(failure_reason) => return refused(self, failure_reason),
         };
+        let order_item = match kind {
+            OrderKind::Sell => {
+                let kit = content.kits.item(&item.item_id);
+                let values = refund.values.as_ref();
+                let gear_score = values
+                    .and_then(|values| values.gear_score)
+                    .or_else(|| kit.map(|kit| kit.gear_score))
+                    .unwrap_or_default();
+                let perks: Vec<String> = values
+                    .and_then(|values| values.perks.clone())
+                    .or_else(|| kit.map(|kit| kit.perk_ids.clone()))
+                    .unwrap_or_default();
+                let gems = perks
+                    .iter()
+                    .filter(|perk| {
+                        content
+                            .item_rolls
+                            .perks
+                            .perk(perk)
+                            .is_some_and(|perk| perk.perk_type == GEM_PERK_TYPE)
+                    })
+                    .count();
+                item.order_item(
+                    gear_score,
+                    perks.iter().map(|perk| lowercase_crc32(perk)).collect(),
+                    u32::try_from(gems).unwrap_or(u32::MAX),
+                    SavedItemRolls {
+                        gear_score: None,
+                        ..refund.rolls()
+                    },
+                )
+            }
+            OrderKind::Buy => item.order_item(0, Vec::new(), 0, SavedItemRolls::default()),
+        };
         count_call("create", true);
         self.economy.jobs.push(EconomyJob::Post {
-            order: NewOrder {
+            order: Box::new(NewOrder {
                 id: Uuid::new_v4(),
                 kind,
                 creator: caller.character,
                 outpost,
-                item: item.order_item(gear_score),
+                item: order_item,
                 price: order.price,
                 quantity: order.count,
                 tax_rate,
@@ -997,19 +1041,23 @@ impl SimWorld {
                 expires_ms: now_ms.saturating_add(u64::from(order.days) * MS_PER_DAY),
                 posting_fee: fee,
                 max_open,
-            },
+            }),
             caller,
             refund,
         });
     }
 
     /// Takes from player `entity` what a new order of `count` units of `item` worth `total`
-    /// costs: the posting fee, and a buy order's total or a sell order's units.
+    /// costs: the posting fee, and a buy order's total or a sell order's units (the stack of
+    /// instance `named` when the call names one), with their own values. A locked or bound
+    /// stack is not sold.
+    #[allow(clippy::too_many_arguments, reason = "one order's costs")]
     fn take_for_order(
         &mut self,
         entity: Entity,
         kind: OrderKind,
         item: &TradeItem,
+        named: Option<[u8; RAW_ID_LEN]>,
         count: u32,
         total: u64,
         fee: u64,
@@ -1024,23 +1072,27 @@ impl SimWorld {
         if player.coins < coins {
             return Err(failure::INSUFFICIENT_GOLD);
         }
-        let items = match kind {
+        let (items, values) = match kind {
             OrderKind::Sell => {
-                let taken = player.gear.as_mut().is_some_and(|gear| {
-                    gear.take_as(&item.item_id, count, SYNC_TRADING_POST_TAKEN)
-                });
-                if !taken {
-                    return Err(failure::INSUFFICIENT_ITEMS);
-                }
-                Some((item.item_id.clone(), count))
+                let moved = player
+                    .gear
+                    .as_mut()
+                    .ok_or(failure::INSUFFICIENT_ITEMS)?
+                    .take_offered(&item.item_id, named, count, Some(SYNC_TRADING_POST_TAKEN))
+                    .map_err(|_| failure::INSUFFICIENT_ITEMS)?;
+                (Some((item.item_id.clone(), count)), moved.values)
             }
-            OrderKind::Buy => None,
+            OrderKind::Buy => (None, None),
         };
         if coins > 0 {
             player.coins -= coins;
             player.coins_changed = true;
         }
-        Ok(Refund { coins, items })
+        Ok(Refund {
+            coins,
+            items,
+            values,
+        })
     }
 
     /// Gives `refund` back to the player of `caller`: at once when it plays here, else as a
@@ -1080,10 +1132,11 @@ impl SimWorld {
         storage: Option<[u8; RAW_ID_LEN]>,
     ) -> Option<Delivery> {
         let wallet_cap = self.content.gameplay.wallet_cap;
+        let content = Arc::clone(&self.content);
         let kit = delivery
             .item
             .as_ref()
-            .and_then(|(item, _)| self.content.kits.item(item).cloned());
+            .and_then(|(item, _)| content.kits.item(item).cloned());
         let mut player = self.world.get_mut::<Player>(entity)?;
         let mut leftover = Delivery {
             coins: 0,
@@ -1102,16 +1155,37 @@ impl SimWorld {
             } else {
                 SYNC_TRADING_POST_RETURNED
             };
-            // A bag that fills part way keeps what it took: only the rest waits.
+            // A stack with values of its own goes whole or waits whole (with its values); a bag
+            // that fills part way with a plain item keeps what it took: only the rest waits.
+            let values = (delivery.rolls != SavedItemRolls::default())
+                .then(|| stored_values(&delivery.rolls));
             let given = match (&kit, player.gear.as_mut(), storage) {
                 (Some(kit), Some(gear), Some(storage)) => {
-                    u32::from(gear.store_new(storage, kit, quantity, reason)) * quantity
+                    let stored = match &values {
+                        Some(values) => gear.store_with_values(
+                            storage,
+                            &content.kits,
+                            kit,
+                            quantity,
+                            values,
+                            reason,
+                        ),
+                        None => gear.store_new(storage, kit, quantity, reason),
+                    };
+                    u32::from(stored) * quantity
                 }
-                (Some(kit), Some(gear), None) => {
-                    let before = gear.bag_count(&item);
-                    gear.add_as(kit, quantity, reason);
-                    gear.bag_count(&item).saturating_sub(before).min(quantity)
-                }
+                (Some(kit), Some(gear), None) => match &values {
+                    Some(values) => {
+                        let put =
+                            gear.add_with_values(&content.kits, kit, quantity, values, reason);
+                        u32::from(put) * quantity
+                    }
+                    None => {
+                        let before = gear.bag_count(&item);
+                        gear.add_as(kit, quantity, reason);
+                        gear.bag_count(&item).saturating_sub(before).min(quantity)
+                    }
+                },
                 _ => 0,
             };
             if given < quantity {
@@ -1320,17 +1394,17 @@ impl SimWorld {
             let paid = if player.coins < coins {
                 Err(failure::INSUFFICIENT_GOLD)
             } else if let Some((item, units)) = &items {
-                let taken = player
+                player
                     .gear
                     .as_mut()
-                    .is_some_and(|gear| gear.take_as(item, *units, SYNC_TRADING_POST_TAKEN));
-                if taken {
-                    Ok(())
-                } else {
-                    Err(failure::INSUFFICIENT_ITEMS)
-                }
+                    .ok_or(failure::INSUFFICIENT_ITEMS)
+                    .and_then(|gear| {
+                        gear.take_offered(item, None, *units, Some(SYNC_TRADING_POST_TAKEN))
+                            .map_err(|_| failure::INSUFFICIENT_ITEMS)
+                    })
+                    .map(|moved| moved.values)
             } else {
-                Ok(())
+                Ok(None)
             };
             if paid.is_ok() && coins > 0 {
                 player.coins -= coins;
@@ -1338,15 +1412,22 @@ impl SimWorld {
             }
             paid
         };
-        if let Err(failure_reason) = taken {
-            return self.reply(caller, &[action_failed(caller, failure_reason)]);
-        }
+        let values = match taken {
+            Ok(values) => values,
+            Err(failure_reason) => {
+                return self.reply(caller, &[action_failed(caller, failure_reason)]);
+            }
+        };
         self.economy.jobs.push(EconomyJob::Complete {
             caller: caller.clone(),
             order: order.id,
             units: call.units,
             tax_rate,
-            refund: Refund { coins, items },
+            refund: Refund {
+                coins,
+                items,
+                values,
+            },
         });
     }
 
@@ -1998,7 +2079,11 @@ impl SimWorld {
         self.end_trade(a.number, reason_value);
     }
 
-    /// Moves `a`'s offer to `b` and `b`'s to `a`; the audit sides, or why nothing moved.
+    /// Moves `a`'s offer to `b` and `b`'s to `a`; the audit sides, or why nothing moved. Each
+    /// stack goes whole, with its own values (gear score, perks, durability, bind state, look).
+    /// A stack no longer offered as it was, a locked or bound one, too few coins, a full wallet
+    /// or a bag without room for the other's offer moves nothing: every stack taken goes back
+    /// to its owner.
     fn swap(
         &mut self,
         a: &TradeSideState,
@@ -2020,66 +2105,120 @@ impl SimWorld {
                 return Err(trade_failure::CANNOT_RECEIVE_ITEMS);
             }
         }
-        let kits: Vec<_> = a_items
-            .iter()
-            .chain(&b_items)
-            .map(|(_, item, _)| self.content.kits.item(item).cloned())
-            .collect();
-        if kits.iter().any(Option::is_none) {
-            return Err(trade_failure::INVALID_ITEMS);
-        }
-        for (side, items) in [(a, &a_items), (b, &b_items)] {
-            let mut player = self
-                .world
-                .get_mut::<Player>(side.entity)
-                .ok_or(trade_failure::FAILED_TO_REMOVE)?;
-            if !items.is_empty() {
-                let Some(gear) = player.gear.as_mut() else {
-                    return Err(trade_failure::FAILED_TO_REMOVE);
-                };
-                for (slot, _, quantity) in items.iter() {
-                    if !gear.take_from_slot(*slot, *quantity) {
-                        return Err(trade_failure::FAILED_TO_REMOVE);
-                    }
-                }
+        let a_moved = self.take_offers(a, &a_items)?;
+        let b_moved = match self.take_offers(b, &b_items) {
+            Ok(moved) => moved,
+            Err(failure_value) => {
+                self.put_stacks(a.entity, a_moved);
+                return Err(failure_value);
             }
-            player.coins -= side.coin;
-            player.coins_changed = true;
+        };
+        if !self.has_room(b.entity, &a_moved) || !self.has_room(a.entity, &b_moved) {
+            self.put_stacks(a.entity, a_moved);
+            self.put_stacks(b.entity, b_moved);
+            return Err(trade_failure::CANNOT_RECEIVE_ITEMS);
         }
-        let mut kits = kits.into_iter().flatten();
-        for (side, items, coin) in [(b, &a_items, a.coin), (a, &b_items, b.coin)] {
-            let mut player = self
-                .world
-                .get_mut::<Player>(side.entity)
-                .ok_or(trade_failure::CANNOT_RECEIVE_ITEMS)?;
-            player.coins = player.coins.saturating_add(coin);
-            player.coins_changed = true;
-            for (_, item, quantity) in items {
-                let Some(kit) = kits.next() else {
-                    return Err(trade_failure::CANNOT_RECEIVE_ITEMS);
-                };
-                let added = player
-                    .gear
-                    .as_mut()
-                    .is_some_and(|gear| gear.add(&kit, *quantity));
-                if !added {
-                    tracing::error!(item = %item, quantity, "a traded stack did not fit the bag");
-                }
+        for (side, gains) in [(a, b.coin), (b, a.coin)] {
+            if let Some(mut player) = self.world.get_mut::<Player>(side.entity) {
+                player.coins = (player.coins - side.coin).saturating_add(gains);
+                player.coins_changed = true;
             }
         }
-        let audit = |side: &TradeSideState, items: &[(u32, String, u32)]| TradeSide {
+        let audit = |side: &TradeSideState, moved: &[MovedStack]| TradeSide {
             character: side.character,
             coins: side.coin,
-            items: items
+            items: moved
                 .iter()
-                .map(|(_, item, quantity)| (item.clone(), *quantity))
+                .map(|stack| (stack.item_id.clone(), stack.quantity))
                 .collect(),
         };
-        Ok((audit(a, &a_items), audit(b, &b_items)))
+        let sides = (audit(a, &a_moved), audit(b, &b_moved));
+        self.put_stacks(b.entity, a_moved);
+        self.put_stacks(a.entity, b_moved);
+        Ok(sides)
     }
 
-    /// The bag slot, item id and quantity of each stack `side` offers, still in its bag.
-    fn offered_items(&self, side: &TradeSideState) -> Result<Vec<(u32, String, u32)>, u32> {
+    /// Takes each of `items` (item id, instance, quantity) out of `side`'s bag; on a refusal the
+    /// stacks taken go back and nothing is taken.
+    fn take_offers(
+        &mut self,
+        side: &TradeSideState,
+        items: &[(String, [u8; RAW_ID_LEN], u32)],
+    ) -> Result<Vec<MovedStack>, u32> {
+        let mut moved = Vec::with_capacity(items.len());
+        for (item, instance, quantity) in items {
+            let taken = self
+                .world
+                .get_mut::<Player>(side.entity)
+                .and_then(|mut player| {
+                    let gear = player.gear.as_mut()?;
+                    Some(gear.take_offered(item, Some(*instance), *quantity, None))
+                })
+                .unwrap_or(Err(ItemRefusal::NoSuchItem));
+            match taken {
+                Ok(stack) => moved.push(stack),
+                Err(refusal) => {
+                    self.put_stacks(side.entity, moved);
+                    return Err(match refusal {
+                        ItemRefusal::Locked | ItemRefusal::Bound => trade_failure::INVALID_ITEMS,
+                        _ => trade_failure::FAILED_TO_REMOVE,
+                    });
+                }
+            }
+        }
+        Ok(moved)
+    }
+
+    /// Whether the bag of player `entity` takes every one of `stacks` at once (nothing always
+    /// fits; an item without a master row never does).
+    pub(super) fn has_room(&self, entity: Entity, stacks: &[MovedStack]) -> bool {
+        let entries: Option<Vec<BagEntry<'_>>> = stacks
+            .iter()
+            .map(|stack| {
+                let item = self.content.kits.item(&stack.item_id)?;
+                Some((item, stack.quantity, stack.values.is_some()))
+            })
+            .collect();
+        stacks.is_empty()
+            || entries.is_some_and(|entries| {
+                self.world
+                    .get::<Player>(entity)
+                    .and_then(|player| player.gear.as_ref())
+                    .is_some_and(|gear| gear.has_room_for(&entries))
+            })
+    }
+
+    /// Puts `stacks` into the bag of player `entity`, each with its own values. Callers check
+    /// [`SimWorld::has_room`] first, or give back stacks just taken from that bag.
+    fn put_stacks(&mut self, entity: Entity, stacks: Vec<MovedStack>) {
+        let content = Arc::clone(&self.content);
+        let Some(mut player) = self.world.get_mut::<Player>(entity) else {
+            return;
+        };
+        let Some(gear) = player.gear.as_mut() else {
+            return;
+        };
+        for stack in stacks {
+            let put = content.kits.item(&stack.item_id).is_some_and(|item| {
+                gear.put_moved(
+                    &content.kits,
+                    item,
+                    stack.quantity,
+                    stack.values.as_ref(),
+                    SYNC_MOVED,
+                )
+            });
+            if !put {
+                tracing::error!(item = %stack.item_id, quantity = stack.quantity, "a traded stack did not fit after the room check");
+            }
+        }
+    }
+
+    /// The item id, instance id and quantity of each stack `side` offers, still in its bag.
+    fn offered_items(
+        &self,
+        side: &TradeSideState,
+    ) -> Result<Vec<(String, [u8; RAW_ID_LEN], u32)>, u32> {
         if side.stacks.is_empty() {
             return Ok(Vec::new());
         }
@@ -2098,7 +2237,7 @@ impl SimWorld {
                         let slot = u32::try_from(slot).ok()?;
                         let (item, record) = gear.bag_item(slot)?;
                         (record.instance == stack.instance && record.quantity >= quantity)
-                            .then(|| (slot, item.to_owned(), quantity))
+                            .then(|| (item.to_owned(), stack.instance, quantity))
                     })
                     .ok_or(trade_failure::FAILED_TO_REMOVE)
             })
@@ -2350,6 +2489,7 @@ mod tests {
         let refund = Refund {
             coins: 500,
             items: Some(("BeeswaxT1".to_owned(), 2)),
+            values: None,
         };
         let delivery = refund.delivery(Uuid::from_u128(3));
         assert_eq!(delivery.order, None);
@@ -2689,6 +2829,128 @@ mod tests {
         (world, entities[0], entities[1])
     }
 
+    /// The seller of [`traders`] gets a sword with values of its own; its bag slot and instance.
+    fn worn_out_sword(world: &mut SimWorld, seller: Entity) -> (u32, [u8; RAW_ID_LEN]) {
+        let content = Arc::clone(&world.content);
+        let sword = content.kits.item(gear::tests::SWORD).expect("sword");
+        // Not bound: the test kit binds its items on pickup, and a bound item does not trade.
+        let values = ItemState {
+            gear_score: Some(OWN_GEAR_SCORE),
+            durability: Some(OWN_DURABILITY),
+            bound: Some(false),
+            ..ItemState::default()
+        };
+        let mut player = world.world.get_mut::<Player>(seller).expect("seller");
+        let gear = player.gear.as_mut().expect("gear");
+        assert!(gear.add_with_values(&content.kits, sword, 1, &values, SYNC_MOVED));
+        gear.bag_stacks()
+            .into_iter()
+            .rev()
+            .find(|(_, item, _, _)| item == gear::tests::SWORD)
+            .map(|(slot, _, instance, _)| (slot, instance))
+            .expect("the sword in the bag")
+    }
+
+    /// The gear score and durability of each `item_id` stack in the bag of `entity`.
+    fn bag_values(world: &SimWorld, entity: Entity, item_id: &str) -> Vec<(u32, u32)> {
+        let gear = world
+            .world
+            .get::<Player>(entity)
+            .and_then(|player| player.gear.as_ref())
+            .expect("gear");
+        (0..u32::try_from(MAX_CONTAINER_SLOTS).expect("slots"))
+            .filter_map(|slot| gear.bag_item(slot))
+            .filter(|(item, _)| *item == item_id)
+            .map(|(_, record)| (record.gear_score, record.durability))
+            .collect()
+    }
+
+    const OWN_GEAR_SCORE: u32 = 512;
+    const OWN_DURABILITY: u32 = 9;
+
+    /// Both sides lock in and confirm the offers of trade between `seller` and `buyer`.
+    fn trade_through(world: &mut SimWorld, seller: Entity, buyer: Entity) {
+        for (entity, number) in [(seller, SELLER_NUMBER), (buyer, BUYER_NUMBER)] {
+            trade(world, entity, number, |header| TradeCall::LockIn { header });
+        }
+        for (entity, number) in [(seller, SELLER_NUMBER), (buyer, BUYER_NUMBER)] {
+            trade(world, entity, number, |header| TradeCall::Confirm {
+                header,
+            });
+        }
+    }
+
+    #[test]
+    fn a_traded_stack_keeps_its_own_values() {
+        let (mut world, seller, buyer) = traders(0.0);
+        let (_, sword) = worn_out_sword(&mut world, seller);
+        assert!(world.start_trade(seller, buyer));
+        world.trade_call(
+            seller,
+            &TradeCall::UpdateItems {
+                header: FacetHeader::of(P2P_TRADE_COMPONENT, SELLER_NUMBER),
+                stacks: vec![OfferedStack {
+                    instance: sword,
+                    quantity: 1,
+                }],
+            },
+        );
+        trade_through(&mut world, seller, buyer);
+        assert!(!world.trading(BUYER_NUMBER), "the trade ended");
+        assert_eq!(
+            bag_values(&world, buyer, gear::tests::SWORD),
+            [(OWN_GEAR_SCORE, OWN_DURABILITY)],
+            "the buyer gets the worn sword, not a new one"
+        );
+        assert!(
+            !bag_values(&world, seller, gear::tests::SWORD)
+                .contains(&(OWN_GEAR_SCORE, OWN_DURABILITY))
+        );
+    }
+
+    #[test]
+    fn a_trade_into_a_full_bag_moves_nothing() {
+        let (mut world, seller, buyer) = traders(0.0);
+        let (_, sword) = worn_out_sword(&mut world, seller);
+        {
+            let content = Arc::clone(&world.content);
+            let staff = content.kits.item(gear::tests::STAFF).expect("staff");
+            let mut player = world.world.get_mut::<Player>(buyer).expect("buyer");
+            let gear = player.gear.as_mut().expect("gear");
+            while gear.has_room_for(&[(staff, 1, true)]) {
+                assert!(gear.add_with_values(
+                    &content.kits,
+                    staff,
+                    1,
+                    &ItemState::default(),
+                    SYNC_MOVED
+                ));
+            }
+        }
+        assert!(world.start_trade(seller, buyer));
+        world.trade_call(
+            seller,
+            &TradeCall::UpdateItems {
+                header: FacetHeader::of(P2P_TRADE_COMPONENT, SELLER_NUMBER),
+                stacks: vec![OfferedStack {
+                    instance: sword,
+                    quantity: 1,
+                }],
+            },
+        );
+        trade_through(&mut world, seller, buyer);
+        assert!(!world.trading(SELLER_NUMBER), "the trade ended, refused");
+        assert_eq!(
+            bag_values(&world, seller, gear::tests::SWORD)
+                .iter()
+                .filter(|values| **values == (OWN_GEAR_SCORE, OWN_DURABILITY))
+                .count(),
+            1,
+            "the seller keeps its sword, with its values"
+        );
+        assert!(bag_values(&world, buyer, gear::tests::SWORD).is_empty());
+    }
+
     /// A player opening a trading post trades at the nearest settlement; a filled buy order's
     /// units go to the storage of the order's settlement, with no bag change (retail
     /// `buy-sell-TP` 328.900 s, `Hivesellandbuyorder` 401.71 s).
@@ -2716,7 +2978,7 @@ mod tests {
             .trading
             .by_id(gear::tests::FLINT)
             .expect("tradable")
-            .order_item(0);
+            .order_item(0, Vec::new(), 0, SavedItemRolls::default());
         let filled = Order {
             id: Uuid::from_u128(5),
             kind: OrderKind::Buy,
@@ -2744,6 +3006,8 @@ mod tests {
                 item: Some((gear::tests::FLINT.to_owned(), UNITS)),
                 completed_count: UNITS,
                 request: None,
+
+                rolls: SavedItemRolls::default(),
             },
             order: Some(order),
         };
@@ -2795,6 +3059,8 @@ mod tests {
                     item: Some((SINGLE.to_owned(), UNITS)),
                     completed_count: UNITS,
                     request: None,
+
+                    rolls: SavedItemRolls::default(),
                 },
                 None,
             )
@@ -2920,12 +3186,15 @@ mod tests {
             item: Some((gear::tests::FLINT.to_owned(), 1)),
             completed_count: 1,
             request: None,
+
+            rolls: SavedItemRolls::default(),
         };
         assert_eq!(world.give(buyer, bought, None), None);
         assert_eq!(flint_reason(&world, buyer), Some(SYNC_TRADING_POST_BOUGHT));
         let returned = Refund {
             coins: 0,
             items: Some((gear::tests::FLINT.to_owned(), LISTED)),
+            values: None,
         }
         .delivery(creator);
         assert_eq!(world.give(seller, returned, None), None);

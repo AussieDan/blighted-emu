@@ -8,9 +8,11 @@
 //!
 //! A craft needs a station of the recipe's name and tier ([`Recipe::made_at`]), its tradeskill's
 //! rank at the recipe's `RecipeLevel`, the ingredients in the bag and the fee in the wallet: the
-//! fee the client sent, at most the recipes' `CraftingFee` (retail took exactly the client's fee
-//! at 34 of 34 crafts; the tax that lowers it is Unknown here). Each craft fires the recipe's
-//! game event: its tradeskill experience ([`SimWorld::grant_event`]).
+//! recipes' `CraftingFee`, whatever fee the client sent (retail took the client's shown fee at 34
+//! of 34 crafts, so the shown fee is the server's own; the discounts that lower it, territory
+//! standing and a settlement's tax, are not run here, Inferred: without them it is the recipes'
+//! fee). Each craft fires the recipe's game event: its tradeskill experience
+//! ([`SimWorld::grant_event`]).
 //!
 //! The stations are the level's ([`nw_world::stations`]): a client shows a station's interaction
 //! only once it has the station's spawn group (campfire note: retail sends it when the station
@@ -45,6 +47,7 @@ use nw_world::stations::CraftingStation;
 
 use super::gear::unix_ns;
 use super::loot_bag::LimitsSent;
+use super::rolled_loot::rolled_values;
 use super::slots::Slot;
 use super::statics::interactor_target;
 use super::tradeskill::EventScale;
@@ -435,9 +438,9 @@ impl SimWorld {
     }
 
     /// Player `number` (`entity`) crafts `crafts` of the recipe whose lowercase id has the CRC-32
-    /// `recipe` at `now_ms`, from the `picked` ingredients, for the fee `fee` its client shows:
-    /// at a station of the recipe's name and tier, at the recipe's level, with every ingredient
-    /// in the bag and the fee in the wallet. The ingredients and the fee are taken with the
+    /// `recipe` at `now_ms`, from the `picked` ingredients (its client shows the fee `fee`; the
+    /// server charges the recipes' own): at a station of the recipe's name and tier, at the
+    /// recipe's level, with every ingredient in the bag and the fee in the wallet. The ingredients and the fee are taken with the
     /// output, [`CRAFT_MS`] later ([`SimWorld::crafts_due`]): retail newchar 2026-09-18 changed
     /// the bag (1755) only after the result (2993) at 535.01 s, the request at 533.94 s took
     /// nothing; taking them at the request made the live client say the craft attempt failed
@@ -481,7 +484,15 @@ impl SimWorld {
                     .allows(&recipe.id, cooldown, crafts, now_ns)
             })
         });
-        let charged = fee.min(details.fee.saturating_mul(crafts));
+        let charged = details.fee.saturating_mul(crafts);
+        if fee != charged {
+            tracing::debug!(
+                player = number,
+                shown = fee,
+                charged,
+                "craft fee differs from the client's"
+            );
+        }
         let perk_items = self.perk_items_of(entity, &recipe.item, choice, details.max_perk_items);
         let taken = if !open {
             Err(CraftRefusal::Locked)
@@ -818,15 +829,16 @@ impl SimWorld {
                     let dice = &mut self.dice;
                     let rolled = (0..craft.quantity)
                         .map(|_| {
-                            content.item_rolls.roll(
+                            let rolled = content.item_rolls.roll(
                                 &craft.item,
                                 roll.gear_score,
                                 &roll.forced,
                                 &mut |below| dice.below(below),
-                            )
+                            );
+                            ((craft.item.clone(), 1), Some(rolled_values(rolled)))
                         })
                         .collect();
-                    self.give_rolled(craft.number, &craft.item, rolled, SYNC_CRAFTED, now_ms);
+                    self.give_drops(craft.number, rolled, SYNC_CRAFTED, now_ms);
                 }
                 None => {
                     let made = vec![(craft.item.clone(), craft.quantity)];
@@ -1211,8 +1223,8 @@ mod tests {
     #[test]
     fn a_batch_craft_takes_its_fee_and_gives_its_items_and_tradeskill_experience() {
         const CRAFTS: u32 = 2;
-        // The client shows a fee above the recipes' own: at most the recipes' is taken.
-        const CLIENT_FEE: u32 = 18;
+        // The client shows a fee other than the recipes' own: the recipes' is taken.
+        const CLIENT_FEE: u32 = 0;
         let (mut world, entity) = at_the_smelter(ORE_PER_CRAFT * CRAFTS, COINS);
         let crc = lowercase_crc32(INGOT);
         world.craft(

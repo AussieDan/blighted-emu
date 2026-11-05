@@ -34,6 +34,7 @@ use super::gear::{server_ms_of, unix_ns};
 use super::tradeskill::ONE_FIRING;
 use super::{EQUIP_LOAD_SLOTS, Player, SimWorld, send_now};
 use crate::combat::AttackOutcome;
+use crate::mob_ai::HeldEffects;
 use crate::objectives::Event;
 
 /// The effect of a hurt player out of combat (`BaseDuration` 180, `Health` 40 a second; retail
@@ -664,6 +665,20 @@ impl StatusEffects {
         self.scale_of(rules, |rule| rule.health_rate)
     }
 
+    /// The held effects as a mob's tree and body read them: their ids, their categories and
+    /// what they keep it from doing.
+    pub(super) fn held_view(&self, rules: &StatusEffectRules) -> HeldEffects {
+        let mut held = HeldEffects {
+            control: self.control(rules),
+            ..HeldEffects::default()
+        };
+        for rule in self.rules(rules) {
+            held.effects.push(rule.id.clone());
+            held.categories.extend(rule.categories.iter().cloned());
+        }
+        held
+    }
+
     /// What the held effects keep the holder from doing.
     pub(super) fn control(&self, rules: &StatusEffectRules) -> Control {
         self.rules(rules).fold(Control::default(), |control, rule| {
@@ -1100,6 +1115,48 @@ impl SimWorld {
             .map_or(PLAIN_POTENCY, |effects| effects.damage_scale(rules, tag))
     }
 
+    /// Gives each mob the status effects this sim holds on it, for its tick: its tree reads
+    /// them (`SE_` keys, `StatusEffectDecorator` conditions) and its control holds it
+    /// ([`crate::mob_ai::TreeMind::step`]).
+    pub(super) fn share_mob_effects(&mut self) {
+        let rules = &self.content.status_effects;
+        let held = self
+            .mob_effects
+            .iter()
+            .map(|(mob, effects)| (*mob, effects.held_view(rules)))
+            .collect();
+        self.mobs.set_held_effects(held);
+    }
+
+    /// Puts the status effects the mobs' trees put on them (fire resist, empower) with the
+    /// effects this sim holds on them, each its own mob's (so that they change its damage and
+    /// show to the clients), and ends those the trees took off.
+    pub(super) fn add_tree_statuses(&mut self) {
+        let changes = self.mobs.take_status_changes();
+        if changes.is_empty() {
+            return;
+        }
+        let now_ms = self.server_ms;
+        let content = std::sync::Arc::clone(&self.content);
+        let rules = &content.status_effects;
+        for (mob, effect, on) in changes {
+            let Some(rule) = rules.by_id(&effect) else {
+                tracing::debug!(mob, effect, "tree status effect without a row");
+                continue;
+            };
+            if on {
+                self.mob_effects.entry(mob).or_default().add(
+                    rules,
+                    rule.crc,
+                    Application::plain(mob),
+                    now_ms,
+                );
+            } else if let Some(held) = self.mob_effects.get_mut(&mob) {
+                held.remove(rule.crc);
+            }
+        }
+    }
+
     /// Puts the effects the instance's mutation queued ([`SimWorld::take_mutation_effects`]) on
     /// their holders, players and mobs; the mutation applies them, so each is its own source.
     fn add_mutation_effects(&mut self) {
@@ -1467,6 +1524,53 @@ mod tests {
             hit_amount: HIT,
             ..Application::plain(source)
         }
+    }
+
+    /// A mob's held effects heal it scaled by its `HealMod`s (the ticks [`SimWorld`] heals mobs
+    /// with), and its tree reads their ids, categories and control.
+    #[test]
+    fn a_mob_heal_takes_its_heal_mods_and_the_tree_reads_the_held_effects() {
+        const DISEASE: &str = "AI_PlagueRat_Disease";
+        const HEAL_MOD: f64 = -0.5;
+        const TICK_MS: u64 = 2_000;
+        let rules = StatusEffectRules::build(StatusEffectSource {
+            effects: vec![
+                EffectSourceRow {
+                    base_duration_s: Some(1200.0),
+                    tick_s: Some(2.0),
+                    health_share: Some(0.01),
+                    ..row(FOOD)
+                },
+                EffectSourceRow {
+                    base_duration_s: Some(30.0),
+                    heal_mod: Some(HEAL_MOD),
+                    categories: Some("Debuff+Disease".to_owned()),
+                    ..row(DISEASE)
+                },
+            ],
+            ..StatusEffectSource::default()
+        });
+        let mut mob = StatusEffects::default();
+        mob.add(&rules, crc(&rules, FOOD), Application::plain(MOB), START_MS);
+        mob.add(
+            &rules,
+            crc(&rules, DISEASE),
+            Application::plain(PLAYER),
+            START_MS,
+        );
+        let ticks = mob.tick(&rules, START_MS + TICK_MS, MAX_HEALTH);
+        assert!(!ticks.is_empty());
+        for tick in ticks {
+            assert!(
+                (tick.health - 0.01 * MAX_HEALTH * (1.0 + HEAL_MOD)).abs() < 1e-6,
+                "{}",
+                tick.health
+            );
+        }
+        let held = mob.held_view(&rules);
+        assert!(held.effects.iter().any(|id| id == DISEASE));
+        assert!(held.categories.iter().any(|category| category == "disease"));
+        assert!(!held.control.any());
     }
 
     #[test]

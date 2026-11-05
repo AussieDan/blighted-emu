@@ -27,6 +27,7 @@ use std::sync::Arc;
 use bevy_ecs::entity::Entity;
 use nw_bus::{ConnectionRef, PlayerMusic};
 use nw_content::music::{MUSIC_TRADESKILL, Song};
+use nw_content::music_charts::ChartNote;
 use nw_messages::gde::AssetId;
 use nw_messages::items::FullList;
 use nw_messages::list_delta::{ListChange, ReplicatedList};
@@ -45,7 +46,7 @@ use nw_sim_core::Position;
 use uuid::Uuid;
 
 use super::slots::Slot;
-use super::tradeskill::progression_gain;
+use super::tradeskill::{gain_progression, progression_gain};
 use super::{Body, Player, SimWorld, send_now};
 use crate::objectives::Event;
 
@@ -88,6 +89,22 @@ const SYNC_COUNTER: u32 = 0x00ff_ffff;
 const MISTAKE_FLAG: u32 = 1 << 24;
 /// The key of a note played without a key: a mistake.
 const NO_KEY: u8 = 0;
+/// Whether note `note` of `chart`, played with `key` at `time_s`, is a hit: the chart note's key
+/// within [`NOTE_WINDOW_S`] of its time (retail: 501 of 502 judged notes of four sessions had
+/// their chart note's key, every time within 0.113 s of its chart time). A note past the chart
+/// and a sheet with no chart are missed.
+fn note_hit(chart: Option<&[ChartNote]>, note: u32, key: u8, time_s: f32) -> bool {
+    key != NO_KEY
+        && chart
+            .and_then(|chart| chart.get(usize::try_from(note).ok()?))
+            .is_some_and(|wanted| {
+                wanted.key == key && (time_s - wanted.time_s).abs() <= NOTE_WINDOW_S
+            })
+}
+
+/// How far from its chart time a played note may be, seconds (Inferred: just above the widest
+/// retail offset, 0.113 s of 502 judged notes; the client's own window is Unknown).
+const NOTE_WINDOW_S: f32 = 0.15;
 /// When the pre show follows the create (retail 36 to 80 ms; 52 ms in `open-world/Music`).
 const PRE_SHOW_AFTER_CREATE_MS: u64 = 52;
 /// When the results follow the song's end (retail 1,052 and 1,077 ms after start time plus
@@ -176,6 +193,8 @@ pub(super) struct Performance {
     stage: PerformanceStage,
     next: Next,
     song: Option<u32>,
+    /// The picked sheet (its wire id) and its column of the song.
+    sheet: Option<u32>,
     sheet_column: Option<u16>,
     reward: Option<u32>,
     start_ns: Option<u64>,
@@ -522,6 +541,7 @@ impl SimWorld {
                     }
                     performance.song = (song != 0).then_some(song);
                     performance.pending.selected_song = Some(song);
+                    performance.sheet = None;
                     if performance.sheet_column.take().is_some() {
                         performance.pending.sheet_indices = Some(0);
                     }
@@ -542,6 +562,7 @@ impl SimWorld {
                         })
                         .and_then(|(song, sheet)| song.sheet_column(&sheet.id));
                     if let Some(column) = column {
+                        performance.sheet = Some(sheet);
                         performance.sheet_column = Some(column);
                         performance.pending.sheet_indices = Some(column);
                     }
@@ -593,12 +614,17 @@ impl SimWorld {
                     };
                 });
             }
-            MusicClientMsg::ValidateInput { key, time_s, .. } => {
-                self.with_performance(number, |performance, _| {
+            MusicClientMsg::ValidateInput {
+                note, key, time_s, ..
+            } => {
+                self.with_performance(number, |performance, content| {
                     if performance.stage != PerformanceStage::Playing {
                         return;
                     }
-                    let hit = key != NO_KEY;
+                    let chart = performance
+                        .sheet
+                        .and_then(|sheet| content.music_charts.chart(sheet));
+                    let hit = note_hit(chart, note, key, time_s);
                     let note = performance.notes.entry(time_s.to_bits()).or_insert(true);
                     *note &= hit;
                     if !hit {
@@ -758,6 +784,7 @@ impl SimWorld {
                 at_ms: now_ms.saturating_add(PRE_SHOW_AFTER_CREATE_MS),
             },
             song: None,
+            sheet: None,
             sheet_column: None,
             reward: None,
             start_ns: None,
@@ -812,6 +839,7 @@ impl SimWorld {
             version,
             value: NO_PERFORMANCE,
         }]));
+        performance.sheet = None;
         performance.sheet_column = None;
         performance.pending.sheet_indices = Some(0);
         performance.stage = PerformanceStage::Ending;
@@ -1001,8 +1029,7 @@ impl SimWorld {
                 ONCE,
                 content.gameplay.xp.progression(&id) * multiplier,
             );
-            let experience = player.masteries.experience(mastery).saturating_add(gain);
-            player.masteries.set(mastery, experience);
+            gain_progression(&mut player, &content, mastery, gain);
             tracing::debug!(
                 player = number,
                 song = %song.id,
@@ -1020,8 +1047,10 @@ impl SimWorld {
                     .map(str::to_owned),
             );
         }
+        // Each event gives what its `GameEventData` row grants (coins, experience, item) and
+        // counts for the quest: the picked reward's event of the grade is the reward itself.
         for event in events {
-            self.quest_event(number, Event::GameEvent(&event), now_ms);
+            self.fire_game_event(number, &event, now_ms);
         }
         if let Some(at) = self
             .player_by_number(number)
@@ -1128,6 +1157,7 @@ mod tests {
             stage: PerformanceStage::WaitingToJoin,
             next: Next::Wait,
             song: None,
+            sheet: None,
             sheet_column: None,
             reward: None,
             start_ns: None,
@@ -1161,6 +1191,30 @@ mod tests {
                 _ => None,
             })
             .expect("a performance state")
+    }
+
+    #[test]
+    fn a_note_is_a_hit_only_with_its_chart_key_near_its_chart_time() {
+        // The first notes of retail `set_azothflute_part1_easy` and the session's first press
+        // (note 0, key 3, 2.343 s: 57 ms early).
+        let chart = [
+            ChartNote {
+                key: 3,
+                lane: 0,
+                time_s: 2.400_041_6,
+            },
+            ChartNote {
+                key: 6,
+                lane: -1,
+                time_s: 3.100_046_2,
+            },
+        ];
+        assert!(note_hit(Some(&chart), 0, 3, 2.343));
+        assert!(!note_hit(Some(&chart), 0, 4, 2.343), "another key");
+        assert!(!note_hit(Some(&chart), 0, 3, 2.9), "too late");
+        assert!(!note_hit(Some(&chart), 0, NO_KEY, 2.4), "no key");
+        assert!(!note_hit(Some(&chart), 5, 3, 2.4), "past the chart");
+        assert!(!note_hit(None, 0, 3, 2.4), "no chart: nothing to judge by");
     }
 
     #[test]

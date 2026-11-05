@@ -48,6 +48,7 @@ use nw_messages::{
     ShownItem, TUTORIAL_LEVEL, TargetMsg, TeleportStep, TimeSynchMsg, UnselectedAsTargetMsg,
     VitalsData, WorldPosition, facet_entity, put_looking_through_loadout, put_member,
 };
+use nw_messages::{SyncExecuteEntitiesMsg, TriggerAddress};
 use nw_sim_core::{
     CellBounds, CellGrid, CellOwners, Dice, Footing, Ground, GroundCheck, Health, Interest,
     LevelGround, MobState, Motion, MotionState, MoveLimits, MoveRefusal, OPEN_WORLD_START,
@@ -138,7 +139,7 @@ use members::{
     remote_group,
 };
 use mob_timeline::{Animations, MobPose, MobTimelines, TreeEntry, TreePose, animations_of};
-use quest_tracker::{JournalRecord, QuestTracker};
+use quest_tracker::{JournalRecord, QuestTracker, instance_of};
 use replica::{RemoteCandidate, Replica, ReplicaSource};
 use slots::Slots;
 use stamina::Stamina;
@@ -355,6 +356,8 @@ pub struct WorldSettings {
     pub instance_role: bool,
     /// Longest wait for the director's answer to an expedition request.
     pub instance_request_timeout_ms: u64,
+    /// Most GM mobs one command spawns (`[admin] max_gm_spawn`).
+    pub max_gm_spawn: u32,
 }
 
 /// Fewest players for which the bundle step uses more than one thread; below that, starting
@@ -623,8 +626,10 @@ struct Player {
     defer_throttle_clear: bool,
     /// The client still auto-pins a new quest (2709). A mask of all zeros turns it off.
     auto_pin: bool,
-    /// The player toggled the PvP flag (2525). Retail sends the faction header and no argument.
+    /// The player's PvP flag is on (after its countdown: [`faction`]); combat counts it.
     pvp_flagged: bool,
+    /// The PvP flag on its way on ([`faction`]).
+    pvp_wait: faction::PvpFlagWait,
     /// The own places its client has ([`own_group`]).
     own_places: OwnPlaces,
     /// The ground and water under its body after its newest moves ([`SimWorld::footing_of`]).
@@ -800,7 +805,7 @@ struct Player {
     travel: travel::TravelState,
     /// Its expeditions, raids and trials ([`instances`]).
     arena: instances::ArenaPlayer,
-    /// Its matchmaking queue, war board and war sign-up state ([`game_mode`]).
+    /// The war of its newest war sign-up or list call ([`game_mode`]).
     game_mode: game_mode::GameModePlayer,
     /// The weekly mutations its client has ([`mutations`]).
     mutation_view: mutations::ScheduleView,
@@ -939,8 +944,9 @@ pub struct SimWorld {
     instance_sim: bool,
     /// The instance this instance sim runs.
     instance_run: Option<instances::InstanceRun>,
-    /// The war sign-ups of this sim's players, by war ([`game_mode`]).
-    war_signups: game_mode::WarSignups,
+    /// The company treasury coin moves done here, by move id, with their answer and sim ms
+    /// ([`social_bus`]): a repeat of a move gets its answer and moves nothing.
+    coin_moves: HashMap<Uuid, (nw_bus::CoinReply, u64)>,
     /// The encounters of the running instance's level script.
     dungeon_run: Option<dungeon_script::DungeonRun>,
     /// The expedition requests for the director since the last tick.
@@ -1200,7 +1206,7 @@ impl SimWorld {
             server_ms: 0,
             instance_sim: settings.instance_role,
             instance_run: None,
-            war_signups: game_mode::WarSignups::default(),
+            coin_moves: HashMap::new(),
             dungeon_run: None,
             instance_requests: Vec::new(),
             instance_levels,
@@ -1767,6 +1773,12 @@ impl SimWorld {
         }) {
             player.tracked.set_equip_load(load);
         }
+        // A held `NoSprint` effect (130 status effect rows) turns the sprint into a run.
+        let no_sprint = player
+            .status_effects
+            .control(&self.content.status_effects)
+            .no_sprint;
+        player.tracked.set_no_sprint(no_sprint);
         if player.tracked.position() != server_at {
             // The server moved the player, or kept it at its last good place.
             player.tracked.stand_at(server_at);
@@ -2123,6 +2135,40 @@ impl SimWorld {
         }
     }
 
+    /// Sends each slice trigger a mob ran (3135) to every client that has the mob's card
+    /// (Inferred: the captures hold one client each, so whether retail sends it to all of them is
+    /// Unknown; oquests triggers note, section 1.3).
+    fn send_mob_triggers(&mut self) {
+        let triggers = self.mobs.take_triggers();
+        if triggers.is_empty() {
+            return;
+        }
+        let viewers: Vec<(ConnectionRef, Vec<u64>)> = self
+            .world
+            .query::<&Player>()
+            .iter(&self.world)
+            .map(|player| {
+                (
+                    player.connection.clone(),
+                    player.slots.assigned().keys().copied().collect(),
+                )
+            })
+            .collect();
+        for (mob, trigger) in triggers {
+            let address = TriggerAddress {
+                child: trigger.child,
+                component: trigger.component,
+            };
+            let message =
+                ServerMessage::SyncExecuteEntities(SyncExecuteEntitiesMsg::of(address, mob));
+            for (connection, shown) in &viewers {
+                if shown.contains(&mob) {
+                    self.send_reliable(connection.clone(), &message);
+                }
+            }
+        }
+    }
+
     /// Every client that has a card of `entity` stops its slot and gets a new card in a new slot,
     /// with the entity's views shown afresh.
     fn recard(&mut self, entity: u64) {
@@ -2274,6 +2320,7 @@ impl SimWorld {
         let mobs_started = Instant::now();
         let mut swings = self.tick_mobs(now_ms);
         self.end_mob_ids();
+        self.send_mob_triggers();
         swings.append(&mut self.scripted_swings);
         let intents = self.swings_landing(swings, now_ms, server_time);
         let mut mob_hits = self.mob_hits(intents, now_ms);
@@ -2294,6 +2341,7 @@ impl SimWorld {
         self.tick_item_effects(server_time);
         self.tick_stamina(now_ms);
         self.server_ms = server_time;
+        self.tick_pvp_flags(now_ms);
         self.tick_max_health();
         self.tick_status_effects(now_ms);
         self.tick_deaths_door(now_ms);
@@ -2339,7 +2387,8 @@ impl SimWorld {
         })
     }
 
-    /// Runs the mobs with the living players of this sim and the player ghosts of others.
+    /// Runs the mobs with the living players of this sim and the player ghosts of others; each
+    /// mob reads the status effects held on it, and those its tree put on it join them.
     fn tick_mobs(&mut self, now_ms: u64) -> Vec<MobAttackIntent> {
         let mut seen: Vec<Seen> = Vec::new();
         let mut query = self.world.query::<(&Player, &Body, &Vitals)>();
@@ -2363,8 +2412,12 @@ impl SimWorld {
                 position: ghost.position,
             });
         }
-        self.mobs
-            .tick(&seen, now_ms, &*self.ground, self.settings.tick_threads)
+        self.share_mob_effects();
+        let intents = self
+            .mobs
+            .tick(&seen, now_ms, &*self.ground, self.settings.tick_threads);
+        self.add_tree_statuses();
+        intents
     }
 
     /// Starts the tutorial of player `number` at `now_ms`; without the quest in the content
@@ -2685,8 +2738,12 @@ impl SimWorld {
             .def
             .success_event
             .as_deref()
-            .and_then(|event| self.content.rewards.get(event))
-            .cloned()
+            .and_then(|event| {
+                let dice = &mut self.dice;
+                self.content
+                    .rewards
+                    .rolled(event, &mut |below| dice.below(below))
+            })
             .unwrap_or_default();
         tracing::info!(player = number, objective = %quest.def.id, "quest done");
         self.scripts.push(scripts::ScriptEvent::QuestDone {
@@ -2715,10 +2772,11 @@ impl SimWorld {
                     .clear_achievement(&self.achievement_rules, &achievement);
             }
             quest_objects::grant(&mut player, &reward, &self.content.gameplay);
-            // The turn-in takes back the items the quest had the player bring.
+            // The turn-in takes back the items the quest had the player bring: the count each
+            // task asks for, not every stack of the item.
             if let Some(gear) = player.gear.as_mut() {
-                for (item, _) in quest.def.tree.returned_items() {
-                    gear.remove(&item, unix_ns(self.server_ms));
+                for (item, count) in quest.def.tree.returned_items() {
+                    remove_quest_item(gear, &item, count, unix_ns(self.server_ms));
                 }
             }
         }
@@ -2738,6 +2796,41 @@ impl SimWorld {
         // `09A_S5_Success`, `Mission_Success_Procurer_T1`).
         if let Some(event) = success_event.as_deref() {
             self.quest_event(number, Event::GameEvent(event), self.last_now_ms);
+        }
+    }
+
+    /// Drops the running quest of instance `instance` of player `number` (3836): it leaves the
+    /// running quests and the journal without a reward and without joining the done list, so it
+    /// can be taken again; its temporary unlocks are cleared as at its end.
+    fn abandon_quest(&mut self, number: u64, instance: u64) {
+        let Some(entity) = self.player_by_number(number) else {
+            return;
+        };
+        let Some(quests) = self.quests.get_mut(&number) else {
+            return;
+        };
+        let Some(position) = quests
+            .iter()
+            .position(|quest| instance_of(&quest.def.id, number) == instance)
+        else {
+            tracing::debug!(player = number, instance, "drop of a quest not running");
+            return;
+        };
+        let quest = quests.remove(position);
+        if quests.is_empty() {
+            self.quests.remove(&number);
+        }
+        tracing::info!(player = number, objective = %quest.def.id, "quest dropped");
+        if let Some(mut player) = self.world.get_mut::<Player>(entity) {
+            for achievement in quest.run.temporary_unlocks() {
+                player
+                    .flow
+                    .clear_achievement(&self.achievement_rules, &achievement);
+            }
+            if let Some(journal) = player.quest.as_mut() {
+                journal.abandon(&quest.def.id);
+            }
+            player.quests_unsaved = true;
         }
     }
 
@@ -3573,9 +3666,7 @@ impl SimWorld {
                 return Ok(());
             }
             ClientFacetMsg::TogglePvpFlag { .. } => {
-                if let Some(mut player) = self.world.get_mut::<Player>(entity) {
-                    player.pvp_flagged = !player.pvp_flagged;
-                }
+                self.toggle_pvp_flag(entity, now_ms);
                 return Ok(());
             }
             ClientFacetMsg::SetFaction { faction, .. } => {
@@ -3611,6 +3702,10 @@ impl SimWorld {
             // `00`, `01` and the instance at 9291 ms and at 450543 ms). An untrack at the clear
             // emptied the tracked list, and the tutorial lost its markers (runs 16 and 17).
             ClientFacetMsg::UpdateTrackedObjectives { .. } => return Ok(()),
+            ClientFacetMsg::AbandonObjective { instance, .. } => {
+                self.abandon_quest(number, *instance);
+                return Ok(());
+            }
             ClientFacetMsg::LookingThroughLoadout { looking, .. } => {
                 if *looking {
                     self.mount_inventory_opened(entity, now_ms);
@@ -4342,6 +4437,7 @@ impl SimWorld {
                     defer_throttle_clear: false,
                     auto_pin: arrival.auto_pin,
                     pvp_flagged: arrival.pvp_flagged,
+                    pvp_wait: faction::PvpFlagWait::default(),
                     own_places: OwnPlaces::default(),
                     footing: Footing::SPAWN,
                     footing_sent: Footing::SPAWN,
@@ -5066,6 +5162,9 @@ impl Neighbourhood<'_> {
                 // and takes its moves again only on them (open-world note).
                 // Death's door goes first with its own block, then its end with the dead block
                 // and the time spent in it (status effects note 2026-10-31).
+                // The incapacitated state is on at death's door and off when it ends, by death or
+                // by a revive ([`HealthChange::incapacitated`]).
+                let was_at_door = player.deaths_door_sent;
                 let life = match player.health_sent {
                     Some(sent) if sent > 0 && health == 0 => {
                         player.deaths_door_sent = vitals.downed();
@@ -5107,6 +5206,8 @@ impl Neighbourhood<'_> {
                         && player.health_sent == player.health_max_sent,
                     life,
                     max,
+                    incapacitated: (was_at_door != player.deaths_door_sent)
+                        .then_some(player.deaths_door_sent),
                 });
                 player.health_sent = Some(health);
                 player.health_max_sent = Some(health_max);
@@ -5759,8 +5860,12 @@ mod tests {
             ocean_level_m: OCEAN_LEVEL_M,
             instance_role: false,
             instance_request_timeout_ms: INSTANCE_REQUEST_TIMEOUT_MS,
+            max_gm_spawn: MAX_GM_SPAWN,
         }
     }
+
+    /// The GM spawn limit of the test worlds (the committed config's).
+    pub(super) const MAX_GM_SPAWN: u32 = 50;
 
     /// The instance request wait of the test worlds.
     const INSTANCE_REQUEST_TIMEOUT_MS: u64 = 3000;
@@ -7520,6 +7625,7 @@ mod tests {
         let mut admit = admit_at(1, CELL_M / 2.0, true);
         admit.backstory = Some(gear::tests::BACKSTORY.to_owned());
         world.admit(&admit, NOW, SERVER_TIME).expect("admit");
+        gathering::tests::place_nodes(&mut world, 1, &[FLINT]);
         let spawn_at = NOW + OWN_CARD_DELAY_MS;
         tick(&mut world, spawn_at);
         world.heard_from(&who);
@@ -7690,6 +7796,7 @@ mod tests {
         let mut admit = admit_at(1, CELL_M / 2.0, true);
         admit.backstory = Some(gear::tests::BACKSTORY.to_owned());
         world.admit(&admit, NOW, SERVER_TIME).expect("admit");
+        gathering::tests::place_nodes(&mut world, 1, &[CHEST]);
         let spawn_at = NOW + OWN_CARD_DELAY_MS;
         tick(&mut world, spawn_at);
         world.heard_from(&who);
@@ -8421,7 +8528,22 @@ mod tests {
         let (_, at) = step(&mut world, TICK_MS);
         assert!(done(&world, "GoToWreck"), "the client says it is in");
 
-        // The manifest: the read is accepted with its title, and its lore fires the whisper.
+        // The manifest: the read is accepted with its title, and its lore fires the whisper. Its
+        // lore point lies at the player.
+        let reader_at = world
+            .player_by_number(1)
+            .and_then(|entity| world.world.get::<Body>(entity))
+            .map(|body| body.motion.position())
+            .expect("reader");
+        let manifest_lore = lowercase_crc32("00_Aeternum_31_01");
+        world.content = Arc::new(PlayerContent {
+            lore_by_title: HashMap::from([(
+                crate::player_content::lore_title_key(&String::from_utf8_lossy(MANIFEST)),
+                manifest_lore,
+            )]),
+            lore_points: crate::placed_points::PlacedPoints::of([(manifest_lore, reader_at)]),
+            ..(*world.content).clone()
+        });
         world.interact(&who, request(LORE_KIND, 1, None), MANIFEST, at);
         let (read, at) = step(&mut world, TICK_MS);
         let read = messages_to(&read, 1);
@@ -8499,6 +8621,7 @@ mod tests {
         assert!(done(&world, "Nodules"));
 
         // The treasure: a gather of its quest object drops it.
+        gathering::tests::place_nodes(&mut world, 1, &[TREASURE_GATHERABLE]);
         let crc = Some(lowercase_crc32(TREASURE_GATHERABLE));
         world.interact(&who, request(GATHER_KIND, 2, crc), &[], at);
         step(&mut world, TICK_MS);

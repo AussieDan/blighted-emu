@@ -13,12 +13,8 @@ use super::attack::Vitals;
 use super::gear::unix_ns;
 use super::{Placement, Player, QuestRefusal, SimWorld};
 
-/// Most GM mobs one command spawns.
-pub const MAX_GM_SPAWN: u32 = 50;
-const LOWEST_LEVEL: u32 = 1;
 /// The answer for a player whose character has no bag (no starter kit row for it).
 pub const NO_BAG: &str = "the player has no bag (its character has no starter kit)";
-const HIGHEST_LEVEL: u32 = 65;
 
 /// A player that takes no damage (GM god mode).
 #[derive(Component, Debug, Clone, Copy)]
@@ -37,10 +33,7 @@ impl SimWorld {
             AdminAction::TeleportPlayer { entity, to } => {
                 self.teleport_player(*entity, *to, now_ms)
             }
-            AdminAction::Heal { entity } => self.with_vitals(*entity, |vitals| {
-                vitals.health.refill();
-                vitals.dead_since_ms = None;
-            }),
+            AdminAction::Heal { entity } => self.admin_heal(*entity),
             AdminAction::Kill { entity } => self.kill_player(*entity, now_ms),
             AdminAction::GodMode { entity, on } => self.god_mode(*entity, *on),
             AdminAction::GiveItem {
@@ -94,10 +87,20 @@ impl SimWorld {
                 rank,
             } => self.set_mastery_rank(*entity, mastery.as_deref(), *rank),
             AdminAction::SetCoins { entity, coins } => self.set_coins(*entity, *coins),
-            AdminAction::Kick { .. } => AdminReply::Failed {
+            AdminAction::Kick { .. } | AdminAction::KickAccount { .. } => AdminReply::Failed {
                 reason: "a kick is the server loop's".to_owned(),
             },
         }
+    }
+
+    /// The entity numbers of the players of account `account` on this sim.
+    pub fn numbers_of_account(&mut self, account: uuid::Uuid) -> Vec<u64> {
+        self.world
+            .query::<&Player>()
+            .iter(&self.world)
+            .filter(|player| player.account == account)
+            .map(|player| player.number)
+            .collect()
     }
 
     /// The connection of the player with entity number `entity`, when it is here.
@@ -153,7 +156,24 @@ impl SimWorld {
         }
     }
 
-    /// Takes all of the player's health as a hit of itself, so its client sees the death.
+    /// Refills the health of the player `entity`. A dead or downed player comes back as at a
+    /// revive ([`Vitals::rise`]): its death's door ends (so the door's end no longer kills it) and
+    /// its mobs forget it; the next own state sends its alive vitals.
+    fn admin_heal(&mut self, entity: u64) -> AdminReply {
+        let mut fallen = false;
+        let reply = self.with_vitals(entity, |vitals| {
+            fallen = vitals.fallen();
+            vitals.health.refill();
+            vitals.rise();
+        });
+        if fallen {
+            self.mobs.forget(entity);
+        }
+        reply
+    }
+
+    /// Takes all of the player's health as a hit of itself, so its client sees the death. A kill
+    /// is the GM's will over god mode: it ends god mode (the log line says so), which stays off.
     fn kill_player(&mut self, entity: u64, now_ms: u64) -> AdminReply {
         let Some(target) = self.player_by_number(entity) else {
             return AdminReply::NotMine;
@@ -167,7 +187,10 @@ impl SimWorld {
                 reason: "the player has no vitals".to_owned(),
             };
         };
-        self.world.entity_mut(target).remove::<GodMode>();
+        if self.is_god(target) {
+            self.world.entity_mut(target).remove::<GodMode>();
+            tracing::info!(player = entity, "GM kill: god mode is off");
+        }
         match self.apply_hit(entity, entity, health, 0, now_ms) {
             Some(_) => AdminReply::Done,
             None => AdminReply::Failed {
@@ -258,7 +281,8 @@ impl SimWorld {
     }
 
     /// Spawns `count` GM mobs of `vitals` at `level` on a ring around `at` (GM commands, scripts
-    /// and events); their entity numbers, or why none spawned.
+    /// and events); their entity numbers, or why none spawned. The level must have a row of the
+    /// mob level table (`VitalsLevelData`); the count is 1 to `[admin] max_gm_spawn`.
     pub(super) fn spawn_gm(
         &mut self,
         vitals: &str,
@@ -266,13 +290,18 @@ impl SimWorld {
         at: Point,
         count: u32,
     ) -> Result<Vec<u64>, String> {
-        if !(LOWEST_LEVEL..=HIGHEST_LEVEL).contains(&level) {
+        if self.combat.data.level(level).is_none() {
+            let levels = self.combat.data.levels().map(|(level, _)| level);
+            let (lowest, highest) = levels.fold((u32::MAX, 0), |(low, high), level| {
+                (low.min(level), high.max(level))
+            });
             return Err(format!(
-                "level {level} is not {LOWEST_LEVEL} to {HIGHEST_LEVEL}"
+                "level {level} has no row in the mob level data (levels {lowest} to {highest})"
             ));
         }
-        if count == 0 || count > MAX_GM_SPAWN {
-            return Err(format!("count {count} is not 1 to {MAX_GM_SPAWN}"));
+        let max_count = self.settings.max_gm_spawn;
+        if count == 0 || count > max_count {
+            return Err(format!("count {count} is not 1 to {max_count}"));
         }
         let mut entities = Vec::new();
         for (x, y) in ring(at.x, at.y, count) {
@@ -423,6 +452,34 @@ mod tests {
         assert_eq!(health(&mut world), full);
     }
 
+    /// A GM heal of a player at death's door ends the door, as a revive does: the door's end
+    /// kills it no more.
+    #[test]
+    fn a_heal_ends_deaths_door_so_its_end_kills_no_more() {
+        const DOOR_MS: u64 = 10_000;
+        const DELAY_MS: u64 = 500;
+        const LETHAL: u32 = 100_000;
+        const OTHER: u64 = PLAYER + 1;
+        let mut world = admitted();
+        std::sync::Arc::make_mut(&mut world.content).deaths_door =
+            nw_content::deaths_door::DeathsDoorRules::new((DOOR_MS, DELAY_MS), &[], Some(10));
+        crate::world::tests::join(&mut world, OTHER, 2.0);
+        world.apply_hit(PLAYER, OTHER, LETHAL, 0, NOW);
+        let vitals = |world: &mut SimWorld| {
+            let target = world.player_by_number(PLAYER).expect("player");
+            *world.world.get::<Vitals>(target).expect("vitals")
+        };
+        assert!(vitals(&mut world).downed(), "at death's door");
+        assert_eq!(
+            world.admin(&command(AdminAction::Heal { entity: PLAYER }), NOW),
+            AdminReply::Done
+        );
+        world.tick_deaths_door(NOW + DOOR_MS);
+        let healed = vitals(&mut world);
+        assert!(!healed.fallen(), "alive, the door over");
+        assert_eq!(healed.health.current(), healed.health.max());
+    }
+
     #[test]
     fn god_mode_stops_damage_until_it_is_turned_off() {
         let mut world = admitted();
@@ -532,7 +589,8 @@ mod tests {
     #[test]
     fn a_spawn_out_of_range_fails() {
         let mut world = world_with_spawns(Vec::new());
-        for (level, count) in [(0, 1), (TEST_LEVEL, 0), (TEST_LEVEL, MAX_GM_SPAWN + 1)] {
+        let too_many = crate::world::tests::MAX_GM_SPAWN + 1;
+        for (level, count) in [(0, 1), (TEST_LEVEL, 0), (TEST_LEVEL, too_many)] {
             assert!(matches!(
                 world.admin(
                     &command(AdminAction::SpawnMobs {

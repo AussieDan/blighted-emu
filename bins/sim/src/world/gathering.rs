@@ -14,13 +14,14 @@
 //! ([`nw_content::gathering::GatherRule`]); without them the request is refused. The gather's
 //! game event gives its tradeskill experience ([`SimWorld::grant_event`]).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 
 use bevy_ecs::entity::Entity;
 use nw_content::chest_lockouts::Lockout;
 use nw_content::corpse_times::{DEFAULT_CORPSE_MS, SKINNED_CORPSE_MS, corpse_ms};
 use nw_content::gathering::Gatherable;
-use nw_content::loot::{LootContext, loot_level};
+use nw_content::loot::{LootContext, TABLE_PREFIX, loot_level};
 use nw_content::tradeskill_xp::NEUTRAL_MODIFIER;
 use nw_formats::objectstream::lowercase_crc32;
 use nw_messages::items::SYNC_MOVED;
@@ -98,6 +99,10 @@ const PERCENT: u32 = 100;
 const ONE_GATHER: u32 = 1;
 /// The gatherable of a water gather (`GatherableData`: `BaseGatherTime` 3, loot table `Water`).
 const WATER_GATHERABLE: &str = "Water";
+/// How far from the player a node it gathers may be, metres, across the ground (Inferred: the
+/// client's interaction reach is Unknown here; generous, so a large node such as a tree, whose
+/// level point is its trunk, and a position a moment old still pass).
+const GATHER_REACH_M: f32 = 15.0;
 
 /// Why a gather request is refused besides a busy node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,6 +175,33 @@ impl SimWorld {
             return;
         };
         let mob = entity_of_raw_id(&request.target).filter(|mob| spawn_index(*mob).is_some());
+        // The node must be one of the level's gatherables of that kind (or a dead mob to skin)
+        // within reach of the player: a client cannot gather from anywhere.
+        let point = match mob {
+            Some(mob) => self
+                .mobs
+                .places(mob)
+                .filter(|(at, _)| at.horizontal_distance(position) <= GATHER_REACH_M)
+                .map(|_| None),
+            None => request
+                .gatherable
+                .and_then(|crc| {
+                    let near = self
+                        .content
+                        .gather_points
+                        .within(crc, position, GATHER_REACH_M);
+                    self.nodes.point_for(&request.target, &near)
+                })
+                .map(Some),
+        };
+        let Some(point) = point else {
+            tracing::debug!(player = number, gatherable = %gatherable.id, "gather out of reach of any such node");
+            if let Some(player) = self.world.get::<Player>(entity) {
+                let refusal = gather_answer(number, request, GATHER_BUSY, NO_NAME);
+                send_now(&mut self.combat_messages, &player.connection, &[refusal]);
+            }
+            return;
+        };
         let table = self.gather_table(&gatherable, request, name);
         let opened = gatherable.loot_container
             && self
@@ -193,12 +225,13 @@ impl SimWorld {
         }
         let tool_efficiency =
             (!gatherable.by_hand).then(|| self.gather_efficiency(entity, &gatherable));
-        let started = match mob {
-            Some(mob) => self.start_skinning(mob, number),
-            None => self
+        let started = match (mob, point) {
+            (Some(mob), _) => self.start_skinning(mob, number),
+            (None, Some((point, at))) => self
                 .nodes
-                .start(request.target, position, number)
+                .start(request.target, point, at, number)
                 .map_err(|busy| tracing::debug!(player = number, ?busy, "gather refused")),
+            (None, None) => Err(()),
         };
         let Some(mut player) = self.world.get_mut::<Player>(entity) else {
             return;
@@ -572,6 +605,7 @@ impl SimWorld {
         self.give_drops(
             gather.number,
             items.into_iter().zip(rolls).collect(),
+            SYNC_MOVED,
             now_ms,
         );
         for (item, quantity) in &gathered {
@@ -720,10 +754,13 @@ impl SimWorld {
             .collect()
     }
 
-    /// Puts rolled `loot` into the bag of player `number`; each item that fits is an event of
-    /// its quest. An item with no master row, or that does not fit, is lost with a log line.
-    pub(super) fn give_loot(&mut self, number: u64, loot: Vec<(String, u32)>, now_ms: u64) {
-        self.give_loot_as(number, loot, SYNC_MOVED, now_ms);
+    /// Gives `loot` to player `number` at `now_ms`: an entry `[LTID]X` rolls loot table `X` once
+    /// per unit (`LootTables`, as a game event's item reward names it), an item that rolls gets
+    /// its gear score and perks ([`SimWorld::roll_drops`]), and each goes into the bag; what does
+    /// not fit drops at the player's feet ([`SimWorld::give_drops`]). Whether every item went
+    /// into the bag.
+    pub(super) fn give_loot(&mut self, number: u64, loot: Vec<(String, u32)>, now_ms: u64) -> bool {
+        self.give_loot_as(number, loot, SYNC_MOVED, now_ms)
     }
 
     /// [`SimWorld::give_loot`] for a bag change of sync reason `reason` (a craft's output).
@@ -733,39 +770,38 @@ impl SimWorld {
         loot: Vec<(String, u32)>,
         reason: u8,
         now_ms: u64,
-    ) {
-        let Some(entity) = self.player_by_number(number) else {
-            return;
-        };
-        let mut gained = Vec::new();
-        if let Some(mut player) = self.world.get_mut::<Player>(entity) {
-            for (item_id, quantity) in loot {
-                let Some(item) = self.content.kits.item(&item_id) else {
-                    tracing::debug!(item = %item_id, "loot item without a master row");
-                    continue;
-                };
-                let added = player
-                    .gear
-                    .as_mut()
-                    .is_some_and(|gear| gear.add_as(item, quantity, reason));
-                if added {
-                    tracing::debug!(player = number, item = %item_id, quantity, "looted");
-                    gained.push((item_id, quantity));
-                } else {
-                    tracing::info!(player = number, item = %item_id, quantity, "loot lost: no bag or a full bag");
-                }
+    ) -> bool {
+        let items = self.rolled_tables(number, loot);
+        let (entries, values) = self.roll_drops(number, None, items, &BTreeMap::new());
+        self.give_drops(
+            number,
+            entries.into_iter().zip(values).collect(),
+            reason,
+            now_ms,
+        )
+    }
+
+    /// `loot` with each `[LTID]` entry rolled for player `number` (its quantity times) within its
+    /// loot limits; the other entries as they are.
+    fn rolled_tables(&mut self, number: u64, loot: Vec<(String, u32)>) -> Vec<(String, u32)> {
+        let content = Arc::clone(&self.content);
+        let mut items = Vec::new();
+        for (item, quantity) in loot {
+            let Some(table) = item.strip_prefix(TABLE_PREFIX) else {
+                items.push((item, quantity));
+                continue;
+            };
+            for _ in 0..quantity {
+                let reached = self.reached_loot_limits(number);
+                let context = self.loot_context(number, None, &reached);
+                let dice = &mut self.dice;
+                let rolled = content
+                    .loot
+                    .roll(table, context, &mut |below| dice.below(below));
+                items.extend(self.limit_loot(number, rolled));
             }
         }
-        for (item, quantity) in &gained {
-            self.quest_event(
-                number,
-                Event::ItemGained {
-                    item,
-                    quantity: *quantity,
-                },
-                now_ms,
-            );
-        }
+        items
     }
 
     /// The client of player `entity` ends interaction `interaction` at `now_ms`: a gather that
@@ -890,6 +926,9 @@ pub(super) enum NodeBusy {
     Gathered,
     /// It is depleted.
     Depleted,
+    /// The request names the level point by another node id than the one it first had, or the
+    /// node id of another point.
+    OtherNode,
 }
 
 /// The gather nodes of one sim.
@@ -897,27 +936,40 @@ pub(super) enum NodeBusy {
 pub(super) struct Nodes {
     nodes: Vec<Node>,
     by_ref: HashMap<[u8; RAW_ID_LEN], usize>,
+    /// The node of each level gatherable point (its index in
+    /// [`crate::player_content::PlayerContent::gather_points`]).
+    by_point: HashMap<usize, usize>,
 }
 
 impl Nodes {
-    /// Player `player` at `position` starts to gather node `gde_ref`; refused while another
-    /// player gathers it or it is depleted.
+    /// Player `player` starts to gather node `gde_ref`, the level's gatherable point `point` at
+    /// `position`; refused while another player gathers it, while it is depleted, and when the
+    /// point and the node id do not name the same node they named first (a new id cannot skip a
+    /// depleted node).
     pub(super) fn start(
         &mut self,
         gde_ref: [u8; RAW_ID_LEN],
+        point: usize,
         position: Position,
         player: u64,
     ) -> Result<(), NodeBusy> {
-        let index = *self.by_ref.entry(gde_ref).or_insert_with(|| {
-            self.nodes.push(Node {
-                gde_ref,
-                position,
-                gatherer: None,
-                respawn_at_ms: None,
-                version: 0,
-            });
-            self.nodes.len() - 1
-        });
+        let index = match (self.by_ref.get(&gde_ref), self.by_point.get(&point)) {
+            (Some(by_ref), Some(by_point)) if by_ref == by_point => *by_ref,
+            (None, None) => {
+                self.nodes.push(Node {
+                    gde_ref,
+                    position,
+                    gatherer: None,
+                    respawn_at_ms: None,
+                    version: 0,
+                });
+                let index = self.nodes.len() - 1;
+                self.by_ref.insert(gde_ref, index);
+                self.by_point.insert(point, index);
+                index
+            }
+            _ => return Err(NodeBusy::OtherNode),
+        };
         let node = &mut self.nodes[index];
         if node.depleted() {
             return Err(NodeBusy::Depleted);
@@ -940,7 +992,27 @@ impl Nodes {
         }
     }
 
-    /// Where node `gde_ref` was first gathered; `None` for a node nobody gathered.
+    /// The level point that node id `gde_ref` names among the points `near` (in reach, nearest
+    /// first): the point it named first when that one is near, else, for an id not seen yet,
+    /// the nearest point no other id holds. `None` when it names no near point.
+    pub(super) fn point_for(
+        &self,
+        gde_ref: &[u8; RAW_ID_LEN],
+        near: &[(usize, Position)],
+    ) -> Option<(usize, Position)> {
+        match self.by_ref.get(gde_ref) {
+            Some(node) => near
+                .iter()
+                .find(|(point, _)| self.by_point.get(point) == Some(node))
+                .copied(),
+            None => near
+                .iter()
+                .find(|(point, _)| !self.by_point.contains_key(point))
+                .copied(),
+        }
+    }
+
+    /// Where node `gde_ref` stands; `None` for a node nobody gathered.
     pub(super) fn position_of(&self, gde_ref: &[u8; RAW_ID_LEN]) -> Option<Position> {
         self.by_ref
             .get(gde_ref)
@@ -1008,7 +1080,7 @@ impl Nodes {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::sync::Arc;
 
     use nw_content::gathering::{
@@ -1019,11 +1091,14 @@ mod tests {
     use nw_formats::objectstream::lowercase_crc32;
 
     use super::*;
+    use crate::placed_points::PlacedPoints;
     use crate::player_content::PlayerContent;
     use crate::world::gear;
     use crate::world::tests::{NOW, SERVER_TIME, admit_at, connection, world_with_spawns};
 
     const FLINT: [u8; RAW_ID_LEN] = [0x5b; RAW_ID_LEN];
+    /// The level point of the flint node.
+    const FLINT_POINT: usize = 0;
     /// The interest radius of the test views.
     const RADIUS_M: f32 = 100.0;
     const AT: Position = Position {
@@ -1042,17 +1117,42 @@ mod tests {
     }
 
     #[test]
+    fn a_level_point_keeps_the_node_id_it_first_had() {
+        const OTHER: [u8; RAW_ID_LEN] = [0x6c; RAW_ID_LEN];
+        let mut nodes = Nodes::default();
+        assert_eq!(nodes.start(FLINT, FLINT_POINT, AT, PLAYER), Ok(()));
+        nodes.deplete(&FLINT, RESPAWN_AT_MS);
+        assert_eq!(
+            nodes.start(OTHER, FLINT_POINT, AT, PLAYER),
+            Err(NodeBusy::OtherNode),
+            "a new id does not skip the depleted node"
+        );
+        assert_eq!(
+            nodes.start(FLINT, FLINT_POINT + 1, AT, PLAYER),
+            Err(NodeBusy::OtherNode),
+            "the id of one node does not gather another"
+        );
+        assert_eq!(nodes.start(OTHER, FLINT_POINT + 1, AT, PLAYER), Ok(()));
+    }
+
+    #[test]
     fn a_node_is_gathered_once_until_it_grows_back() {
         let mut nodes = Nodes::default();
-        assert_eq!(nodes.start(FLINT, AT, PLAYER), Ok(()));
-        assert_eq!(nodes.start(FLINT, AT, PLAYER + 1), Err(NodeBusy::Gathered));
+        assert_eq!(nodes.start(FLINT, FLINT_POINT, AT, PLAYER), Ok(()));
+        assert_eq!(
+            nodes.start(FLINT, FLINT_POINT, AT, PLAYER + 1),
+            Err(NodeBusy::Gathered)
+        );
         assert_eq!(
             nodes.numbers_near(AT, RADIUS_M).count(),
             0,
             "a node in its default state is not shown"
         );
         nodes.deplete(&FLINT, RESPAWN_AT_MS);
-        assert_eq!(nodes.start(FLINT, AT, PLAYER), Err(NodeBusy::Depleted));
+        assert_eq!(
+            nodes.start(FLINT, FLINT_POINT, AT, PLAYER),
+            Err(NodeBusy::Depleted)
+        );
         let number = GATHERABLE_ENTITY_BASE;
         assert_eq!(
             nodes.numbers_near(AT, RADIUS_M).collect::<Vec<_>>(),
@@ -1069,14 +1169,21 @@ mod tests {
         let kept = Slot { new: false, ..new };
         assert_eq!(nodes.group(number, kept, &mut sent), None, "sent once");
         nodes.tick(RESPAWN_AT_MS - 1);
-        assert_eq!(nodes.start(FLINT, AT, PLAYER), Err(NodeBusy::Depleted));
+        assert_eq!(
+            nodes.start(FLINT, FLINT_POINT, AT, PLAYER),
+            Err(NodeBusy::Depleted)
+        );
         nodes.tick(RESPAWN_AT_MS);
         let grown = nodes.group(number, kept, &mut sent).expect("change");
         assert_eq!(grown.members.len(), 2, "the states without the card");
         assert_eq!(state_of(&grown), Some(HEALTHY));
-        assert_eq!(nodes.start(FLINT, AT, PLAYER + 1), Ok(()));
+        assert_eq!(nodes.start(FLINT, FLINT_POINT, AT, PLAYER + 1), Ok(()));
         nodes.release(&FLINT);
-        assert_eq!(nodes.start(FLINT, AT, PLAYER), Ok(()), "a cancel frees it");
+        assert_eq!(
+            nodes.start(FLINT, FLINT_POINT, AT, PLAYER),
+            Ok(()),
+            "a cancel frees it"
+        );
         let far = Position {
             x: AT.x + RADIUS_M + 1.0,
             ..AT
@@ -1179,7 +1286,41 @@ mod tests {
         }
     }
 
-    /// A world with the test content and one player wearing the pick.
+    /// Level points of each of `kinds` at `at`, [`NODES_PER_KIND`] of each a metre apart.
+    pub(crate) fn points_at(kinds: &[&str], at: Position) -> PlacedPoints {
+        PlacedPoints::of(kinds.iter().flat_map(|kind| {
+            (0..NODES_PER_KIND).map(move |step| {
+                #[allow(clippy::cast_precision_loss, reason = "a few metres")]
+                let east = step as f32;
+                (
+                    lowercase_crc32(kind),
+                    Position {
+                        x: at.x + east,
+                        ..at
+                    },
+                )
+            })
+        }))
+    }
+
+    /// Nodes of one kind the test level has at the player.
+    const NODES_PER_KIND: usize = 3;
+
+    /// The level of `world` gets nodes of each of `kinds` at the feet of player `number`.
+    pub(crate) fn place_nodes(world: &mut SimWorld, number: u64, kinds: &[&str]) {
+        let at = world
+            .player_by_number(number)
+            .and_then(|entity| world.world.get::<Body>(entity))
+            .map(|body| body.motion.position())
+            .expect("body");
+        world.content = Arc::new(PlayerContent {
+            gather_points: points_at(kinds, at),
+            ..(*world.content).clone()
+        });
+    }
+
+    /// A world with the test content and one player wearing the pick, with the test nodes at
+    /// its feet.
     fn admitted() -> (SimWorld, Entity) {
         let mut world = world_with_spawns(Vec::new());
         world.content = Arc::new(content());
@@ -1187,6 +1328,7 @@ mod tests {
         admit.backstory = Some(gear::tests::BACKSTORY.to_owned());
         world.admit(&admit, NOW, SERVER_TIME).expect("admit");
         let entity = world.by_connection[&connection(NUMBER)];
+        place_nodes(&mut world, NUMBER, &[VEIN, HIGH_VEIN, BARREL]);
         let pick = world.content.kits.item(PICK).cloned().expect("pick");
         {
             let mut player = world.world.get_mut::<Player>(entity).expect("player");
@@ -1291,6 +1433,56 @@ mod tests {
     }
 
     #[test]
+    fn a_gather_needs_a_level_node_of_its_kind_in_reach() {
+        let (mut world, entity) = admitted();
+        world.gather_open_world(entity, NUMBER, request(1, 0x12, "SomeOtherVein"), &[], NOW);
+        assert!(
+            world.open_gathers.is_empty(),
+            "a kind the content does not know"
+        );
+        place_nodes(&mut world, NUMBER, &[]);
+        world.gather_open_world(entity, NUMBER, request(2, 0x13, BARREL), &[], NOW);
+        assert!(
+            world.open_gathers.is_empty(),
+            "no barrel of the level lies in reach: a client cannot gather from anywhere"
+        );
+    }
+
+    #[test]
+    fn items_that_do_not_fit_the_bag_drop_at_the_players_feet() {
+        let (mut world, entity) = admitted();
+        {
+            let content = Arc::clone(&world.content);
+            let pick = content.kits.item(PICK).expect("pick");
+            let mut player = world.world.get_mut::<Player>(entity).expect("player");
+            let gear = player.gear.as_mut().expect("gear");
+            while gear.has_room_for(&[(pick, 1, true)]) {
+                assert!(gear.add_with_values(
+                    &content.kits,
+                    pick,
+                    1,
+                    &nw_bus::ItemState::default(),
+                    SYNC_MOVED
+                ));
+            }
+        }
+        let bags_before = world.bags.counts();
+        assert!(
+            !world.give_loot(NUMBER, vec![(KEY.to_owned(), 1)], NOW),
+            "not every item went into the bag"
+        );
+        assert_ne!(
+            world.bags.counts(),
+            bags_before,
+            "a bag of dropped items lies there"
+        );
+        assert!(
+            !world.give_loot(NUMBER, vec![("NoSuchItem".to_owned(), 1)], NOW),
+            "an unknown item is never given"
+        );
+    }
+
+    #[test]
     fn a_gather_asks_for_its_rank_and_its_item() {
         let (mut world, entity) = admitted();
         world.gather_open_world(entity, NUMBER, request(1, 0x12, HIGH_VEIN), &[], NOW);
@@ -1349,6 +1541,7 @@ mod tests {
             }]),
         );
         world.content = Arc::new(content);
+        place_nodes(&mut world, NUMBER, &[TRUFFLE]);
         world.start_quest(NUMBER, QUEST, NOW).expect("quest");
         world.gather_open_world(entity, NUMBER, request(1, 0x16, TRUFFLE), &[], NOW);
         let end_ms = world
@@ -1388,6 +1581,7 @@ mod tests {
             ),
         ]);
         world.content = Arc::new(content);
+        place_nodes(&mut world, NUMBER, &[STONE]);
         world.gather_open_world(entity, NUMBER, request(1, 0x15, STONE), &[], NOW);
         let end_ms = world.open_gathers.first().expect("the stone turns").end_ms;
         world.gathers_due(end_ms);
@@ -1521,6 +1715,7 @@ mod tests {
             max_respawn_s: 0.0,
         }]);
         world.content = Arc::new(content);
+        place_nodes(&mut world, NUMBER, &[CHEST]);
         world.gather_open_world(entity, NUMBER, request(1, 0x15, CHEST), &[], NOW);
         let end_ms = world
             .open_gathers
@@ -1532,7 +1727,7 @@ mod tests {
         let player = world.world.get::<Player>(entity).expect("player");
         assert!(player.loot.opened(&target), "the opener's tracker holds it");
         assert_eq!(
-            world.nodes.start(target, AT, PLAYER),
+            world.nodes.start(target, FLINT_POINT, AT, PLAYER),
             Ok(()),
             "the chest is not depleted for others"
         );

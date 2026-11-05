@@ -27,7 +27,9 @@ use bevy_ecs::entity::Entity;
 use nw_bus::{BusId, ConnectionRef, Hit};
 use std::sync::Arc;
 
-use nw_content::combat::{AffixDamage, AttackRow, DamageCategory, RangedBlock, WeaponRow};
+use nw_content::combat::{
+    AffixDamage, AttackRow, DamageCategory, LevelRow, RangedBlock, WeaponRow,
+};
 use nw_content::player_attacks::{AttackHit, AttackKind, BasicAttack, Homing, MeleeShape, Stance};
 use nw_content::respawn_points::{nearest_respawn_point, respawn_point};
 use nw_content::status_effects::{Control, RowKey};
@@ -39,7 +41,10 @@ use nw_messages::{
     SpreadshotProcessedMsg, SpreadshotRequestMsg, facet_entity,
 };
 use nw_sim_core::character::swim_floor;
-use nw_sim_core::{Damage, Health, PlayerAttack, TUTORIAL_START, mob_hit, player_hit};
+use nw_sim_core::{
+    Damage, Health, PlayerAttack, TUTORIAL_START, armor_rating, armor_share, mob_hit, player_hit,
+    weapon_damage_scale,
+};
 
 use super::encounter::Tutorial;
 use super::gear::{Gear, unix_ns};
@@ -61,19 +66,16 @@ use crate::objectives::Event;
 /// tutorial's sea and walked onto the beach at 3.5 m).
 const SWIM_HEIGHT_M: f32 = 1.6;
 
-/// The fit of the damage share that a mob's armor takes off a player's hit (xp-potion-exit note,
-/// section 4.2, Inferred from two points: retail tutorial hits kept 0.7011 with a gear score 60
-/// weapon and 0.7541 with gear score 75, on level 1 mobs of armor rating 109.336):
-/// `armor / (armor + SCALE × gear score ^ POWER)`. The client's player attributes
-/// (`playerbaseattributes.pbadb`) hold `Physical Armor Scale Factor` 1850, `Armor Mitigation
-/// Exponent` 1.2 and `Diminishing Gear Score Threshold` 500; the formula that uses them is
-/// Unknown (no function of the client sweep reads them by name), so the fit stays.
-const ARMOR_FIT_SCALE: f64 = 1.8748;
-const ARMOR_FIT_POWER: f64 = 1.2013;
+/// The armor slots whose items rate a player's armor (`ArmorItemDefinitions`).
+const ARMOR_SLOTS: [u32; 5] = [slot::HEAD, slot::CHEST, slot::HANDS, slot::LEGS, slot::FEET];
 
-/// The share of a hit that a mob of armor rating `armor` takes off a weapon of `gear_score`.
-fn armor_share(armor: f64, gear_score: u32) -> f64 {
-    armor / (armor + ARMOR_FIT_SCALE * f64::from(gear_score).powf(ARMOR_FIT_POWER))
+/// The armor rating of a mob of level row `level` against a hit of `category`.
+fn mob_armor(level: &LevelRow, category: DamageCategory) -> f64 {
+    if category == DamageCategory::Elemental {
+        level.elemental_armor_rating
+    } else {
+        level.physical_armor_rating
+    }
 }
 
 /// The share of a hit that armor taking off `share` takes off once the armor is `scale` times
@@ -678,8 +680,8 @@ impl SimWorld {
     /// who is not is no target). The damage rolls as a hit on a mob does ([`player_hit`]: the
     /// weapon's base damage, the row's coefficient and the crit), times the open-world PvP
     /// balance of the weapon's class ([`nw_content::combat::CombatData::pvp_damage_factor`]) and
-    /// the attacker's status effects; the target's armor takes the share it takes of a mob's hit
-    /// ([`crate::combat::CombatSettings::player_armor_share`]), its status effects their share.
+    /// the attacker's status effects; the target's worn armor takes its share against the
+    /// attacker's weapon ([`SimWorld::worn_armor_share`]), its status effects their share.
     /// It lands as any hit on a player does ([`SimWorld::apply_hit_with`]: 3601 to the target,
     /// its death and recap), and the attacker gets its 2071.
     fn pvp_hit(&mut self, pvp: PvpStrike<'_>, now_ms: u64) -> Result<AttackOutcome, AttackRefusal> {
@@ -723,7 +725,7 @@ impl SimWorld {
         {
             return Err(AttackRefusal::TargetDead);
         }
-        let (weapon, pvp_factor) = self
+        let (weapon, pvp_factor, gear_score) = self
             .world
             .get::<Player>(entity)
             .and_then(|player| {
@@ -731,16 +733,20 @@ impl SimWorld {
                     .gear
                     .as_ref()?
                     .main_weapon()
-                    .map(|(item, _)| item.to_owned())
+                    .map(|(item, gear_score)| (item.to_owned(), gear_score))
             })
-            .and_then(|item| {
+            .and_then(|(item, gear_score)| {
                 let data = &self.combat.data;
-                Some((*data.weapon_of_item(&item)?, data.pvp_damage_factor(&item)))
+                Some((
+                    *data.weapon_of_item(&item)?,
+                    data.pvp_damage_factor(&item),
+                    Some(gear_score),
+                ))
             })
-            .unwrap_or((*self.combat.data.weapon(), PLAIN_DAMAGE_FACTOR));
+            .unwrap_or((*self.combat.data.weapon(), PLAIN_DAMAGE_FACTOR, None));
         let (crit_chance, crit_multiplier) = self.player_crit(entity, &weapon);
         let attack = PlayerAttack {
-            base_damage: weapon.base_damage,
+            base_damage: weapon.base_damage * gear_score.map_or(1.0, weapon_damage_scale),
             coefficient: row.coefficient,
             can_crit: row.can_crit,
             crit_chance,
@@ -750,7 +756,7 @@ impl SimWorld {
             vitals.last_attack_ms = Some(now_ms);
         }
         let armor_share = rent_share(
-            self.combat.player_armor_share,
+            self.worn_armor_share(target, number, row.category),
             self.player_armor_scale(target_entity, row.category),
             row.category,
         );
@@ -929,7 +935,7 @@ impl SimWorld {
         let plain_share = held
             .zip(self.combat.data.level(view.level))
             .map_or(self.combat.armor_share, |((_, gear_score), level)| {
-                armor_share(level.physical_armor_rating, gear_score)
+                armor_share(mob_armor(level, row.category), gear_score)
             });
         // The mob's rend effects lower its armor (`PhysicalArmor`, `ElementalArmor`).
         let rend = self.mob_effects.get(&target).map_or(1.0, |effects| {
@@ -941,7 +947,8 @@ impl SimWorld {
         let armor_share = rent_share(plain_share, rend, row.category);
         let (crit_chance, crit_multiplier) = self.player_crit(entity, &weapon);
         let attack = PlayerAttack {
-            base_damage: weapon.base_damage,
+            base_damage: weapon.base_damage
+                * held.map_or(1.0, |(_, gear_score)| weapon_damage_scale(gear_score)),
             coefficient: row.coefficient,
             can_crit: row.can_crit,
             crit_chance,
@@ -1145,7 +1152,7 @@ impl SimWorld {
     }
 
     /// Queues `message` for `connection`, reliable on the message channel.
-    fn send_reliable(&mut self, connection: ConnectionRef, message: &ServerMessage) {
+    pub(super) fn send_reliable(&mut self, connection: ConnectionRef, message: &ServerMessage) {
         match message.envelope() {
             Ok(envelope) => self.combat_messages.push(Outgoing {
                 connection,
@@ -2186,9 +2193,10 @@ impl SimWorld {
         }
         let connection = player.connection.clone();
         let attacker_at = self.attacker_position(attacker);
-        let scale = self
-            .mobs
-            .hit_scale(attacker, (1.0 - self.combat.player_armor_share) as f32);
+        let category = style.map_or(DamageCategory::Physical, |style| style.category);
+        let kept = 1.0 - self.worn_armor_share(target, attacker, category);
+        // A share of a hit: f32 holds it.
+        let scale = self.mobs.hit_scale(attacker, kept as f32);
         // The player's status effects take their share of the hit (`Abs*`).
         let tag = style.map_or(DEFAULT_HIT_TAG, |style| style.tag);
         let amount = self.player_absorbs(entity, tag, amount);
@@ -2283,8 +2291,9 @@ impl SimWorld {
         self.content.deaths_door.takes(mode, gap)
     }
 
-    /// Player `entity` (`target`) died to `attacker`: its mobs forget it, its worn items wear,
-    /// its weapon goes away, its departure is saved and its client gets its death recap.
+    /// Player `entity` (`target`) died to `attacker`: its mobs forget it, its quests count the
+    /// death, its worn items wear, its weapon goes away, its departure is saved and its client
+    /// gets its death recap.
     pub(super) fn player_died(
         &mut self,
         entity: Entity,
@@ -2294,6 +2303,8 @@ impl SimWorld {
     ) {
         self.mobs.forget(target);
         self.meta_event(entity, super::meta_achievements::MetaEvent::Died);
+        let now_ms = self.last_now_ms;
+        self.quest_event(target, crate::objectives::Event::Died, now_ms);
         // A death wears the worn items (durability loss, [`super::repair`]); a player killer
         // makes it a PvP death.
         let by_player =
@@ -2479,6 +2490,100 @@ impl SimWorld {
                 category != DamageCategory::Elemental,
             )
         })
+    }
+
+    /// The share of a hit of `category` by `attacker` that the worn armor of player `number`
+    /// takes off ([`armor_share`] of [`SimWorld::player_armor`] against
+    /// [`SimWorld::attacker_gear_score`]).
+    pub(super) fn worn_armor_share(
+        &mut self,
+        number: u64,
+        attacker: u64,
+        category: DamageCategory,
+    ) -> f64 {
+        armor_share(
+            self.player_armor(number, category),
+            self.attacker_gear_score(attacker),
+        )
+    }
+
+    /// The gear score of `attacker` that a defender's armor mitigates: a mob's level row's
+    /// `GearScore` (`VitalsLevelData`), a player's weapon in the hand; else (a player of another
+    /// sim, a player with no weapon) the weakest weapon gear score, `Min Possible Weapon Gear
+    /// Score` (Inferred).
+    fn attacker_gear_score(&mut self, attacker: u64) -> u32 {
+        let mob = self
+            .mobs
+            .level(attacker)
+            .and_then(|level| self.combat.data.level(level))
+            .map(|row| row.gear_score);
+        let player = self.player_by_number(attacker).and_then(|entity| {
+            let (_, gear_score) = self
+                .world
+                .get::<Player>(entity)?
+                .gear
+                .as_ref()?
+                .main_weapon()?;
+            Some(gear_score)
+        });
+        mob.or(player)
+            .unwrap_or(nw_sim_core::combat::MIN_WEAPON_GEAR_SCORE)
+    }
+
+    /// The armor rating of player `number` against a hit of `category`: over its worn armor
+    /// items, each item's share of a set (`ArmorRatingScaleFactor`) times its set's physical or
+    /// elemental scale factor times the rating of its gear score ([`armor_rating`];
+    /// `ArmorItemDefinitions`). Inferred: the pieces add. Retail check: the four starter pieces
+    /// of gear score 75 (the helmet comes later) against a level 1 sailor (gear score 50) keep
+    /// 0.6091 of a hit; retail kept 0.6006 (live capture 2026-09-12, 3601 scale), 1.4 % apart.
+    /// A player of another sim (a ghost) rates by the items that show on it, at their base gear
+    /// score (Inferred: a ghost carries no gear score).
+    fn player_armor(&mut self, number: u64, category: DamageCategory) -> f64 {
+        let entity = self.player_by_number(number);
+        let worn: Vec<(&str, u32)> =
+            match entity.and_then(|entity| self.world.get::<Player>(entity)?.gear.as_ref()) {
+                Some(gear) => {
+                    let visible = gear.visible_items();
+                    ARMOR_SLOTS
+                        .iter()
+                        .filter_map(|slot_id| {
+                            let gear_score = visible
+                                .iter()
+                                .find(|item| item.slot == *slot_id)?
+                                .item?
+                                .gear_score;
+                            Some((gear.worn_item(*slot_id)?, gear_score))
+                        })
+                        .collect()
+                }
+                None => self
+                    .ghost(number)
+                    .and_then(|(_, ghost)| ghost.player)
+                    .map(|player| {
+                        player
+                            .items
+                            .iter()
+                            .flatten()
+                            .filter(|item| ARMOR_SLOTS.contains(&u32::from(item.slot)))
+                            .filter_map(|item| {
+                                let kit = self.content.kits.item_at(item.item_index)?;
+                                Some((kit.item_id.as_str(), kit.gear_score))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
+        worn.into_iter()
+            .filter_map(|(item, gear_score)| {
+                let armor = self.combat.data.armor_of_item(item)?;
+                let scale = if category == DamageCategory::Elemental {
+                    armor.elemental_scale
+                } else {
+                    armor.physical_scale
+                };
+                Some(armor.rating_share * scale * armor_rating(gear_score))
+            })
+            .sum()
     }
 
     /// How the hit `intent` of a mob, of the move hit `move_hit` when it has one, lands on the
@@ -2692,7 +2797,7 @@ impl SimWorld {
                 let style = self.mob_hit_style(&intent, move_hit, defender);
                 // The player's rend effects lower its armor; a ghost's take theirs at home.
                 let armor_share = rent_share(
-                    self.combat.player_armor_share,
+                    self.worn_armor_share(intent.target, intent.mob, style.category),
                     defender.map_or(1.0, |defender| {
                         self.player_armor_scale(defender, style.category)
                     }),
@@ -4240,11 +4345,8 @@ mod tests {
                 output.mob_hits
             );
         };
-        let full = mob_hit(
-            &world.mobs.get(mob()).expect("mob").attack,
-            world.combat.player_armor_share,
-        )
-        .amount;
+        let share = world.worn_armor_share(1, mob(), DamageCategory::Physical);
+        let full = mob_hit(&world.mobs.get(mob()).expect("mob").attack, share).amount;
         assert_eq!(*amount, full / BROKEN_GUARD_DAMAGE_DIVISOR);
         assert_eq!(player_stamina(&mut world, 1), 0.0);
         let vitals = |world: &mut SimWorld| *world.world.get::<Vitals>(entity).expect("vitals");
@@ -4431,13 +4533,54 @@ mod tests {
         panic!("the mob never hit");
     }
 
+    /// A player's worn armor rates by its pieces (`ArmorItemDefinitions` of the kit chest,
+    /// `HeavyChest_Balanced`: 0.35 of a set, physical scale 0.875) against the mob's level gear
+    /// score (retail level 1: 50), physical and elemental apart; without the chest it takes
+    /// nothing off.
     #[test]
-    fn the_armor_fit_gives_the_retail_tutorial_shares() {
-        const LEVEL_1_ARMOR: f64 = 109.336;
-        const KEPT_GS_60: f64 = 0.7011;
-        const KEPT_GS_75: f64 = 0.7541;
-        assert!((1.0 - armor_share(LEVEL_1_ARMOR, 60) - KEPT_GS_60).abs() < 1e-3);
-        assert!((1.0 - armor_share(LEVEL_1_ARMOR, 75) - KEPT_GS_75).abs() < 1e-3);
+    fn worn_armor_takes_its_share_of_a_mob_hit() {
+        const CHEST: &str = "MysticArchetypeChest";
+        const CHEST_STATS: &str = "HeavyChest_Balanced";
+        const SET_SCALE: f64 = 0.874_996_5;
+        const ELEMENTAL_SCALE: f64 = 0.5;
+        const KIT_GEAR_SCORE: u32 = 75;
+        const MOB_GEAR_SCORE: u32 = 50;
+        let mut source = crate::combat::test_support::test_source();
+        source.levels[0].1.gear_score = MOB_GEAR_SCORE;
+        source
+            .item_stats
+            .push((CHEST.to_owned(), CHEST_STATS.to_owned()));
+        let chest = nw_content::combat::ArmorRow {
+            rating_share: 0.35,
+            physical_scale: SET_SCALE,
+            elemental_scale: ELEMENTAL_SCALE,
+        };
+        source.armors.push((CHEST_STATS.to_owned(), chest));
+        let mut world = fight();
+        world.combat = committed().combat_settings(
+            Arc::new(test_data_of(source)),
+            Arc::from([]),
+            crate::combat::tests::test_mob_ai(),
+        );
+        let entity = world.by_connection[&connection(1)];
+        world.world.get_mut::<Player>(entity).expect("player").gear = Gear::starter(
+            &gear::tests::kits(),
+            gear::tests::CHARACTER,
+            Some(gear::tests::BACKSTORY),
+        );
+        let against = |scale: f64| {
+            let armor = 0.35 * scale * armor_rating(KIT_GEAR_SCORE);
+            armor_share(armor, MOB_GEAR_SCORE)
+        };
+        let physical = world.worn_armor_share(1, mob(), DamageCategory::Physical);
+        assert!((physical - against(SET_SCALE)).abs() < 1e-9, "{physical}");
+        let elemental = world.worn_armor_share(1, mob(), DamageCategory::Elemental);
+        assert!((elemental - against(ELEMENTAL_SCALE)).abs() < 1e-9);
+        world.world.get_mut::<Player>(entity).expect("player").gear = None;
+        assert_eq!(
+            world.worn_armor_share(1, mob(), DamageCategory::Physical),
+            0.0
+        );
     }
 
     #[test]
@@ -5841,9 +5984,8 @@ mod tests {
         let remote = remote.expect("the mob hit the ghost player");
         assert_eq!(remote.owner, sim_b());
         assert_eq!((remote.hit.target, remote.hit.attacker), (9, mob()));
-        let unscaled = (crate::combat::test_support::TEST_LEVEL_DAMAGE
-            * (1.0 - world.combat.player_armor_share))
-            .round();
+        let share = world.worn_armor_share(9, mob(), DamageCategory::Physical);
+        let unscaled = (crate::combat::test_support::TEST_LEVEL_DAMAGE * (1.0 - share)).round();
         assert_eq!(
             f64::from(remote.hit.amount),
             (unscaled * ROW_FACTOR).round(),

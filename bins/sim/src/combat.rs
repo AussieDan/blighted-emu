@@ -151,8 +151,6 @@ pub struct CombatSettings {
     pub mob_respawn_ms: u64,
     /// Share of a player's damage that mob armor takes off.
     pub armor_share: f64,
-    /// Share of a mob's damage that player armor takes off.
-    pub player_armor_share: f64,
     /// Extra reach allowed for lag.
     pub reach_margin_m: f32,
     /// Shortest time between two attacks of a player.
@@ -233,6 +231,8 @@ pub mod test_support {
                     base_max_health: TEST_LEVEL_HEALTH,
                     base_damage: TEST_LEVEL_DAMAGE,
                     physical_armor_rating: 0.0,
+                    elemental_armor_rating: 0.0,
+                    gear_score: 0,
                 },
             )],
             weapons: vec![(
