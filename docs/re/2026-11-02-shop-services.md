@@ -55,6 +55,15 @@ From the retail captures under `local-data/captures` (folders `catalog` and `ent
 - **Observed.** The capture of the privacy settings service (`POST .../privacy-settings`) is a
   separate host, read from `omni.privacy-settings.client-endpoint` (`FUN_14160ad60`). Our live
   run showed no connection to it.
+- **Observed** (`captures/open-world/unlock_store_content-a3d37ef02324761e/privacy`, call 52):
+  `POST /players/<persona>/games/new-world/privacy-settings` on
+  `client.agsprivacysettingsservice.amazongames.com`, body `{"settings": [5 names]}` (friend
+  requests, online status, private text, public or group text, voice). Reply `200`
+  `application/json`: one entry per name, each `value` and `defaultValue` `Everyone`, `status`
+  `DEFAULT`, its `allowedValues`, `errorCode` and `lastUpdateDate` `null`, `lastUpdateTimeMs` 0;
+  the reply's order is not the request's. `FUN_14160ad60` reads
+  `omni.privacy-settings.assume-role`, `.region` and `.client-endpoint`, the same shape as the
+  leaderboard client.
 
 ## 2. What the server does
 
@@ -63,9 +72,17 @@ From the retail captures under `local-data/captures` (folders `catalog` and `ent
   keys. The tracked layer has `omni.fcs.region` `us-east-1` and an empty `omni.fcs.endpoints`
   object; the server refuses a file that sets one of the keys itself.
 - `crates/nw-login/src/shop.rs` serves on `game.<domain>`: a catalog with one free offer per
-  mount of the store table (2026-11-04, below), one hidden store with no slot for each alias, the
-  entitlement list of the player's account, and `202` for a sync. The catalog and store replies
-  have an ETag (base64 of the SHA-256 of the reply with an empty `etag`) and answer `304` to it.
+  mount of the store table (2026-11-04, below), one hidden store with one empty static slot for
+  each alias (every one of the 1,029 retail store replies in the captures had one to six; with no slot the change
+  mount screen kept spinning, live 2026-11-04), the entitlement list of the player's account,
+  and `202` for a sync. The catalog and store replies have an ETag (base64 of the SHA-256 of the
+  reply with an empty `etag`) and answer `304` to it, named in `x-amzn-if-none-match` (the
+  client's header, live 2026-11-04) or `If-None-Match`. A free offer shows a 99 % discount (every
+  free price of the `unlock_store_content` catalog: 1,872 of 1,872).
+- An offer's `alias` is its mount's store product (`javelindata_storeproducts` `UniqueTagID`
+  with the mount's `DisplayName`, the variant telling two apart): retail `Mount_Wolf_1`,
+  `Mount_Bear_MTX7_Ronin` (Observed, `unlock_store_content` catalog). The client leaves out an
+  offer whose alias names no product, so the 5 store mounts without one are not sold (47 of 52).
   Each call is logged (`store call`: method, path, query, header names, status).
 
 ### 2.1 Free store mounts (2026-11-04)
@@ -107,6 +124,17 @@ From the retail captures under `local-data/captures` (folders `catalog` and `ent
   reaches Amazon. This server has no purchase route; it answers `404` (the game buys through 898,
   section 2.1).
 
+### 2.2 Privacy settings (2026-11-04)
+
+- The remote config fills `omni.privacy-settings.client-endpoint` with `game.<domain>` (the
+  same fill as the shop keys); the tracked layer sets `omni.privacy-settings.region`
+  `us-east-1` (Inferred: the region of the other services).
+- `crates/nw-login/src/privacy.rs` answers the settings post on `game.<domain>` with the retail
+  defaults of each known setting the request names, in the retail reply's order. The retail
+  request gets the retail reply byte for byte (test). A name the service does not know gets no
+  entry (Inferred: no capture). This server keeps no privacy settings and has no route that
+  changes one (no retail capture of a change).
+
 ## 3. Live check (Linux, 2026-11-02)
 
 - **Observed.** After a new game start, at character select, the game held connections only to
@@ -117,5 +145,5 @@ From the retail captures under `local-data/captures` (folders `catalog` and `ent
 
 1. How the shop screen shows an empty catalog and no stores. A live run with the shop screen
    open answers it.
-2. Whether our client calls the privacy settings service in some screen. Its endpoint key
-   (`omni.privacy-settings.client-endpoint`) is not set yet.
+2. Whether our client calls the privacy settings service, and when. Its endpoint key is set
+   since 2026-11-04 and the server answers as retail; no live run has shown the call yet.
