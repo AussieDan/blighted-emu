@@ -315,7 +315,7 @@ struct PlayerPath {
 }
 
 /// The account a persona names: the id itself, or the last part of a retail-style persona.
-fn account_of(persona: &str) -> Option<Uuid> {
+pub(crate) fn account_of(persona: &str) -> Option<Uuid> {
     persona
         .rsplit(PERSONA_SEPARATOR)
         .next()

@@ -139,6 +139,19 @@ mount_price = 20000
 # Ent_Mount_MTX_1_wolf = 15000
 [shop.mount_prices]
 
+# The analytics stream the client puts its events on (research data; nothing reads it).
+# Best guesses from 6,533 retail PutRecords of 255 sessions: the largest body was 61,922 bytes,
+# one client sent at most 44 requests and 1,096,336 bytes in a minute.
+[analytics]
+# Largest body of one request, in bytes.
+max_body_bytes = 262144
+# Requests of one client address a minute.
+requests_per_minute = 120
+# Body bytes of one client address a minute.
+bytes_per_minute = 4194304
+# Days a record is kept; older ones are deleted once an hour.
+retention_days = 30
+
 # Experience multipliers. Each value multiplies one kind of experience: 1.0 is normal (the
 # amount the game data gives), 2.0 is double, 0.5 is half, 0.0 gives none. Any number of 0 or
 # more works. The server sends these values to the game (remote config javelin.xp-multipliers,

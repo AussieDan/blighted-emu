@@ -96,6 +96,7 @@ pub fn edge_app(
             global,
             Arc::new(StoreTable::default()),
             Arc::new(ShopConfig::default()),
+            crate::analytics::AnalyticsConfig::default(),
             Router::new(),
             CmsRouters {
                 news: Router::new(),

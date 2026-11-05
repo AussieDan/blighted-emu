@@ -1,18 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-//! [`AccountStore`], [`CharacterStore`], [`StatsStore`] and [`AnalyticsStore`] on PostgreSQL.
+//! [`AccountStore`], [`CharacterStore`], [`StatsStore`], [`AnalyticsStore`] and
+//! [`PrivacyStore`] on PostgreSQL.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use nw_db::{
     Account, AccountEntitlement, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character,
-    DbError, DiscordProfile, NewCharacter, PgPool, StatValues, Wallet, account_entitlements,
-    wallet,
+    DbError, DiscordProfile, NewCharacter, PgPool, PrivacySetting, StatValues, Wallet,
+    account_by_id, account_entitlements, privacy_settings, set_privacy_settings, wallet,
 };
 use uuid::Uuid;
 
 use crate::store::{
-    AccountStore, AnalyticsStore, CharacterStore, EntitlementStore, StatsStore, StoreError,
+    AccountStore, AnalyticsStore, CharacterStore, EntitlementStore, PrivacyStore, StatsStore,
+    StoreError,
 };
 
 /// Accounts and launcher sessions in PostgreSQL.
@@ -121,6 +123,13 @@ impl CharacterStore for PgCharacters {
         nw_db::character_name_taken(&self.global, name)
             .await
             .map_err(store_error)
+    }
+
+    async fn account_banned(&self, account: Uuid) -> Result<bool, StoreError> {
+        Ok(account_by_id(&self.global, account)
+            .await
+            .map_err(store_error)?
+            .is_some_and(|found| found.banned))
     }
 
     /// Runs in its own task, so a dropped request cannot stop between the name reservation and
@@ -421,6 +430,43 @@ impl AnalyticsStore for PgStats {
         records: &[AnalyticsRecord],
     ) -> Result<Vec<i64>, StoreError> {
         nw_db::insert_analytics_events(&self.pool, stream_name, records)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn delete_older_than(&self, retention_seconds: u64) -> Result<u64, StoreError> {
+        nw_db::delete_old_analytics_events(&self.pool, retention_seconds)
+            .await
+            .map_err(store_error)
+    }
+}
+
+/// The privacy settings of accounts in the global database.
+#[derive(Debug, Clone)]
+pub struct PgPrivacy {
+    pool: PgPool,
+}
+
+impl PgPrivacy {
+    /// Uses a pool of the migrated global database.
+    pub fn new(pool: PgPool) -> Self {
+        Self { pool }
+    }
+}
+
+impl PrivacyStore for PgPrivacy {
+    async fn settings(&self, account: Uuid) -> Result<Vec<PrivacySetting>, StoreError> {
+        privacy_settings(&self.pool, account)
+            .await
+            .map_err(store_error)
+    }
+
+    async fn set(
+        &self,
+        account: Uuid,
+        settings: &[(String, String)],
+    ) -> Result<Vec<PrivacySetting>, StoreError> {
+        set_privacy_settings(&self.pool, account, settings)
             .await
             .map_err(store_error)
     }

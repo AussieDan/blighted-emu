@@ -15,6 +15,7 @@ use nw_protocol::launcher_api::{AuthMode, SESSION_PLACEHOLDER, is_forbidden_host
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::analytics::AnalyticsConfig;
 use crate::discord::is_discord_user_id;
 use crate::experience::ExperienceConfig;
 use crate::game::API_REGION;
@@ -108,6 +109,9 @@ pub struct EdgeConfig {
     /// The store; an empty store when left out.
     #[serde(default)]
     pub shop: ShopConfig,
+    /// The limits and retention of the analytics stream; the defaults when left out.
+    #[serde(default)]
+    pub analytics: AnalyticsConfig,
     /// Worlds, one `[[world]]` block each.
     #[serde(rename = "world")]
     pub worlds: Vec<WorldConfig>,
@@ -466,6 +470,14 @@ impl EdgeConfig {
         }
         if self.request_timeout_seconds == 0 {
             return invalid("request_timeout_seconds", "must be above 0");
+        }
+        let analytics = &self.analytics;
+        if analytics.max_body_bytes == 0
+            || analytics.requests_per_minute == 0
+            || analytics.bytes_per_minute == 0
+            || analytics.retention_days == 0
+        {
+            return invalid("analytics", "every limit must be above 0");
         }
         if self.max_connections == 0 {
             return invalid("max_connections", "must be above 0");

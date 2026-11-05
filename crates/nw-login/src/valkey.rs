@@ -125,6 +125,11 @@ impl GameSessionStore for Valkey {
             .await?;
         Ok(value.and_then(|text| Uuid::parse_str(&text).ok()))
     }
+
+    async fn revoke(&self, key: &str) -> Result<(), StoreError> {
+        self.query::<()>(redis::cmd("DEL").arg(format!("{GAME_SESSION_PREFIX}{key}")))
+            .await
+    }
 }
 
 impl RateLimiter for Valkey {
@@ -295,6 +300,13 @@ impl QueueStore for Valkey {
                 .arg(ttl_ms),
         )
         .await
+    }
+
+    async fn free_slots(&self, world_id: Uuid) -> Result<u32, StoreError> {
+        let slots: Option<u32> = self
+            .query(redis::cmd("GET").arg(format!("{QUEUE_FREE_SLOTS_PREFIX}{world_id}")))
+            .await?;
+        Ok(slots.unwrap_or_default())
     }
 
     async fn take_entry(&self, ticket_id: &str) -> Result<Option<EntryRecord>, StoreError> {

@@ -120,7 +120,7 @@ struct SessionAccount(Uuid);
 impl<G, C, R, Q> FromRequestParts<GameState<G, C, R, Q>> for SessionAccount
 where
     G: GameSessionStore,
-    C: Send + Sync,
+    C: CharacterStore,
     R: Send + Sync,
     Q: Send + Sync,
 {
@@ -207,19 +207,28 @@ where
         .with_state(state)
 }
 
-/// The account of a live game session; extends the session.
-async fn session_account<G: GameSessionStore, C, R, Q>(
+/// The account of a live game session; extends the session. The session of a banned account
+/// ends here (the admin tool bans in the global database, which has no list of its sessions):
+/// its next call, the channel document, a queue refresh included, is refused, so a banned
+/// player in the queue is never admitted.
+async fn session_account<G: GameSessionStore, C: CharacterStore, R, Q>(
     state: &GameState<G, C, R, Q>,
     session: &str,
 ) -> Result<Uuid, ApiError> {
     if !is_game_session_key(session) {
         return Err(ApiError::NoSession);
     }
-    state
+    let account = state
         .game_sessions
         .resolve(session, state.config.auth.game_session_ttl_seconds)
         .await?
-        .ok_or(ApiError::NoSession)
+        .ok_or(ApiError::NoSession)?;
+    if state.characters.account_banned(account).await? {
+        state.game_sessions.revoke(session).await?;
+        tracing::info!(%account, "game session of a banned account ended");
+        return Err(ApiError::Banned);
+    }
+    Ok(account)
 }
 
 fn is_channel_key_byte(byte: u8) -> bool {
@@ -274,6 +283,7 @@ async fn channel<G, C, R, Q>(
 ) -> Result<Json<ChannelDocument>, ApiError>
 where
     G: GameSessionStore,
+    C: CharacterStore,
 {
     let Some(key) = file.strip_suffix(CHANNEL_FILE_SUFFIX) else {
         return Err(unknown_route(method, uri).await);
@@ -304,9 +314,11 @@ fn to_json_integer(value: u32) -> i64 {
     i64::from(value)
 }
 
-fn world_model(world: &WorldConfig) -> WorldModel {
+/// The world model of `world`; `is_full` when `world-director` reports no free player slot
+/// (its players are at its capacity, or no report came: the queue then admits nobody either).
+fn world_model(world: &WorldConfig, is_full: bool) -> WorldModel {
     WorldModel {
-        is_full: false,
+        is_full,
         max_account_characters: to_json_integer(world.max_characters_per_account),
         max_connection_count: to_json_integer(world.capacity),
         public_name: world.name.clone(),
@@ -330,8 +342,15 @@ fn channel_character_slots(config: &EdgeConfig) -> i64 {
         .sum()
 }
 
-fn world_models(config: &EdgeConfig) -> Vec<WorldModel> {
-    config.worlds.iter().map(world_model).collect()
+async fn world_models<G, C, R, Q: QueueStore>(
+    state: &GameState<G, C, R, Q>,
+) -> Result<Vec<WorldModel>, ApiError> {
+    let mut models = Vec::with_capacity(state.config.worlds.len());
+    for world in &state.config.worlds {
+        let is_full = state.queue.free_slots(world.id).await? == 0;
+        models.push(world_model(world, is_full));
+    }
+    Ok(models)
 }
 
 /// The character summary the client shows (JSON note section 5.1.1). Its `currentLevel` is
@@ -364,6 +383,7 @@ async fn login_info<G, C, R, Q>(
 ) -> Result<Json<LoginInfoReply>, ApiError>
 where
     C: CharacterStore,
+    Q: QueueStore,
 {
     let mut characters = Vec::new();
     let mut name_reservations = Vec::new();
@@ -378,18 +398,18 @@ where
             characters,
             max_channel_characters: channel_character_slots(&state.config),
             name_reservations,
-            worlds: world_models(&state.config),
+            worlds: world_models(&state).await?,
         },
     }))
 }
 
-async fn list_worlds<G, C, R, Q>(
+async fn list_worlds<G, C, R, Q: QueueStore>(
     State(state): State<GameState<G, C, R, Q>>,
     _session: SessionAccount,
 ) -> Result<Json<ListWorldsReply>, ApiError> {
     Ok(Json(ListWorldsReply {
         list_worlds_response_body: ListWorldsBody {
-            worlds: world_models(&state.config),
+            worlds: world_models(&state).await?,
         },
     }))
 }
@@ -1053,7 +1073,14 @@ pub(crate) mod tests {
                 .sum();
             assert_eq!(list.max_channel_characters, i64::from(slots));
             assert_eq!(list.name_reservations[0].display_name, NAME);
-            assert_eq!(list.worlds, world_models(&fixture.state.config));
+            assert_eq!(
+                list.worlds,
+                world_models(&fixture.state).await.expect("worlds")
+            );
+            assert!(
+                list.worlds.iter().all(|world| !world.is_full),
+                "the director reported free slots"
+            );
         }
         let (status, _) = call(
             &app,
@@ -1104,6 +1131,53 @@ pub(crate) mod tests {
         assert_eq!(world.public_status_code, PUBLIC_STATUS_OPEN);
         assert_eq!(world.world_type, WORLD_TYPE_OPEN_WORLD);
         assert_eq!(world.transfer_to_region, NO_TRANSFER_REGION);
+        assert!(!world.is_full);
+        fixture
+            .state
+            .queue
+            .set_free_slots(configured.id, 0, FIXTURE_SLOTS_TTL_MS)
+            .await
+            .expect("no slot");
+        let (_, body) = call(&app, "POST", &path).await;
+        let reply: ListWorldsReply = serde_json::from_slice(&body).expect("worlds");
+        assert!(
+            reply.list_worlds_response_body.worlds[0].is_full,
+            "its players are at its capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_banned_account_loses_its_session_and_its_queue() {
+        let fixture = fixture().await;
+        let app = game_router(fixture.state.clone());
+        let path = game_path(
+            &fixture.session,
+            &format!("{GATEWAY_STAGE}{LIST_WORLDS_PATH}"),
+        );
+        let (status, _) = call(&app, "POST", &path).await;
+        assert_eq!(status, StatusCode::OK);
+        fixture.state.characters.ban(fixture.account);
+        let (status, body) = call(&app, "POST", &path).await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (StatusCode::FORBIDDEN, "banned")
+        );
+        assert_eq!(
+            fixture
+                .state
+                .game_sessions
+                .resolve(&fixture.session, CLAIM_SECONDS)
+                .await
+                .expect("read"),
+            None,
+            "the session key is gone"
+        );
+        let queue = game_path(
+            &fixture.session,
+            &format!("{GATEWAY_STAGE}{QUEUE_LOGIN_PATH}/ticket"),
+        );
+        let (status, _) = call(&app, "POST", &queue).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "no queue refresh");
     }
 
     #[tokio::test]

@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use nw_db::{
     Account, AccountEntitlement, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character,
-    DiscordProfile, NewCharacter, StatValues, Wallet,
+    DiscordProfile, NewCharacter, PrivacySetting, StatValues, Wallet,
 };
 use nw_protocol::launcher_api::LauncherSession;
 use uuid::Uuid;
@@ -19,7 +19,7 @@ use crate::queue::{
 };
 use crate::store::{
     AccountStore, AnalyticsStore, CharacterStore, DiscordAttempt, DiscordStateStore,
-    EntitlementStore, GameSessionStore, RateLimiter, StatsStore, StoreError,
+    EntitlementStore, GameSessionStore, PrivacyStore, RateLimiter, StatsStore, StoreError,
 };
 use crate::time::MILLIS_PER_SECOND;
 use nw_common::time::{unix_ms, unix_seconds};
@@ -199,12 +199,18 @@ impl GameSessionStore for MemoryGameSessions {
         sessions.insert(key.to_owned(), Expiring::new(account_id, ttl_seconds));
         Ok(Some(account_id))
     }
+
+    async fn revoke(&self, key: &str) -> Result<(), StoreError> {
+        lock(&self.0).remove(key);
+        Ok(())
+    }
 }
 
 #[derive(Default)]
 struct Characters {
     worlds: HashMap<Uuid, Vec<Character>>,
     names: HashMap<String, Uuid>,
+    banned: std::collections::HashSet<Uuid>,
 }
 
 /// Characters and names in memory.
@@ -218,7 +224,13 @@ impl MemoryCharacters {
         Self(Arc::new(Mutex::new(Characters {
             worlds,
             names: HashMap::new(),
+            banned: std::collections::HashSet::new(),
         })))
+    }
+
+    /// Bans `account`.
+    pub(crate) fn ban(&self, account: Uuid) {
+        lock(&self.0).banned.insert(account);
     }
 }
 
@@ -258,6 +270,10 @@ impl CharacterStore for MemoryCharacters {
 
     async fn name_taken(&self, name: &str) -> Result<bool, StoreError> {
         Ok(lock(&self.0).names.contains_key(&name.to_lowercase()))
+    }
+
+    async fn account_banned(&self, account: Uuid) -> Result<bool, StoreError> {
+        Ok(lock(&self.0).banned.contains(&account))
     }
 
     async fn create(&self, world_id: Uuid, new: &NewCharacter) -> Result<Character, StoreError> {
@@ -563,6 +579,14 @@ impl QueueStore for MemoryQueue {
         Ok(())
     }
 
+    async fn free_slots(&self, world_id: Uuid) -> Result<u32, StoreError> {
+        Ok(lock(&self.0)
+            .get(&world_id)
+            .and_then(|queue| queue.free_slots)
+            .filter(|(_, ends_ms)| *ends_ms > unix_ms())
+            .map_or(0, |(slots, _)| slots))
+    }
+
     async fn take_entry(&self, ticket_id: &str) -> Result<Option<EntryRecord>, StoreError> {
         let mut worlds = lock(&self.0);
         for queue in worlds.values_mut() {
@@ -736,6 +760,43 @@ impl AnalyticsStore for MemoryAnalytics {
                 .map(|record| (stream_name.to_owned(), record.clone())),
         );
         Ok((first..).take(records.len()).collect())
+    }
+
+    async fn delete_older_than(&self, _retention_seconds: u64) -> Result<u64, StoreError> {
+        // The memory stream keeps no receive times: every record is new.
+        Ok(0)
+    }
+}
+
+/// Privacy settings in memory, by account.
+#[derive(Clone, Default)]
+pub(crate) struct MemoryPrivacy(Arc<Mutex<HashMap<Uuid, Vec<PrivacySetting>>>>);
+
+impl PrivacyStore for MemoryPrivacy {
+    async fn settings(&self, account: Uuid) -> Result<Vec<PrivacySetting>, StoreError> {
+        Ok(lock(&self.0).get(&account).cloned().unwrap_or_default())
+    }
+
+    async fn set(
+        &self,
+        account: Uuid,
+        settings: &[(String, String)],
+    ) -> Result<Vec<PrivacySetting>, StoreError> {
+        let now_ms = unix_ms();
+        let mut accounts = lock(&self.0);
+        let stored = accounts.entry(account).or_default();
+        let mut changed = Vec::with_capacity(settings.len());
+        for (alias, value) in settings {
+            let setting = PrivacySetting {
+                alias: alias.clone(),
+                value: value.clone(),
+                updated_at_ms: now_ms,
+            };
+            stored.retain(|known| known.alias != *alias);
+            stored.push(setting.clone());
+            changed.push(setting);
+        }
+        Ok(changed)
     }
 }
 
@@ -911,6 +972,8 @@ pub(crate) mod contract {
             store.resolve(&key, LONG_SECONDS).await.expect("again"),
             Some(account)
         );
+        store.revoke(&key).await.expect("revoke");
+        assert_eq!(store.resolve(&key, LONG_SECONDS).await.expect("gone"), None);
     }
 
     /// Checks a [`RateLimiter`].
@@ -990,7 +1053,16 @@ pub(crate) mod contract {
                 .expect("no slots"),
         );
         let slots = |count| store.set_free_slots(settings.world_id, count, SLOTS_TTL_MS);
+        assert_eq!(
+            store.free_slots(settings.world_id).await.expect("none"),
+            0,
+            "no report: no slot"
+        );
         slots(ONE_SLOT).await.expect("one slot");
+        assert_eq!(
+            store.free_slots(settings.world_id).await.expect("read"),
+            ONE_SLOT
+        );
         let first = store
             .update(&settings, Uuid::new_v4(), refresh(&first_ticket), at(1))
             .await

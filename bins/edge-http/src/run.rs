@@ -275,6 +275,7 @@ async fn serve_async(config: EdgeConfig, secrets: Secrets) -> Result<(), RunErro
         &global,
         store,
         Arc::new(config.shop.clone()),
+        config.analytics.clone(),
         remote_config_router(remote_config),
         cms.routers(),
     );

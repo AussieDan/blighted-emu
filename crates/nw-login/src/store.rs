@@ -6,7 +6,7 @@ use std::future::Future;
 
 use nw_db::{
     Account, AccountEntitlement, AnalyticsRecord, BoardEntry, BoardOrder, BoardPage, Character,
-    DiscordProfile, NewCharacter, StatValues, Wallet,
+    DiscordProfile, NewCharacter, PrivacySetting, StatValues, Wallet,
 };
 use nw_protocol::launcher_api::LauncherSession;
 use uuid::Uuid;
@@ -100,6 +100,9 @@ pub trait GameSessionStore: Clone + Send + Sync + 'static {
         key: &str,
         ttl_seconds: u64,
     ) -> impl Future<Output = Result<Option<Uuid>, StoreError>> + Send;
+
+    /// Ends `key` (its account is banned).
+    fn revoke(&self, key: &str) -> impl Future<Output = Result<(), StoreError>> + Send;
 }
 
 /// Characters (world databases) and their names (global database).
@@ -120,6 +123,12 @@ pub trait CharacterStore: Clone + Send + Sync + 'static {
 
     /// Whether a character name (compared in lower case) is used in any world.
     fn name_taken(&self, name: &str) -> impl Future<Output = Result<bool, StoreError>> + Send;
+
+    /// Whether `account` is banned (global database); an unknown account is not.
+    fn account_banned(
+        &self,
+        account: Uuid,
+    ) -> impl Future<Output = Result<bool, StoreError>> + Send;
 
     /// Reserves the name over all worlds, then inserts the character into its world; frees the
     /// name again when the insert fails (M2 spec section 7).
@@ -243,4 +252,26 @@ pub trait AnalyticsStore: Clone + Send + Sync + 'static {
         stream_name: &str,
         records: &[AnalyticsRecord],
     ) -> impl Future<Output = Result<Vec<i64>, StoreError>> + Send;
+
+    /// Deletes the records older than `retention_seconds`; returns how many went.
+    fn delete_older_than(
+        &self,
+        retention_seconds: u64,
+    ) -> impl Future<Output = Result<u64, StoreError>> + Send;
+}
+
+/// The privacy settings of accounts (global database).
+pub trait PrivacyStore: Clone + Send + Sync + 'static {
+    /// The settings `account` set.
+    fn settings(
+        &self,
+        account: Uuid,
+    ) -> impl Future<Output = Result<Vec<PrivacySetting>, StoreError>> + Send;
+
+    /// Stores `settings` (alias, value) of `account` together; returns them as stored.
+    fn set(
+        &self,
+        account: Uuid,
+        settings: &[(String, String)],
+    ) -> impl Future<Output = Result<Vec<PrivacySetting>, StoreError>> + Send;
 }

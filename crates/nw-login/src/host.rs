@@ -17,15 +17,17 @@ use nw_db::PgPool;
 use nw_protocol::aws_mirror::{CMS_HOST, CMS_IMAGE_HOST, remote_config_host};
 use nw_protocol::store_api::StoreTable;
 
-use crate::analytics::{AnalyticsState, is_kinesis_host, is_sts_host, kinesis_router, sts_router};
+use crate::analytics::{
+    AnalyticsConfig, AnalyticsState, is_kinesis_host, is_sts_host, kinesis_router, sts_router,
+};
 use crate::cms::CmsRouters;
 use crate::config::ShopConfig;
 use crate::discord::DiscordApi;
 use crate::error::ApiError;
 use crate::game::{GameState, channel_router, game_router, unknown_route};
 use crate::launcher::{LauncherState, launcher_router};
-use crate::pg::{PgEntitlements, PgStats};
-use crate::privacy::privacy_router;
+use crate::pg::{PgEntitlements, PgPrivacy, PgStats};
+use crate::privacy::{PrivacyState, privacy_router};
 use crate::queue::QueueStore;
 use crate::shop::{ShopState, shop_router};
 use crate::stats::{StatsState, stats_router};
@@ -66,16 +68,19 @@ pub struct ServiceRouters {
     pub remote_config: Router,
     /// Our own news ([`crate::cms::CmsObjects::routers`]), on the news host and its image host.
     pub cms: CmsRouters,
+    /// The privacy settings service ([`crate::privacy::privacy_router`]), on `game.<domain>`.
+    pub privacy: Router,
 }
 
 impl ServiceRouters {
     /// The services over the migrated global database `global`, the store table `store` and the
-    /// store settings `settings`, the remote config route
+    /// store settings `settings`, the analytics limits `analytics`, the remote config route
     /// ([`crate::remote_config::remote_config_router`]) and the news routes.
     pub fn on_postgres(
         global: &PgPool,
         store: Arc<StoreTable>,
         settings: Arc<ShopConfig>,
+        analytics: AnalyticsConfig,
         remote_config: Router,
         cms: CmsRouters,
     ) -> Self {
@@ -89,10 +94,13 @@ impl ServiceRouters {
             stats: stats_router(StatsState {
                 stats: stats.clone(),
             }),
-            kinesis: kinesis_router(AnalyticsState { analytics: stats }),
+            kinesis: kinesis_router(AnalyticsState::new(stats, analytics)),
             sts: sts_router(),
             remote_config,
             cms,
+            privacy: privacy_router(PrivacyState {
+                store: PgPrivacy::new(global.clone()),
+            }),
         }
     }
 }
@@ -157,7 +165,7 @@ where
         game: game_router(game)
             .merge(services.stats)
             .merge(services.shop)
-            .merge(privacy_router()),
+            .merge(services.privacy),
         kinesis: services.kinesis,
         sts: services.sts,
         remote_config: services.remote_config,
@@ -170,6 +178,7 @@ where
 #[cfg(test)]
 mod tests {
     use axum::body::{Body, Bytes};
+    use axum::extract::connect_info::MockConnectInfo;
     use axum::http::{Request as HttpRequest, StatusCode};
     use nw_protocol::game_api::{AUTH_STACK_STAGE, STEAM_AUTH_PATH};
     use nw_protocol::launcher_api::{AuthMode, INFO_PATH, LOGIN_PATH};
@@ -180,7 +189,7 @@ mod tests {
     use crate::game::SESSION_PREFIX;
     use crate::game::tests::fixture;
     use crate::launcher::tests::state;
-    use crate::memory::{MemoryAnalytics, MemoryEntitlements, MemoryStats};
+    use crate::memory::{MemoryAnalytics, MemoryEntitlements, MemoryPrivacy, MemoryStats};
     use crate::remote_config::remote_config_router;
     use crate::remote_config::tests::committed_sets;
     use crate::test_http::{self, error_code};
@@ -200,14 +209,21 @@ mod tests {
                 entitlements: MemoryEntitlements::default(),
             }),
             stats: stats_router(StatsState { stats }),
-            kinesis: kinesis_router(AnalyticsState {
-                analytics: MemoryAnalytics::default(),
-            }),
+            kinesis: kinesis_router(AnalyticsState::new(
+                MemoryAnalytics::default(),
+                AnalyticsConfig::default(),
+            )),
             sts: sts_router(),
             remote_config: remote_config_router(committed_sets(&game.state.config)),
             cms: committed_objects(&game.state.config).routers(),
+            privacy: privacy_router(PrivacyState {
+                store: MemoryPrivacy::default(),
+            }),
         };
-        (edge_router(launcher, game.state, services), game.session)
+        // `edge-http` serves with the client address (`into_make_service_with_connect_info`).
+        let app = edge_router(launcher, game.state, services)
+            .layer(MockConnectInfo(crate::test_support::random_peer()));
+        (app, game.session)
     }
 
     async fn get(app: &Router, host: &str, path: &str) -> (StatusCode, Bytes) {

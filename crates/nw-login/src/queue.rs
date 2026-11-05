@@ -138,6 +138,10 @@ pub trait QueueStore: Clone + Send + Sync + 'static {
         ttl_ms: u64,
     ) -> impl Future<Output = Result<(), StoreError>> + Send;
 
+    /// The free player slots `world-director` last reported for `world_id`; 0 when its report
+    /// is older than its time to live, or none came.
+    fn free_slots(&self, world_id: Uuid) -> impl Future<Output = Result<u32, StoreError>> + Send;
+
     /// Returns the entry record of `ticket_id` one time and deletes it, with its queue entry and
     /// its admission slot (M3 spec section 7). `None` when the record is absent or already
     /// taken. The caller checks `expires_at`.
