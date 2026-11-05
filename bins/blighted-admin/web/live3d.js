@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // The live 3D admin page: the world as a low-poly wire model (the terrain from the height grid,
-// the rocks, buildings and props from the level collision file, the sea at its level) with every
+// coloured by height and slope out to the horizon, the rocks, buildings and props from the level
+// collision file, the trees from the gatherables, the sea at its level) with every
 // player and mob the server sends for the render radius. It follows a picked player, or looks at
 // a place picked by its coordinates. The pure helpers are exported so node:test covers them
 // without three.js.
@@ -15,35 +16,59 @@ const TILE_URL = '/api/world/tiles';
 const SHAPES_URL = '/api/world/shapes';
 const SPAWNS_URL = '/api/world/spawns';
 
-/** Half side of the terrain square around the followed player, in metres. */
-const TERRAIN_HALF_M = 384;
+/** Half side of the fine terrain square around the followed player, in metres (the shapes route
+ * reads at most this far). */
+const TERRAIN_HALF_M = 512;
 /** Spacing of two height samples, in metres: one wire square of the ground. */
 export const TERRAIN_STEP_M = 6;
 /** Pixels per metre of the ground picture. */
 const GROUND_PX_PER_M = 2;
 /** The terrain loads again when the player is this far from its centre, in metres. */
 const TERRAIN_RELOAD_M = TERRAIN_HALF_M / 2;
+/** The coarse terrain out to the horizon: its half side and sample spacing, in metres. Where the
+ * fine square covers it, it has a hole; the band they share sits this much lower. */
+const FAR_HALF_M = 4096;
+export const FAR_STEP_M = 32;
+const FAR_DROP_M = 1.5;
 /** Depth used for a terrain sample with no height (off the terrain), below the sea, in metres. */
 const NO_GROUND_DEPTH_M = 5;
+/**
+ * The ground colour bands, by height over the sea and slope (our choice, for a readable relief):
+ * under the sea, the shore up to SHORE_M, grass, highland from HIGHLAND_M, bare peaks from PEAK_M,
+ * and cliffs where the face's up share is under CLIFF_UP_SHARE (about 44 degrees).
+ */
+export const GROUND_BANDS = Object.freeze(['seabed', 'shore', 'grass', 'highland', 'peak', 'cliff']);
+const SHORE_M = 1.5;
+const HIGHLAND_M = 120;
+const PEAK_M = 320;
+const CLIFF_UP_SHARE = 0.72;
 /** Colour of the ground picture where a map tile is missing. */
 const GROUND_FALLBACK = '#8a8061';
 /** Opacity of the sea and of the ground wire. */
-const SEA_OPACITY = 0.45;
-const GROUND_WIRE_OPACITY = 0.35;
+const SEA_OPACITY = 0.7;
+const GROUND_WIRE_OPACITY = 0.14;
+/** Each ground face is up to this share lighter or darker than its band (from its place), so a
+ * plain of one band still shows its faces. */
+const FACE_SHADE_SPREAD = 0.14;
 /** A solid's outline shows an edge where its faces meet at this angle or more, in degrees. */
 const EDGE_ANGLE_DEG = 25;
 /** Fog: where it starts and where it hides everything, in metres from the camera. */
-const FOG_NEAR_M = 250;
-const FOG_FAR_M = 1100;
-/** The colours of the scene by theme (style.css: the game panels' night and day). */
+const FOG_NEAR_M = 600;
+const FOG_FAR_M = 4200;
+/** Radius of the sky dome around the camera, in metres (inside the far plane). */
+const SKY_RADIUS_M = 15000;
+/** The colours of the scene by theme (style.css: the game panels' night and day). The sky fades
+ * from `skyTop` overhead to `horizon`, which is also the fog. */
 const PALETTES = Object.freeze({
   dark: {
-    sky: 0x0d0f10, groundFill: 0x16191b, groundWire: 0xc9a24a, shapeFill: 0x23272a, shapeEdge: 0xe4dbc6,
-    plantFill: 0x1b281d, plantEdge: 0x86b06e, sea: 0x1d4a6e,
+    skyTop: 0x06080b, horizon: 0x24303a, groundWire: 0xd9c27e, shapeFill: 0x5d5850, shapeEdge: 0xefe6cf,
+    plantFill: 0x24402a, plantEdge: 0x9cc77f, sea: 0x173f5f,
+    seabed: 0x3a3a2f, shore: 0x7a6d4c, grass: 0x3d5130, highland: 0x55603c, peak: 0x77736a, cliff: 0x5a554c,
   },
   light: {
-    sky: 0xd9cfb3, groundFill: 0xc9bb92, groundWire: 0x6b5a2e, shapeFill: 0xb6a477, shapeEdge: 0x231c11,
-    plantFill: 0x93a46f, plantEdge: 0x2b3a20, sea: 0x5b86a6,
+    skyTop: 0x7fa7c4, horizon: 0xe2dccb, groundWire: 0x3b321f, shapeFill: 0xc9bc9c, shapeEdge: 0x231c11,
+    plantFill: 0x4f7a3a, plantEdge: 0x1f3317, sea: 0x4f86ad,
+    seabed: 0xa59a74, shore: 0xd8c696, grass: 0x86a35a, highland: 0xa3a466, peak: 0xc8c2b4, cliff: 0x9d9384,
   },
 });
 /**
@@ -55,11 +80,13 @@ const TREE_HEIGHTS_M = Object.freeze([['huge', 24], ['large', 18], ['medium', 12
 const TREE_DEFAULT_M = 10;
 const BUSH_HEIGHTS_M = Object.freeze([['huge', 3.5], ['large', 2.5], ['medium', 1.8], ['small', 1.2]]);
 const BUSH_DEFAULT_M = 1.8;
-/** Shape of a low-poly tree, as shares of its height: the trunk, and the cone of leaves on it. */
-const TRUNK_TOP = 0.4;
+/** Shape of a low-poly tree, as shares of its height: the trunk, and two stacked cones of leaves. */
+const TRUNK_TOP = 0.35;
 const TRUNK_RADIUS = 0.04;
-const CROWN_BASE = 0.3;
-const CROWN_RADIUS = 0.3;
+const CROWN_TIERS = Object.freeze([
+  { base: 0.25, top: 0.75, radius: 0.34 },
+  { base: 0.5, top: 1, radius: 0.24 },
+]);
 /** A bush is one cone from the ground, its base this share of its height across. */
 const BUSH_RADIUS = 0.6;
 /** Sides of a trunk and of a cone. */
@@ -70,8 +97,8 @@ const CONE_SIDES = 6;
 const PLANT_PIECES = 2;
 const THEME_ATTRIBUTE = 'data-theme';
 const LIGHT_THEME = 'light';
-/** The sea plane is this many terrain sides wide. */
-const SEA_SIDES = 8;
+/** The sea plane is this many coarse terrain sides wide. */
+const SEA_SIDES = 2;
 
 /** The dead mob state in `MobState` order (`asleep, idle, chase, attack, return, dead`). */
 export const MOB_STATE_DEAD = 5;
@@ -97,12 +124,12 @@ const RING_OUTER_M = 1.6;
 
 /** Camera: nearest and farthest distance, and the start offset behind and above the player. */
 const MIN_ZOOM_M = 5;
-const MAX_ZOOM_M = 1500;
+const MAX_ZOOM_M = 3000;
 const START_BACK_M = 70;
-const START_UP_M = 55;
+const START_UP_M = 40;
 /** The camera offset over a place picked by Go to: high enough to clear its rocks and cliffs. */
-const PLACE_BACK_M = 320;
-const PLACE_UP_M = 260;
+const PLACE_BACK_M = 340;
+const PLACE_UP_M = 110;
 const FAR_PLANE_M = 20000;
 const FIELD_OF_VIEW_DEG = 55;
 /** Pixel ratio cap. */
@@ -238,7 +265,7 @@ export function plantOf(id) {
 
 /**
  * The scene buffers of the trees and bushes among gatherable points ({ id, x, y, z }): a tree is
- * a square trunk under a six-sided cone of leaves, a bush one cone on the ground; every cone and
+ * a square trunk under two stacked six-sided cones of leaves, a bush one cone on the ground; every cone and
  * trunk is closed. Other gatherables are left out.
  */
 export function plantTriangles(points) {
@@ -276,7 +303,9 @@ export function plantTriangles(points) {
     const { height } = plant;
     if (plant.tree) {
       prism(point.x, point.y, point.z, point.z + height * TRUNK_TOP, height * TRUNK_RADIUS);
-      cone(point.x, point.y, point.z + height * CROWN_BASE, point.z + height, height * CROWN_RADIUS);
+      for (const tier of CROWN_TIERS) {
+        cone(point.x, point.y, point.z + height * tier.base, point.z + height * tier.top, height * tier.radius);
+      }
     } else {
       cone(point.x, point.y, point.z, point.z + height, height * BUSH_RADIUS);
     }
@@ -284,10 +313,77 @@ export function plantTriangles(points) {
   return { positions: Float32Array.from(positions), index: Uint32Array.from(index) };
 }
 
-/** The height of grid row `row` counted from the north edge, with no-ground samples filled. */
-export function northRowHeight(heights, size, row, column, fill) {
-  const height = heights?.[size - 1 - row]?.[column];
+/** The height of a height-grid sample (`row` counted from the south edge), `fill` with no ground. */
+export function gridHeight(heights, row, column, fill) {
+  const height = heights?.[row]?.[column];
   return height == null ? fill : height;
+}
+
+/**
+ * The brightness factor of the ground face at the scene point (x, z): a fixed hash of the place,
+ * from 1 - FACE_SHADE_SPREAD / 2 to 1 + FACE_SHADE_SPREAD / 2, the same on every load.
+ */
+export function faceShade(x, z) {
+  const hash = Math.abs(Math.sin(x * 12.9898 + z * 78.233) * 43758.5453) % 1;
+  return 1 + (hash - 0.5) * FACE_SHADE_SPREAD;
+}
+
+/** The colour band (an index into GROUND_BANDS) of a ground face: its mean height and up share. */
+export function groundBand(height, upShare, oceanLevel) {
+  const over = height - oceanLevel;
+  if (over < 0) return GROUND_BANDS.indexOf('seabed');
+  if (upShare < CLIFF_UP_SHARE) return GROUND_BANDS.indexOf('cliff');
+  if (over < SHORE_M) return GROUND_BANDS.indexOf('shore');
+  if (over >= PEAK_M) return GROUND_BANDS.indexOf('peak');
+  if (over >= HIGHLAND_M) return GROUND_BANDS.indexOf('highland');
+  return GROUND_BANDS.indexOf('grass');
+}
+
+/**
+ * The flat-faced ground of a height grid (`heights[row][column]`, row 0 south) over `square`
+ * (`{ x0, y0, side }`, `step` metres apart): two triangles a cell, in scene space, facing up, each
+ * with its colour band and its place on the square's ground picture (u east, v north). Missing
+ * samples take `fill`. A cell whose four corners all lie inside `hole` (a square, or null) is left
+ * out; `drop` lowers every corner by that many metres.
+ * @returns {{ positions: Float32Array, uvs: Float32Array, bands: Uint8Array }}
+ */
+export function groundTriangles(heights, size, square, step, { fill, oceanLevel, hole = null, drop = 0 }) {
+  const inside = (x, y) => hole != null && x >= hole.x0 && x <= hole.x0 + hole.side
+    && y >= hole.y0 && y <= hole.y0 + hole.side;
+  const positions = [];
+  const uvs = [];
+  const bands = [];
+  const corner = (row, column) => {
+    const x = square.x0 + column * step;
+    const y = square.y0 + row * step;
+    return { x, y, z: gridHeight(heights, row, column, fill) - drop };
+  };
+  const face = (a, b, c) => {
+    for (const point of [a, b, c]) {
+      const at = toScene(point.x, point.y, point.z);
+      positions.push(at.x, at.y, at.z);
+      uvs.push((point.x - square.x0) / square.side, (point.y - square.y0) / square.side);
+    }
+    const [ux, uy, uz] = [b.x - a.x, b.y - a.y, b.z - a.z];
+    const [vx, vy, vz] = [c.x - a.x, c.y - a.y, c.z - a.z];
+    const nx = uy * vz - uz * vy;
+    const ny = uz * vx - ux * vz;
+    const nz = ux * vy - uy * vx;
+    const upShare = Math.abs(nz) / Math.hypot(nx, ny, nz);
+    bands.push(groundBand((a.z + b.z + c.z) / 3 + drop, upShare, oceanLevel));
+  };
+  for (let row = 0; row < size - 1; row += 1) {
+    for (let column = 0; column < size - 1; column += 1) {
+      const southWest = corner(row, column);
+      const southEast = corner(row, column + 1);
+      const northWest = corner(row + 1, column);
+      const northEast = corner(row + 1, column + 1);
+      if ([southWest, southEast, northWest, northEast].every((point) => inside(point.x, point.y))) continue;
+      face(southWest, southEast, northEast);
+      face(southWest, northEast, northWest);
+    }
+  }
+  return { positions: Float32Array.from(positions), uvs: Float32Array.from(uvs), bands: Uint8Array.from(bands) };
 }
 
 async function fetchJson(url) {
@@ -338,8 +434,12 @@ export async function run(THREE, { OrbitControls }) {
   const solid = (extra) => new THREE.MeshLambertMaterial({
     flatShading: true, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1, ...extra,
   });
+  // The ground faces carry their colour band; `paint` turns bands into the theme's colours.
+  const groundMaterials = {
+    groundFill: solid({ vertexColors: true }),
+    farFill: solid({ vertexColors: true }),
+  };
   const materials = {
-    groundFill: solid({}),
     groundWire: new THREE.LineBasicMaterial({ transparent: true, opacity: GROUND_WIRE_OPACITY }),
     shapeFill: solid({}),
     shapeEdge: new THREE.LineBasicMaterial({}),
@@ -347,13 +447,55 @@ export async function run(THREE, { OrbitControls }) {
     plantEdge: new THREE.LineBasicMaterial({}),
     sea: new THREE.MeshLambertMaterial({ transparent: true, opacity: SEA_OPACITY }),
   };
+  const sky = new THREE.Mesh(
+    new THREE.SphereGeometry(SKY_RADIUS_M, 32, 16),
+    new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide, fog: false, depthWrite: false }),
+  );
+  sky.renderOrder = -1;
+  scene.add(sky);
+  /** The ground meshes on show, recoloured by `paint`. */
+  const groundMeshes = new Set();
+
+  /** Sets the colour of each corner of a ground mesh from its face's band. */
+  function colourGround(mesh) {
+    const colours = palette();
+    const bandColours = GROUND_BANDS.map((band) => new THREE.Color(colours[band]));
+    const { bands } = mesh.userData;
+    const colour = mesh.geometry.getAttribute('color');
+    const position = mesh.geometry.getAttribute('position');
+    for (let faceIndex = 0; faceIndex < bands.length; faceIndex += 1) {
+      const { r, g, b } = bandColours[bands[faceIndex]];
+      const shade = faceShade(position.getX(faceIndex * 3), position.getZ(faceIndex * 3));
+      for (let point = faceIndex * 3; point < faceIndex * 3 + 3; point += 1) {
+        colour.setXYZ(point, r * shade, g * shade, b * shade);
+      }
+    }
+    colour.needsUpdate = true;
+  }
+
+  /** Fades the sky dome from the theme's top colour overhead to its horizon colour. */
+  function colourSky() {
+    const colours = palette();
+    const top = new THREE.Color(colours.skyTop);
+    const horizon = new THREE.Color(colours.horizon);
+    const positions = sky.geometry.getAttribute('position');
+    const colour = new Float32Array(positions.count * 3);
+    const mixed = new THREE.Color();
+    for (let point = 0; point < positions.count; point += 1) {
+      const height = Math.max(0, positions.getY(point) / SKY_RADIUS_M);
+      mixed.copy(horizon).lerp(top, Math.sqrt(height));
+      colour.set([mixed.r, mixed.g, mixed.b], point * 3);
+    }
+    sky.geometry.setAttribute('color', new THREE.BufferAttribute(colour, 3));
+  }
+
   function paint() {
     const colours = palette();
-    scene.background.setHex(colours.sky);
-    scene.fog.color.setHex(colours.sky);
-    for (const [name, material] of Object.entries(materials)) {
-      material.color.setHex(material.map ? 0xffffff : colours[name]);
-    }
+    scene.background.setHex(colours.horizon);
+    scene.fog.color.setHex(colours.horizon);
+    for (const [name, material] of Object.entries(materials)) material.color.setHex(colours[name]);
+    colourSky();
+    for (const mesh of groundMeshes) colourGround(mesh);
   }
   paint();
   new MutationObserver(paint).observe(document.documentElement, { attributes: true, attributeFilter: [THEME_ATTRIBUTE] });
@@ -363,9 +505,10 @@ export async function run(THREE, { OrbitControls }) {
   controls.maxDistance = MAX_ZOOM_M;
   controls.maxPolarAngle = Math.PI / 2.05;
   controls.enableDamping = true;
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x3a4a5a, 1.6));
-  const sun = new THREE.DirectionalLight(0xfff2cc, 1.2);
-  sun.position.set(300, 600, 200);
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x3a4a5a, 1.1));
+  // A low sun from the south-west, so the faces of the hills read by their shade.
+  const sun = new THREE.DirectionalLight(0xfff2cc, 1.8);
+  sun.position.set(-400, 450, 300);
   scene.add(sun);
 
   const resize = () => {
@@ -383,6 +526,7 @@ export async function run(THREE, { OrbitControls }) {
   scene.add(sea);
 
   let terrain = null;
+  let farTerrain = null;
   let shapes = null;
   let plants = null;
   let terrainCentre = null;
@@ -394,7 +538,26 @@ export async function run(THREE, { OrbitControls }) {
   function drop(group) {
     if (!group) return;
     scene.remove(group);
-    group.traverse((part) => part.geometry?.dispose());
+    group.traverse((part) => {
+      groundMeshes.delete(part);
+      part.geometry?.dispose();
+    });
+  }
+
+  /** The coloured, wired ground of `groundTriangles` buffers, filled with `fill`. */
+  function groundGroup({ positions, uvs, bands }, fill) {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    geometry.setAttribute('uv', new THREE.BufferAttribute(uvs, 2));
+    geometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(positions.length), 3));
+    geometry.computeVertexNormals();
+    const faces = new THREE.Mesh(geometry, fill);
+    faces.userData.bands = bands;
+    colourGround(faces);
+    groundMeshes.add(faces);
+    const group = new THREE.Group();
+    group.add(faces, new THREE.LineSegments(new THREE.WireframeGeometry(geometry), materials.groundWire));
+    return group;
   }
 
   /** The map tiles painted on a ground picture of `square`, as a texture. */
@@ -420,12 +583,14 @@ export async function run(THREE, { OrbitControls }) {
     return texture;
   }
 
-  /** Puts the map tiles on the ground, or takes them off, as the Map colours box says. */
+  /** Puts the map tiles on the fine ground in place of the height colours, or takes them off, as
+   * the Map colours box says. */
   function paintGround() {
-    materials.groundFill.map?.dispose();
-    materials.groundFill.map = mapColours.checked && terrain ? groundPicture(terrain.userData.square) : null;
-    materials.groundFill.needsUpdate = true;
-    paint();
+    const fill = groundMaterials.groundFill;
+    fill.map?.dispose();
+    fill.map = mapColours.checked && terrain ? groundPicture(terrain.userData.square) : null;
+    fill.vertexColors = fill.map == null;
+    fill.needsUpdate = true;
   }
 
   async function loadShapes(square) {
@@ -468,40 +633,44 @@ export async function run(THREE, { OrbitControls }) {
     return outlined(plantTriangles((await Promise.all(requests)).flat()), materials.plantFill, materials.plantEdge);
   }
 
+  /** The height grid of a square around (cx, cy) with `half` and `step` in metres. */
+  function fetchGrid(cx, cy, half, step) {
+    return fetchJson(`${GRID_URL}?x=${cx}&y=${cy}&half=${half}&step=${step}`);
+  }
+
   /** Loads the ground, the solids and the sea around (cx, cy); returns the ground height there. */
   async function loadTerrain(cx, cy) {
     terrainLoading = true;
     try {
       const square = terrainSquare(cx, cy);
       const half = square.side / 2;
-      const [grid, solids, trees] = await Promise.all([
-        fetchJson(`${GRID_URL}?x=${square.x0 + half}&y=${square.y0 + half}&half=${half}&step=${TERRAIN_STEP_M}`),
+      const middleX = square.x0 + half;
+      const middleY = square.y0 + half;
+      const [grid, farGrid, solids, trees] = await Promise.all([
+        fetchGrid(middleX, middleY, half, TERRAIN_STEP_M),
+        fetchGrid(middleX, middleY, FAR_HALF_M, FAR_STEP_M),
         loadShapes(square),
         loadPlants(square),
       ]);
-      const { size, heights } = grid;
       const fill = info.ocean_level - NO_GROUND_DEPTH_M;
-      const geometry = new THREE.PlaneGeometry(square.side, square.side, size - 1, size - 1);
-      geometry.rotateX(-Math.PI / 2);
-      const positions = geometry.attributes.position;
-      for (let row = 0; row < size; row += 1) {
-        for (let column = 0; column < size; column += 1) {
-          positions.setY(row * size + column, northRowHeight(heights, size, row, column, fill));
-        }
-      }
-      geometry.computeVertexNormals();
-      const ground = new THREE.Group();
-      ground.add(
-        new THREE.Mesh(geometry, materials.groundFill),
-        new THREE.LineSegments(new THREE.WireframeGeometry(geometry), materials.groundWire),
-      );
-      const centre = toScene(square.x0 + half, square.y0 + half, 0);
-      ground.position.set(centre.x, 0, centre.z);
+      const ground = groundGroup(groundTriangles(grid.heights, grid.size, square, TERRAIN_STEP_M, {
+        fill, oceanLevel: info.ocean_level,
+      }), groundMaterials.groundFill);
       ground.userData.square = square;
       drop(terrain);
       terrain = ground;
       scene.add(terrain);
       paintGround();
+      const farSquare = { x0: farGrid.x0, y0: farGrid.y0, side: 2 * FAR_HALF_M };
+      const hole = {
+        x0: square.x0 + FAR_STEP_M, y0: square.y0 + FAR_STEP_M, side: square.side - 2 * FAR_STEP_M,
+      };
+      const far = groundGroup(groundTriangles(farGrid.heights, farGrid.size, farSquare, FAR_STEP_M, {
+        fill, oceanLevel: info.ocean_level, hole, drop: FAR_DROP_M,
+      }), groundMaterials.farFill);
+      drop(farTerrain);
+      farTerrain = far;
+      scene.add(farTerrain);
       drop(shapes);
       shapes = solids;
       if (shapes) scene.add(shapes);
@@ -509,13 +678,14 @@ export async function run(THREE, { OrbitControls }) {
       plants = trees;
       scene.add(plants);
 
-      const seaSide = square.side * SEA_SIDES;
+      const seaSide = 2 * FAR_HALF_M * SEA_SIDES;
+      const centre = toScene(middleX, middleY, info.ocean_level);
       sea.scale.set(seaSide, 1, seaSide);
-      sea.position.set(centre.x, info.ocean_level, centre.z);
+      sea.position.set(centre.x, centre.y, centre.z);
       sea.visible = true;
       terrainCentre = { x: cx, y: cy };
-      const middle = Math.floor(size / 2);
-      return northRowHeight(heights, size, middle, middle, info.ocean_level);
+      const middle = Math.floor(grid.size / 2);
+      return gridHeight(grid.heights, middle, middle, info.ocean_level);
     } finally {
       terrainLoading = false;
     }
@@ -769,6 +939,7 @@ export async function run(THREE, { OrbitControls }) {
     lines.geometry.dispose();
     lines.geometry = new THREE.BufferGeometry().setFromPoints(points);
     controls.update();
+    sky.position.copy(camera.position);
     renderer.render(scene, camera);
     requestAnimationFrame(frame);
   }

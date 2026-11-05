@@ -3,13 +3,17 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 const {
+  GROUND_BANDS,
   MOB_STATE_DEAD,
   TERRAIN_STEP_M,
+  faceShade,
   fightLines,
+  gridHeight,
+  groundBand,
   groundTiles,
+  groundTriangles,
   labelText,
   lerpPosition,
-  northRowHeight,
   plantOf,
   plantTriangles,
   sceneTriangles,
@@ -94,7 +98,7 @@ test('terrainSquare snaps its corner to the sample step and centres on the playe
   const square = terrainSquare(1000.7, 2000.2);
   assert.equal(square.x0 % TERRAIN_STEP_M, 0);
   assert.equal(square.y0 % TERRAIN_STEP_M, 0);
-  assert.equal(square.side, 768);
+  assert.equal(square.side, 1024);
   assert.ok(Math.abs(square.x0 + square.side / 2 - 1000.7) < TERRAIN_STEP_M);
   assert.ok(Math.abs(square.y0 + square.side / 2 - 2000.2) < TERRAIN_STEP_M);
 });
@@ -117,14 +121,67 @@ test('groundTiles places the north tile at the top of the picture', () => {
   assert.equal(north.sizePx, 512);
 });
 
-test('northRowHeight reads rows from the north and fills missing samples', () => {
+test('gridHeight reads rows from the south and fills missing samples', () => {
   const heights = [
     [1, 2],
     [3, null],
   ];
-  assert.equal(northRowHeight(heights, 2, 0, 0, -1), 3);
-  assert.equal(northRowHeight(heights, 2, 0, 1, -1), -1);
-  assert.equal(northRowHeight(heights, 2, 1, 1, -1), 2);
+  assert.equal(gridHeight(heights, 0, 0, -1), 1);
+  assert.equal(gridHeight(heights, 1, 0, -1), 3);
+  assert.equal(gridHeight(heights, 1, 1, -1), -1);
+});
+
+test('groundBand colours by height over the sea, and steep faces as cliffs', () => {
+  const band = (height, upShare) => GROUND_BANDS[groundBand(height, upShare, 40)];
+  assert.equal(band(30, 1), 'seabed');
+  assert.equal(band(41, 1), 'shore');
+  assert.equal(band(100, 1), 'grass');
+  assert.equal(band(200, 1), 'highland');
+  assert.equal(band(400, 1), 'peak');
+  assert.equal(band(100, 0.5), 'cliff');
+  assert.equal(band(30, 0.5), 'seabed', 'under the sea a slope is still seabed');
+});
+
+test('faceShade is a fixed brightness near 1 for each place', () => {
+  const shades = Array.from({ length: 200 }, (_, n) => faceShade(n * 6, -n * 7));
+  assert.ok(shades.every((shade) => shade >= 0.929 && shade <= 1.071));
+  assert.ok(new Set(shades).size > 100, 'places differ');
+  assert.equal(faceShade(120, -42), faceShade(120, -42));
+});
+
+test('groundTriangles builds two upward faces a cell with bands and ground picture places', () => {
+  // Row 0 is south: the north edge is 10 m higher.
+  const heights = [
+    [50, 50, 50],
+    [55, 55, 55],
+    [60, 60, 60],
+  ];
+  const square = { x0: 100, y0: 200, side: 20 };
+  const ground = groundTriangles(heights, 3, square, 10, { fill: 0, oceanLevel: 40 });
+  assert.equal(ground.bands.length, 2 * 2 * 2, 'four cells, two faces each');
+  assert.equal(ground.positions.length, ground.bands.length * 9);
+  assert.equal(ground.uvs.length, ground.bands.length * 6);
+  assert.ok(ground.bands.every((band) => GROUND_BANDS[band] === 'grass'));
+  // The first face: south-west, south-east, north-east of the south-west cell.
+  assert.deepEqual([...ground.positions.slice(0, 9)], [100, 50, -200, 110, 50, -200, 110, 55, -210]);
+  assert.deepEqual([...ground.uvs.slice(0, 6)], [0, 0, 0.5, 0, 0.5, 0.5]);
+  // Every face is wound so its normal points up in the scene.
+  for (let face = 0; face < ground.bands.length; face += 1) {
+    const p = ground.positions.slice(face * 9, face * 9 + 9);
+    const [ux, uy, uz] = [p[3] - p[0], p[4] - p[1], p[5] - p[2]];
+    const [vx, vy, vz] = [p[6] - p[0], p[7] - p[1], p[8] - p[2]];
+    assert.ok(uz * vx - ux * vz > 0, `face ${face} faces up`);
+  }
+});
+
+test('groundTriangles leaves out cells inside the hole and lowers by drop', () => {
+  const heights = Array.from({ length: 4 }, () => [80, 80, 80, 80]);
+  const square = { x0: 0, y0: 0, side: 30 };
+  const hole = { x0: 10, y0: 10, side: 10 };
+  const ground = groundTriangles(heights, 4, square, 10, { fill: 0, oceanLevel: 40, hole, drop: 2 });
+  assert.equal(ground.bands.length, (9 - 1) * 2, 'the middle cell is the hole');
+  assert.equal(ground.positions[1], 78);
+  assert.equal(GROUND_BANDS[ground.bands[0]], 'grass', 'the band reads the height before the drop');
 });
 
 test('plantOf sizes trees and bushes by the size word of their id and skips the rest', () => {
@@ -139,8 +196,8 @@ test('plantOf sizes trees and bushes by the size word of their id and skips the 
 
 test('plantTriangles builds a closed trunk and crown for a tree and one cone for a bush', () => {
   const tree = plantTriangles([{ id: 'TreeHardwoodLarge', x: 100, y: 200, z: 30 }]);
-  // A square trunk (4 sides, 2 triangles each) and a six-sided cone (side and base per side).
-  assert.equal(tree.index.length / 3, 4 * 2 + 6 * 2);
+  // A square trunk (4 sides, 2 triangles each) and two six-sided cones (side and base per side).
+  assert.equal(tree.index.length / 3, 4 * 2 + 2 * 6 * 2);
   const heights = [];
   for (let corner = 1; corner < tree.positions.length; corner += 3) heights.push(tree.positions[corner]);
   assert.equal(Math.min(...heights), 30, 'the trunk stands on the gatherable point');

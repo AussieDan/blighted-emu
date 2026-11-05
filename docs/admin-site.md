@@ -48,6 +48,10 @@ The world map with every sim, player, bot and mob, live.
 The world as a low-poly wire model: the ground, rocks, cliffs, buildings and props, trees and
 bushes, the sea, and the players and mobs near the camera.
 
+- The ground is coloured by height over the sea and by slope: seabed, shore, grass, highland, bare
+  peaks and cliffs (our choice of bands). Fine 6 m faces cover 1 km around the camera; coarse
+  32 m faces go on for 8 km to the horizon, into the fog.
+
 - Trees and bushes are the tree and bush gatherables of the world file (the ones players can
   chop or pick), drawn as green cones. Their height comes from the size word of the name (Tiny 5 m
   to Huge 24 m for a tree): the game data read here has no plant size, so these heights are our
