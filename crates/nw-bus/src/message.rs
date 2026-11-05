@@ -342,6 +342,11 @@ pub struct PlayerInventory {
     pub stored: Vec<StoredItem>,
     /// Its saved loadouts.
     pub loadouts: Vec<SavedLoadout>,
+    /// The paperdoll slots whose skin it hid or showed again (5978): (slot, hidden). Kept over
+    /// handoffs; a login starts without (Inferred: whether retail keeps it over a login is
+    /// Unknown, the one capture hides and shows a skin in one session).
+    #[serde(default)]
+    pub hidden_skins: Vec<(u32, bool)>,
 }
 
 /// One player moving to another sim (M5 spec section 3.3).
@@ -1514,6 +1519,7 @@ mod tests {
                     items: vec![(24, GDE_REF)],
                     attributes: vec![(0, 150), (1, 350)],
                 }],
+                hidden_skins: vec![(2, true)],
             },
             quests: PlayerQuests::default(),
             progression: progression(),
@@ -1644,6 +1650,9 @@ mod tests {
                     players: 1,
                     empty_for_ms: Some(u64::MAX),
                     open_for_ms: 1,
+                    phase: 7,
+                    capacity: 5,
+                    ends_at_ms: None,
                 }),
             }),
         });

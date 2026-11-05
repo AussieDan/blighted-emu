@@ -54,7 +54,12 @@ pub enum PeerEvent {
     /// A V3 request arrived; check the ticket and call [`Peer::complete_registration`].
     RegistrationRequested(TicketClaims),
     /// A registered client sent a game message; forward its envelope bytes to the world.
-    ClientMessage(Vec<u8>),
+    ClientMessage {
+        /// The envelope bytes.
+        envelope: Vec<u8>,
+        /// The client sent it reliably.
+        reliable: bool,
+    },
     /// The client echoed a ping: the time from sending it to its echo, on the gateway's clock.
     RoundTrip {
         /// Milliseconds.
@@ -267,7 +272,10 @@ impl Peer {
                 Ok(self.ping_echo(now_ms, &envelope.body))
             }
             (Phase::Registered, Some(index)) if index != REGISTRATION_REQUEST_V3_MSG_TYPE_INDEX => {
-                Ok(Some(PeerEvent::ClientMessage(client.envelope.to_vec())))
+                Ok(Some(PeerEvent::ClientMessage {
+                    envelope: client.envelope.to_vec(),
+                    reliable: message.reliable,
+                }))
             }
             (_, type_index) => Err(PeerError::UnexpectedMessage { type_index }),
         }
@@ -720,8 +728,9 @@ mod tests {
         let forwarded: Vec<Option<u64>> = peer_events
             .iter()
             .filter_map(|event| match event {
-                PeerEvent::ClientMessage(bytes) => {
-                    Some(Envelope::decode(bytes).expect("envelope").type_index())
+                PeerEvent::ClientMessage { envelope, reliable } => {
+                    assert!(!reliable, "sent unreliable");
+                    Some(Envelope::decode(envelope).expect("envelope").type_index())
                 }
                 PeerEvent::RegistrationRequested(_) | PeerEvent::RoundTrip { .. } => None,
             })

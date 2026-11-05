@@ -209,8 +209,10 @@ impl<Q: QueueStore, W: World> Loop<Q, W> {
                         PeerEvent::RegistrationRequested(claims) => {
                             self.check(address, connection, claims);
                         }
-                        PeerEvent::ClientMessage(envelope) => {
-                            self.gateway.world.client_message(connection, envelope);
+                        PeerEvent::ClientMessage { envelope, reliable } => {
+                            self.gateway
+                                .world
+                                .client_message(connection, envelope, reliable);
                         }
                         PeerEvent::RoundTrip { ms } => {
                             metrics::histogram!(METRIC_ROUND_TRIP_MS).record(ms as f64);

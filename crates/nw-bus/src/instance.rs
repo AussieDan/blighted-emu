@@ -164,6 +164,17 @@ pub struct RunningInstance {
     pub empty_for_ms: Option<u64>,
     /// Milliseconds since it opened.
     pub open_for_ms: u64,
+    /// The phase id of the instance (the one of its [`InstanceCommand::Open`]); 0 when the sim
+    /// does not know it.
+    #[serde(default)]
+    pub phase: u64,
+    /// Most players (`TeamCapacity` of the game mode); 0 when the sim does not know it.
+    #[serde(default)]
+    pub capacity: u32,
+    /// Unix milliseconds when it ends (the `ends_at_ms` of its [`InstanceCommand::Open`]), when
+    /// its game mode limits it.
+    #[serde(default)]
+    pub ends_at_ms: Option<u64>,
 }
 
 /// A player's stay in an instance, as its arena state keeps it (world migration 0015): the
@@ -289,6 +300,9 @@ mod tests {
                 players: 1,
                 empty_for_ms: None,
                 open_for_ms: 30,
+                phase: 9,
+                capacity: 5,
+                ends_at_ms: Some(1_792_670_400_250),
             }),
         };
         assert_eq!(

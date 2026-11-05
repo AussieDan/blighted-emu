@@ -200,8 +200,12 @@ pub struct SocialDeliveries {
 }
 
 /// Service to sim, request/reply: add `change` coins to a player (a negative change takes them).
+/// The service asks again with the same `id` when no answer came; the sim moves the coins of one
+/// id once and answers a repeat with the first answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CoinTransfer {
+    /// The move.
+    pub id: Uuid,
     /// The character.
     pub character: Uuid,
     /// The change, in hundredths of a coin.
@@ -295,6 +299,15 @@ mod tests {
         assert_eq!(
             decode::<SocialDeliveries>(&encode(&deliveries).expect("encode")).expect("decode"),
             deliveries
+        );
+        let transfer = CoinTransfer {
+            id: Uuid::from_u128(8),
+            character,
+            change: -5,
+        };
+        assert_eq!(
+            decode::<CoinTransfer>(&encode(&transfer).expect("encode")).expect("decode"),
+            transfer
         );
         let reply = CoinReply::Done { coins: 5 };
         assert_eq!(

@@ -133,6 +133,11 @@ pub struct Admission {
 /// token for an accepted registration (empty for a refused one), the server version text, and the
 /// four flag bytes: the observed ones, or the GM ones for a game master.
 ///
+/// The gateway keeps no session token and checks none: no client message this server decodes
+/// carries it back (the `RegistrationRequestV3Msg` reads only the login token block at +0xc0,
+/// and a reconnect registers again with a new queue ticket, which is single use). Whether the
+/// client sends it in a message this server does not decode is Unknown.
+///
 /// # Errors
 ///
 /// Returns [`getrandom::Error`] when the system cannot give random bytes.
@@ -215,6 +220,10 @@ pub(crate) mod tests {
 
         async fn set_free_slots(&self, _: Uuid, _: u32, _: u64) -> Result<(), StoreError> {
             Ok(())
+        }
+
+        async fn free_slots(&self, _: Uuid) -> Result<u32, StoreError> {
+            Ok(0)
         }
 
         async fn take_entry(&self, ticket_id: &str) -> Result<Option<EntryRecord>, StoreError> {

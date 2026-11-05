@@ -3,8 +3,9 @@
 //!
 //! A join sets the route. A handoff changes it only with a higher sequence, so two route messages
 //! that arrive out of order cannot leave an old sim. A connection whose sim and generation leave
-//! the cell table is resumed through the director; until the answer it has no route, and its
-//! inputs are dropped. A resume raises the sequence by [`RESUME_SEQUENCE_STEP`], so a late route
+//! the cell table is resumed through the director; until the answer it has no route: its
+//! reliable inputs wait (up to [`MAX_HELD_INPUT_BYTES`]) and go to the new sim in order, its
+//! unreliable ones are dropped. A resume raises the sequence by [`RESUME_SEQUENCE_STEP`], so a late route
 //! of the lost sim loses.
 //!
 //! A sim that is not a connection's route and still sends messages for it after
@@ -23,6 +24,20 @@ pub const RESUME_SEQUENCE_STEP: u64 = 1 << 32;
 /// How long a sim that is not the route may send for a connection: longer than a handoff with
 /// its route message.
 pub const STRAY_GRACE: Duration = Duration::from_secs(2);
+/// Bytes of reliable inputs one resuming connection may hold. Inferred: about 1 s of a busy
+/// client's reliable messages, far below one input batch (`nw_bus::MAX_BATCH_BYTES`).
+pub const MAX_HELD_INPUT_BYTES: usize = 64 * 1024;
+
+/// What became of a reliable input of a connection with no route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Hold {
+    /// It waits for the end of the resume.
+    Held,
+    /// The connection holds [`MAX_HELD_INPUT_BYTES`] already: it must close.
+    Full,
+    /// The gateway does not know the connection (gone).
+    Unknown,
+}
 
 /// What to do with messages from a sim for a connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +60,9 @@ struct Route {
     entity: u64,
     bundles_sent: u64,
     resuming: bool,
+    /// The reliable inputs that came during a resume, in order, and their bytes.
+    held: Vec<Vec<u8>>,
+    held_bytes: usize,
 }
 
 /// A connection to resume through the director.
@@ -92,6 +110,8 @@ impl Routes {
                 entity,
                 bundles_sent: 0,
                 resuming: false,
+                held: Vec::new(),
+                held_bytes: 0,
             },
         );
     }
@@ -102,6 +122,20 @@ impl Routes {
             .get(&connection)
             .filter(|route| !route.resuming)
             .map(|route| &route.sim)
+    }
+
+    /// Keeps the reliable input `envelope` of a resuming `connection` for its new sim.
+    pub fn hold(&mut self, connection: u64, envelope: Vec<u8>) -> Hold {
+        let Some(route) = self.routes.get_mut(&connection) else {
+            return Hold::Unknown;
+        };
+        let bytes = route.held_bytes.saturating_add(envelope.len());
+        if bytes > MAX_HELD_INPUT_BYTES {
+            return Hold::Full;
+        }
+        route.held_bytes = bytes;
+        route.held.push(envelope);
+        Hold::Held
     }
 
     /// A handoff moved `connection` to `sim`. Returns whether the route changed: only a higher
@@ -155,18 +189,17 @@ impl Routes {
         jobs
     }
 
-    /// The director put the player of `job` on `sim`. Returns `false` when the connection left
-    /// during the resume.
-    pub fn resumed(&mut self, job: &Resume, sim: BusId, generation: u64) -> bool {
-        let Some(route) = self.routes.get_mut(&job.connection) else {
-            return false;
-        };
+    /// The director put the player of `job` on `sim`. Returns the reliable inputs held during
+    /// the resume, in order; `None` when the connection left during the resume.
+    pub fn resumed(&mut self, job: &Resume, sim: BusId, generation: u64) -> Option<Vec<Vec<u8>>> {
+        let route = self.routes.get_mut(&job.connection)?;
         self.strays.remove(&(job.connection, sim.clone()));
         route.sim = sim;
         route.generation = generation;
         route.sequence = job.handoffs;
         route.resuming = false;
-        true
+        route.held_bytes = 0;
+        Some(std::mem::take(&mut route.held))
     }
 
     /// One bundle (an unreliable server message) went to `connection`.
@@ -276,7 +309,7 @@ mod tests {
     }
 
     #[test]
-    fn inputs_during_a_resume_are_dropped_and_a_late_route_of_the_lost_sim_loses() {
+    fn reliable_inputs_during_a_resume_wait_and_a_late_route_of_the_lost_sim_loses() {
         let mut routes = Routes::default();
         routes.joined(1, &record(), sim("sim-a"), GENERATION, ENTITY);
         routes.apply_route(1, sim("sim-a"), GENERATION, 3);
@@ -284,7 +317,13 @@ mod tests {
         assert_eq!(jobs[0].handoffs, 3 + RESUME_SEQUENCE_STEP);
         assert_eq!(routes.target(1), None);
         assert!(!routes.apply_route(1, sim("sim-b"), GENERATION, 4));
-        assert!(routes.resumed(&jobs[0], sim("sim-c"), GENERATION));
+        assert_eq!(routes.hold(1, vec![1]), Hold::Held);
+        assert_eq!(routes.hold(1, vec![2]), Hold::Held);
+        assert_eq!(routes.hold(9, vec![3]), Hold::Unknown);
+        assert_eq!(
+            routes.resumed(&jobs[0], sim("sim-c"), GENERATION),
+            Some(vec![vec![1], vec![2]])
+        );
         assert_eq!(routes.target(1), Some(&sim("sim-c")));
         assert!(
             !routes.apply_route(1, sim("sim-b"), GENERATION, 4),
@@ -293,7 +332,16 @@ mod tests {
         assert!(routes.apply_route(1, sim("sim-d"), GENERATION, jobs[0].handoffs + 1));
         assert_eq!(routes.left(1), Some(sim("sim-d")));
         assert_eq!(routes.left(1), None);
-        assert!(!routes.resumed(&jobs[0], sim("sim-c"), GENERATION));
+        assert_eq!(routes.resumed(&jobs[0], sim("sim-c"), GENERATION), None);
+    }
+
+    #[test]
+    fn a_resuming_connection_holds_a_bounded_number_of_bytes() {
+        let mut routes = Routes::default();
+        routes.joined(1, &record(), sim("sim-a"), GENERATION, ENTITY);
+        routes.lost(&table(&[]));
+        assert_eq!(routes.hold(1, vec![0; MAX_HELD_INPUT_BYTES]), Hold::Held);
+        assert_eq!(routes.hold(1, vec![0]), Hold::Full);
     }
 
     #[test]

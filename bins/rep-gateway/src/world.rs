@@ -7,7 +7,10 @@
 //! each connection: a join sets it, a route message of a handoff changes it, and a connection
 //! whose sim leaves the cell table is resumed through the director. Inputs and heartbeats go
 //! through publishing queues ([`Publisher`]), so each sim gets the inputs in the order the clients
-//! sent them, and a lost NATS connection never blocks the loop.
+//! sent them, and a lost NATS connection never blocks the loop. Inputs that do not fit the queue
+//! wait for the next flush (up to [`INPUT_BACKLOG_BYTES`] for each sim): above that an unreliable
+//! input is dropped and a reliable one closes its connection (a client whose reliable message is
+//! lost no longer agrees with its sim).
 
 use std::future::Future;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -27,7 +30,7 @@ use uuid::Uuid;
 
 use crate::events::{Delivery, EventReceiver, EventSender, event_queue};
 use crate::registration::{Admission, Refusal};
-use crate::routes::{Resume, Routes, Stray};
+use crate::routes::{Hold, Resume, Routes, Stray};
 use crate::workers::worker_of;
 
 /// Input batches that may wait for the publishing task: about 0.3 s of batches of eight sims.
@@ -42,8 +45,13 @@ pub const INPUT_FLUSH: Duration = Duration::from_millis(10);
 pub const EVENT_QUEUE: usize = 4096;
 /// Heartbeats that may wait for NATS.
 const HEARTBEAT_QUEUE: usize = 16;
-/// Metric: inputs dropped because the publishing task is behind.
+/// Metric: unreliable inputs dropped because the publishing task is behind.
 pub const METRIC_INPUTS_DROPPED: &str = "rep_gateway_world_inputs_dropped_total";
+/// Metric: connections closed because their reliable inputs could not wait.
+pub const METRIC_INPUT_CLOSES: &str = "rep_gateway_world_input_closes_total";
+/// Bytes of inputs that may wait for one sim when the publishing task is behind. Inferred: four
+/// full batches, about 1 s of a busy sim's inputs.
+pub const INPUT_BACKLOG_BYTES: usize = 4 * MAX_BATCH_BYTES;
 /// Metric: inputs of a connection without a route (resuming, or gone).
 pub const METRIC_INPUTS_WITHOUT_ROUTE: &str = "rep_gateway_inputs_without_route_total";
 /// Metric: sims told to drop a copy that nobody routes to.
@@ -91,8 +99,9 @@ pub trait World: Clone + Send + Sync + 'static {
         record: &EntryRecord,
     ) -> impl Future<Output = Result<Admission, Refusal>> + Send;
 
-    /// Forwards one client message envelope, unchanged, without waiting.
-    fn client_message(&self, connection: u64, envelope: Vec<u8>);
+    /// Forwards one client message envelope, unchanged, without waiting; `reliable` when the
+    /// client sent it reliably (the world must not lose it).
+    fn client_message(&self, connection: u64, envelope: Vec<u8>, reliable: bool);
 
     /// Tells the world that a connection is gone, without waiting.
     fn left(&self, connection: u64);
@@ -119,6 +128,31 @@ pub struct WorldLinkSettings {
 
 /// The inputs of each sim that wait for the next batch, and their bytes.
 type PendingInputs = BTreeMap<BusId, (Vec<SimInput>, usize)>;
+
+/// How an input is treated when its sim's backlog is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backlog {
+    /// An unreliable client message: dropped.
+    Droppable,
+    /// A reliable client message: its connection closes.
+    Reliable,
+    /// A departure: always kept (a sim must hear that a player left).
+    Always,
+}
+
+/// Whether an input of `kind` and `size` bytes joins a backlog of `waiting` bytes.
+fn backlog_admits(kind: Backlog, waiting: usize, size: usize) -> bool {
+    kind == Backlog::Always || waiting.saturating_add(size) <= INPUT_BACKLOG_BYTES
+}
+
+/// Puts the `unsent` inputs of a sim back before the ones that came since, so the order holds.
+fn requeue(pending: &mut PendingInputs, sim: BusId, unsent: Vec<SimInput>) {
+    let bytes: usize = unsent.iter().map(SimInput::size_bytes).sum();
+    let (inputs, waiting) = pending.entry(sim).or_default();
+    let newer = std::mem::replace(inputs, unsent);
+    inputs.extend(newer);
+    *waiting = waiting.saturating_add(bytes);
+}
 
 /// The world over NATS.
 #[derive(Debug, Clone)]
@@ -201,18 +235,28 @@ impl BusWorld {
         self.pending.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Sends the inputs that wait for `sim` (or for every sim), in batches.
+    /// Sends the inputs that wait for `sim` (or for every sim), in batches. The batches that do
+    /// not fit the publishing queue wait for the next flush.
     fn send_inputs(&self, batches: PendingInputs) {
         for (sim, (inputs, _)) in batches {
             let subject = subject::sim_input(self.settings.world_id, &sim);
+            let mut unsent = Vec::new();
             for inputs in split_batches(inputs, SimInput::size_bytes) {
+                if !unsent.is_empty() {
+                    unsent.extend(inputs);
+                    continue;
+                }
                 let batch = InputBatch {
                     forwarded: false,
                     inputs,
                 };
-                if !self.inputs.send(subject.clone(), batch) {
-                    metrics::counter!(METRIC_INPUTS_DROPPED).increment(1);
+                if let Err(batch) = self.inputs.try_send(subject.clone(), batch) {
+                    unsent = batch.inputs;
                 }
+            }
+            if !unsent.is_empty() {
+                tracing::debug!(%sim, inputs = unsent.len(), "publishing queue full; inputs wait");
+                requeue(&mut self.pending(), sim, unsent);
             }
         }
     }
@@ -242,12 +286,20 @@ impl BusWorld {
         }
     }
 
-    /// Queues `input` for the next batch of `sim`; a full batch goes out at once.
-    fn input(&self, sim: &BusId, input: SimInput) {
+    /// Queues `input` for the next batch of `sim`; a full batch goes out at once. Above
+    /// [`INPUT_BACKLOG_BYTES`] an input of `kind` [`Backlog::Droppable`] is dropped and one of
+    /// [`Backlog::Reliable`] closes `connection`.
+    fn input(&self, sim: &BusId, connection: u64, input: SimInput, kind: Backlog) {
+        let size = input.size_bytes();
         let full = {
             let mut pending = self.pending();
             let (inputs, bytes) = pending.entry(sim.clone()).or_default();
-            *bytes += input.size_bytes();
+            if !backlog_admits(kind, *bytes, size) {
+                drop(pending);
+                self.refuse_input(sim, connection, kind);
+                return;
+            }
+            *bytes += size;
             inputs.push(input);
             if *bytes >= MAX_BATCH_BYTES {
                 pending.remove_entry(sim)
@@ -260,12 +312,42 @@ impl BusWorld {
         }
     }
 
+    /// An input that its sim's full backlog does not take.
+    fn refuse_input(&self, sim: &BusId, connection: u64, kind: Backlog) {
+        if kind == Backlog::Reliable {
+            metrics::counter!(METRIC_INPUT_CLOSES).increment(1);
+            tracing::warn!(
+                connection,
+                %sim,
+                "reliable input does not fit the sim's backlog; the connection closes"
+            );
+            self.event(connection, WorldEvent::Close { connection });
+        } else {
+            metrics::counter!(METRIC_INPUTS_DROPPED).increment(1);
+        }
+    }
+
     fn send_left(&self, connection: u64, sim: &BusId) {
         self.input(
             sim,
+            connection,
             SimInput::Left {
                 connection: self.connection(connection),
             },
+            Backlog::Always,
+        );
+    }
+
+    /// Queues a client message of `connection` for `sim`.
+    fn send_client_message(&self, sim: &BusId, connection: u64, envelope: Vec<u8>, kind: Backlog) {
+        self.input(
+            sim,
+            connection,
+            SimInput::ClientMessage {
+                connection: self.connection(connection),
+                envelope,
+            },
+            kind,
         );
     }
 
@@ -404,9 +486,24 @@ impl BusWorld {
             }) => {
                 metrics::counter!(METRIC_RESUMES, RESULT_LABEL => RESUMED).increment(1);
                 tracing::info!(connection = job.connection, %sim, "player resumed");
-                let still_here = self.routes().resumed(&job, sim.clone(), generation);
-                if !still_here {
-                    self.send_left(job.connection, &sim);
+                // The held inputs go out under the routes lock, so no newer input of the
+                // connection passes them.
+                let mut routes = self.routes();
+                match routes.resumed(&job, sim.clone(), generation) {
+                    Some(held) => {
+                        for envelope in held {
+                            self.send_client_message(
+                                &sim,
+                                job.connection,
+                                envelope,
+                                Backlog::Reliable,
+                            );
+                        }
+                    }
+                    None => {
+                        drop(routes);
+                        self.send_left(job.connection, &sim);
+                    }
                 }
             }
             Ok(JoinReply::Refused { reason }) => self.close(job.connection, &reason).await,
@@ -450,18 +547,36 @@ impl World for BusWorld {
         }
     }
 
-    fn client_message(&self, connection: u64, envelope: Vec<u8>) {
-        let Some(sim) = self.routes().target(connection).cloned() else {
-            metrics::counter!(METRIC_INPUTS_WITHOUT_ROUTE).increment(1);
+    fn client_message(&self, connection: u64, envelope: Vec<u8>, reliable: bool) {
+        let mut routes = self.routes();
+        if let Some(sim) = routes.target(connection).cloned() {
+            drop(routes);
+            let kind = if reliable {
+                Backlog::Reliable
+            } else {
+                Backlog::Droppable
+            };
+            self.send_client_message(&sim, connection, envelope, kind);
             return;
+        }
+        let hold = if reliable {
+            routes.hold(connection, envelope)
+        } else {
+            Hold::Unknown
         };
-        self.input(
-            &sim,
-            SimInput::ClientMessage {
-                connection: self.connection(connection),
-                envelope,
-            },
-        );
+        drop(routes);
+        match hold {
+            Hold::Held => {}
+            Hold::Full => {
+                metrics::counter!(METRIC_INPUT_CLOSES).increment(1);
+                tracing::warn!(
+                    connection,
+                    "reliable inputs during a resume exceed the hold; the connection closes"
+                );
+                self.event(connection, WorldEvent::Close { connection });
+            }
+            Hold::Unknown => metrics::counter!(METRIC_INPUTS_WITHOUT_ROUTE).increment(1),
+        }
     }
 
     fn left(&self, connection: u64) {
@@ -569,7 +684,7 @@ pub(crate) mod tests {
             Ok(Admission::default())
         }
 
-        fn client_message(&self, connection: u64, envelope: Vec<u8>) {
+        fn client_message(&self, connection: u64, envelope: Vec<u8>, _: bool) {
             self.sent
                 .lock()
                 .expect("lock")
@@ -587,6 +702,32 @@ pub(crate) mod tests {
 
     /// The carrier channel of the login messages.
     const LOGIN_CHANNEL: u8 = 0;
+
+    fn left_of(connection: u64) -> SimInput {
+        SimInput::Left {
+            connection: ConnectionRef {
+                gateway: test_sim(),
+                connection,
+            },
+        }
+    }
+
+    #[test]
+    fn a_full_backlog_keeps_departures_only_and_unsent_inputs_keep_their_order() {
+        assert!(backlog_admits(Backlog::Reliable, 0, INPUT_BACKLOG_BYTES));
+        assert!(!backlog_admits(Backlog::Reliable, INPUT_BACKLOG_BYTES, 1));
+        assert!(!backlog_admits(Backlog::Droppable, INPUT_BACKLOG_BYTES, 1));
+        assert!(backlog_admits(Backlog::Always, INPUT_BACKLOG_BYTES, 1));
+        let mut pending = PendingInputs::new();
+        requeue(&mut pending, test_sim(), vec![left_of(3)]);
+        requeue(&mut pending, test_sim(), vec![left_of(1), left_of(2)]);
+        let (inputs, bytes) = &pending[&test_sim()];
+        assert_eq!(inputs, &vec![left_of(1), left_of(2), left_of(3)]);
+        assert_eq!(
+            *bytes,
+            inputs.iter().map(SimInput::size_bytes).sum::<usize>()
+        );
+    }
 }
 
 #[cfg(all(test, feature = "infra"))]
@@ -806,7 +947,7 @@ mod bus_tests {
     async fn reaches(world: &BusWorld, inputs: &mut Inputs, connection: u64) {
         let reached = async {
             loop {
-                world.client_message(connection, ENVELOPE.to_vec());
+                world.client_message(connection, ENVELOPE.to_vec(), true);
                 if let Ok(Some(Ok(_))) = tokio::time::timeout(PAUSE, inputs.batches.next()).await {
                     return;
                 }
@@ -879,9 +1020,9 @@ mod bus_tests {
         director(&bus, settings.world_id, joined(&sim), joined(&sim)).await;
         let mut inputs = inputs_of(&bus, settings.world_id, &sim).await;
         let (world, mut events) = start_one(&bus, settings.clone()).await;
-        world.client_message(CONNECTION, ENVELOPE.to_vec());
+        world.client_message(CONNECTION, ENVELOPE.to_vec(), true);
         world.join(CONNECTION, &record()).await.expect("join");
-        world.client_message(CONNECTION, ENVELOPE.to_vec());
+        world.client_message(CONNECTION, ENVELOPE.to_vec(), true);
         world.left(CONNECTION);
         world.unknown(UNKNOWN_CONNECTION, &sim);
         let connection = |number| ConnectionRef {

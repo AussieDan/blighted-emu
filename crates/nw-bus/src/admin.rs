@@ -34,6 +34,12 @@ pub enum AdminAction {
         /// The player.
         entity: u64,
     },
+    /// Saves and closes the connection of every player of an account on the sim (a ban):
+    /// [`AdminReply::Done`] when one was here, [`AdminReply::NotMine`] when none was.
+    KickAccount {
+        /// The account (global database).
+        account: Uuid,
+    },
     /// Fills the player's health; brings a dead player back.
     Heal {
         /// The player.

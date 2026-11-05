@@ -39,7 +39,18 @@ impl<T: Serialize + Send + Sync + 'static> Publisher<T> {
     /// Queues `message` for `subject`. Returns `false` when the queue is full and the message is
     /// dropped.
     pub fn send(&self, subject: String, message: T) -> bool {
-        self.queue.try_send((subject, message)).is_ok()
+        self.try_send(subject, message).is_ok()
+    }
+
+    /// Queues `message` for `subject`.
+    ///
+    /// # Errors
+    ///
+    /// Returns the message when the queue is full (or the task ended), so the caller may keep it.
+    pub fn try_send(&self, subject: String, message: T) -> Result<(), T> {
+        self.queue
+            .try_send((subject, message))
+            .map_err(|error| error.into_inner().1)
     }
 }
 
