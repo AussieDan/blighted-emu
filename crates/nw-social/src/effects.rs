@@ -4,8 +4,8 @@
 
 use nw_bus::{BusId, CoinTransfer, GroupEntityDelivery, OwnStateDelivery, SocialDelivery};
 use nw_db::{
-    Company, CompanyInvite, CompanyMember, LinkKind, PlayerReport, SocialGroup, SocialSettings,
-    TreasuryReason,
+    CoinReturn, Company, CompanyInvite, CompanyMember, LinkKind, PlayerReport, SocialGroup,
+    SocialSettings, TreasuryReason,
 };
 use uuid::Uuid;
 
@@ -35,6 +35,12 @@ pub enum Effect {
     },
     /// Store a change.
     Store(StoreOp),
+    /// Read the account of a character the state did not load at start (a character made since);
+    /// the answer comes back with `SocialWorld::account_found`.
+    FindAccount {
+        /// The character.
+        character: Uuid,
+    },
     /// Move a player's coins through its sim; the answer comes back with
     /// `SocialWorld::coins_moved` and the same ticket.
     MoveCoins {
@@ -124,4 +130,20 @@ pub enum StoreOp {
     SaveGroup(SocialGroup),
     /// A group that ended.
     DeleteGroup(Uuid),
+    /// Coin owed to a character (its sim did not take it).
+    AddCoinReturn(CoinReturn),
+    /// Coin owed to a character that its sim took now.
+    RemoveCoinReturn(Uuid),
+}
+
+/// What the database did with a treasury change ([`Effect::Treasury`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TreasuryOutcome {
+    /// Stored; the treasury holds this much now, hundredths of a coin.
+    Stored(u64),
+    /// Refused: the treasury holds less than the change takes, or the company is gone.
+    Refused,
+    /// The database failed for good (a refused value, not a lost connection: the service runs a
+    /// change again until the database is back).
+    Failed,
 }

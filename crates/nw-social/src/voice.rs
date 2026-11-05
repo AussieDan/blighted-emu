@@ -42,6 +42,14 @@ const PLACE_DIGITS: usize = 3;
 /// The largest place number with [`PLACE_DIGITS`] digits.
 const MAX_PLACE: i64 = 999;
 
+/// The places on each side of a player's own place whose positional channels it may join.
+const NEAR_PLACES: i64 = 1;
+
+/// The name of the positional channel of place (`east`, `north`).
+fn place_channel(east: i64, north: i64) -> String {
+    format!("{east:0PLACE_DIGITS$}{north:0PLACE_DIGITS$}_{OPEN_WORLD_LAYER}")
+}
+
 /// The voice service a community runs, from the social service's configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoiceService {
@@ -105,16 +113,28 @@ impl VoiceService {
 
     /// The name of the positional channel at `position` (metres east, north).
     pub fn positional_channel(&self, position: [f32; 2]) -> String {
+        let (east, north) = self.place_of(position);
+        place_channel(east, north)
+    }
+
+    /// The positional channels a player at `position` may join: its own place and the
+    /// [`NEAR_PLACES`] around it. Inferred: the client joins the channel of its channel list
+    /// (its own place), and a player that crossed into the next place between the list and the
+    /// join still joins its old one; retail's rule is Unknown.
+    pub fn positional_channels_near(&self, position: [f32; 2]) -> Vec<String> {
+        let (east, north) = self.place_of(position);
+        let span = |place: i64| (place - NEAR_PLACES).max(0)..=(place + NEAR_PLACES).min(MAX_PLACE);
+        span(east)
+            .flat_map(|east| span(north).map(move |north| place_channel(east, north)))
+            .collect()
+    }
+
+    fn place_of(&self, position: [f32; 2]) -> (i64, i64) {
         let place = |metres: f32| -> i64 {
             // A finite position over a positive cell size is a small number.
             ((metres / self.cell_size_m).floor() as i64).clamp(0, MAX_PLACE)
         };
-        format!(
-            "{:0width$}{:0width$}_{OPEN_WORLD_LAYER}",
-            place(position[0]),
-            place(position[1]),
-            width = PLACE_DIGITS
-        )
+        (place(position[0]), place(position[1]))
     }
 
     /// A token of `action` for `character` with request number `request` at Unix seconds
@@ -205,6 +225,15 @@ mod tests {
                 .starts_with("sip:confctl-g-issuer-1.abc")
         );
         assert_eq!(service.positional_channel([6700.0, 3600.0]), "013007_0");
+        let near = service.positional_channels_near([6700.0, 3600.0]);
+        assert_eq!(near.len(), 9);
+        assert!(near.contains(&"012006_0".to_owned()) && near.contains(&"014008_0".to_owned()));
+        assert!(!near.contains(&"015007_0".to_owned()));
+        assert_eq!(
+            service.positional_channels_near([0.0, 0.0]),
+            ["000000_0", "000001_0", "001000_0", "001001_0"],
+            "no place below 0"
+        );
         assert_eq!(service.domain_text(), "@voice.example");
         assert_eq!(new_group_channel().len(), 43);
     }

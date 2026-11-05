@@ -15,7 +15,6 @@
 use std::collections::BTreeSet;
 
 use nw_bus::{GroupEntityDelivery, GroupEntityView, OwnStateDelivery, SocialStateKind};
-use nw_db::WITHDRAWAL_WINDOW_MS;
 use nw_messages::FullList;
 use nw_messages::items::FIRST_VERSION;
 use nw_messages::social::group_data::{GroupDataState, GroupMemberView};
@@ -151,11 +150,14 @@ impl SocialWorld {
                 StoreOp::SaveGroup(group) => group.members.clone(),
                 StoreOp::Settings { .. }
                 | StoreOp::Report(_)
+                | StoreOp::AddCoinReturn(_)
+                | StoreOp::RemoveCoinReturn(_)
                 | StoreOp::DeleteCompany(_)
                 | StoreOp::DeleteGroup(_) => Vec::new(),
             },
             // The treasury changes when its change is stored (`treasury_changed` touches).
             Effect::Treasury { .. }
+            | Effect::FindAccount { .. }
             | Effect::Deliver { .. }
             | Effect::MoveCoins { .. }
             | Effect::OwnState { .. }
@@ -381,22 +383,6 @@ impl SocialWorld {
             (left.created_ns, left.guild).cmp(&(right.created_ns, right.guild))
         });
         invites
-    }
-
-    /// The coin `character` took from a treasury in the withdrawal window.
-    fn withdrawn_today(&self, character: Uuid, now_ms: u64) -> u64 {
-        self.withdrawals
-            .get(&character)
-            .map(|changes| {
-                changes
-                    .iter()
-                    .filter(|(at_ms, change)| {
-                        *change < 0 && now_ms.saturating_sub(*at_ms) < WITHDRAWAL_WINDOW_MS
-                    })
-                    .map(|(_, change)| change.unsigned_abs())
-                    .sum()
-            })
-            .unwrap_or_default()
     }
 
     fn guilds_view(&self, character: Uuid, now_ms: u64) -> GuildsState {

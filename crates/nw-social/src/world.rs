@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use nw_bus::{
     BusId, LeaveReason, SocialDelivery, SocialFacetKind, SocialHeader, SocialInput, SocialPlayer,
 };
-use nw_db::{Company, LinkKind, SocialGroup, SocialRecords, SocialSettings};
+use nw_db::{CoinReturn, Company, LinkKind, SocialGroup, SocialRecords, SocialSettings};
 use nw_messages::FacetHeader;
 use nw_messages::social::players::{ONLINE_STATE_OFFLINE, ONLINE_STATE_ONLINE};
 use nw_messages::social::{ICON_LEN, PlayerPush, SocialCall, SocialFacet, SocialPush};
@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::companies::CompanyRules;
 use crate::effects::{Effect, StoreOp};
+use crate::privacy::PrivacyByAccount;
 use crate::profanity::ProfanityFilter;
 use crate::throttle::ChatThrottle;
 use crate::views::{GroupVitals, SentViews, vitals_of};
@@ -60,6 +61,8 @@ pub struct Loaded {
 #[derive(Debug, Clone)]
 pub(crate) struct Person {
     pub(crate) name: String,
+    /// Its account; `None` for a character the database did not list at start.
+    pub(crate) account: Option<Uuid>,
     pub(crate) settings: SocialSettings,
     pub(crate) friends: BTreeSet<Uuid>,
     /// Friend invites this character sent.
@@ -81,9 +84,10 @@ pub(crate) struct Person {
 }
 
 impl Person {
-    fn new(name: String, icon: Option<[u8; ICON_LEN]>) -> Self {
+    fn new(name: String, account: Option<Uuid>, icon: Option<[u8; ICON_LEN]>) -> Self {
         Self {
             name,
+            account,
             settings: SocialSettings {
                 icon,
                 ..SocialSettings::default()
@@ -120,25 +124,28 @@ pub(crate) struct GroupInvite {
     pub(crate) created_ms: u64,
 }
 
-/// A treasury transfer between its steps.
+/// The coins of one treasury transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CoinMove {
+    pub(crate) character: Uuid,
+    pub(crate) company: Uuid,
+    /// Hundredths of a coin.
+    pub(crate) amount: u64,
+}
+
+/// A treasury transfer between its steps ([`crate::treasury`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Transfer {
-    /// A deposit whose coins left the player.
-    Deposit {
-        character: Uuid,
-        company: Uuid,
-        amount: u64,
-    },
-    /// A deposit whose coins went back to the player after the treasury refused them.
-    DepositReturn,
-    /// A withdrawal that left the treasury and goes to the player.
-    Withdraw {
-        character: Uuid,
-        company: Uuid,
-        amount: u64,
-    },
-    /// A withdrawal that the treasury must take back.
-    Refund,
+    /// A deposit: its coins leave the player, then enter the treasury.
+    Deposit(CoinMove),
+    /// Deposit coins that go back to the player: the treasury did not take them.
+    DepositReturn(CoinMove),
+    /// A withdrawal: its coins leave the treasury, then reach the player.
+    Withdraw(CoinMove),
+    /// Withdrawn coins that the treasury takes back: the player did not get them.
+    Refund(CoinMove),
+    /// Coin owed to the player that goes to it now.
+    Debt(CoinReturn),
 }
 
 /// The social state of one world.
@@ -154,9 +161,17 @@ pub struct SocialWorld {
     pub(crate) company_names: HashMap<String, Uuid>,
     pub(crate) groups: HashMap<Uuid, SocialGroup>,
     pub(crate) group_invites: HashMap<[u8; 16], GroupInvite>,
-    /// Treasury withdrawals and refunds per character: Unix milliseconds and change.
+    /// Done treasury withdrawals (and, from the database, their refunds) per character: Unix
+    /// milliseconds and change.
     pub(crate) withdrawals: HashMap<Uuid, Vec<(u64, i64)>>,
     pub(crate) transfers: HashMap<u64, Transfer>,
+    /// Coin owed to each character and not on its way to it now (world migration 0031).
+    pub(crate) owed: HashMap<Uuid, Vec<CoinReturn>>,
+    /// The phase of the instance each instance sim runs (its heartbeat); a sim without one is in
+    /// the open world.
+    pub(crate) sim_phases: HashMap<BusId, u64>,
+    /// The privacy settings of the accounts that set one ([`crate::privacy`]).
+    pub(crate) privacy: PrivacyByAccount,
     pub(crate) next_ticket: u64,
     pub(crate) out: Vec<Effect>,
     /// Characters whose replicated states this input may have changed ([`crate::views`]).
@@ -177,7 +192,11 @@ impl SocialWorld {
             .map(|character| {
                 (
                     character.id,
-                    Person::new(character.name.clone(), icons.get(&character.id).copied()),
+                    Person::new(
+                        character.name.clone(),
+                        Some(character.account),
+                        icons.get(&character.id).copied(),
+                    ),
                 )
             })
             .collect();
@@ -264,6 +283,10 @@ impl SocialWorld {
                 .or_default()
                 .push((at_ms, change));
         }
+        let mut owed: HashMap<Uuid, Vec<CoinReturn>> = HashMap::new();
+        for debt in records.coin_returns {
+            owed.entry(debt.character).or_default().push(debt);
+        }
         Self {
             rules,
             filter,
@@ -275,6 +298,9 @@ impl SocialWorld {
             group_invites: HashMap::new(),
             withdrawals,
             transfers: HashMap::new(),
+            owed,
+            sim_phases: HashMap::new(),
+            privacy: PrivacyByAccount::new(),
             next_ticket: 0,
             out: Vec::new(),
             touched: BTreeSet::new(),
@@ -321,6 +347,7 @@ impl SocialWorld {
 
     /// Sim `sim` stopped beating: its players are offline.
     pub fn sim_lost(&mut self, sim: &BusId, now_ms: u64) -> Vec<Effect> {
+        self.sim_phases.remove(sim);
         let gone: Vec<Uuid> = self
             .people
             .iter()
@@ -353,8 +380,10 @@ impl SocialWorld {
             self.names.insert(player.name.to_lowercase(), character);
             self.people.insert(
                 character,
-                Person::new(player.name.clone(), Some(player.icon)),
+                Person::new(player.name.clone(), None, Some(player.icon)),
             );
+            // Its account names its privacy settings.
+            self.out.push(Effect::FindAccount { character });
         }
         let Some(person) = self.people.get_mut(&character) else {
             return;
@@ -377,7 +406,37 @@ impl SocialWorld {
         if came_online {
             metrics::gauge!(METRIC_ONLINE).set(self.online_count() as f64);
             self.tell_watchers(character, ONLINE_STATE_ONLINE);
+            self.pay_debts(character);
         }
+    }
+
+    /// The database holds `account` for `character` ([`Effect::FindAccount`]).
+    pub fn account_found(&mut self, character: Uuid, account: Uuid) {
+        if let Some(person) = self.people.get_mut(&character) {
+            person.account = Some(account);
+        }
+    }
+
+    /// Sim `sim` runs an instance of phase `phase` (`Some`), or none (its heartbeat): its players
+    /// are in that phase.
+    pub fn set_sim_phase(&mut self, sim: &BusId, phase: Option<u64>) {
+        match phase {
+            Some(phase) => {
+                self.sim_phases.insert(sim.clone(), phase);
+            }
+            None => {
+                self.sim_phases.remove(sim);
+            }
+        }
+    }
+
+    /// The phase `character` is in: its sim's instance, else the open world (also when offline).
+    pub(crate) fn phase_of(&self, character: Uuid) -> Option<u64> {
+        self.people
+            .get(&character)
+            .and_then(|person| person.online.as_ref())
+            .and_then(|online| self.sim_phases.get(&online.sim))
+            .copied()
     }
 
     fn went_offline(&mut self, character: Uuid, now_ms: u64) {
@@ -399,7 +458,11 @@ impl SocialWorld {
 
     /// Tells the friends, company members and group members of `character` its online state.
     fn tell_watchers(&mut self, character: Uuid, state: u8) {
-        let watchers = self.watchers(character);
+        let watchers: Vec<Uuid> = self
+            .watchers(character)
+            .into_iter()
+            .filter(|watcher| self.sees_online(character, *watcher))
+            .collect();
         self.push(
             &watchers,
             SocialPush::Player(PlayerPush::OnlineState {

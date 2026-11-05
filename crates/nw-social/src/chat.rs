@@ -14,7 +14,9 @@
 //! | Whisper | the online player named by the line, and the sender |
 //!
 //! Other channels (announcements, system, war, raid, lobby, game mode) are the server's own;
-//! a client line on them is refused. A listener who blocks or mutes the sender does not hear it.
+//! a client line on them is refused. A listener who blocks or mutes the sender does not hear it,
+//! nor one whose privacy settings, or the sender's, close the channel to the other
+//! ([`crate::privacy`]).
 
 use nw_messages::social::chat::{
     MESSAGE_RESERVED, MESSAGE_TRAILER, MUTE_FOREVER, MuteNotice, SENDER_KIND,
@@ -160,7 +162,7 @@ impl SocialWorld {
             .filter(|listener| {
                 self.people.get(listener).is_some_and(|heard| {
                     !heard.blocks.contains(&sender) && !heard.mutes.contains(&sender)
-                })
+                }) && self.may_chat(sender, *listener, kind)
             })
             .collect();
         let filtered = self.filter.filter(&body).unwrap_or_default();

@@ -17,6 +17,9 @@ heartbeat_interval_ms = 1000
 heartbeat_misses = 3
 # Longest wait for a sim to move a player's coins (company treasury).
 coin_timeout_ms = 2000
+# Milliseconds between two reads of the privacy settings that changed (best guess: a change
+# reaches the world within seconds at one small read each time).
+privacy_poll_ms = 5000
 metrics_listen = "127.0.0.1:9111"
 log_filter = "info"
 
@@ -35,6 +38,16 @@ treasury_max = 10000000
 [world_database]
 url = "postgres://nw@127.0.0.1:5432/nw_world_1"
 max_connections = 4
+
+# The global database with the players' privacy settings (set in the game's privacy menu, stored
+# by edge-http). Without this section every setting keeps its default: everyone may write, talk,
+# ask for friendship and see the online status. Its password is in the variable named by
+# password_env.
+# [global_database]
+# password_env = "NW_SECRET_GLOBAL_DATABASE_PASSWORD"
+# [global_database.database]
+# url = "postgres://nw@127.0.0.1:5432/nw_global"
+# max_connections = 2
 
 # A Vivox-compatible voice service the community runs. Without this section voice calls stay
 # unanswered and the client keeps its voice chat off.

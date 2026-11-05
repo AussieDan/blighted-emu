@@ -26,7 +26,8 @@ use nw_messages::{PlayerDataResponseMsg, PlayerDataView};
 use uuid::Uuid;
 
 use crate::effects::StoreOp;
-use crate::voice::TokenAction;
+use crate::privacy::Audience;
+use crate::voice::{TokenAction, VoiceService};
 use crate::world::{METRIC_CALLS, REFUSED, RESULT_LABEL, SocialWorld};
 
 /// The pronoun of a character of this server: it has no pronoun choice (0 is the value of 251
@@ -34,7 +35,9 @@ use crate::world::{METRIC_CALLS, REFUSED, RESULT_LABEL, SocialWorld};
 const DEFAULT_PRONOUN: u8 = 0;
 /// The 6675 of a player in no phase (retail `Hive 3v3 group`: every field 0).
 const NO_PHASE_STATE: u8 = 0;
-/// The phase of a player in the open world (retail: 0 outside instances).
+/// The phase of a player in the open world (retail: 0 outside instances); an offline player's
+/// phase too (Inferred: no capture asks for an offline player). A player on an instance sim is in
+/// that instance's phase, from the sim's heartbeat.
 const OPEN_WORLD_PHASE: u64 = 0;
 /// Milliseconds per second, for token times.
 const MS_PER_SECOND: u64 = 1000;
@@ -55,7 +58,7 @@ impl SocialWorld {
                 if let Ok(other) = Uuid::parse_str(&other) {
                     let push = PlayerPush::PhaseId {
                         character: CharacterRef(Some(*other.as_bytes())),
-                        phase: OPEN_WORLD_PHASE,
+                        phase: self.phase_of(other).unwrap_or(OPEN_WORLD_PHASE),
                         trailer: PHASE_ID_TRAILER,
                     };
                     self.answer(character, header, SocialPush::Player(push));
@@ -65,12 +68,14 @@ impl SocialWorld {
                 character: other, ..
             } => {
                 if let Ok(other) = Uuid::parse_str(&other) {
+                    // The state byte and the two counts of a player in an instance are
+                    // Unknown (no capture asks for one): they stay those of no phase.
                     let push = PlayerPush::PhaseData {
                         character: CharacterRef(Some(*other.as_bytes())),
                         state: NO_PHASE_STATE,
                         first: 0,
                         second: 0,
-                        sector: OPEN_WORLD_PHASE,
+                        sector: self.phase_of(other).unwrap_or(OPEN_WORLD_PHASE),
                     };
                     self.answer(character, header, SocialPush::Player(push));
                 }
@@ -200,6 +205,13 @@ impl SocialWorld {
         match request {
             FriendRequest::Invite | FriendRequest::Accept if invited_me => {
                 self.befriend(character, other);
+            }
+            FriendRequest::Invite
+                if !self.lets_in(other, self.privacy_of(other).friend_requests, character) =>
+            {
+                // Its privacy settings refuse the request; retail's answer to the sender is
+                // Unknown, so it gets none (Inferred).
+                metrics::counter!(METRIC_CALLS, RESULT_LABEL => REFUSED).increment(1);
             }
             FriendRequest::Invite => {
                 let fresh = self.people.get_mut(&character).is_some_and(|person| {
@@ -336,6 +348,10 @@ impl SocialWorld {
                 } else {
                     service.group_uri(&channel)
                 };
+                if !self.may_hear(&service, character, &target) {
+                    metrics::counter!(METRIC_CALLS, RESULT_LABEL => REFUSED).increment(1);
+                    return;
+                }
                 VoicePush::Token {
                     token: service.token(
                         TokenAction::Join,
@@ -351,17 +367,23 @@ impl SocialWorld {
             VoiceCall::TranscriptionToken {
                 request,
                 channel_uri,
-            } => VoicePush::Token {
-                token: service.token(
-                    TokenAction::Transcription,
-                    character,
+            } => {
+                if !self.may_hear(&service, character, &channel_uri) {
+                    metrics::counter!(METRIC_CALLS, RESULT_LABEL => REFUSED).increment(1);
+                    return;
+                }
+                VoicePush::Token {
+                    token: service.token(
+                        TokenAction::Transcription,
+                        character,
+                        request,
+                        Some(&channel_uri),
+                        now_s,
+                    ),
+                    kind: TOKEN_TRANSCRIPTION,
                     request,
-                    Some(&channel_uri),
-                    now_s,
-                ),
-                kind: TOKEN_TRANSCRIPTION,
-                request,
-            },
+                }
+            }
             VoiceCall::WorldChannels => {
                 let Some(position) = self
                     .people
@@ -397,6 +419,34 @@ impl SocialWorld {
     }
 }
 
+impl SocialWorld {
+    /// Whether `character` may get a token for the channel at address `uri`: its group's channel,
+    /// or a positional channel at or next to its place, as its voice privacy setting allows
+    /// ([`crate::privacy`]). Any other channel is refused with no
+    /// answer (Inferred: retail's refusal of a token is Unknown; no token is the safe answer).
+    fn may_hear(&self, service: &VoiceService, character: Uuid, uri: &str) -> bool {
+        let Some(person) = self.people.get(&character) else {
+            return false;
+        };
+        let voice = self.privacy_of(character).voice;
+        if voice == Audience::NoOne {
+            return false;
+        }
+        let in_group = person
+            .group
+            .and_then(|group| self.groups.get(&group))
+            .is_some_and(|group| service.group_uri(&group.voice_channel) == uri);
+        let near = voice == Audience::Everyone
+            && person.online.as_ref().is_some_and(|online| {
+                service
+                    .positional_channels_near(online.position)
+                    .iter()
+                    .any(|channel| service.positional_uri(channel) == uri)
+            });
+        in_group || near
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use nw_messages::social::players::{
@@ -405,14 +455,15 @@ mod tests {
         REQUEST_FAILED_TYPE_INDEX, SEARCH_PLAYERS_TYPE_INDEX,
     };
     use nw_messages::social::voice::{
-        JOIN_TOKEN_TYPE_INDEX, REGISTER_TYPE_INDEX, REGISTERED_TYPE_INDEX, TOKEN_TYPE_INDEX,
-        WORLD_CHANNEL_URIS_TYPE_INDEX, WORLD_CHANNELS_TYPE_INDEX,
+        CHANNEL_GROUP, JOIN_TOKEN_TYPE_INDEX, REGISTER_TYPE_INDEX, REGISTERED_TYPE_INDEX,
+        TOKEN_TYPE_INDEX, TRANSCRIPTION_TOKEN_TYPE_INDEX, WORLD_CHANNEL_URIS_TYPE_INDEX,
+        WORLD_CHANNELS_TYPE_INDEX,
     };
 
     use super::*;
     use crate::Effect;
     use crate::voice::VoiceService;
-    use crate::world::tests::{NOW_MS, call, character, join, pushes, text, world};
+    use crate::world::tests::{NOW_MS, call, character, join, pushes, sim, text, world};
 
     const REQUEST: [u8; 16] = [9; 16];
 
@@ -511,6 +562,47 @@ mod tests {
     }
 
     #[test]
+    fn a_player_on_an_instance_sim_is_in_its_phase() {
+        const PHASE: u64 = 9;
+        let mut world = world();
+        join(&mut world, 1, "Ann", "sim-a");
+        join(&mut world, 2, "Bob", "inst-1");
+        let mut args = REQUEST.to_vec();
+        args.extend(text(&character(2).hyphenated().to_string()));
+        let ask = |world: &mut SocialWorld, type_index, answer| {
+            let effects = call(world, 1, "sim-a", type_index, &args, NOW_MS);
+            pushes(&effects, answer)[0].1.clone()
+        };
+        let phase_id = |world: &mut SocialWorld| {
+            ask(
+                world,
+                PLAYER_PHASE_ID_TYPE_INDEX,
+                nw_messages::social::players::PHASE_ID_RESPONSE_TYPE_INDEX,
+            )
+        };
+        let id_push = |phase| {
+            SocialPush::Player(PlayerPush::PhaseId {
+                character: CharacterRef(Some(*character(2).as_bytes())),
+                phase,
+                trailer: PHASE_ID_TRAILER,
+            })
+        };
+        assert_eq!(phase_id(&mut world), id_push(OPEN_WORLD_PHASE));
+        world.set_sim_phase(&sim("inst-1"), Some(PHASE));
+        assert_eq!(phase_id(&mut world), id_push(PHASE));
+        let SocialPush::Player(PlayerPush::PhaseData { sector, .. }) = ask(
+            &mut world,
+            nw_messages::social::players::PLAYER_PHASE_DATA_TYPE_INDEX,
+            nw_messages::social::players::PHASE_DATA_RESPONSE_TYPE_INDEX,
+        ) else {
+            panic!("phase data");
+        };
+        assert_eq!(sector, PHASE);
+        world.sim_lost(&sim("inst-1"), NOW_MS);
+        assert_eq!(phase_id(&mut world), id_push(OPEN_WORLD_PHASE));
+    }
+
+    #[test]
     fn phase_and_report_calls_are_answered_and_stored() {
         let mut world = world();
         join(&mut world, 1, "Ann", "sim-a");
@@ -598,5 +690,57 @@ mod tests {
             panic!("a token");
         };
         assert_eq!((kind, request), (TOKEN_JOIN, 2));
+        let token_for = |world: &mut SocialWorld, channel: &str, kind: u32| {
+            let mut args = 3_u16.to_be_bytes().to_vec();
+            args.extend(text(channel));
+            args.extend(kind.to_be_bytes());
+            let effects = call(world, 1, "sim-a", JOIN_TOKEN_TYPE_INDEX, &args, NOW_MS);
+            pushes(&effects, TOKEN_TYPE_INDEX).len()
+        };
+        assert_eq!(
+            token_for(&mut world, "009009_0", CHANNEL_POSITIONAL),
+            0,
+            "far away"
+        );
+        assert_eq!(
+            token_for(&mut world, "000001_0", CHANNEL_POSITIONAL),
+            1,
+            "next place"
+        );
+        let group_kind = CHANNEL_GROUP;
+        assert_eq!(
+            token_for(&mut world, "someone-elses", group_kind),
+            0,
+            "not its group"
+        );
+        let group = nw_db::SocialGroup {
+            id: Uuid::from_u128(900),
+            leader: character(1),
+            voice_channel: "own-group".to_owned(),
+            members: vec![character(1)],
+        };
+        world.people.get_mut(&character(1)).expect("Ann").group = Some(group.id);
+        world.groups.insert(group.id, group);
+        assert_eq!(
+            token_for(&mut world, "own-group", group_kind),
+            1,
+            "its group"
+        );
+        let service = world.rules.voice.clone().expect("voice");
+        let transcribe = |world: &mut SocialWorld, uri: &str| {
+            let mut args = 4_u16.to_be_bytes().to_vec();
+            args.extend(text(uri));
+            let effects = call(
+                world,
+                1,
+                "sim-a",
+                TRANSCRIPTION_TOKEN_TYPE_INDEX,
+                &args,
+                NOW_MS,
+            );
+            pushes(&effects, TOKEN_TYPE_INDEX).len()
+        };
+        assert_eq!(transcribe(&mut world, &service.group_uri("own-group")), 1);
+        assert_eq!(transcribe(&mut world, &service.group_uri("other")), 0);
     }
 }

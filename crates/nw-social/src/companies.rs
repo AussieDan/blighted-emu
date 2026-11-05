@@ -17,23 +17,17 @@
 //! The client shows its own company from the `GuildsComponentReplicatedState`, which
 //! [`crate::views`] sends.
 
-use nw_bus::CoinTransfer;
-use nw_db::{
-    Company, CompanyInvite, CompanyListing, CompanyMember, TreasuryReason, WITHDRAWAL_WINDOW_MS,
-};
+use nw_db::{Company, CompanyInvite, CompanyListing, CompanyMember};
 use nw_messages::FacetHeader;
 use nw_messages::guild_lookup::{OtherGuildData, SiegeWindow, UnorderedGuildsMsg};
-use nw_messages::social::guilds::{
-    ListOrder, RANK_FAILED_SELF, TREASURY_DAILY_LIMIT, TREASURY_NO_PRIVILEGE,
-    TREASURY_NOT_ENOUGH_TREASURY_FUNDS, TREASURY_SUCCESS,
-};
+use nw_messages::social::guilds::{ListOrder, RANK_FAILED_SELF};
 use nw_messages::social::{
     CharacterRef, GuildCall, GuildPush, SocialPush, crest_bytes, crest_of_bytes,
 };
 use uuid::Uuid;
 
 use crate::effects::{Effect, StoreOp};
-use crate::world::{CompanyState, METRIC_CALLS, REFUSED, RESULT_LABEL, SocialWorld, Transfer};
+use crate::world::{CompanyState, METRIC_CALLS, REFUSED, RESULT_LABEL, SocialWorld};
 
 /// Rank 0: the governor.
 pub(crate) const RANK_GOVERNOR: u8 = 0;
@@ -342,7 +336,7 @@ impl SocialWorld {
     }
 
     /// The company and rank of `character`.
-    fn company_of(&self, character: Uuid) -> Option<(Uuid, u8)> {
+    pub(crate) fn company_of(&self, character: Uuid) -> Option<(Uuid, u8)> {
         self.people
             .get(&character)
             .and_then(|person| person.company)
@@ -543,6 +537,48 @@ impl SocialWorld {
         }
     }
 
+    /// The database refused a change of company `id` (its name is another company's there), and
+    /// holds `stored` for it: the state takes the stored company, or ends a company the database
+    /// does not hold, so memory and database agree. Its members are told.
+    pub fn company_from_database(
+        &mut self,
+        id: Uuid,
+        stored: Option<Company>,
+        now_ms: u64,
+    ) -> Vec<Effect> {
+        let members = self.members_of(id);
+        if let Some(state) = self.companies.get(&id) {
+            self.company_names.remove(&state.record.name.to_lowercase());
+        }
+        match stored {
+            Some(record) => {
+                self.company_names.insert(record.name.to_lowercase(), id);
+                if let Some(state) = self.companies.get_mut(&id) {
+                    state.record = record;
+                }
+                self.tell_company_changed(id, 1, &members);
+            }
+            None => {
+                tracing::error!(company = %id, "company not in the database; it ends");
+                self.companies.remove(&id);
+                for member in &members {
+                    if let Some(person) = self.people.get_mut(member) {
+                        person.company = None;
+                    }
+                }
+                self.push(
+                    &members,
+                    SocialPush::Guild(GuildPush::DataUpdated { guild: NO_COMPANY }),
+                );
+            }
+        }
+        for member in members {
+            self.touch(member);
+        }
+        self.refresh_views(now_ms);
+        std::mem::take(&mut self.out)
+    }
+
     fn leave_company(&mut self, character: Uuid, now_ms: u64) {
         let Some((company, rank)) = self.company_of(character) else {
             return;
@@ -705,317 +741,16 @@ impl SocialWorld {
         };
         self.answer(caller, header, SocialPush::Guild(push));
     }
-
-    fn deposit(&mut self, character: Uuid, asked: u64) {
-        let Some((company, rank)) = self.company_of(character) else {
-            return;
-        };
-        if !may(rank, Right::Has(Privilege::TreasuryDeposit)) {
-            metrics::counter!(METRIC_CALLS, RESULT_LABEL => REFUSED).increment(1);
-            return;
-        }
-        // `DepositCappedByTreasuryMax`: the deposit stops at the treasury maximum.
-        let room = self.companies.get(&company).map_or(0, |state| {
-            self.rules
-                .companies
-                .treasury_max
-                .saturating_sub(state.record.treasury)
-        });
-        let amount = asked.min(room);
-        let (Some(sim), Ok(change)) = (self.sim_of(character), i64::try_from(amount)) else {
-            return;
-        };
-        if amount == 0 {
-            return;
-        }
-        let ticket = self.ticket();
-        self.transfers.insert(
-            ticket,
-            Transfer::Deposit {
-                character,
-                company,
-                amount,
-            },
-        );
-        self.out.push(Effect::MoveCoins {
-            ticket,
-            sim,
-            transfer: CoinTransfer {
-                character,
-                change: -change,
-            },
-        });
-    }
-
-    fn withdraw(&mut self, character: Uuid, amount: u64, now_ms: u64) {
-        let Some((company, rank)) = self.company_of(character) else {
-            return;
-        };
-        let Ok(change) = i64::try_from(amount) else {
-            return;
-        };
-        let result = |world: &mut Self, result| {
-            let push = GuildPush::Withdrawn { amount, result };
-            world.push(&[character], SocialPush::Guild(push));
-        };
-        if !may(rank, Right::Has(Privilege::TreasuryWithdraw)) {
-            result(self, TREASURY_NO_PRIVILEGE);
-            return;
-        }
-        let Some((treasury, limit)) = self
-            .companies
-            .get(&company)
-            .map(|state| (state.record.treasury, state.record.withdrawal_limit))
-        else {
-            return;
-        };
-        if treasury < amount {
-            result(self, TREASURY_NOT_ENOUGH_TREASURY_FUNDS);
-            return;
-        }
-        if !may(rank, Right::Has(Privilege::TreasuryWithdrawUnlimited))
-            && let Some(limit) = limit
-        {
-            let taken: i64 = self
-                .withdrawals
-                .get(&character)
-                .into_iter()
-                .flatten()
-                .filter(|(at, _)| now_ms.saturating_sub(*at) < WITHDRAWAL_WINDOW_MS)
-                .map(|(_, change)| -change)
-                .sum();
-            if u64::try_from(taken.saturating_add(change)).unwrap_or(u64::MAX) > limit {
-                result(self, TREASURY_DAILY_LIMIT);
-                return;
-            }
-        }
-        if amount == 0 {
-            return;
-        }
-        let ticket = self.ticket();
-        self.transfers.insert(
-            ticket,
-            Transfer::Withdraw {
-                character,
-                company,
-                amount,
-            },
-        );
-        self.withdrawals
-            .entry(character)
-            .or_default()
-            .push((now_ms, -change));
-        self.out.push(Effect::Treasury {
-            ticket,
-            company,
-            character,
-            change: -change,
-            reason: TreasuryReason::Withdraw,
-        });
-    }
-
-    fn sim_of(&self, character: Uuid) -> Option<nw_bus::BusId> {
-        self.people
-            .get(&character)
-            .and_then(|person| person.online.as_ref())
-            .map(|online| online.sim.clone())
-    }
-
-    /// The coins of transfer `ticket` moved (`Some` reply) or did not reach the sim (`None`).
-    pub fn coins_moved(
-        &mut self,
-        ticket: u64,
-        reply: Option<nw_bus::CoinReply>,
-        now_ms: u64,
-    ) -> Vec<Effect> {
-        let done = matches!(reply, Some(nw_bus::CoinReply::Done { .. }));
-        match self.transfers.remove(&ticket) {
-            Some(Transfer::Deposit {
-                character,
-                company,
-                amount,
-            }) if done => {
-                let ticket = self.ticket();
-                self.transfers.insert(
-                    ticket,
-                    Transfer::Deposit {
-                        character,
-                        company,
-                        amount,
-                    },
-                );
-                self.out.push(Effect::Treasury {
-                    ticket,
-                    company,
-                    character,
-                    change: i64::try_from(amount).unwrap_or(i64::MAX),
-                    reason: TreasuryReason::Deposit,
-                });
-            }
-            Some(Transfer::Withdraw {
-                character, amount, ..
-            }) if done => {
-                let push = GuildPush::Withdrawn {
-                    amount,
-                    result: TREASURY_SUCCESS,
-                };
-                self.push(&[character], SocialPush::Guild(push));
-            }
-            Some(Transfer::Withdraw {
-                character,
-                company,
-                amount,
-            }) => {
-                // The coin left the treasury but did not reach the player: it goes back.
-                let change = i64::try_from(amount).unwrap_or(i64::MAX);
-                let ticket = self.ticket();
-                self.transfers.insert(ticket, Transfer::Refund);
-                self.withdrawals
-                    .entry(character)
-                    .or_default()
-                    .push((now_ms, change));
-                self.out.push(Effect::Treasury {
-                    ticket,
-                    company,
-                    character,
-                    change,
-                    reason: TreasuryReason::Refund,
-                });
-            }
-            Some(Transfer::DepositReturn) if !done => {
-                tracing::error!(ticket, "deposit coins could not go back to the player");
-            }
-            _ => {}
-        }
-        self.refresh_views(now_ms);
-        std::mem::take(&mut self.out)
-    }
-
-    /// The treasury change of transfer `ticket` is stored with the balance after it (`Some`), or
-    /// was refused or failed (`None`).
-    pub fn treasury_changed(
-        &mut self,
-        ticket: u64,
-        balance: Option<u64>,
-        now_ms: u64,
-    ) -> Vec<Effect> {
-        let Some(transfer) = self.transfers.remove(&ticket) else {
-            return Vec::new();
-        };
-        let company_of_transfer = match transfer {
-            Transfer::Deposit { company, .. } | Transfer::Withdraw { company, .. } => Some(company),
-            Transfer::DepositReturn | Transfer::Refund => None,
-        };
-        if let (Some(balance), Some(company)) = (balance, company_of_transfer)
-            && let Some(state) = self.companies.get_mut(&company)
-        {
-            state.record.treasury = balance;
-            let members = state.members.clone();
-            for member in members {
-                self.touch(member);
-            }
-        }
-        match (transfer, balance) {
-            (
-                Transfer::Deposit {
-                    character, amount, ..
-                },
-                Some(_),
-            ) => {
-                self.push(
-                    &[character],
-                    SocialPush::Guild(GuildPush::Deposited { amount }),
-                );
-            }
-            (
-                Transfer::Deposit {
-                    character, amount, ..
-                },
-                None,
-            ) => {
-                // The coin left the player but the treasury did not take it: it goes back.
-                if let Some(sim) = self.sim_of(character) {
-                    let ticket = self.ticket();
-                    self.transfers.insert(ticket, Transfer::DepositReturn);
-                    self.out.push(Effect::MoveCoins {
-                        ticket,
-                        sim,
-                        transfer: CoinTransfer {
-                            character,
-                            change: i64::try_from(amount).unwrap_or(i64::MAX),
-                        },
-                    });
-                } else {
-                    tracing::error!(%character, amount, "deposit coins lost: the player left");
-                }
-            }
-            (
-                Transfer::Withdraw {
-                    character,
-                    company,
-                    amount,
-                },
-                Some(_),
-            ) => {
-                let Some(sim) = self.sim_of(character) else {
-                    self.transfers.insert(
-                        ticket,
-                        Transfer::Withdraw {
-                            character,
-                            company,
-                            amount,
-                        },
-                    );
-                    return self.coins_moved(ticket, None, now_ms);
-                };
-                let ticket = self.ticket();
-                self.transfers.insert(
-                    ticket,
-                    Transfer::Withdraw {
-                        character,
-                        company,
-                        amount,
-                    },
-                );
-                self.out.push(Effect::MoveCoins {
-                    ticket,
-                    sim,
-                    transfer: CoinTransfer {
-                        character,
-                        change: i64::try_from(amount).unwrap_or(i64::MAX),
-                    },
-                });
-            }
-            (Transfer::Withdraw { character, .. }, None) => {
-                if let Some(entries) = self.withdrawals.get_mut(&character) {
-                    entries.pop();
-                }
-                let push = GuildPush::Withdrawn {
-                    amount: 0,
-                    result: TREASURY_NOT_ENOUGH_TREASURY_FUNDS,
-                };
-                self.push(&[character], SocialPush::Guild(push));
-            }
-            (Transfer::Refund, None) => {
-                tracing::error!(ticket, "treasury refund failed");
-            }
-            (Transfer::Refund | Transfer::DepositReturn, _) => {}
-        }
-        self.refresh_views(now_ms);
-        std::mem::take(&mut self.out)
-    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use nw_bus::CoinReply;
     use nw_messages::social::guilds::{
-        CREATE_GUILD_TYPE_INDEX, CREATE_INVITE_TYPE_INDEX, DEPOSIT_TYPE_INDEX,
-        DEPOSITED_TYPE_INDEX, GUILD_DATA_UPDATED_TYPE_INDEX, INVITE_RESPONDED_TYPE_INDEX,
-        KICKED_TYPE_INDEX, LEAVE_GUILD_TYPE_INDEX, LIST_BY_NAME_TYPE_INDEX,
-        NAME_AVAILABILITY_TYPE_INDEX, NAME_AVAILABLE_TYPE_INDEX, ORDERED_GUILDS_TYPE_INDEX,
-        REMOVE_MEMBER_TYPE_INDEX, RESPOND_TO_INVITE_TYPE_INDEX, SET_MEMBER_RANK_TYPE_INDEX,
-        WITHDRAW_TYPE_INDEX, WITHDRAWN_TYPE_INDEX,
+        CREATE_GUILD_TYPE_INDEX, CREATE_INVITE_TYPE_INDEX, GUILD_DATA_UPDATED_TYPE_INDEX,
+        INVITE_RESPONDED_TYPE_INDEX, KICKED_TYPE_INDEX, LEAVE_GUILD_TYPE_INDEX,
+        LIST_BY_NAME_TYPE_INDEX, NAME_AVAILABILITY_TYPE_INDEX, NAME_AVAILABLE_TYPE_INDEX,
+        ORDERED_GUILDS_TYPE_INDEX, REMOVE_MEMBER_TYPE_INDEX, RESPOND_TO_INVITE_TYPE_INDEX,
+        SET_MEMBER_RANK_TYPE_INDEX,
     };
 
     use super::*;
@@ -1050,44 +785,6 @@ pub(crate) mod tests {
         assert_eq!(RANK_PRIVILEGES[usize::from(RANK_GOVERNOR)], u32::MAX);
         assert!(may(RANK_GOVERNOR, Right::Lead));
         assert!(!may(RANK_SETTLER + 1, Right::Has(Privilege::ChatListen)));
-    }
-
-    #[test]
-    fn a_deposit_stops_at_the_treasury_maximum() {
-        let (mut world, company) = company_of_two();
-        world
-            .companies
-            .get_mut(&company)
-            .expect("company")
-            .record
-            .treasury = RULES.treasury_max - 100;
-        let effects = call(
-            &mut world,
-            2,
-            "sim-a",
-            DEPOSIT_TYPE_INDEX,
-            &500_u64.to_be_bytes(),
-            NOW_MS,
-        );
-        let [Effect::MoveCoins { transfer, .. }] = effects.as_slice() else {
-            panic!("a coin move: {effects:?}");
-        };
-        assert_eq!(transfer.change, -100, "only the room left");
-        world
-            .companies
-            .get_mut(&company)
-            .expect("company")
-            .record
-            .treasury = RULES.treasury_max;
-        let effects = call(
-            &mut world,
-            2,
-            "sim-a",
-            DEPOSIT_TYPE_INDEX,
-            &500_u64.to_be_bytes(),
-            NOW_MS,
-        );
-        assert!(effects.is_empty(), "a full treasury takes nothing");
     }
 
     #[test]
@@ -1158,7 +855,7 @@ pub(crate) mod tests {
     }
 
     /// Ann creates Alpha and Bob joins it by invite.
-    fn company_of_two() -> (SocialWorld, Uuid) {
+    pub(crate) fn company_of_two() -> (SocialWorld, Uuid) {
         let mut world = world();
         join(&mut world, 1, "Ann", "sim-a");
         join(&mut world, 2, "Bob", "sim-a");
@@ -1229,6 +926,39 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_company_the_database_refused_follows_the_database() {
+        let (mut world, company) = company_of_two();
+        let mut stored = world.companies[&company].record.clone();
+        world
+            .companies
+            .get_mut(&company)
+            .expect("company")
+            .record
+            .name = "Renamed".to_owned();
+        world.company_names.remove("alpha");
+        world.company_names.insert("renamed".to_owned(), company);
+        stored.motd = "stored".to_owned();
+        let effects = world.company_from_database(company, Some(stored), NOW_MS);
+        assert_eq!(world.companies[&company].record.name, "Alpha");
+        assert_eq!(world.companies[&company].record.motd, "stored");
+        assert_eq!(world.company_names.get("alpha"), Some(&company));
+        assert!(!world.company_names.contains_key("renamed"));
+        assert_eq!(deliveries(&effects, GUILD_DATA_UPDATED_TYPE_INDEX).len(), 1);
+        let effects = world.company_from_database(company, None, NOW_MS);
+        assert!(world.companies.is_empty() && world.company_names.is_empty());
+        assert_eq!(world.people[&character(1)].company, None);
+        assert_eq!(world.people[&character(2)].company, None);
+        assert_eq!(
+            pushes(&effects, GUILD_DATA_UPDATED_TYPE_INDEX)[0],
+            (
+                vec![character(1), character(2)],
+                SocialPush::Guild(GuildPush::DataUpdated { guild: NO_COMPANY })
+            ),
+            "no memory-only company is left"
+        );
+    }
+
+    #[test]
     fn ranks_removal_and_leaving_follow_the_rights() {
         let (mut world, company) = company_of_two();
         let mut rank = id_text(1);
@@ -1284,86 +1014,6 @@ pub(crate) mod tests {
                 .any(|effect| matches!(effect, Effect::Store(StoreOp::DeleteCompany(_))))
         );
         assert!(world.companies.is_empty() && world.company_names.is_empty());
-    }
-
-    #[test]
-    fn a_deposit_and_a_withdrawal_move_coins_in_two_steps() {
-        let (mut world, company) = company_of_two();
-        let effects = call(
-            &mut world,
-            2,
-            "sim-a",
-            DEPOSIT_TYPE_INDEX,
-            &500_u64.to_be_bytes(),
-            NOW_MS,
-        );
-        let [
-            Effect::MoveCoins {
-                ticket, transfer, ..
-            },
-        ] = effects.as_slice()
-        else {
-            panic!("a coin move: {effects:?}");
-        };
-        assert_eq!(transfer.change, -500);
-        let effects = world.coins_moved(*ticket, Some(CoinReply::Done { coins: 0 }), NOW_MS);
-        let [Effect::Treasury { ticket, change, .. }] = effects.as_slice() else {
-            panic!("a treasury change: {effects:?}");
-        };
-        assert_eq!(*change, 500);
-        let effects = world.treasury_changed(*ticket, Some(500), NOW_MS);
-        assert_eq!(pushes(&effects, DEPOSITED_TYPE_INDEX).len(), 1);
-        assert_eq!(world.companies[&company].record.treasury, 500);
-        let effects = call(
-            &mut world,
-            2,
-            "sim-a",
-            WITHDRAW_TYPE_INDEX,
-            &100_u64.to_be_bytes(),
-            NOW_MS,
-        );
-        assert_eq!(
-            pushes(&effects, WITHDRAWN_TYPE_INDEX)[0].1,
-            SocialPush::Guild(GuildPush::Withdrawn {
-                amount: 100,
-                result: TREASURY_NO_PRIVILEGE
-            }),
-            "a settler takes nothing"
-        );
-        let effects = call(
-            &mut world,
-            1,
-            "sim-a",
-            WITHDRAW_TYPE_INDEX,
-            &100_u64.to_be_bytes(),
-            NOW_MS,
-        );
-        let [Effect::Treasury { ticket, change, .. }] = effects.as_slice() else {
-            panic!("a treasury change: {effects:?}");
-        };
-        assert_eq!(*change, -100);
-        let effects = world.treasury_changed(*ticket, Some(400), NOW_MS);
-        assert!(
-            effects
-                .iter()
-                .any(|effect| matches!(effect, Effect::OwnState { .. })),
-            "the members see the new treasury"
-        );
-        let moves: Vec<&Effect> = effects
-            .iter()
-            .filter(|effect| matches!(effect, Effect::MoveCoins { .. }))
-            .collect();
-        let [Effect::MoveCoins { ticket, .. }] = moves.as_slice() else {
-            panic!("a coin move: {effects:?}");
-        };
-        let effects = world.coins_moved(*ticket, Some(CoinReply::Done { coins: 100 }), NOW_MS);
-        assert_eq!(
-            pushes(&effects, WITHDRAWN_TYPE_INDEX)[0].1,
-            SocialPush::Guild(GuildPush::Withdrawn {
-                amount: 100,
-                result: TREASURY_SUCCESS
-            })
-        );
     }
 
     #[test]

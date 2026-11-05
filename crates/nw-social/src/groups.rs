@@ -29,6 +29,12 @@ use crate::world::{GroupInvite, METRIC_CALLS, REFUSED, RESULT_LABEL, SocialWorld
 pub(crate) const GROUP_MEMBER_LIMIT: usize = 5;
 /// The last byte of every retail 1677.
 const INVITE_REMOVED_FLAG: u8 = 0;
+/// The 3453 error of an invite that the rules refuse (the invitee blocks the inviter, is in a
+/// group, or the group is full) and of an accepted invite whose group filled up. Inferred: the
+/// only retail 3453 error of the captures is [`ERROR_INVITEE_OFFLINE`], and the client's other
+/// error values are Unknown; it also tells a blocked inviter nothing more than an offline
+/// invitee would.
+const ERROR_INVITE_REFUSED: u32 = ERROR_INVITEE_OFFLINE;
 
 fn reference(character: Uuid) -> CharacterRef {
     CharacterRef(Some(*character.as_bytes()))
@@ -206,6 +212,7 @@ impl SocialWorld {
             });
         if blocked || target_grouped || full {
             metrics::counter!(METRIC_CALLS, RESULT_LABEL => REFUSED).increment(1);
+            self.refuse_group(inviter, target);
             return;
         }
         let mut id = [0; 16];
@@ -273,12 +280,29 @@ impl SocialWorld {
         }
     }
 
+    /// Tells `told` that its group step with `other` was refused (3453).
+    fn refuse_group(&mut self, told: Uuid, other: Uuid) {
+        let push = GroupPush::Error {
+            error: ERROR_INVITE_REFUSED,
+            character: reference(other),
+        };
+        self.push(&[told], SocialPush::Group(push));
+    }
+
     fn join_group(&mut self, inviter: Uuid, invitee: Uuid) {
-        if self
+        let invitee_grouped = self
             .people
             .get(&invitee)
-            .is_some_and(|person| person.group.is_some())
-        {
+            .is_some_and(|person| person.group.is_some());
+        let inviter_group_full = self
+            .people
+            .get(&inviter)
+            .and_then(|person| person.group)
+            .and_then(|group| self.groups.get(&group))
+            .is_some_and(|group| group.members.len() >= GROUP_MEMBER_LIMIT);
+        if invitee_grouped || inviter_group_full {
+            metrics::counter!(METRIC_CALLS, RESULT_LABEL => REFUSED).increment(1);
+            self.refuse_group(invitee, inviter);
             return;
         }
         let group_id = match self.people.get(&inviter).and_then(|person| person.group) {
@@ -301,9 +325,6 @@ impl SocialWorld {
         let Some(group) = self.groups.get_mut(&group_id) else {
             return;
         };
-        if group.members.len() >= GROUP_MEMBER_LIMIT {
-            return;
-        }
         group.members.push(invitee);
         let saved = group.clone();
         if let Some(person) = self.people.get_mut(&invitee) {
@@ -479,6 +500,82 @@ mod tests {
         );
         assert!(world.groups.is_empty());
         assert_eq!(world.people[&character(1)].group, None);
+    }
+
+    fn group_error(effects: &[Effect]) -> Vec<(Vec<Uuid>, SocialPush)> {
+        pushes(effects, GROUP_ERROR_TYPE_INDEX)
+    }
+
+    fn refused(to: u128, other: u128) -> (Vec<Uuid>, SocialPush) {
+        (
+            vec![character(to)],
+            SocialPush::Group(GroupPush::Error {
+                error: ERROR_INVITE_REFUSED,
+                character: reference(character(other)),
+            }),
+        )
+    }
+
+    #[test]
+    fn a_refused_invite_and_an_accept_into_a_full_group_are_answered() {
+        let mut world = world();
+        join(&mut world, 1, "Ann", "sim-a");
+        join(&mut world, 2, "Bob", "sim-a");
+        join(&mut world, 3, "Cid", "sim-a");
+        let invite = |world: &mut SocialWorld, from: u128, to: u128| {
+            call(
+                world,
+                from,
+                "sim-a",
+                GROUP_INVITE_TYPE_INDEX,
+                &invite_args(to),
+                NOW_MS,
+            )
+        };
+        world
+            .people
+            .get_mut(&character(2))
+            .expect("Bob")
+            .blocks
+            .insert(character(1));
+        assert_eq!(
+            group_error(&invite(&mut world, 1, 2)),
+            [refused(1, 2)],
+            "blocked"
+        );
+        assert!(world.group_invites.is_empty());
+        // Cid invites Ann; Bob's own group (Bob and Cid's) fills up before Ann answers.
+        invite(&mut world, 3, 1);
+        let open = *world.group_invites.keys().next().expect("an open invite");
+        let full = SocialGroup {
+            id: Uuid::from_u128(900),
+            leader: character(3),
+            voice_channel: String::new(),
+            members: (3..3 + GROUP_MEMBER_LIMIT as u128).map(character).collect(),
+        };
+        for member in &full.members {
+            if let Some(person) = world.people.get_mut(member) {
+                person.group = Some(full.id);
+            }
+        }
+        world.groups.insert(full.id, full);
+        let mut reply = open.to_vec();
+        reply.extend(REPLY_ACCEPT.to_be_bytes());
+        let effects = call(
+            &mut world,
+            1,
+            "sim-a",
+            REPLY_TO_INVITE_TYPE_INDEX,
+            &reply,
+            NOW_MS,
+        );
+        assert_eq!(group_error(&effects), [refused(1, 3)], "the group is full");
+        assert_eq!(world.people[&character(1)].group, None, "no silent join");
+        assert_eq!(
+            group_error(&invite(&mut world, 1, 3)),
+            [refused(1, 3)],
+            "Cid is in a group"
+        );
     }
 
     #[test]

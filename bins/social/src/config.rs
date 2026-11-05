@@ -5,12 +5,18 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use nw_common::config::{ConfigError, SECRET_ENV_PREFIX, load_config};
-use nw_db::DatabaseConfig;
+use nw_db::{DatabaseConfig, GlobalDatabase};
 use serde::Deserialize;
 use uuid::Uuid;
 
 /// Environment prefix of `social` overrides.
 pub const SOCIAL_ENV_PREFIX: &str = "NW_SOCIAL_";
+/// The default time between two reads of the changed privacy settings.
+pub const DEFAULT_PRIVACY_POLL_MS: u64 = 5000;
+
+const fn default_privacy_poll_ms() -> u64 {
+    DEFAULT_PRIVACY_POLL_MS
+}
 
 /// The whole `social` configuration.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -37,6 +43,16 @@ pub struct SocialConfig {
     /// The voice service; leave it out when the community runs none.
     #[serde(default)]
     pub voice: Option<VoiceConfig>,
+    /// The global database with the players' privacy settings; leave it out and every setting
+    /// keeps its default (everyone may write, talk, ask for friendship and see the online
+    /// status).
+    #[serde(default)]
+    pub global_database: Option<GlobalDatabase>,
+    /// Time between two reads of the privacy settings that changed (Inferred default
+    /// [`DEFAULT_PRIVACY_POLL_MS`]: a change reaches the world within seconds, at one small
+    /// read each time).
+    #[serde(default = "default_privacy_poll_ms")]
+    pub privacy_poll_ms: u64,
     /// Internal Prometheus listener.
     pub metrics_listen: SocketAddr,
     /// `tracing` filter, for example `info`.
@@ -111,7 +127,15 @@ impl SocialConfig {
         {
             return invalid("world_database_password_env", "must start with NW_SECRET_");
         }
-        if self.heartbeat_interval_ms == 0 || self.coin_timeout_ms == 0 {
+        if self
+            .global_database
+            .as_ref()
+            .is_some_and(|global| !global.password_env.starts_with(SECRET_ENV_PREFIX))
+        {
+            return invalid("global_database.password_env", "must start with NW_SECRET_");
+        }
+        if self.heartbeat_interval_ms == 0 || self.coin_timeout_ms == 0 || self.privacy_poll_ms == 0
+        {
             return invalid("timeouts", "must be above 0");
         }
         if self.heartbeat_misses == 0 {
@@ -164,6 +188,18 @@ mod tests {
         let mut config = committed();
         config.companies.treasury_max = 0;
         assert!(config.validate().is_err());
+        let mut config = committed();
+        config.privacy_poll_ms = 0;
+        assert!(config.validate().is_err());
+        let mut config = committed();
+        config.global_database = Some(GlobalDatabase {
+            database: config.world_database.clone(),
+            password_env: "PASSWORD".to_owned(),
+        });
+        assert!(
+            config.validate().is_err(),
+            "the password must be a secret variable"
+        );
         let mut config = committed();
         config.voice = Some(VoiceConfig {
             api_url: "https://voice.example/api2/".to_owned(),

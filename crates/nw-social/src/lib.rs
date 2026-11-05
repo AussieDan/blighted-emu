@@ -11,8 +11,10 @@ mod companies;
 pub mod effects;
 mod groups;
 mod people;
+pub mod privacy;
 pub mod profanity;
 pub mod throttle;
+mod treasury;
 mod views;
 pub mod voice;
 mod world;
@@ -20,7 +22,7 @@ mod world;
 pub use companies::{
     COMPANY_MEMBER_LIMIT, CompanyRules, JOIN_UPDATE_COPIES, NEW_COMPANY_SIEGE_HOUR, other_guild,
 };
-pub use effects::{Effect, StoreOp};
+pub use effects::{Effect, StoreOp, TreasuryOutcome};
 pub use profanity::ProfanityFilter;
 pub use voice::VoiceService;
 pub use world::{Loaded, SocialRules, SocialWorld};
