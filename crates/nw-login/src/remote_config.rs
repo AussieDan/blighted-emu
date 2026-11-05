@@ -32,10 +32,13 @@ pub const ENDPOINTS_APPLICATION: &str = "publicGameplay";
 /// The service endpoints this server fills with `game.<domain>` (and the public HTTPS port when it
 /// is not the default, [`EdgeConfig::game_authority`]): the path of their object in
 /// that layer, and their key. The tracked files leave them out, because the domain is the
-/// server's own. The stats service host (leaderboards note), and the shop, entitlement and
-/// purchase service hosts (`omni.fcs.endpoints.*`, read by `FUN_1416190f0`; shop note).
-pub const GAME_HOST_ENDPOINTS: [(&[&str], &str); 4] = [
+/// server's own. The stats service host (leaderboards note), the shop, entitlement and
+/// purchase service hosts (`omni.fcs.endpoints.*`, read by `FUN_1416190f0`; shop note), and the
+/// privacy settings service host (`omni.privacy-settings.client-endpoint`, read by
+/// `FUN_14160ad60`; [`crate::privacy`]).
+pub const GAME_HOST_ENDPOINTS: [(&[&str], &str); 5] = [
     (&["omni", "leaderboards"], "client-endpoint"),
+    (&["omni", "privacy-settings"], "client-endpoint"),
     (&["omni", "fcs", "endpoints"], "catalog-service"),
     (&["omni", "fcs", "endpoints"], "entitlement-service"),
     (&["omni", "fcs", "endpoints"], "transaction-service"),
@@ -398,8 +401,9 @@ pub(crate) mod tests {
     /// less the four Amazon-only stats keys (`server-endpoint`, `ingestion-endpoint`,
     /// `stats-assume-role`, `ingestion-assume-role`), plus the switches the leaderboards study
     /// asks for (`analytics/enable` and seven `javelin` keys of the publicGameplay `RegionId`
-    /// layer; leaderboards note section 1), plus the shop service keys `omni/fcs/*` that retail
-    /// leaves to the client's defaults (shop note). The experience multipliers are served once, in
+    /// layer; leaderboards note section 1), plus the shop service keys `omni/fcs/*` and the
+    /// privacy settings keys `omni/privacy-settings/*` that retail leaves to the client's defaults
+    /// (shop note). The experience multipliers are served once, in
     /// the `ProductId` layer, from `[experience]`.
     const SERVED_KEY_PATHS: [(&str, Dimension, &[&str]); 8] = [
         (
@@ -461,6 +465,8 @@ pub(crate) mod tests {
                 "omni/fcs/region",
                 "omni/leaderboards/client-endpoint",
                 "omni/leaderboards/region",
+                "omni/privacy-settings/client-endpoint",
+                "omni/privacy-settings/region",
             ],
         ),
         (
@@ -588,6 +594,7 @@ pub(crate) mod tests {
         assert_service_endpoints(&served, "game.example.org");
         assert_eq!(served["omni"]["leaderboards"]["region"], "us-east-1");
         assert_eq!(served["omni"]["fcs"]["region"], "us-east-1");
+        assert_eq!(served["omni"]["privacy-settings"]["region"], "us-east-1");
     }
 
     #[test]

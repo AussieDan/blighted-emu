@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! Routing by host name (M2 spec section 14, parent spec 4.2). `login.<domain>` serves the
 //! launcher API and the channel document; `game.<domain>` serves the game routes, the stats
-//! service and the shop services. The Kinesis and STS host names of the client's analytics get our analytics stream
+//! service, the shop services and the privacy settings service. The Kinesis and STS host names of the client's analytics get our analytics stream
 //! when they lead here, the remote-config bucket host gets our own config sets, and the news host
 //! and its image host get our own news. A request for any other host gets `421`.
 
@@ -25,6 +25,7 @@ use crate::error::ApiError;
 use crate::game::{GameState, channel_router, game_router, unknown_route};
 use crate::launcher::{LauncherState, launcher_router};
 use crate::pg::{PgEntitlements, PgStats};
+use crate::privacy::privacy_router;
 use crate::queue::QueueStore;
 use crate::shop::{ShopState, shop_router};
 use crate::stats::{StatsState, stats_router};
@@ -153,7 +154,10 @@ where
             .merge(channel_router(game.clone()))
             .fallback(unknown_route)
             .method_not_allowed_fallback(unknown_route),
-        game: game_router(game).merge(services.stats).merge(services.shop),
+        game: game_router(game)
+            .merge(services.stats)
+            .merge(services.shop)
+            .merge(privacy_router()),
         kinesis: services.kinesis,
         sts: services.sts,
         remote_config: services.remote_config,
@@ -259,6 +263,18 @@ mod tests {
         let (status, _) = get(&app, GAME_HOST, catalog).await;
         assert_eq!(status, StatusCode::OK);
         let (status, _) = get(&app, LOGIN_HOST, catalog).await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        let privacy = |host: &str| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/players/p/games/new-world/privacy-settings")
+                .header(HOST, host)
+                .body(Body::from(r#"{"settings":[]}"#))
+                .expect("request")
+        };
+        let (status, _) = test_http::send(&app, privacy(GAME_HOST)).await;
+        assert_eq!(status, StatusCode::OK);
+        let (status, _) = test_http::send(&app, privacy(LOGIN_HOST)).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
     }
 

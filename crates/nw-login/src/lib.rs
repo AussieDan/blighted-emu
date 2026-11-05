@@ -21,6 +21,7 @@ mod memory;
 pub mod names;
 pub mod password;
 pub mod pg;
+pub mod privacy;
 pub mod queue;
 pub mod region_ping;
 pub mod remote_config;

@@ -19,6 +19,9 @@
         "fcs": {
             "region": "us-east-1",
             "endpoints": {}
+        },
+        "privacy-settings": {
+            "region": "us-east-1"
         }
     },
     "javelin-server": {
