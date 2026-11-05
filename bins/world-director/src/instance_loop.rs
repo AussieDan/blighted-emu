@@ -63,7 +63,17 @@ pub enum InstanceEvent {
         /// Whether it opened.
         ok: bool,
     },
+    /// The admission of `character` to `instance` did not reach its sim.
+    AdmitFailed {
+        /// The instance.
+        instance: Uuid,
+        /// The character.
+        character: Uuid,
+    },
 }
+
+/// A request that waits for the opening of its group's instance, with its group.
+type Waiting = (Incoming<InstanceRequest>, GroupAnswer);
 
 /// The instances of the loop with their bus and processes.
 pub struct InstanceLoop {
@@ -74,6 +84,8 @@ pub struct InstanceLoop {
     launches: Launches,
     children: HashMap<BusId, Child>,
     events: mpsc::Sender<InstanceEvent>,
+    /// The requests that wait for an instance's opening, by instance.
+    waiting: HashMap<Uuid, Vec<Waiting>>,
 }
 
 impl InstanceLoop {
@@ -92,6 +104,7 @@ impl InstanceLoop {
             launches: Launches::default(),
             children: HashMap::new(),
             events,
+            waiting: HashMap::new(),
         }
     }
 
@@ -145,7 +158,25 @@ impl InstanceLoop {
             InstanceEvent::Opened { instance, ok } => {
                 self.instances.opened(instance, ok);
                 metrics::gauge!(METRIC_INSTANCES).set(self.instances.len() as f64);
+                // The requests that waited get what the first one got: a decision on the
+                // confirmed instance, or the same refusal.
+                for (request, group) in self.waiting.remove(&instance).unwrap_or_default() {
+                    if ok {
+                        self.decide(request, Ok(group), sims);
+                    } else {
+                        self.reply(
+                            request,
+                            InstanceReply::Refused {
+                                reason: InstanceRefusal::OpenFailed,
+                            },
+                        );
+                    }
+                }
             }
+            InstanceEvent::AdmitFailed {
+                instance,
+                character,
+            } => self.instances.remove_member(instance, character),
         }
     }
 
@@ -169,6 +200,11 @@ impl InstanceLoop {
             .decide(&request.message, &group, &free, ids, unix_ms())
         {
             Decision::Reply(reply) => self.reply(request, reply),
+            Decision::Wait { instance } => self
+                .waiting
+                .entry(instance)
+                .or_default()
+                .push((request, group)),
             Decision::AddMember {
                 instance,
                 character,
@@ -177,19 +213,35 @@ impl InstanceLoop {
                     .instances
                     .add_member(instance.id, character)
                     .unwrap_or(instance);
-                let (bus, world_id) = (self.bus.clone(), self.world_id);
+                let (bus, world_id, events) =
+                    (self.bus.clone(), self.world_id, self.events.clone());
                 tokio::spawn(async move {
                     let command = InstanceCommand::Admit {
                         instance: open.id,
                         character,
                     };
-                    if let Err(error) = bus
+                    let reply = match bus
                         .publish(subject::sim_instance(world_id, &open.sim.id), &command)
                         .await
                     {
-                        tracing::warn!(%error, "instance member not sent");
-                    }
-                    answer(&bus, &request, &granted(&open, false)).await;
+                        Ok(()) => granted(&open, false),
+                        Err(error) => {
+                            tracing::warn!(%error, instance = %open.id, %character, "instance member not sent");
+                            // The loop may have stopped; then the member no longer matters.
+                            let _ = events
+                                .send(InstanceEvent::AdmitFailed {
+                                    instance: open.id,
+                                    character,
+                                })
+                                .await;
+                            // Inferred: the sim never heard of the member, so the entrance
+                            // answers as for a failed opening (`EntranceActivationFailure`).
+                            InstanceReply::Refused {
+                                reason: InstanceRefusal::OpenFailed,
+                            }
+                        }
+                    };
+                    answer(&bus, &request, &reply).await;
                 });
             }
             Decision::Open(open) => {

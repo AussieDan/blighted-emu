@@ -5,7 +5,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use nw_common::config::{ConfigError, SECRET_ENV_PREFIX, load_config};
-use nw_db::DatabaseConfig;
+use nw_db::{DatabaseConfig, GlobalDatabase};
 use nw_sim_core::{Ground, Position};
 use serde::Deserialize;
 use uuid::Uuid;
@@ -92,17 +92,6 @@ pub struct LaunchConfig {
     pub id_prefix: String,
     /// A level nobody asked for in this long keeps no spare sim.
     pub forget_after_ms: u64,
-}
-
-/// The global database and the environment variable with its password (it starts with
-/// `NW_SECRET_`).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct GlobalDatabase {
-    /// Where it is.
-    pub database: DatabaseConfig,
-    /// The environment variable with its password.
-    pub password_env: String,
 }
 
 /// A start position, in metres. The height comes from the ground of the level.

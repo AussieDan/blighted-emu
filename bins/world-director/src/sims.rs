@@ -510,6 +510,9 @@ mod tests {
             players: 1,
             empty_for_ms: None,
             open_for_ms: 0,
+            phase: 1,
+            capacity: 5,
+            ends_at_ms: None,
         }
     }
 

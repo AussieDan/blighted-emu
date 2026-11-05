@@ -25,8 +25,14 @@ use uuid::Uuid;
 use crate::instances::InstanceTable;
 use crate::sims::Assignment;
 
-/// Longest wait for an account's admin rank and age; it stays far below the admit timeout.
+/// Longest wait for one read of an account's admin rank, age and store entitlements.
 const RANK_READ_TIMEOUT: Duration = Duration::from_millis(300);
+/// Reads of the account before the join is refused, and the pause between two. Inferred: three
+/// reads and two pauses take at most 1.1 s, so with the admit timeout (3 s,
+/// `config/world-director.toml`) the join stays below the gateway's 5 s
+/// (`config/rep-gateway.toml` `join_timeout_ms`).
+const ACCOUNT_READ_ATTEMPTS: u32 = 3;
+const ACCOUNT_READ_PAUSE: Duration = Duration::from_millis(100);
 /// An account younger than this is in probation: its client blocks global and trade chat
 /// (the client's `javelin.account-probation-time-hours` default 72, the text
 /// `ui_cannot_chat_global_blocked` "...until your account is older than {hoursNeeded} hours").
@@ -82,6 +88,14 @@ pub enum JoinRefusal {
     /// The entity number is in the mob range.
     #[error("entity number {0} is in the mob range")]
     EntityRange(u64),
+    /// The account's rank, age and store entitlements did not read: the player tries again
+    /// (a join without them would drop its GM rights, its probation and its bought items).
+    #[error("the account did not read; try again: {0}")]
+    AccountUnavailable(String),
+    /// The account is banned (global database): a ban ends its live game sessions in
+    /// `edge-http`, and an entry ticket it got before the ban enters no world.
+    #[error("the account is banned")]
+    Banned,
 }
 
 impl JoinRefusal {
@@ -96,6 +110,8 @@ impl JoinRefusal {
             Self::SimRefused(_) => "sim_refused",
             Self::SimSilent(_) => "sim_silent",
             Self::EntityRange(_) => "entity_range",
+            Self::AccountUnavailable(_) => "account_unavailable",
+            Self::Banned => "banned",
         }
     }
 }
@@ -244,7 +260,7 @@ pub async fn route_join(
                 .unwrap_or_default(),
         ),
     };
-    let standing = account_standing(context.ranks.as_ref(), join.account).await;
+    let standing = account_standing(context.ranks.as_ref(), join.account).await?;
     let game_master = standing.game_master;
     let stay = progression.arena.stay.as_ref().and_then(|stay| {
         stay_route(
@@ -327,35 +343,78 @@ struct Standing {
     entitlements: Vec<String>,
 }
 
-/// The standing of `account` from the global database `ranks`. No database, or a failed or slow
-/// read (above [`RANK_READ_TIMEOUT`]), gives no GM rights, no probation and no store
-/// entitlements, so a database fault never refuses, holds up or mutes a join.
-async fn account_standing(ranks: Option<&PgPool>, account: Uuid) -> Standing {
+/// The standing of `account` from the global database `ranks`. No database gives no GM rights,
+/// no probation and no store entitlements (a world with no global database configured). A read
+/// that fails or is slower than [`RANK_READ_TIMEOUT`] is tried again, [`ACCOUNT_READ_ATTEMPTS`]
+/// times in all.
+///
+/// # Errors
+///
+/// Returns [`JoinRefusal::AccountUnavailable`] when no read succeeded, and
+/// [`JoinRefusal::Banned`] for a banned account.
+async fn account_standing(ranks: Option<&PgPool>, account: Uuid) -> Result<Standing, JoinRefusal> {
     let Some(ranks) = ranks else {
-        return Standing::default();
+        return Ok(Standing::default());
     };
-    let read = async {
-        Ok::<_, nw_db::DbError>((
-            admin_rank(ranks, account).await?,
-            account_by_id(ranks, account).await?,
-            account_entitlements(ranks, account).await?,
-        ))
-    };
-    match tokio::time::timeout(RANK_READ_TIMEOUT, read).await {
-        Ok(Ok((rank, found, held))) => Standing {
-            game_master: rank.is_some_and(|rank| rank >= AdminRank::GameMaster),
-            in_probation: in_probation(rank, found.map(|found| found.created_at_unix), unix_now()),
-            entitlements: held.into_iter().map(|held| held.entitlement).collect(),
-        },
-        Ok(Err(error)) => {
-            tracing::warn!(%error, %account, "account read failed; no GM rights, no probation");
-            Standing::default()
+    let read = retry_read(ACCOUNT_READ_ATTEMPTS, ACCOUNT_READ_PAUSE, || async {
+        let read = async {
+            Ok::<_, nw_db::DbError>((
+                admin_rank(ranks, account).await?,
+                account_by_id(ranks, account).await?,
+                account_entitlements(ranks, account).await?,
+            ))
+        };
+        match tokio::time::timeout(RANK_READ_TIMEOUT, read).await {
+            Ok(Ok(read)) => Ok(read),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(_) => Err(format!("slower than {RANK_READ_TIMEOUT:?}")),
         }
-        Err(_) => {
-            tracing::warn!(%account, "account read too slow; no GM rights, no probation");
-            Standing::default()
+    })
+    .await
+    .map_err(|error| {
+        tracing::warn!(%error, %account, "account read failed; join refused");
+        JoinRefusal::AccountUnavailable(error)
+    })?;
+    let (rank, found, held) = read;
+    standing_of(rank, found, held, unix_now())
+}
+
+/// What the admin rank `rank`, the account row `found` and the entitlements `held` give an
+/// account at Unix second `now_unix`; a banned account is refused.
+fn standing_of(
+    rank: Option<AdminRank>,
+    found: Option<nw_db::Account>,
+    held: Vec<nw_db::AccountEntitlement>,
+    now_unix: i64,
+) -> Result<Standing, JoinRefusal> {
+    if found.as_ref().is_some_and(|found| found.banned) {
+        return Err(JoinRefusal::Banned);
+    }
+    Ok(Standing {
+        game_master: rank.is_some_and(|rank| rank >= AdminRank::GameMaster),
+        in_probation: in_probation(rank, found.map(|found| found.created_at_unix), now_unix),
+        entitlements: held.into_iter().map(|held| held.entitlement).collect(),
+    })
+}
+
+/// The first success of `read` within `attempts` tries with `pause` between two; else the last
+/// error.
+async fn retry_read<T, F, Fut>(attempts: u32, pause: Duration, mut read: F) -> Result<T, String>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, String>>,
+{
+    let mut last = String::new();
+    for attempt in 0..attempts {
+        if attempt > 0 {
+            tokio::time::sleep(pause).await;
+        }
+        match read().await {
+            Ok(value) => return Ok(value),
+            Err(error) => last = error,
         }
     }
+    Err(last)
 }
 
 /// Whether an account with the admin rank `rank`, created at `created_at_unix`, is in
@@ -651,12 +710,73 @@ fn player_inventory(saved: SavedInventory) -> PlayerInventory {
                 attributes: loadout.attributes,
             })
             .collect(),
+        hidden_skins: Vec::new(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_account_read_is_tried_again_then_refuses_the_join() {
+        let pause = Duration::from_millis(1);
+        let mut calls = 0;
+        let second = retry_read(ACCOUNT_READ_ATTEMPTS, pause, || {
+            calls += 1;
+            let call = calls;
+            async move {
+                if call < 2 {
+                    Err("slow".to_owned())
+                } else {
+                    Ok(call)
+                }
+            }
+        })
+        .await;
+        assert_eq!(second, Ok(2));
+        let mut tries = 0;
+        let failed: Result<(), String> = retry_read(ACCOUNT_READ_ATTEMPTS, pause, || {
+            tries += 1;
+            async { Err("down".to_owned()) }
+        })
+        .await;
+        assert_eq!(failed, Err("down".to_owned()));
+        assert_eq!(tries, ACCOUNT_READ_ATTEMPTS);
+        assert_eq!(
+            JoinRefusal::AccountUnavailable("down".to_owned()).label(),
+            "account_unavailable"
+        );
+        // No global database configured: the join goes on with no rights.
+        assert_eq!(
+            account_standing(None, Uuid::from_u128(1)).await,
+            Ok(Standing::default())
+        );
+    }
+
+    #[test]
+    fn a_banned_account_is_refused_and_another_gets_its_standing() {
+        const NOW: i64 = 1_800_000_000;
+        let account = |banned| nw_db::Account {
+            id: Uuid::from_u128(1),
+            display_name: "Ann".to_owned(),
+            created_at_unix: NOW,
+            banned,
+        };
+        assert_eq!(
+            standing_of(None, Some(account(true)), Vec::new(), NOW),
+            Err(JoinRefusal::Banned)
+        );
+        assert_eq!(JoinRefusal::Banned.label(), "banned");
+        let standing = standing_of(
+            Some(AdminRank::GameMaster),
+            Some(account(false)),
+            Vec::new(),
+            NOW,
+        )
+        .expect("not banned");
+        assert!(standing.game_master && !standing.in_probation);
+    }
 
     #[test]
     fn a_young_account_is_in_probation_unless_it_has_an_admin_rank() {

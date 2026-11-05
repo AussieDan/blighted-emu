@@ -98,6 +98,7 @@ mod tests {
                         required_level: None,
                         perks: Vec::new(),
                         gem_perk_count: 0,
+                        rolls: nw_db::SavedItemRolls::default(),
                     },
                     price: 100,
                     quantity: 5,

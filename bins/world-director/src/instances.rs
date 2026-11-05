@@ -91,6 +91,12 @@ pub enum Decision {
     },
     /// Open `instance` on its sim, then answer.
     Open(OpenInstance),
+    /// The group's instance is still opening: decide again when its sim answers the opening
+    /// (a grant before then names an instance the join cannot find yet).
+    Wait {
+        /// The instance.
+        instance: Uuid,
+    },
 }
 
 /// An instance to end: its sim and id.
@@ -149,20 +155,24 @@ impl Instances {
             GroupAnswer::Alone => (request.requester, vec![request.requester]),
         };
         let count = u32::try_from(members.len()).unwrap_or(u32::MAX);
-        // The owner's instance, or one the requester is a member of (an instance adopted after
-        // a restart knows its members, not its group).
+        // The owner's instance, or one the requester is a member of, or an adopted one whose
+        // owner is in the group (an instance adopted after a restart knows its members, not its
+        // group: its owner is its first member).
         let existing = self
             .by_owner
             .get(&owner)
             .and_then(|instance| self.open.get(instance))
             .or_else(|| {
-                self.open
-                    .values()
-                    .find(|open| open.members.contains(&request.requester))
+                self.open.values().find(|open| {
+                    open.members.contains(&request.requester) || members.contains(&open.owner)
+                })
             });
         if let Some(open) = existing {
             if open.game_mode != request.game_mode {
                 return refuse(InstanceRefusal::GroupInOtherInstance);
+            }
+            if !open.confirmed {
+                return Decision::Wait { instance: open.id };
             }
             if open.members.contains(&request.requester) {
                 return Decision::Reply(granted(open, false));
@@ -225,6 +235,13 @@ impl Instances {
         Some(open.clone())
     }
 
+    /// `character` may no longer enter `instance` (its sim did not get the admission).
+    pub fn remove_member(&mut self, instance: Uuid, character: Uuid) {
+        if let Some(open) = self.open.get_mut(&instance) {
+            open.members.retain(|member| *member != character);
+        }
+    }
+
     /// The instances to end from the instance sims' reports `running` (each live instance sim
     /// with what it runs) at Unix millisecond `now_ms`; an instance whose sim is gone, or that
     /// its sim no longer runs, is forgotten.
@@ -268,7 +285,8 @@ impl Instances {
     }
 
     /// Adopts the instances that live sims run but this director does not know (a restarted
-    /// director), so their groups keep them.
+    /// director), so their groups keep them: with the phase, capacity and end time the sims
+    /// report.
     pub fn adopt(
         &mut self,
         running: &[(SimSlot, Option<RunningInstance>)],
@@ -285,7 +303,13 @@ impl Instances {
                 continue;
             };
             let owner = report.members.first().copied().unwrap_or(report.instance);
-            let capacity = u32::try_from(report.members.len()).unwrap_or(u32::MAX);
+            let capacity = if report.capacity == UNKNOWN_CAPACITY {
+                // Inferred (safe choice): a sim that does not know the capacity takes no player
+                // beyond the members it reports, so the instance never goes above its real one.
+                u32::try_from(report.members.len()).unwrap_or(u32::MAX)
+            } else {
+                report.capacity
+            };
             self.by_owner.insert(owner, report.instance);
             self.open.insert(
                 report.instance,
@@ -294,11 +318,11 @@ impl Instances {
                     game_mode: report.game_mode.clone(),
                     level,
                     sim: sim.clone(),
-                    phase: ADOPTED_PHASE,
+                    phase: report.phase,
                     members: report.members.clone(),
                     capacity,
                     owner,
-                    ends_at_ms: None,
+                    ends_at_ms: report.ends_at_ms,
                     confirmed: true,
                 },
             );
@@ -323,9 +347,8 @@ impl Instances {
     }
 }
 
-/// The phase of an instance a restarted director adopted: its sims keep the real one, and a
-/// re-entry goes to the sim, which sends its own.
-const ADOPTED_PHASE: u64 = 0;
+/// The capacity a sim reports when it does not know its game mode's `TeamCapacity`.
+const UNKNOWN_CAPACITY: u32 = 0;
 /// Milliseconds in a second.
 const MS_PER_SECOND: u64 = 1000;
 
@@ -665,6 +688,9 @@ mod tests {
                     players: 1,
                     empty_for_ms,
                     open_for_ms: 0,
+                    phase: open.phase,
+                    capacity: open.capacity,
+                    ends_at_ms: open.ends_at_ms,
                 }),
             )]
         };
@@ -691,10 +717,8 @@ mod tests {
         assert!(instances.is_empty());
     }
 
-    #[test]
-    fn a_restarted_director_adopts_what_the_sims_run() {
-        let mut instances = Instances::default();
-        let running = vec![(
+    fn adopted_report(capacity: u32) -> Vec<(SimSlot, Option<RunningInstance>)> {
+        vec![(
             slot("inst-1"),
             Some(RunningInstance {
                 instance: Uuid::from_u128(7),
@@ -703,12 +727,98 @@ mod tests {
                 players: 3,
                 empty_for_ms: None,
                 open_for_ms: 5,
+                phase: PHASE,
+                capacity,
+                ends_at_ms: Some(NOW_MS + TRIAL_SECONDS * MS_PER_SECOND),
             }),
-        )];
-        instances.adopt(&running, |_| Some(LEVEL.to_owned()));
+        )]
+    }
+
+    #[test]
+    fn a_restarted_director_adopts_what_the_sims_run() {
+        let mut instances = Instances::default();
+        instances.adopt(&adopted_report(5), |_| Some(LEVEL.to_owned()));
         assert_eq!(instances.len(), 1);
         let table = instances.table();
         assert!(table.sim_for(&Uuid::from_u128(7), &character(2)).is_some());
+        let adopted = instances.get(&Uuid::from_u128(7)).expect("adopted");
+        assert_eq!(adopted.phase, PHASE);
+        assert_eq!(adopted.capacity, 5);
+        assert_eq!(
+            adopted.ends_at_ms,
+            Some(NOW_MS + TRIAL_SECONDS * MS_PER_SECOND)
+        );
+        // A member who joined the group later still gets in (the capacity is the real one).
+        assert!(matches!(
+            instances.decide(
+                &request(4),
+                &group(&[1, 2, 3, 4]),
+                &[],
+                (Uuid::from_u128(8), 1),
+                NOW_MS,
+            ),
+            Decision::AddMember { .. }
+        ));
+        // The end time ends it.
+        let end_ms = NOW_MS + TRIAL_SECONDS * MS_PER_SECOND;
+        assert_eq!(
+            instances.review(&adopted_report(5), &settings(), end_ms),
+            vec![Closing {
+                sim: slot("inst-1"),
+                instance: Uuid::from_u128(7),
+            }]
+        );
+    }
+
+    #[test]
+    fn an_adopted_instance_of_unknown_capacity_takes_no_new_member() {
+        let mut instances = Instances::default();
+        instances.adopt(&adopted_report(UNKNOWN_CAPACITY), |_| {
+            Some(LEVEL.to_owned())
+        });
+        assert_eq!(
+            instances.decide(
+                &request(4),
+                &group(&[1, 2, 3, 4]),
+                &[],
+                (Uuid::from_u128(8), 1),
+                NOW_MS,
+            ),
+            refuse(InstanceRefusal::TooManyMembers)
+        );
+    }
+
+    #[test]
+    fn a_repeat_ask_waits_for_the_opening_and_a_failed_admission_takes_the_member_back() {
+        let mut instances = Instances::default();
+        let free = [slot("inst-1")];
+        let Decision::Open(open) = instances.decide(
+            &request(1),
+            &group(&[1, 2, 3]),
+            &free,
+            (Uuid::from_u128(7), PHASE),
+            NOW_MS,
+        ) else {
+            panic!("opens");
+        };
+        // Not confirmed yet: a member and a later member both wait.
+        let ids = (Uuid::from_u128(8), 1);
+        assert_eq!(
+            instances.decide(&request(2), &group(&[1, 2, 3]), &free, ids, NOW_MS),
+            Decision::Wait { instance: open.id }
+        );
+        assert_eq!(
+            instances.decide(&request(4), &group(&[1, 2, 3, 4]), &free, ids, NOW_MS),
+            Decision::Wait { instance: open.id }
+        );
+        instances.opened(open.id, true);
+        assert!(matches!(
+            instances.decide(&request(2), &group(&[1, 2, 3]), &free, ids, NOW_MS),
+            Decision::Reply(InstanceReply::Granted { .. })
+        ));
+        instances.add_member(open.id, character(4));
+        instances.remove_member(open.id, character(4));
+        assert!(instances.table().sim_for(&open.id, &character(4)).is_none());
     }
 
     fn launch_settings() -> LaunchSettings {
