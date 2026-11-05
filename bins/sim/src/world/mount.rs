@@ -2107,6 +2107,7 @@ mod tests {
                             name: "Ronin Bear Mount".to_owned(),
                         },
                         mount: STORE_BEAR.to_owned(),
+                        product: "Mount_Bear_MTX7_Ronin".to_owned(),
                     }],
                     held_by_all: Vec::new(),
                 },

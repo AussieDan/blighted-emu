@@ -9,8 +9,9 @@
 //! weeks, `mount-menu-buying-all-store-horses`, 2026-11-04), else for its price. The entitlement
 //! list holds what every account holds (the expansion), the account's wallet and what the account
 //! got (global database). A purchase goes to the sim over the game connection (898), not to these
-//! routes. Every store has no slot, and a sync is accepted. The shapes, the `ETag` and
-//! the `304` follow the retail replies (`Loadouts` capture: 368 offers, 69 of them mounts).
+//! routes. An offer's alias is its mount's store product, every store is hidden with one empty
+//! slot, and a sync is accepted. The shapes, the `ETag` and the `304` follow the retail replies
+//! (`Loadouts` capture: 368 offers, 69 of them mounts).
 //!
 //! The persona of a path is the player's account id (`PersonaId` of the login). Inferred: the
 //! client sends no proof of its account to these routes that this server checks, so the
@@ -47,6 +48,10 @@ const COUNTRY_CODE: &str = "US";
 const JSON_CONTENT_TYPE: &str = "application/json";
 /// Content type of a `304` (retail).
 const NOT_MODIFIED_CONTENT_TYPE: &str = "text/plain; charset=utf-8";
+/// The header the client names its cached ETag in (live 2026-11-04: every catalog and store call
+/// after the first carried it, never `If-None-Match`). Retail answered such calls `304`
+/// (`unlock_store_content` capture: every store call after the first).
+const CLIENT_IF_NONE_MATCH: HeaderName = HeaderName::from_static("x-amzn-if-none-match");
 /// Between the parts of a retail persona (`amzn1.developerPersonaId.<id>`).
 const PERSONA_SEPARATOR: char = '.';
 /// The price kind of the store currency (retail `virtualCurrencyPrices[].type`).
@@ -66,8 +71,8 @@ const DURABLE_SUFFIX: &str = " Durable";
 const STORE_START: &str = "2023-10-03T13:30:00.000Z";
 /// How many of an offer an account may get, and the amount of a held entitlement.
 const ONE: u32 = 1;
-/// The discount of a free offer: all of its listed price.
-const FULL_DISCOUNT: u32 = 100;
+/// The discount retail shows on a free offer (10386 of 10386 free retail prices: 99, not 100).
+const FREE_DISCOUNT: u32 = 99;
 
 /// The shop's state: the store table, the `[shop]` settings and the accounts' stores.
 #[derive(Clone)]
@@ -175,20 +180,36 @@ struct Stores {
     etag: String,
 }
 
-/// One store: hidden, with no slot. Retail's hidden stores have the metadata
-/// `{"visible":"false"}` (`Special1`); a store with no slot is Inferred (every retail store had
-/// one or more).
+/// One store: hidden, with one empty slot. Retail's hidden stores have the metadata
+/// `{"visible":"false"}` (`Special1`), and every one of the 1,029 retail store replies had one slot
+/// or more (`Featured`: 6 with no offer). A store with no slot left the change mount screen
+/// spinning (live 2026-11-04).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Store {
     metadata: &'static str,
-    slots: [(); 0],
+    slots: [Slot; 1],
     next_schedule_start_date: Option<&'static str>,
     alias: String,
 }
 
 /// The metadata of a hidden store (retail `Special1`).
 const HIDDEN_STORE_METADATA: &str = r#"{"visible":"false"}"#;
+
+/// A store slot: static, with no offer (retail `Featured`; a hidden store's slot metadata is the
+/// text `null`, `Special1`).
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Slot {
+    metadata: &'static str,
+    offers: [(); 0],
+    slot_type: &'static str,
+}
+
+/// The metadata of a hidden store's slot (retail `Special1`).
+const HIDDEN_SLOT_METADATA: &str = "null";
+/// The kind of a slot whose offers do not rotate (retail).
+const STATIC_SLOT: &str = "Static";
 
 /// `GET .../entitlements`: one page of the player's entitlements. Inferred: the last page leaves
 /// out `paginationToken` (no retail last page was captured); this server sends one page.
@@ -339,19 +360,19 @@ struct Price {
 }
 
 impl Price {
-    /// The discount the store shows: all of the listed price for a free offer.
+    /// The discount the store shows: retail's for a free offer.
     fn discount(self) -> u32 {
         if self.cost == 0 && self.listed > 0 {
-            FULL_DISCOUNT
+            FREE_DISCOUNT
         } else {
             0
         }
     }
 }
 
-/// The offer of the store mount entitlement `unlock` for mount `mount`, at `price`, got `count`
-/// times.
-fn offer(unlock: &StoreEntitlement, mount: &str, price: Price, count: u32) -> Offer {
+/// The offer of the store mount entitlement `unlock` for the store product `product`, at
+/// `price`, got `count` times.
+fn offer(unlock: &StoreEntitlement, product: &str, price: Price, count: u32) -> Offer {
     Offer {
         is_refundable: false,
         acquisition_count: count,
@@ -393,7 +414,7 @@ fn offer(unlock: &StoreEntitlement, mount: &str, price: Price, count: u32) -> Of
         name: unlock.name.clone(),
         kind: PRODUCT_TYPE,
         description: format!("{}{DURABLE_SUFFIX}", unlock.name),
-        alias: mount.to_owned(),
+        alias: product.to_owned(),
         product_id: unlock.entitlement.clone(),
         offer_id: unlock.entitlement.clone(),
         max_acquisition_count: ONE,
@@ -471,7 +492,8 @@ async fn log_store_call(request: Request, next: Next) -> Response {
     response
 }
 
-/// A reply with an ETag in its body and its header, or `304` when `If-None-Match` names it.
+/// A reply with an ETag in its body and its header, or `304` when the client's
+/// [`CLIENT_IF_NONE_MATCH`] or `If-None-Match` names it.
 /// `with_etag` builds the reply with the ETag it is given; the ETag is taken over the reply with
 /// an empty one.
 fn tagged_reply<T: Serialize>(headers: &HeaderMap, with_etag: impl Fn(String) -> T) -> Response {
@@ -482,9 +504,11 @@ fn tagged_reply<T: Serialize>(headers: &HeaderMap, with_etag: impl Fn(String) ->
     let Ok(etag_header) = HeaderValue::from_str(&etag) else {
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     };
-    let known = headers
-        .get(IF_NONE_MATCH)
-        .is_some_and(|value| value.as_bytes() == etag.as_bytes());
+    let known = [CLIENT_IF_NONE_MATCH, IF_NONE_MATCH].iter().any(|name| {
+        headers
+            .get(name)
+            .is_some_and(|value| value.as_bytes() == etag.as_bytes())
+    });
     if known {
         return (
             StatusCode::NOT_MODIFIED,
@@ -528,7 +552,7 @@ async fn catalog<E: EntitlementStore>(
                 cost: shop.settings.price(entitlement),
                 listed: shop.settings.list_price(entitlement),
             };
-            offer(&mount.unlock, &mount.mount, price, u32::from(got))
+            offer(&mount.unlock, &mount.product, price, u32::from(got))
         })
         .collect();
     Ok(tagged_reply(&headers, |etag| Catalog {
@@ -544,7 +568,11 @@ async fn stores(Path(path): Path<StorePath>, headers: HeaderMap) -> Response {
         currency_code: CURRENCY_CODE,
         stores: [Store {
             metadata: HIDDEN_STORE_METADATA,
-            slots: [],
+            slots: [Slot {
+                metadata: HIDDEN_SLOT_METADATA,
+                offers: [],
+                slot_type: STATIC_SLOT,
+            }],
             next_schedule_start_date: None,
             alias: path.alias.clone(),
         }],
@@ -637,12 +665,13 @@ mod tests {
     }
 
     fn shop_with(settings: ShopConfig) -> ShopState<MemoryEntitlements> {
-        let mount = |entitlement: &str, name: &str, mount: &str| StoreMount {
+        let mount = |entitlement: &str, name: &str, mount: &str, product: &str| StoreMount {
             unlock: StoreEntitlement {
                 entitlement: entitlement.to_owned(),
                 name: name.to_owned(),
             },
             mount: mount.to_owned(),
+            product: product.to_owned(),
         };
         let entitlements = MemoryEntitlements::default();
         entitlements.hold(
@@ -663,8 +692,13 @@ mod tests {
         ShopState {
             table: Arc::new(StoreTable {
                 mounts: vec![
-                    mount(BEAR, "Ronin Bear Mount", "Mount_MTX_7_bear_Ronin"),
-                    mount(WOLF, "Ira", "Mount_MTX_1_wolf"),
+                    mount(
+                        BEAR,
+                        "Ronin Bear Mount",
+                        "Mount_MTX_7_bear_Ronin",
+                        "Mount_Bear_MTX7_Ronin",
+                    ),
+                    mount(WOLF, "Ira", "Mount_MTX_1_wolf", "Mount_Wolf_1"),
                 ],
                 held_by_all: vec![StoreEntitlement {
                     entitlement: XPACK.to_owned(),
@@ -688,7 +722,7 @@ mod tests {
     ) -> (StatusCode, HeaderMap, Bytes) {
         let mut request = Request::builder().method(method).uri(path);
         if let Some(etag) = etag {
-            request = request.header(IF_NONE_MATCH, etag);
+            request = request.header(CLIENT_IF_NONE_MATCH, etag);
         }
         let response = tower::ServiceExt::oneshot(
             shop_router(shop),
@@ -723,7 +757,7 @@ mod tests {
         let bear = &offers[0];
         assert_eq!(bear["offerId"], BEAR);
         assert_eq!(bear["productId"], BEAR);
-        assert_eq!(bear["alias"], "Mount_MTX_7_bear_Ronin");
+        assert_eq!(bear["alias"], "Mount_Bear_MTX7_Ronin", "its store product");
         assert_eq!(bear["name"], "Ronin Bear Mount");
         assert_eq!(bear["description"], "Ronin Bear Mount Durable");
         assert_eq!(bear["metadata"], MOUNT_OFFER_METADATA);
@@ -735,7 +769,7 @@ mod tests {
         let price = &bear["virtualCurrencyPrices"][0];
         assert_eq!(price["salesPriceWithDiscount"], 0, "the store is free");
         assert_eq!(price["originalPrice"], DEFAULT_MOUNT_PRICE);
-        assert_eq!(price["discountPercentage"], FULL_DISCOUNT);
+        assert_eq!(price["discountPercentage"], FREE_DISCOUNT);
         assert_eq!(price["currencyId"], STORE_CURRENCY);
         assert_eq!(bear["inGameCurrencyPrices"][0]["salesPriceWithDiscount"], 0);
         assert_eq!(offers[1]["acquisitionCount"], 0, "not got yet");
@@ -818,7 +852,11 @@ mod tests {
                     value[list],
                     serde_json::json!([{
                         "metadata": HIDDEN_STORE_METADATA,
-                        "slots": [],
+                        "slots": [{
+                            "metadata": HIDDEN_SLOT_METADATA,
+                            "offers": [],
+                            "slotType": STATIC_SLOT,
+                        }],
                         "nextScheduleStartDate": null,
                         "alias": alias,
                     }]),
@@ -836,6 +874,19 @@ mod tests {
             assert!(body.is_empty());
             let (status, _, _) = send("GET", &path, Some("other")).await;
             assert_eq!(status, StatusCode::OK, "{path}");
+            let standard = Request::builder()
+                .uri(&path)
+                .header(IF_NONE_MATCH, &etag)
+                .body(Body::empty())
+                .expect("request");
+            let response = tower::ServiceExt::oneshot(shop_router(shop()), standard)
+                .await
+                .expect("response");
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_MODIFIED,
+                "If-None-Match too: {path}"
+            );
         }
     }
 

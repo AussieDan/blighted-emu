@@ -39,6 +39,10 @@ pub struct StoreMount {
     pub unlock: StoreEntitlement,
     /// The mount it unlocks: its `MountId` (`Mount_MTX_7_bear_Ronin`).
     pub mount: String,
+    /// Its store product: the `UniqueTagID` of `javelindata_storeproducts`
+    /// (`Mount_Bear_MTX7_Ronin`), the offer's `alias` (retail: the client finds an offer's product
+    /// by its alias, and leaves out an offer without one).
+    pub product: String,
 }
 
 /// The store table.
@@ -148,6 +152,7 @@ mod tests {
                     name: "Ronin Bear Mount".to_owned(),
                 },
                 mount: "Mount_MTX_7_bear_Ronin".to_owned(),
+                product: "Mount_Bear_MTX7_Ronin".to_owned(),
             }],
             held_by_all: vec![StoreEntitlement {
                 entitlement: "Ent_Xpack_RiseOfTheAngryEarth_Owner".to_owned(),
