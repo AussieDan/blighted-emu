@@ -21,6 +21,7 @@ use nw_content::equip_load::PLAYER_CONTAINER;
 use nw_content::gameplay_config::{FastTravelCostKeys, GameplayConfig, TravelKeys};
 use nw_content::starter::StarterKits;
 use nw_formats::objectstream::lowercase_crc32;
+use nw_formats::rigid::{quat_normalize, rotate};
 use nw_world::WorldFile;
 use nw_world::capitals::capital_id;
 use nw_world::records::{Capital, Landmark};
@@ -38,6 +39,21 @@ const OBSERVED_UNSTUCK_COOLDOWN_MS: u64 = 120_000;
 pub const OBSERVED_BREADCRUMBS: usize = 11;
 /// The spacing of the breadcrumbs when no layer sets it, metres (Inferred).
 pub const OBSERVED_BREADCRUMB_SPACING_M: f32 = 24.0;
+/// The slice name part of a spirit shrine's fast travel point (`FastTravel_Teleporter_*`): the
+/// capital each retail shrine home point names (63 of 63 in `general-other-01`).
+const SHRINE_TELEPORTER_SLICE: &str = "FastTravel_Teleporter";
+/// How far a shrine's teleporter stands from its shrine landmark at most. Observed: all 123
+/// teleporters of `newworld_vitaeeterna` stand 2.0 m from one shrine landmark each.
+const SHRINE_TELEPORTER_REACH_M: f32 = 3.0;
+/// Where a shrine home point lies in its teleporter's frame. Observed: three retail shrine home
+/// points lie 2 m along the teleporter's -x axis and 0.1225 m above it (to 0.01 m).
+const SHRINE_POINT_OFFSET: [f32; 3] = [-2.0, 0.0, 0.1225];
+/// The `PoiTag` of a fast travel point.
+const FAST_TRAVEL_POI_TAG: &str = "fasttravel";
+
+/// The landmark type of a spirit shrine (`eTerritoryLandmarkType`, the retail shrine type of
+/// 3713; the 133 shrine landmarks of `newworld_vitaeeterna`).
+pub const SHRINE_LANDMARK_TYPE: u8 = 27;
 
 /// Milliseconds in a minute.
 const MS_PER_MINUTE: u64 = 60_000;
@@ -334,6 +350,15 @@ pub struct TravelLandmark {
     pub territory: Option<u32>,
 }
 
+/// A spirit shrine's fast travel point: the home point a player has once it charted the shrine.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ShrinePoint {
+    /// The entity id of the shrine's teleporter capital.
+    pub entity: u64,
+    /// The home point's position, metres.
+    pub position: [f32; 3],
+}
+
 /// The game data and timings of travel.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TravelRules {
@@ -374,6 +399,9 @@ pub struct TravelRules {
     pub costs: FastTravelCosts,
     /// The inn recall cooldown, ms.
     pub inn_cooldown_ms: u64,
+    /// The spirit shrine fast travel points, by the lowercase `ChartedAchievement` of the
+    /// shrine's territory, in entity id order.
+    shrine_points: Vec<(String, ShrinePoint)>,
 }
 
 impl Default for TravelRules {
@@ -455,6 +483,7 @@ impl TravelRules {
         .with_teleporters(&level.teleporters);
         rules.camp_territories = camp_territories;
         rules.territories = territories;
+        rules.shrine_points = shrine_points(tables, level);
         rules.housing = HousingRules::of(&gameplay.house_level_reqs, &gameplay.fast_travel_costs);
         rules.costs = FastTravelCosts::of(&gameplay.fast_travel_costs);
         rules
@@ -606,6 +635,7 @@ impl TravelRules {
             housing: HousingRules::default(),
             costs: FastTravelCosts::default(),
             inn_cooldown_ms: OBSERVED_INN_COOLDOWN_MS,
+            shrine_points: Vec::new(),
         }
     }
 
@@ -624,10 +654,36 @@ impl TravelRules {
             .map(|(landmark, _)| landmark)
     }
 
+    /// Whether a landmark of type `landmark_type` lies within `reach_m` of (`x`, `y`) on the
+    /// ground plane.
+    pub fn landmark_within(&self, landmark_type: u8, x: f32, y: f32, reach_m: f32) -> bool {
+        self.landmarks.iter().any(|landmark| {
+            landmark.landmark_type == landmark_type
+                && (landmark.position[0] - x).hypot(landmark.position[1] - y) <= reach_m
+        })
+    }
+
     /// The achievement that marks territory `territory` discovered; `None` for a territory that
     /// is not discoverable.
     pub fn discovered_achievement(&self, territory: u32) -> Option<&str> {
         self.discovered.get(&territory).map(String::as_str)
+    }
+
+    /// The spirit shrine fast travel points a player has who holds the achievements `holds`
+    /// says it holds: one per charted shrine.
+    pub fn charted_shrine_points(&self, holds: impl Fn(&str) -> bool) -> Vec<ShrinePoint> {
+        self.shrine_points
+            .iter()
+            .filter(|(achievement, _)| holds(achievement))
+            .map(|(_, point)| *point)
+            .collect()
+    }
+
+    /// Whether charting achievement `achievement` (any case) gives a shrine fast travel point.
+    pub fn is_shrine_chart(&self, achievement: &str) -> bool {
+        self.shrine_points
+            .iter()
+            .any(|(charted, _)| charted.eq_ignore_ascii_case(achievement))
     }
 
     /// The position of the capital of entity id `id` (a respawn point, an inn, a respawn camp).
@@ -697,6 +753,64 @@ fn furniture(tables: &Tables, kits: &StarterKits) -> HashMap<u32, Furniture> {
         .collect()
 }
 
+/// The spirit shrine fast travel points of `level` with the tables `tables`.
+fn shrine_points(tables: &Tables, level: &WorldFile) -> Vec<(String, ShrinePoint)> {
+    let charts: HashMap<u32, String> = tables
+        .territory_definition
+        .iter()
+        .flat_map(|table| &table.rows)
+        .filter(|row| {
+            row.poi_tag.as_deref().is_some_and(|tags| {
+                tags.split(',')
+                    .any(|tag| tag.trim().eq_ignore_ascii_case(FAST_TRAVEL_POI_TAG))
+            })
+        })
+        .filter_map(|row| {
+            Some((
+                u32::try_from(row.territory_id).ok()?,
+                row.charted_achievement.clone()?,
+            ))
+        })
+        .collect();
+    build_shrine_points(&charts, &level.capitals, &level.landmarks)
+}
+
+/// Each shrine teleporter of `capitals`, by the lowercase `ChartedAchievement` (`charts`, by
+/// fast travel territory) of the territory of the shrine landmark beside it, in entity id
+/// order.
+fn build_shrine_points(
+    charts: &HashMap<u32, String>,
+    capitals: &[Capital],
+    landmarks: &[Landmark],
+) -> Vec<(String, ShrinePoint)> {
+    let mut points: Vec<(String, ShrinePoint)> = capitals
+        .iter()
+        .filter(|capital| capital.slice_name.contains(SHRINE_TELEPORTER_SLICE))
+        .filter_map(|capital| {
+            let [x, y, _] = capital.position;
+            let achievement = landmarks
+                .iter()
+                .filter(|landmark| {
+                    landmark.landmark_type == SHRINE_LANDMARK_TYPE
+                        && (landmark.position[0] - x).hypot(landmark.position[1] - y)
+                            <= SHRINE_TELEPORTER_REACH_M
+                })
+                .flat_map(|landmark| &landmark.territory_ids)
+                .find_map(|id| charts.get(&u32::from(*id)))?;
+            let offset = rotate(quat_normalize(capital.rotation), SHRINE_POINT_OFFSET);
+            Some((
+                achievement.to_lowercase(),
+                ShrinePoint {
+                    entity: capital_id(&capital.id)?,
+                    position: [0, 1, 2].map(|axis| capital.position[axis] + offset[axis]),
+                },
+            ))
+        })
+        .collect();
+    points.sort_by_key(|(_, point)| point.entity);
+    points
+}
+
 /// The position of each capital by its entity id; a capital whose GUID does not read is left
 /// out.
 fn capitals(capitals: &[Capital]) -> HashMap<u64, [f32; 3]> {
@@ -713,8 +827,8 @@ mod tests {
     /// The MB watchtower capital of the GDE id note and its card id.
     const WATCHTOWER_GUID: &str = "f6593b66-abc3-7460-7a4d-5afaeb8b2620";
     const WATCHTOWER_ID: u64 = 0x8c14_619c_4048_5243;
-    /// A shrine landmark (synthetic position; the retail shrine type of 3713).
-    const SHRINE_TYPE: u8 = 27;
+    /// A shrine landmark (synthetic position).
+    const SHRINE_TYPE: u8 = SHRINE_LANDMARK_TYPE;
     const SHRINE: [f32; 3] = [6_061.9, 9_856.0, 320.0];
     const SHRINE_RADIUS_M: f32 = 6.0;
 
@@ -756,6 +870,74 @@ mod tests {
         assert_eq!(rules().spawn_point(1), None);
     }
 
+    /// A shrine teleporter of retail `general-other-01` (home point entity 6465088412215028035)
+    /// and its home point there.
+    const TELEPORTER_AT: [f32; 3] = [10_695.786, 7_509.441_4, 304.357_27];
+    const TELEPORTER_ROTATION: [f32; 4] = [0.0, 0.0, 0.985_302, -0.170_821_7];
+    const RETAIL_SHRINE_POINT: [f32; 3] = [10_697.668, 7_510.114_7, 304.479_74];
+    const TELEPORTER_GUID: &str = "f6593b66-abc3-7460-7a4d-5afaeb8b2621";
+    const SHRINE_TERRITORY: u16 = 50_342;
+    const SHRINE_CHARTED: &str = "SpiritShrine_Test_50342_Charted";
+
+    fn teleporter(slice: &str, at: [f32; 3]) -> Capital {
+        Capital {
+            id: TELEPORTER_GUID.to_owned(),
+            position: at,
+            rotation: TELEPORTER_ROTATION,
+            slice_name: slice.to_owned(),
+            ..Capital::default()
+        }
+    }
+
+    #[test]
+    fn a_shrine_teleporter_is_the_fast_travel_point_of_its_charted_shrine() {
+        let charts = HashMap::from([(u32::from(SHRINE_TERRITORY), SHRINE_CHARTED.to_owned())]);
+        let shrine = Landmark {
+            landmark_type: SHRINE_LANDMARK_TYPE,
+            position: [10_694.0, 7_508.6, 304.0],
+            territory_ids: vec![14, SHRINE_TERRITORY, 9102],
+            ..Landmark::default()
+        };
+        let far = [TELEPORTER_AT[0] + 50.0, TELEPORTER_AT[1], TELEPORTER_AT[2]];
+        let points = build_shrine_points(
+            &charts,
+            &[
+                teleporter(
+                    "CoatGen\\e8645cbe\\FastTravel_Teleporter_2061056835.dynamicslice",
+                    TELEPORTER_AT,
+                ),
+                teleporter("CoatGen\\x\\FastTravel_Teleporter_1.dynamicslice", far),
+                teleporter("POI/Outpost/Outpost_Brimstone_A", TELEPORTER_AT),
+            ],
+            &[shrine],
+        );
+        assert_eq!(
+            points.len(),
+            1,
+            "a teleporter far from a shrine and a town are left out"
+        );
+        let (achievement, point) = &points[0];
+        assert_eq!(achievement, &SHRINE_CHARTED.to_lowercase());
+        assert_eq!(Some(point.entity), capital_id(TELEPORTER_GUID));
+        for (axis, (got, retail)) in point.position.iter().zip(RETAIL_SHRINE_POINT).enumerate() {
+            assert!(
+                (got - retail).abs() < 0.01,
+                "axis {axis}: {:?}",
+                point.position
+            );
+        }
+        let rules = TravelRules {
+            shrine_points: points.clone(),
+            ..TravelRules::default()
+        };
+        assert!(rules.is_shrine_chart("spiritshrine_test_50342_CHARTED"));
+        assert_eq!(
+            rules.charted_shrine_points(|held| held.eq_ignore_ascii_case(SHRINE_CHARTED)),
+            vec![*point]
+        );
+        assert!(rules.charted_shrine_points(|_| false).is_empty());
+    }
+
     #[test]
     fn a_landmark_is_found_by_its_type_within_its_radius() {
         let rules = rules();
@@ -769,6 +951,9 @@ mod tests {
                 .is_none()
         );
         assert!(rules.landmark(2, SHRINE[0], SHRINE[1]).is_none());
+        assert!(rules.landmark_within(SHRINE_TYPE, SHRINE[0] + 7.0, SHRINE[1], 7.0));
+        assert!(!rules.landmark_within(SHRINE_TYPE, SHRINE[0] + 7.1, SHRINE[1], 7.0));
+        assert!(!rules.landmark_within(2, SHRINE[0], SHRINE[1], 7.0));
         assert_eq!(
             rules.discovered_achievement(20_422),
             Some("Discovered_Shrine")

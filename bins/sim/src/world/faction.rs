@@ -18,7 +18,7 @@
 //! flagged. Entering a sanctuary with the flag on takes it off and makes it pending again; a
 //! toggle while pending cancels it. Inferred: a sanctuary is the reach of a settlement or outpost
 //! capital ([`crate::trading_post::SETTLEMENT_REACH_M`]: the level data loaded here has no
-//! sanctuary volumes); a toggle outside a sanctuary starts the countdown at once, a toggle with
+//! sanctuary volumes); Observed: a spirit shrine is one too ([`SHRINE_SANCTUARY_REACH_M`]); a toggle outside a sanctuary starts the countdown at once, a toggle with
 //! the flag on takes it off (`pvpFlag` 0, `notifyPending` 1), and entering a sanctuary during a
 //! countdown stops it (`pvpFlagPendingEndTime` 0): the captured run toggled in a sanctuary only.
 //! A countdown does not survive a handoff to another sim (the handoff carries the flag alone).
@@ -29,11 +29,19 @@ use nw_messages::faction_state::{FactionChange, FactionStateChange};
 
 use super::gear::unix_ns;
 use super::{Body, Player, SimWorld};
+use crate::travel_rules::SHRINE_LANDMARK_TYPE;
 
 /// The PvP flag countdown after the player leaves a sanctuary. Observed: in
 /// `Hive_flag_pvp_on_and_off` the flag went on 30.0 s after the bundle that left the sanctuary
 /// (1782821022777 to 1782821052796).
 pub(super) const PVP_FLAG_DELAY_MS: u64 = 30_000;
+/// The reach of a spirit shrine's sanctuary, metres from its landmark. Observed (scan of 1,080
+/// retail ledgers, 2026-11-06, the own player's `Sanctuary` effect 1316 near a shrine landmark
+/// and 30 m nearer to it than to any other landmark): 498 walks out turned it off at a median
+/// of 7.6 m (p10 5.0, p90 11.8) and 380 walks in turned it on at a median of 5.4 m (p10 2.5,
+/// p90 8.6); every fast travel to a shrine arrives with it on. The edge between the two medians
+/// is Inferred (the samples lag the crossing by up to 300 ms).
+const SHRINE_SANCTUARY_REACH_M: f32 = 6.5;
 
 /// A player's PvP flag on its way on.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -134,10 +142,17 @@ impl SimWorld {
     pub(super) fn tick_pvp_flags(&mut self, now_ms: u64) {
         let end_ns = unix_ns(self.server_ms.saturating_add(PVP_FLAG_DELAY_MS));
         let settlements = &self.content.settlements;
+        let travel = &self.content.travel;
         let mut query = self.world.query::<(&mut Player, &Body)>();
         for (mut player, body) in query.iter_mut(&mut self.world) {
             let at = body.motion.position();
-            let inside = settlements.nearest(at.x, at.y).is_some();
+            let inside = settlements.nearest(at.x, at.y).is_some()
+                || travel.landmark_within(
+                    SHRINE_LANDMARK_TYPE,
+                    at.x,
+                    at.y,
+                    SHRINE_SANCTUARY_REACH_M,
+                );
             let mut change = FactionStateChange::default();
             let was = player.pvp_wait.in_sanctuary;
             if was != Some(inside) {
@@ -402,5 +417,45 @@ mod tests {
         world.tick_pvp_flags(left_ms * 2);
         world.tick_pvp_flags(left_ms * 4);
         assert!(!flagged(&world, entity), "a cancelled flag stays off");
+    }
+
+    /// Retail ledgers: a spirit shrine is a sanctuary out to [`SHRINE_SANCTUARY_REACH_M`] of its
+    /// landmark, so a flagged player who walks onto one is flagged no more.
+    #[test]
+    fn a_spirit_shrine_is_a_sanctuary_within_its_reach() {
+        /// The shrine landmark, far from every settlement (there is none in this world).
+        const SHRINE_X_M: f32 = 2_000.0;
+        const OUTSIDE_M: f32 = SHRINE_X_M + SHRINE_SANCTUARY_REACH_M + 1.0;
+        let (mut world, entity) = world();
+        Arc::make_mut(&mut world.content).travel = crate::travel_rules::TravelRules::build(
+            vec![crate::travel_rules::TravelLandmark {
+                landmark_type: SHRINE_LANDMARK_TYPE,
+                position: [SHRINE_X_M, 0.0, 50.0],
+                radius: 0.0,
+                territory: None,
+            }],
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            None,
+            nw_content::gameplay_config::TravelKeys::default(),
+        );
+        move_to(&mut world, entity, OUTSIDE_M);
+        world.tick_pvp_flags(NOW);
+        world.toggle_pvp_flag(entity, NOW);
+        world.tick_pvp_flags(NOW + PVP_FLAG_DELAY_MS);
+        world.tick_pvp_flags(NOW + PVP_FLAG_DELAY_MS * 2);
+        assert!(flagged(&world, entity), "flagged outside the shrine");
+        faction_bodies(&mut world, entity);
+        move_to(&mut world, entity, SHRINE_X_M + SHRINE_SANCTUARY_REACH_M);
+        world.tick_pvp_flags(NOW + PVP_FLAG_DELAY_MS * 3);
+        assert!(
+            !flagged(&world, entity),
+            "the shrine's sanctuary takes it off"
+        );
+        assert_eq!(
+            faction_bodies(&mut world, entity),
+            [vec![0x06, 0x01, 0x01, 0x06, 0x00, 0x01]],
+            "the same change as a settlement's sanctuary"
+        );
     }
 }

@@ -82,7 +82,7 @@ use nw_sim_core::Position;
 
 use crate::charting::CHART_EVENT;
 use crate::objectives::Event;
-use crate::travel_rules::{HousingRules, TravelRules};
+use crate::travel_rules::{HousingRules, ShrinePoint, TravelRules};
 
 use super::camps::{CampEntity, CampPlacement};
 use super::quest_objects::gain_experience;
@@ -156,6 +156,8 @@ const CAMP_BIND_COOLDOWN_MS: u64 = 60_000;
 const CAMP_COOLDOWN_NS: u64 = 1_000_000_000;
 /// The name of a house home point (all 1,042 retail ones).
 const HOUSE_POINT_NAME: &[u8] = b"House";
+/// The name of a spirit shrine home point (Observed: 63 of 63 retail shrine points).
+const SPIRIT_SHRINE_POINT_NAME: &[u8] = b"@ui_spirit_shrine";
 /// The index of a single home point of an entity (every inn, house and camp of retail).
 const SINGLE_POINT: u32 = 0;
 /// `lastHouseRequestResponse` (0 in every retail body).
@@ -902,6 +904,7 @@ impl SimWorld {
     fn send_travel_states(&mut self) {
         let server_ms = self.server_ms;
         let rules = &self.content.travel;
+        let achievement_rules = &self.achievement_rules;
         let mut query = self.world.query::<&mut Player>();
         for mut player in query.iter_mut(&mut self.world) {
             let number = player.number;
@@ -933,7 +936,10 @@ impl SimWorld {
             }
             if due.homes {
                 player.travel.homes_version = player.travel.homes_version.saturating_add(1);
-                let body = home_state(&player.travel, rules).body();
+                let shrines = rules.charted_shrine_points(|achievement| {
+                    player.flow.has_achievement(achievement_rules, achievement)
+                });
+                let body = home_state(&player.travel, rules, &shrines).body();
                 members.push((PLAYER_HOME_COMPONENT, PLAYER_HOME_TYPE_INDEX, body));
             }
             if due.camping {
@@ -1125,6 +1131,10 @@ impl SimWorld {
         player
             .flow
             .set_achievement(&self.achievement_rules, achievement);
+        // A charted shrine is a new fast travel point: the home points go out again.
+        if content.travel.is_shrine_chart(achievement) {
+            player.travel.due.homes = true;
+        }
         let amount = charting
             .territory_of(u32::from(area))
             .and_then(|territory| charting.experience(territory))
@@ -1970,9 +1980,13 @@ fn housing_state(travel: &TravelState) -> PlayerHousingState {
     }
 }
 
-/// The home points of `travel`: its bound inn, its houses and its camp's respawn point, and
-/// the bound inn's id as the chosen point.
-fn home_state(travel: &TravelState, rules: &TravelRules) -> PlayerHomeState {
+/// The home points of `travel`: its bound inn, its houses, its camp's respawn point and the
+/// spirit shrines it charted (`shrines`), and the bound inn's id as the chosen point.
+fn home_state(
+    travel: &TravelState,
+    rules: &TravelRules,
+    shrines: &[ShrinePoint],
+) -> PlayerHomeState {
     let saved = &travel.saved;
     let point =
         |entity: u64, name: Vec<u8>, position: [f32; 3], cooldown_ns, used_ns, kind| HomePoint {
@@ -2029,10 +2043,26 @@ fn home_state(travel: &TravelState, rules: &TravelRules) -> PlayerHomeState {
             )
         }
     });
+    // Retail sends a shrine's point with the name `@ui_spirit_shrine` and no cooldown.
+    let shrines = shrines.iter().map(|shrine| {
+        point(
+            shrine.entity,
+            SPIRIT_SHRINE_POINT_NAME.to_vec(),
+            shrine.position,
+            0,
+            0,
+            home_point_kind::SPIRIT_SHRINE,
+        )
+    });
     PlayerHomeState {
         home_points: Some(FullList {
             version: Some(travel.homes_version),
-            elements: inn.into_iter().chain(houses).chain(camp).collect(),
+            elements: inn
+                .into_iter()
+                .chain(houses)
+                .chain(camp)
+                .chain(shrines)
+                .collect(),
         }),
         home_point_id: saved.inn.map(|inn| home_point_id(inn, SINGLE_POINT)),
     }
@@ -3254,7 +3284,7 @@ mod tests {
         ] {
             assert!(classes.contains(&class), "class {class}");
         }
-        let homes = home_state(&player.travel, &world.content.travel);
+        let homes = home_state(&player.travel, &world.content.travel, &[]);
         let points = homes.home_points.expect("list").elements;
         assert_eq!(points.len(), 1);
         assert_eq!(
@@ -3310,6 +3340,27 @@ mod tests {
         assert!(state.waypoint_due);
         assert_eq!(state.carried(), saved);
         assert!(!TravelState::of(PlayerTravel::default()).waypoint_due);
+    }
+
+    #[test]
+    fn a_charted_shrine_is_a_spirit_shrine_home_point() {
+        const SHRINE_ENTITY: u64 = 6_465_088_412_215_028_035;
+        const SHRINE_POINT: [f32; 3] = [10_697.668, 7_510.114_7, 304.479_74];
+        let shrine = ShrinePoint {
+            entity: SHRINE_ENTITY,
+            position: SHRINE_POINT,
+        };
+        let state = home_state(&TravelState::default(), &TravelRules::default(), &[shrine]);
+        let points = state.home_points.expect("list").elements;
+        assert_eq!(points.len(), 1);
+        let point = &points[0];
+        assert_eq!(point.kind, home_point_kind::SPIRIT_SHRINE);
+        assert_eq!(point.name, SPIRIT_SHRINE_POINT_NAME);
+        assert_eq!(point.position, SHRINE_POINT);
+        assert_eq!((point.cooldown_ns, point.used_ns), (0, 0));
+        assert_eq!(point.entity.facet, SHRINE_ENTITY);
+        assert_eq!(point.id, home_point_id(SHRINE_ENTITY, SINGLE_POINT));
+        assert_eq!(state.home_point_id, None, "a shrine is no bound inn");
     }
 
     #[test]

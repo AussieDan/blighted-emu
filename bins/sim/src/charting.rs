@@ -26,9 +26,13 @@
 //! "Undiscovered Fast Travel Point" (`fasttravelicon.luac`). A discoverable shrine with a
 //! `DiscoveredAchievement` is discovered at its first entry and charted at a later one.
 //!
-//! **Unknown.** What charts another point of interest: retail discovered the shipwreck 40142 at
-//! the same entry (`drowned_shipwreck_2_40142_discovered`) but did not chart it, though it has a
-//! `ChartedAchievement`. Only areas (`IsArea`) and fast travel points are charted here.
+//! **Observed.** A discoverable point of interest is charted at an entry after its discovery:
+//! retail discovered the shipwreck 40142 at its first entry but did not chart it; over the
+//! retail `Playthrough_Part_01` to `_05` ledgers, 66 entries of a discovered, uncharted point of
+//! interest (shipwrecks, ruins, villages, caverns, bridges) each set its `ChartedAchievement`
+//! within 70 ms. The world map shows such a point as an "Uncharted Landmark" until then (live
+//! 2026-11-06). Another point of interest (no `DiscoveredAchievement`, not an area or a fast
+//! travel point) is not charted here: what charts it is Unknown.
 
 use std::collections::{HashMap, HashSet};
 
@@ -53,6 +57,18 @@ fn is_fast_travel_point(poi_tag: Option<&str>) -> bool {
         tags.split(POI_TAG_SEPARATOR)
             .any(|tag| tag.trim().eq_ignore_ascii_case(FAST_TRAVEL_POI_TAG))
     })
+}
+
+/// Whether an entry charts a chartable territory row: an area, a fast travel point, or a
+/// discoverable point of interest (one with a `DiscoveredAchievement`; the entry that discovers
+/// it charts nothing, a later one charts it).
+fn is_charted_at_entry(
+    chartable: bool,
+    area: bool,
+    poi_tag: Option<&str>,
+    discoverable: bool,
+) -> bool {
+    chartable && (area || is_fast_travel_point(poi_tag) || discoverable)
 }
 
 /// What a territory's charts and standing give.
@@ -87,9 +103,12 @@ impl ChartRules {
         };
         let charted = rows()
             .filter(|row| {
-                row.is_chartable.unwrap_or_default()
-                    && (row.is_area.unwrap_or_default()
-                        || is_fast_travel_point(row.poi_tag.as_deref()))
+                is_charted_at_entry(
+                    row.is_chartable.unwrap_or_default(),
+                    row.is_area.unwrap_or_default(),
+                    row.poi_tag.as_deref(),
+                    row.is_discoverable.unwrap_or_default() && row.discovered_achievement.is_some(),
+                )
             })
             .filter_map(|row| {
                 let area = u32::try_from(row.territory_id).ok()?;
@@ -194,6 +213,30 @@ mod tests {
         assert!(is_fast_travel_point(Some("FastTravel")));
         assert!(!is_fast_travel_point(Some("camp_30143")));
         assert!(!is_fast_travel_point(None));
+    }
+
+    #[test]
+    fn areas_fast_travel_points_and_discoverable_points_of_interest_are_charted() {
+        // The start beach, Brysedd Overlook Shrine, the shipwreck 30125 and the watchtower
+        // 30117 (no achievements), build 25810808.
+        assert!(is_charted_at_entry(true, true, Some("starterbeach"), false));
+        assert!(is_charted_at_entry(
+            true,
+            false,
+            Some("spiritshrine_02_30151,fasttravel"),
+            false
+        ));
+        assert!(is_charted_at_entry(
+            true,
+            false,
+            Some("drowned_shipwreck_2_30125"),
+            true
+        ));
+        assert!(!is_charted_at_entry(true, false, Some("watchtower"), false));
+        assert!(
+            !is_charted_at_entry(false, true, None, true),
+            "not chartable"
+        );
     }
 
     #[test]

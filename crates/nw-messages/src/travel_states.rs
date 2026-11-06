@@ -427,6 +427,10 @@ pub mod home_point_kind {
     pub const INN: u32 = 6;
     /// A player's camp (`@CampTn_MasterName`, a 1 s cooldown).
     pub const CAMP: u32 = 9;
+    /// A charted spirit shrine (`@ui_spirit_shrine`, no cooldown: 63 of 63 retail elements). The
+    /// world map counts a shrine charted when the player has a point of this kind in its
+    /// territory (`HasFastTravelPointInTerritory`, `FUN_143589fe0`).
+    pub const SPIRIT_SHRINE: u32 = 11;
 }
 
 /// One home point of the player (`FUN_1434fe010`, `FUN_1434dc760`): a place it may respawn at.
