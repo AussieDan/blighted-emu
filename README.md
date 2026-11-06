@@ -508,6 +508,7 @@ The client has no menu or console command for its GM calls, so a game master typ
 | `!god <on\|off> [player]` | Turns damage off or on |
 | `!kick <player>` | Saves the player and closes its connection |
 | `!give <item id> <quantity> [player]` / `!take <item id> [player]` | Puts items in the bag, or takes every stack of one item |
+| `!gearup [player]` | Wears, for each worn item, the best item of its kind (same item classes, no fixed gear score) at its highest gear score; the old item goes into the bag |
 | `!quest <objective id> [player]` | Starts a quest |
 | `!queststate <objective id> [player]` | Says whether the quest runs (and each step it waits on), waits for its turn-in, is done, or was not taken (and why no NPC offers it) |
 | `!questplan <objective id> [player]` | Says what each waiting step of a running quest needs next, with its place (the plan the quest walk uses) |
