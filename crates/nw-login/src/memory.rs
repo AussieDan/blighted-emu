@@ -292,6 +292,7 @@ impl CharacterStore for MemoryCharacters {
             appearance: new.appearance.clone(),
             created_at_unix: unix_seconds(),
             level: NEW_CHARACTER_LEVEL,
+            published_look: None,
         };
         characters.names.insert(name_key, new.id);
         characters

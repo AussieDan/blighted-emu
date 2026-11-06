@@ -17,6 +17,11 @@
 //! Twitch, season and leaderboard rewards) and are never granted here. Of the 9 others, the 5
 //! without an `Outfit` (the hide-armor skins) are every character's; the 4 of the
 //! `RabbitsRevenge2024` outfit come from that event (best guess: an outfit is an event reward).
+//!
+//! **Published look (Observed: 427 armor slots of retail `PublishedData`, the character select
+//! look).** Each armor slot holds the CRC-32 of the lowercase `ArmorAppearanceDefinitions`
+//! `ItemID` the character shows there, of its gender (`m_DynastyWarriorHeavy_Chest`): store
+//! skins appear in them, so a worn skin counts over its item ([`SkinCatalog::published_look`]).
 
 use std::collections::HashMap;
 
@@ -24,6 +29,21 @@ use nw_formats::objectstream::lowercase_crc32;
 
 use crate::Tables;
 use crate::perks::parts;
+use crate::starter::EquipSlot;
+
+/// The armor slots of a published look, in [`PublishedLook`] order.
+pub const PUBLISHED_SLOTS: [EquipSlot; 5] = [
+    EquipSlot::Head,
+    EquipSlot::Chest,
+    EquipSlot::Hands,
+    EquipSlot::Legs,
+    EquipSlot::Feet,
+];
+/// The appearance a character shows in each slot of [`PUBLISHED_SLOTS`]: the CRC-32 of the
+/// lowercase gendered appearance id, 0 for a slot it wears nothing in.
+pub type PublishedLook = [u32; PUBLISHED_SLOTS.len()];
+/// A published look slot that shows nothing.
+pub const NO_APPEARANCE: u32 = 0;
 
 /// The start of the class part that names where an item is worn.
 const EQUIPPABLE_PREFIX: &str = "Equippable";
@@ -68,6 +88,8 @@ pub struct SkinItemRow {
     pub classes: Vec<String>,
     /// `ArmorAppearanceM`.
     pub armor_appearance: Option<String>,
+    /// `ArmorAppearanceF`.
+    pub armor_appearance_female: Option<String>,
     /// `WeaponAppearanceOverride`.
     pub weapon_appearance: Option<String>,
 }
@@ -96,6 +118,7 @@ impl SkinSource {
                     item_id: row.item_id.clone(),
                     classes: parts(row.item_class.as_deref()),
                     armor_appearance: filled(&row.armor_appearance_m),
+                    armor_appearance_female: filled(&row.armor_appearance_f),
                     weapon_appearance: filled(&row.weapon_appearance_override),
                 })
                 .collect(),
@@ -125,6 +148,23 @@ pub struct SkinCatalog {
     kinds: HashMap<u32, String>,
     /// The skins every character has.
     free: Vec<u32>,
+    /// The published slot and look of each lowercase armor item id.
+    armor_looks: HashMap<String, (usize, GenderedLook)>,
+    /// The look of each armor skin: that of the first item that gives it.
+    skin_looks: HashMap<u32, GenderedLook>,
+}
+
+/// The appearance CRCs of one armor look, male and female.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GenderedLook {
+    male: u32,
+    female: u32,
+}
+
+impl GenderedLook {
+    const fn of(&self, female: bool) -> u32 {
+        if female { self.female } else { self.male }
+    }
 }
 
 impl SkinCatalog {
@@ -168,6 +208,22 @@ impl SkinCatalog {
             let skin = lowercase_crc32(&appearance);
             catalog.by_item.insert(row.item_id.to_lowercase(), skin);
             catalog.kinds.entry(skin).or_insert(kind);
+            let slot = row.classes.iter().find_map(|part| {
+                PUBLISHED_SLOTS
+                    .iter()
+                    .position(|slot| EquipSlot::of_item_class(part) == Some(*slot))
+            });
+            if let (Some(slot), Some(male)) = (slot, &row.armor_appearance) {
+                let female = row.armor_appearance_female.as_ref().unwrap_or(male);
+                let look = GenderedLook {
+                    male: lowercase_crc32(male),
+                    female: lowercase_crc32(female),
+                };
+                catalog
+                    .armor_looks
+                    .insert(row.item_id.to_lowercase(), (slot, look));
+                catalog.skin_looks.entry(skin).or_insert(look);
+            }
         }
         catalog.free = source
             .free_items
@@ -185,6 +241,25 @@ impl SkinCatalog {
     /// The skins every character has.
     pub fn free(&self) -> &[u32] {
         &self.free
+    }
+
+    /// The published look of a character of gender `female` who wears `worn` (item id, applied
+    /// skin or 0): each armor item's appearance, or its skin's when one is applied ([module
+    /// notes](self)). Items that are not armor are left out.
+    pub fn published_look<'a>(
+        &self,
+        worn: impl IntoIterator<Item = (&'a str, u32)>,
+        female: bool,
+    ) -> PublishedLook {
+        let mut look = [NO_APPEARANCE; PUBLISHED_SLOTS.len()];
+        for (item_id, skin) in worn {
+            let Some((slot, item_look)) = self.armor_looks.get(&item_id.to_lowercase()) else {
+                continue;
+            };
+            let shown = self.skin_looks.get(&skin).unwrap_or(item_look);
+            look[*slot] = shown.of(female);
+        }
+        look
     }
 
     /// Whether `skin` goes on an item of `classes`.
@@ -257,6 +332,7 @@ mod tests {
             item_id: item_id.to_owned(),
             classes: parts(Some(classes)),
             armor_appearance: armor.map(str::to_owned),
+            armor_appearance_female: armor.map(|male| format!("f_{male}")),
             weapon_appearance: weapon.map(str::to_owned),
         }
     }
@@ -303,6 +379,40 @@ mod tests {
             )],
             free_items: vec!["Skin_Head_HideHelmet".to_owned(), "NoSuchItem".to_owned()],
         })
+    }
+
+    #[test]
+    fn the_published_look_shows_each_slots_item_or_its_skin_by_gender() {
+        let catalog = catalog();
+        let worn = [
+            ("HeavyChest_MonarchsBluffT3", NO_APPEARANCE),
+            ("2hBowT4", NO_APPEARANCE),
+        ];
+        let chest = PUBLISHED_SLOTS
+            .iter()
+            .position(|slot| *slot == EquipSlot::Chest)
+            .expect("chest");
+        let male = catalog.published_look(worn, false);
+        assert_eq!(male[chest], lowercase_crc32("Conquistador_Chest_T2"));
+        assert_eq!(
+            male.iter().filter(|crc| **crc != NO_APPEARANCE).count(),
+            1,
+            "a weapon has no armor slot"
+        );
+        assert_eq!(
+            catalog.published_look(worn, true)[chest],
+            lowercase_crc32("f_Conquistador_Chest_T2")
+        );
+        let cloth = catalog.skin_of("LightChestT1").expect("skin");
+        assert_eq!(
+            catalog.published_look([("HeavyChest_MonarchsBluffT3", cloth)], false)[chest],
+            lowercase_crc32("Cloth_Shirt_T1"),
+            "the skin shows over the item"
+        );
+        assert_eq!(
+            catalog.published_look([], false),
+            [NO_APPEARANCE; PUBLISHED_SLOTS.len()]
+        );
     }
 
     #[test]

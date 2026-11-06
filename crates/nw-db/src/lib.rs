@@ -52,7 +52,7 @@ pub use analytics::{AnalyticsRecord, delete_old_analytics_events, insert_analyti
 pub use arena::{DUNGEON_ID_LEN, SavedArena, SavedStay};
 pub use character::{
     character_by_id, character_name_taken, characters_for_account, delete_character,
-    insert_character, release_character_name, reserve_character_name,
+    insert_character, release_character_name, reserve_character_name, save_published_look,
 };
 pub use connect::{DatabaseConfig, GlobalDatabase, connect, connect_lazy, connect_options};
 pub use consumable_cooldowns::SavedConsumableCooldown;
@@ -158,6 +158,9 @@ pub struct Character {
     pub created_at_unix: i64,
     /// The level (zero-based) when it was last online; 0 before its first time in game.
     pub level: u32,
+    /// The armor look the character select screen shows (migration 0032): per armor slot the
+    /// CRC-32 of the appearance worn there, 0 for none; `None` before its first item save.
+    pub published_look: Option<Vec<u32>>,
 }
 
 /// A character to insert.

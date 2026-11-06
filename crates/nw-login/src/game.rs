@@ -357,7 +357,11 @@ async fn world_models<G, C, R, Q: QueueStore>(
 /// zero-based, as the client's own create request (`"currentLevel":0`) and the saved level are.
 pub(crate) fn character_summary(world_id: Uuid, character: &Character) -> CharacterSummary {
     CharacterSummary {
-        published_data: look::published_data(&character.appearance, character.level),
+        published_data: look::published_data(
+            &character.appearance,
+            character.level,
+            character.published_look.as_deref(),
+        ),
         character_id: character.id.to_string(),
         created_date: http_date(character.created_at_unix),
         name: character.name.clone(),
@@ -1101,6 +1105,7 @@ pub(crate) mod tests {
             appearance: crate::look::tests::saved_appearance(),
             created_at_unix: 0,
             level: SAVED_LEVEL,
+            published_look: None,
         };
         let summary = character_summary(Uuid::new_v4(), &character);
         let published = summary.published_data.expect("published");

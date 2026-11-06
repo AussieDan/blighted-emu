@@ -34,7 +34,7 @@ use nw_db::{
     SavedItem, SavedItemRolls, SavedLoadout, SavedLootLimit, SavedMount, SavedMounts, SavedPlace,
     SavedPosition, SavedProgression, SavedQuests, SavedStoredItem, SavedTravel, StatUpdate,
     save_character_items, save_character_position, save_character_progression,
-    save_character_quests, submit_stats,
+    save_character_quests, save_published_look, submit_stats,
 };
 use nw_db::{Purchase, buy_entitlement};
 use nw_db::{clear_new_account_titles, company_listings, earn_account_titles, stored_players};
@@ -271,6 +271,8 @@ enum SaveKind {
     Items,
     Quests,
     Progression,
+    /// The character select look: one write per departure, nothing queued.
+    Look,
 }
 
 type SaveResult = (SaveKind, Uuid, bool);
@@ -1816,6 +1818,7 @@ impl Loop {
             self.spawn_save(departure.character, position);
         }
         if let Some(items) = &departure.items {
+            self.spawn_look_save(departure.character, items, departure.female);
             let save = ItemSave {
                 items: items.clone(),
                 inventory: departure.inventory.clone().unwrap_or_default(),
@@ -1886,6 +1889,25 @@ impl Loop {
         });
     }
 
+    /// Saves the armor look of `character`, who carries `items`, for the character select screen
+    /// (retail republishes it): with every item save, and at a leave, which carries every item
+    /// even when none changed.
+    fn spawn_look_save(&mut self, character: Uuid, items: &[CarriedItem], female: bool) {
+        let db = self.db.clone();
+        let look = self.settings.content.skins.published_look(
+            items
+                .iter()
+                .filter(|item| matches!(item.place, ItemPlace::Worn(_)))
+                .map(|item| (item.item_id.as_str(), item.state.look.appearance)),
+            female,
+        );
+        self.spawn_store(SaveKind::Look, character, async move {
+            save_published_look(&db, character, &look)
+                .await
+                .map(|()| SaveOutcome::Saved)
+        });
+    }
+
     fn spawn_quest_save(&mut self, character: Uuid, save: QuestSave) {
         let db = self.db.clone();
         self.spawn_store(SaveKind::Quests, character, async move {
@@ -1945,6 +1967,7 @@ impl Loop {
                     self.spawn_progression_save(character, next);
                 }
             }
+            SaveKind::Look => {}
         }
     }
 

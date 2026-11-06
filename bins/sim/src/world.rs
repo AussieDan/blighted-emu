@@ -433,6 +433,9 @@ pub struct Departure {
     /// The progression to save; `None` when there is nothing to save (no change since the last
     /// save, or the tutorial).
     pub progression: Option<PlayerProgression>,
+    /// Whether the character is female: its worn armor shows the female appearances on the
+    /// character select screen.
+    pub female: bool,
 }
 
 /// A handoff that a tick started: the player is frozen until [`SimWorld::handoff_done`].
@@ -4772,6 +4775,7 @@ fn departure_of(
         items,
         inventory,
         progression,
+        female: player.look.is_some_and(|look| look.is_female()),
     }
 }
 

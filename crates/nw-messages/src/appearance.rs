@@ -27,6 +27,8 @@ pub const LOOK_UNCHANGED: u8 = 0;
 /// `m_backgroundColorIndex` of the icon: 0 on 5,291 of 6,749 retail bodies; its table is Unknown.
 pub const DEFAULT_ICON_BACKGROUND: u16 = 0;
 const FIELD: &str = "player appearance";
+/// `playerGender` of a female character.
+const FEMALE: u8 = 1;
 
 /// The twelve look choices of a character, in child order. Each is a position in its
 /// character-creation list.
@@ -59,6 +61,11 @@ pub struct PlayerLook {
 }
 
 impl PlayerLook {
+    /// Whether the character is female.
+    pub const fn is_female(&self) -> bool {
+        self.gender == FEMALE
+    }
+
     /// The choices in child order.
     pub const fn choices(&self) -> [u8; LOOK_CHOICES] {
         [
@@ -295,6 +302,16 @@ mod tests {
         reader.finish().expect("to the end");
         assert_eq!(read, PlayerAppearanceState::of(look));
         assert_eq!(read.look.map(|look| look.choices()), Some(LOOK));
+    }
+
+    #[test]
+    fn gender_1_is_female() {
+        let female = PlayerLook {
+            gender: FEMALE,
+            ..PlayerLook::default()
+        };
+        assert!(female.is_female());
+        assert!(!PlayerLook::default().is_female(), "gender 0 is male");
     }
 
     #[test]

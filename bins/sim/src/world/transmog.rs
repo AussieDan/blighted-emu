@@ -795,6 +795,7 @@ mod tests {
                         item_id: SWORD.to_owned(),
                         classes: parts(Some(SWORD_CLASS)),
                         armor_appearance: None,
+                        armor_appearance_female: None,
                         weapon_appearance: None,
                     }],
                     ..SkinSource::default()

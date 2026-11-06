@@ -12,16 +12,25 @@ use crate::{Character, NewCharacter};
 
 const CHARACTER_NAME_PKEY: &str = "character_name_pkey";
 
-type CharacterRow = (Uuid, Uuid, String, serde_json::Value, i64, i64);
+type CharacterRow = (
+    Uuid,
+    Uuid,
+    String,
+    serde_json::Value,
+    i64,
+    i64,
+    Option<Vec<i32>>,
+);
 
 /// The level is the one the social save keeps from the character's last time online.
 const CHARACTER_COLUMNS: &str = "character_id, account_id, name, appearance, \
      CAST(EXTRACT(EPOCH FROM created_at) AS BIGINT), \
      COALESCE((SELECT social.level FROM character_social social \
-               WHERE social.character_id = player_character.character_id), 0)";
+               WHERE social.character_id = player_character.character_id), 0), \
+     published_look";
 
 fn character_from_row(
-    (id, account_id, name, appearance, created_at_unix, level): CharacterRow,
+    (id, account_id, name, appearance, created_at_unix, level, published_look): CharacterRow,
 ) -> Result<Character, DbError> {
     Ok(Character {
         id,
@@ -30,7 +39,42 @@ fn character_from_row(
         appearance,
         created_at_unix,
         level: narrow(level, LEVEL_FIELD)?,
+        published_look: published_look.map(|look| look.into_iter().map(crc_of_column).collect()),
     })
+}
+
+/// A CRC-32 stored as its signed 32-bit bit pattern.
+#[allow(
+    clippy::cast_sign_loss,
+    reason = "the column keeps the CRC's bit pattern"
+)]
+const fn crc_of_column(value: i32) -> u32 {
+    value as u32
+}
+
+/// A CRC-32 as its signed 32-bit bit pattern.
+#[allow(
+    clippy::cast_possible_wrap,
+    reason = "the column keeps the CRC's bit pattern"
+)]
+const fn column_of_crc(crc: u32) -> i32 {
+    crc as i32
+}
+
+/// Saves the armor look the character select screen shows for `character_id`
+/// ([`Character::published_look`]).
+pub async fn save_published_look(
+    world: &PgPool,
+    character_id: Uuid,
+    look: &[u32],
+) -> Result<(), DbError> {
+    let column: Vec<i32> = look.iter().copied().map(column_of_crc).collect();
+    sqlx::query("UPDATE player_character SET published_look = $2 WHERE character_id = $1")
+        .bind(character_id)
+        .bind(column)
+        .execute(world)
+        .await?;
+    Ok(())
 }
 
 /// Reserves `name` (compared in lower case) for a character in `world_id`.
@@ -199,6 +243,29 @@ mod tests {
         assert_eq!(listed, vec![inserted.clone()]);
         assert!(other.is_empty());
         assert_eq!(loaded, Some(inserted));
+    }
+
+    #[tokio::test]
+    async fn the_published_look_is_saved_with_the_crc_bit_patterns() {
+        /// `m_Archetype_Sellsword_gloves` and `m_DynastyWarriorHeavy_Chest`: one above i32::MAX.
+        const LOOK: [u32; 5] = [0, 0x49ee_1aec, 0xc3d5_0a8f, 0, 0];
+        let (before, after) = with_test_schema(async |pool| {
+            WORLD_MIGRATOR.run(pool).await.expect("migrate");
+            let inserted = insert_character(pool, &new_character(Uuid::new_v4()))
+                .await
+                .expect("insert");
+            save_published_look(pool, inserted.id, &LOOK)
+                .await
+                .expect("save");
+            let after = character_by_id(pool, inserted.id).await.expect("load");
+            (
+                inserted.published_look,
+                after.and_then(|c| c.published_look),
+            )
+        })
+        .await;
+        assert_eq!(before, None, "a new character has no published look");
+        assert_eq!(after, Some(LOOK.to_vec()));
     }
 
     #[tokio::test]

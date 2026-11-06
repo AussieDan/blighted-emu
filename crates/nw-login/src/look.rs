@@ -89,6 +89,24 @@ const GENDER_NAME: &str = "gender";
 const RACE_NAME: &str = "race";
 /// The ObjectStream child name of the archetype pick: a backstory id.
 const BACKSTORY_NAME: &str = "backstory";
+
+/// The armor slot list of a `visualsBlob` (Observed: the client's creation settings and 427 slots
+/// of retail published data): the list, each slot entry, the entry's slot name, its item, the
+/// item's appearance and the appearance's CRC-32 (4 bytes, big-endian).
+const SLOT_LIST: u32 = 0xd338_d583;
+const SLOT_ENTRY: u32 = 0x4140_5e39;
+const SLOT_NAME: u32 = 0xa275_6c5a;
+const SLOT_ITEM: u32 = 0x3b7c_3de0;
+const ITEM_APPEARANCE: u32 = 0xcdce_a5f5;
+const APPEARANCE_CRC: u32 = 0x1d77_5834;
+/// The slot names of the armor entries, in published look order: head, chest, hands, legs, feet
+/// (`nw_db::Character::published_look`).
+const LOOK_SLOT_NAMES: [&str; 5] = ["hat", "shirt", "gloves", "pants", "boots"];
+/// A published look slot that shows nothing: its entry is left out (Observed: an older retail
+/// published look without a `hat` entry).
+const NO_APPEARANCE: u32 = 0;
+/// The JSON key that starts the `visualsBlob` string, with its opening quote.
+const VISUALS_BLOB_START: &[u8] = b"\"visualsBlob\":\"";
 /// The race row name prefix.
 const RACE_PREFIX: &str = "face";
 /// The head and facial hair names end with this letter in both genders' lists.
@@ -126,11 +144,20 @@ pub fn saved_backstory(appearance: &serde_json::Value) -> Option<String> {
 const CURRENT_LEVEL_KEY: &[u8] = b"\"currentLevel\":";
 
 /// The character's `PublishedData` for the character select screen (character-select note): the
-/// stored creation settings with `currentLevel` set to `level`, in the same form (base64 of zlib
-/// data of the JSON). The screen draws the character from its `visualsBlob`; without it the
-/// character is a blank body. `None` when the settings are missing or have no level.
-pub fn published_data(appearance: &serde_json::Value, level: u32) -> Option<String> {
+/// stored creation settings with `currentLevel` set to `level` and, when the character has one,
+/// its worn armor `look` in place of the creation look ([`with_worn_look`]), in the same form
+/// (base64 of zlib data of the JSON). The screen draws the character from its `visualsBlob`;
+/// without it the character is a blank body. `None` when the settings are missing or have no
+/// level.
+pub fn published_data(
+    appearance: &serde_json::Value,
+    level: u32,
+    look: Option<&[u32]>,
+) -> Option<String> {
     let mut text = inflated(appearance.get(CREATION_PARAMS_KEY)?.as_str()?)?;
+    if let Some(worn) = look.and_then(|look| with_worn_look(&text, look)) {
+        text = worn;
+    }
     let start = text
         .windows(CURRENT_LEVEL_KEY.len())
         .position(|window| window == CURRENT_LEVEL_KEY)?
@@ -146,6 +173,98 @@ pub fn published_data(appearance: &serde_json::Value, level: u32) -> Option<Stri
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&text).ok()?;
     Some(BASE64.encode(&encoder.finish().ok()?))
+}
+
+/// The creation settings JSON `text` with its armor slot entries showing `look` (one CRC-32 per
+/// [`LOOK_SLOT_NAMES`] slot): each slot's appearance CRC is set, a slot of [`NO_APPEARANCE`] is
+/// left out, and a slot the settings lack takes the shape of their first entry. `None` when the
+/// look has another length, the blob does not read, or it has no slot list to follow.
+fn with_worn_look(text: &[u8], look: &[u32]) -> Option<Vec<u8>> {
+    if look.len() != LOOK_SLOT_NAMES.len() {
+        return None;
+    }
+    let start = text
+        .windows(VISUALS_BLOB_START.len())
+        .position(|window| window == VISUALS_BLOB_START)?
+        + VISUALS_BLOB_START.len();
+    let mut end = start;
+    while *text.get(end)? != b'"' {
+        end += if text[end] == b'\\' { 2 } else { 1 };
+    }
+    let quoted: String = text[start - 1..=end]
+        .iter()
+        .map(|byte| char::from(*byte))
+        .collect();
+    let blob: Vec<u8> = serde_json::from_str::<String>(&quoted)
+        .ok()?
+        .chars()
+        .map(|unit| u8::try_from(unit).ok())
+        .collect::<Option<_>>()?;
+    let mut root = parse_object_stream(&blob).ok()?;
+    let list = root
+        .children
+        .iter_mut()
+        .find(|child| child.name_crc == Some(SLOT_LIST))?;
+    let template = list
+        .children
+        .iter()
+        .find(|entry| entry.name_crc == Some(SLOT_ENTRY))?
+        .clone();
+    let mut entries = Vec::new();
+    for (name, crc) in LOOK_SLOT_NAMES.iter().zip(look) {
+        if *crc == NO_APPEARANCE {
+            continue;
+        }
+        let mut entry = list
+            .children
+            .iter()
+            .find(|entry| slot_name(entry) == Some(name.as_bytes()))
+            .unwrap_or(&template)
+            .clone();
+        child_mut(&mut entry, SLOT_NAME)?.value = name.as_bytes().to_vec();
+        let item = child_mut(&mut entry, SLOT_ITEM)?;
+        child_mut(child_mut(item, ITEM_APPEARANCE)?, APPEARANCE_CRC)?.value =
+            crc.to_be_bytes().to_vec();
+        entries.push(entry);
+    }
+    list.children
+        .retain(|child| child.name_crc != Some(SLOT_ENTRY));
+    list.children.extend(entries);
+    let mut written = text[..start].to_vec();
+    written.extend(escaped(&write_object_stream(&root).ok()?));
+    written.extend(&text[end..]);
+    Some(written)
+}
+
+/// The slot name of an armor slot entry.
+fn slot_name(entry: &Element) -> Option<&[u8]> {
+    entry
+        .children
+        .iter()
+        .find(|child| child.name_crc == Some(SLOT_NAME))
+        .map(|child| child.value.as_slice())
+}
+
+/// The child of `element` named `name_crc`.
+fn child_mut(element: &mut Element, name_crc: u32) -> Option<&mut Element> {
+    element
+        .children
+        .iter_mut()
+        .find(|child| child.name_crc == Some(name_crc))
+}
+
+/// ObjectStream bytes as the client writes them in a JSON string: byte by byte, with the bytes
+/// below [`ESCAPE_BELOW`], the quote and the backslash as `\u` escapes.
+fn escaped(blob: &[u8]) -> Vec<u8> {
+    let mut json = Vec::with_capacity(blob.len());
+    for byte in blob {
+        if *byte < ESCAPE_BELOW || *byte == b'"' || *byte == b'\\' {
+            json.extend(format!("\\u{byte:04x}").bytes());
+        } else {
+            json.push(*byte);
+        }
+    }
+    json
 }
 
 /// The JSON bytes of creation settings `params` (base64 of zlib data); its text is not UTF-8.
@@ -250,15 +369,14 @@ pub fn creation_params(children: &[(&str, Vec<u8>)]) -> Option<String> {
             .collect(),
         ..Element::default()
     };
-    let blob = write_object_stream(&root).ok()?;
+    params_of_root(&root)
+}
+
+/// Creation settings as the client writes them, with the ObjectStream `root`.
+fn params_of_root(root: &Element) -> Option<String> {
+    let blob = write_object_stream(root).ok()?;
     let mut json = br#"{"currency":0,"visualsBlob":""#.to_vec();
-    for byte in blob {
-        if byte < ESCAPE_BELOW || byte == b'"' || byte == b'\\' {
-            json.extend(format!("\\u{byte:04x}").bytes());
-        } else {
-            json.push(byte);
-        }
-    }
+    json.extend(escaped(&blob));
     json.extend(br#"","position":{"x":0.0,"y":0.0,"z":0.0},"currentLevel":0}"#);
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
     encoder.write_all(&json).ok()?;
@@ -306,13 +424,124 @@ pub(crate) mod tests {
     fn published_data_is_the_saved_settings_at_the_level() {
         const LEVEL: u32 = 1;
         let saved = saved_appearance();
-        let published = published_data(&saved, LEVEL).expect("published");
+        let published = published_data(&saved, LEVEL, None).expect("published");
         let text = published_text(&published);
         let level = br#""currentLevel":1}"#;
         assert!(text.ends_with(level), "the level is written in");
         let again = appearance(published);
         assert_eq!(saved_look(&again), saved_look(&saved), "the look stays");
-        assert_eq!(published_data(&serde_json::json!({}), LEVEL), None);
+        assert_eq!(published_data(&serde_json::json!({}), LEVEL, None), None);
+    }
+
+    /// The CRC-32 of `m_Archetype_Sellsword_gloves`, a creation look slot.
+    const CREATION_GLOVES: u32 = 0xc3d5_0a8f;
+    /// The CRC-32 of `m_DynastyWarriorHeavy_Chest`, a retail published chest.
+    const WORN_CHEST: u32 = 0x49ee_1aec;
+
+    /// An armor slot entry as the creation settings write it.
+    fn slot_entry(name: &str, crc: u32) -> Element {
+        Element::with_children(
+            SLOT_ENTRY,
+            vec![
+                Element::with_value(SLOT_NAME, name.as_bytes().to_vec()),
+                Element::with_children(
+                    SLOT_ITEM,
+                    vec![Element::with_children(
+                        ITEM_APPEARANCE,
+                        vec![Element::with_value(
+                            APPEARANCE_CRC,
+                            crc.to_be_bytes().to_vec(),
+                        )],
+                    )],
+                ),
+            ],
+        )
+    }
+
+    /// Saved settings of the live test character with a creation armor slot list.
+    fn saved_with_slots(slots: Vec<Element>) -> serde_json::Value {
+        let mut children: Vec<Element> = names(&MALE_NAMES)
+            .into_iter()
+            .map(|(name, value)| Element::with_value(lowercase_crc32(name), value))
+            .collect();
+        children.push(Element::with_children(SLOT_LIST, slots));
+        let root = Element {
+            children,
+            ..Element::default()
+        };
+        appearance(params_of_root(&root).expect("params"))
+    }
+
+    /// The armor slots of published data: (slot name, appearance CRC).
+    fn published_slots(published: String) -> Vec<(String, u32)> {
+        let root = saved_visuals(&appearance(published)).expect("visuals");
+        root.child(SLOT_LIST)
+            .expect("slot list")
+            .children_named(SLOT_ENTRY)
+            .map(|entry| {
+                let name = entry
+                    .child(SLOT_NAME)
+                    .expect("name")
+                    .as_string()
+                    .expect("text");
+                let crc = entry
+                    .child(SLOT_ITEM)
+                    .and_then(|item| item.child(ITEM_APPEARANCE))
+                    .and_then(|look| look.child(APPEARANCE_CRC))
+                    .expect("crc")
+                    .as_u32()
+                    .expect("u32");
+                (name.to_owned(), crc)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_published_data_shows_the_worn_armor_in_place_of_the_creation_look() {
+        let saved = saved_with_slots(vec![
+            slot_entry("gloves", CREATION_GLOVES),
+            slot_entry("shirt", CREATION_GLOVES),
+        ]);
+        let look = [
+            NO_APPEARANCE,
+            WORN_CHEST,
+            NO_APPEARANCE,
+            CREATION_GLOVES,
+            NO_APPEARANCE,
+        ];
+        let published = published_data(&saved, 1, Some(&look)).expect("published");
+        assert_eq!(
+            published_slots(published),
+            vec![
+                ("shirt".to_owned(), WORN_CHEST),
+                ("pants".to_owned(), CREATION_GLOVES)
+            ],
+            "the chest is set, the bare gloves slot is left out, the pants take an entry's shape"
+        );
+        let unchanged = published_data(&saved, 1, None).expect("published");
+        assert_eq!(
+            published_slots(unchanged),
+            vec![
+                ("gloves".to_owned(), CREATION_GLOVES),
+                ("shirt".to_owned(), CREATION_GLOVES)
+            ],
+            "without a saved look the creation look stays"
+        );
+        assert_eq!(
+            published_data(&saved, 1, Some(&look[..2])),
+            published_data(&saved, 1, None),
+            "a look of another length is not used"
+        );
+    }
+
+    #[test]
+    fn a_blob_without_a_slot_list_keeps_its_look() {
+        let saved = saved_appearance();
+        let look = [WORN_CHEST; LOOK_SLOT_NAMES.len()];
+        assert_eq!(
+            published_data(&saved, 1, Some(&look)),
+            published_data(&saved, 1, None)
+        );
     }
 
     #[test]
