@@ -509,12 +509,21 @@ The client has no menu or console command for its GM calls, so a game master typ
 | `!kick <player>` | Saves the player and closes its connection |
 | `!give <item id> <quantity> [player]` / `!take <item id> [player]` | Puts items in the bag, or takes every stack of one item |
 | `!quest <objective id> [player]` | Starts a quest |
+| `!queststate <objective id> [player]` | Says whether the quest runs (and each step it waits on), waits for its turn-in, is done, or was not taken (and why no NPC offers it) |
+| `!questplan <objective id> [player]` | Says what each waiting step of a running quest needs next, with its place (the plan the quest walk uses) |
+| `!state [player]` | Says the level, experience, coins, faction, PvP flag, bound inn, mount phase and quest counts |
 | `!tp <x> <y> <z> [player]` / `!tp <player>` | Teleports to a point, or the sender to a player |
 | `!spawn <vitals id> <level> <count>` | Spawns GM mobs around the sender (at most 50) |
 | `!despawn` | Removes every GM mob of the sim |
 | `!event <start\|stop> <event id>` / `!events` | Starts an event at the sender, stops one, or lists the running ones |
 
 Chat commands skip the admin site's audit log. The sim logs each line and its answer (`GM chat command`, `GM chat answer`).
+
+#### Quest walk and play bot
+
+`sim --config config/sim.toml quest-walk --report <file.md> [--only <id prefix>]` plays every quest of the sim's level with a test character in a world of its own (no database, no bus) and writes which quests end and, for each other one, the step it stops at and why. Talks, accepts, territory entries, topics, cinematics and turn-ins go through the client's calls; kills, gathers, crafts and catches go in as the server's game events, after a check that the level has the mob, the item source, the recipe or the place.
+
+`nw-testclient play --account <name> --backstory <Archetype_X> --quests <ids> --activities <kinds> --report <file.md>` runs one bot on running servers through the client's calls. Its account needs the `game_master` rank (`blighted-admin grant-rank`). It leaves the tutorial, plays the quests in the order their requirements allow (it plays the quest that gives a missing achievement first), and then the activities: `level`, `pvp`, `harvest`, `craft`, `inn`, `shrine`, `dungeon`, `board`, `mount` (after the mount quest), `group`, `music`. Each step waits for the server's proof. It gathers a quest object or a gatherable for a step's item, and fights the placed mobs when a step counts only one spawn group; else a game master line spawns the mobs or gives the item. The bot logs in with a password, so it needs an edge in `password` mode.
 
 `LIVE_STACK_INSTANCE=2 just live` starts a second test world next to the first. Every port moves up by 100 (the admin site is on 9280). The second world has its own world id, bot names and log folder (`local-data/logs/live-2/`).
 
