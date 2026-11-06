@@ -44,9 +44,11 @@ use crate::view::{CombatView, InteractionAnswer, WorldView};
 use crate::walk::{WalkSettings, login_token, walk};
 
 /// The game master lines after the tutorial's exit, before the first quest: the bot does not
-/// die, lives again when a mob killed it before (a dead player wakes no mob), and is at a high
-/// level.
-const SETUP_LINES: [&str; 3] = ["!god on", "!heal", "!level 60"];
+/// die, lives again when a mob killed it before (a dead player wakes no mob), is at the top
+/// level (the sim holds it to the game data's highest), and wears the best item of each kind at
+/// its top gear score, so its level and gear never limit a kill (a starter sword hit a level 34
+/// bear of 8,776 health for 42).
+const SETUP_LINES: [&str; 4] = ["!god on", "!heal", "!level 65", "!gearup"];
 /// The byte of the client's leave of the tutorial (0 in the capture).
 const LEAVE_FLAG: u8 = 0;
 /// Time a new character takes from the tutorial's leave into the open world (the leave, the
