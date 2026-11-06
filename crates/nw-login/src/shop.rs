@@ -61,9 +61,19 @@ const OFFER_TYPE: &str = "MTx";
 const PRODUCT_TYPE: &str = "PRODUCT";
 /// The metadata of a retail mount offer.
 const MOUNT_OFFER_METADATA: &str = r#"{"type":"Mount"}"#;
-/// The entitlement kind of a mount (retail `Durable`), and of the store currency (`Wallet`).
+/// The entitlement kind of a mount (retail `Durable`), of the store currency (`Wallet`) and of
+/// the transmog tokens (`Consumable`).
 const DURABLE: &str = "Durable";
 const WALLET: &str = "Wallet";
+const CONSUMABLE: &str = "Consumable";
+/// The transmog token entitlement (retail `unlock_store_content`: alias `Transmog_Token`, name
+/// `Transmog Token`). The inventory's token counter (`transmogtokenscontainer.luac`) shows a
+/// spinner until the list holds it (`GetEntitlementBalance` of the CRC of `transmog_token`).
+const TRANSMOG_TOKEN: &str = "Transmog_Token";
+const TRANSMOG_TOKEN_NAME: &str = "Transmog Token";
+/// The transmog tokens of every account. Inferred: this server grants none and charges none (a
+/// skin of the collection is applied for free, `bins/sim/src/world/transmog.rs`).
+const TRANSMOG_TOKENS_HELD: i64 = 0;
 /// The description of a retail mount offer: its name and this.
 const DURABLE_SUFFIX: &str = " Durable";
 /// When every offer and every entitlement held by all accounts starts: the expansion's store
@@ -211,13 +221,15 @@ const HIDDEN_SLOT_METADATA: &str = "null";
 /// The kind of a slot whose offers do not rotate (retail).
 const STATIC_SLOT: &str = "Static";
 
-/// `GET .../entitlements`: one page of the player's entitlements. Inferred: the last page leaves
-/// out `paginationToken` (no retail last page was captured); this server sends one page.
+/// `GET .../entitlements`: one page of the player's entitlements. This server sends one page: the
+/// last, whose `paginationToken` is `null` (retail `unlock_store_content`: 7 pages with a token,
+/// then the last with `null`).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Entitlements {
     has_more_results: bool,
     entitlements: Vec<HeldEntitlement>,
+    pagination_token: Option<String>,
 }
 
 /// One held entitlement (retail shape).
@@ -234,8 +246,8 @@ struct HeldEntitlement {
     external_items: [(); 0],
 }
 
-/// The amount of a held entitlement: its instances, or a wallet's balance (retail
-/// `freeAmount`, `paidAmount`, `pendingAmount`, `lossAmount`, `totalAmount`).
+/// The amount of a held entitlement: its instances, or the balance of a wallet or a consumable
+/// (retail `freeAmount`, `paidAmount`, `pendingAmount`, `lossAmount`, `totalAmount`).
 #[derive(Serialize)]
 #[serde(untagged)]
 enum HeldAmount {
@@ -245,9 +257,9 @@ enum HeldAmount {
         instance_ids: [Instance; 1],
         total_amount: u32,
     },
-    /// The wallet. Every Mark of this server is free (none is bought with money).
+    /// A balance. Everything of this server is free (nothing is bought with money).
     #[serde(rename_all = "camelCase")]
-    Wallet {
+    Balance {
         free_amount: i64,
         paid_amount: i64,
         pending_amount: i64,
@@ -286,23 +298,51 @@ impl HeldEntitlement {
 
     /// The store currency entry of `wallet`.
     fn wallet(wallet: Wallet) -> Self {
-        Self {
-            name: STORE_CURRENCY_NAME.to_owned(),
-            id: STORE_CURRENCY.to_owned(),
-            kind: WALLET,
-            alias: STORE_CURRENCY.to_owned(),
-            amount: HeldAmount::Wallet {
-                free_amount: wallet.marks,
-                paid_amount: 0,
-                pending_amount: 0,
-                loss_amount: 0,
-                total_amount: wallet.marks,
-            },
-            last_updated_date: if wallet.updated_at_ms > 0 {
+        Self::balance(
+            STORE_CURRENCY,
+            STORE_CURRENCY_NAME,
+            WALLET,
+            wallet.marks,
+            if wallet.updated_at_ms > 0 {
                 iso8601_millis(u64::try_from(wallet.updated_at_ms).unwrap_or_default())
             } else {
                 STORE_START.to_owned()
             },
+        )
+    }
+
+    /// The transmog token entry.
+    fn transmog_tokens() -> Self {
+        Self::balance(
+            TRANSMOG_TOKEN,
+            TRANSMOG_TOKEN_NAME,
+            CONSUMABLE,
+            TRANSMOG_TOKENS_HELD,
+            STORE_START.to_owned(),
+        )
+    }
+
+    /// The `kind` entry `alias`, named `name`, with `amount` free units, changed at `updated`.
+    fn balance(
+        alias: &str,
+        name: &str,
+        kind: &'static str,
+        amount: i64,
+        updated: String,
+    ) -> Self {
+        Self {
+            name: name.to_owned(),
+            id: alias.to_owned(),
+            kind,
+            alias: alias.to_owned(),
+            amount: HeldAmount::Balance {
+                free_amount: amount,
+                paid_amount: 0,
+                pending_amount: 0,
+                loss_amount: 0,
+                total_amount: amount,
+            },
+            last_updated_date: updated,
             external_items: [],
         }
     }
@@ -618,9 +658,13 @@ async fn entitlements<E: EntitlementStore>(
         axum::Json(Entitlements {
             has_more_results: false,
             entitlements: everyone
-                .chain(std::iter::once(HeldEntitlement::wallet(wallet)))
+                .chain([
+                    HeldEntitlement::wallet(wallet),
+                    HeldEntitlement::transmog_tokens(),
+                ])
                 .chain(bought)
                 .collect(),
+            pagination_token: None,
         }),
     )
         .into_response())
@@ -950,6 +994,21 @@ mod tests {
                             "externalItems": []
                         },
                         {
+                            "name": TRANSMOG_TOKEN_NAME,
+                            "id": TRANSMOG_TOKEN,
+                            "type": CONSUMABLE,
+                            "alias": TRANSMOG_TOKEN,
+                            "amount": {
+                                "freeAmount": TRANSMOG_TOKENS_HELD,
+                                "paidAmount": 0,
+                                "pendingAmount": 0,
+                                "lossAmount": 0,
+                                "totalAmount": TRANSMOG_TOKENS_HELD
+                            },
+                            "lastUpdatedDate": STORE_START,
+                            "externalItems": []
+                        },
+                        {
                             "name": "Ronin Bear Mount",
                             "id": BEAR,
                             "type": DURABLE,
@@ -964,7 +1023,8 @@ mod tests {
                             "lastUpdatedDate": "2026-11-04T12:32:26.000Z",
                             "externalItems": []
                         }
-                    ]
+                    ],
+                    "paginationToken": null
                 }),
                 "{persona}"
             );
@@ -972,8 +1032,8 @@ mod tests {
         let stranger = json(&format!("{}/entitlements", player("p"))).await;
         assert_eq!(
             stranger["entitlements"].as_array().map(Vec::len),
-            Some(2),
-            "the expansion and an empty wallet"
+            Some(3),
+            "the expansion, an empty wallet and the transmog tokens"
         );
         assert_eq!(stranger["entitlements"][1]["amount"]["totalAmount"], 0);
         let (status, _, body) =
