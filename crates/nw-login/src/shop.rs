@@ -18,6 +18,7 @@
 //! entitlement list of an account answers whoever names its id; it holds only store mounts.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Path, Request, State};
@@ -39,6 +40,15 @@ use crate::error::ApiError;
 use crate::store::EntitlementStore;
 
 /// The route prefix: the player's persona, the game alias and the platform.
+/// How long the catalog and store answers wait. Observed (client trace 2026-11-06, three opens
+/// of the change mount screen): the screen asks for the catalog while its script still loads on a
+/// loader thread and is active 20 to 32 ms later; the client's Lua bus hook (`FUN_141438d20`)
+/// skips a script context that is not active and owned by another thread, so an answer within
+/// 12 to 18 ms reached only the copies of other screens, and the screen spun until another
+/// screen asked again (the dye menu). Retail answers from Amazon's store service over the
+/// internet (the retail change mount screen listed its mounts some seconds after it opened,
+/// `shrines-maps-mount-edit-menu` video); one second is Inferred, well past the loading time.
+const CATALOG_REPLY_DELAY: Duration = Duration::from_secs(1);
 const PLAYER_GAME_PREFIX: &str = "/players/{persona}/games/new-world/platforms/{platform}";
 /// Currency and country of the prices. Inferred: retail answers in the player's own currency
 /// and country; this server has one region, `us-east`.
@@ -323,13 +333,7 @@ impl HeldEntitlement {
     }
 
     /// The `kind` entry `alias`, named `name`, with `amount` free units, changed at `updated`.
-    fn balance(
-        alias: &str,
-        name: &str,
-        kind: &'static str,
-        amount: i64,
-        updated: String,
-    ) -> Self {
+    fn balance(alias: &str, name: &str, kind: &'static str, amount: i64, updated: String) -> Self {
         Self {
             name: name.to_owned(),
             id: alias.to_owned(),
@@ -577,6 +581,7 @@ async fn catalog<E: EntitlementStore>(
     Path(path): Path<PlayerPath>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    tokio::time::sleep(CATALOG_REPLY_DELAY).await;
     let held = held_by(&shop, &path.persona).await?;
     let sold = if shop.settings.enabled {
         shop.table.mounts.as_slice()
@@ -604,6 +609,7 @@ async fn catalog<E: EntitlementStore>(
 }
 
 async fn stores(Path(path): Path<StorePath>, headers: HeaderMap) -> Response {
+    tokio::time::sleep(CATALOG_REPLY_DELAY).await;
     tagged_reply(&headers, |etag| Stores {
         currency_code: CURRENCY_CODE,
         stores: [Store {
@@ -789,7 +795,7 @@ mod tests {
         serde_json::from_slice(&body).expect("json")
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_catalog_offers_each_store_mount_for_free_and_counts_what_the_account_got() {
         let catalog = json(&format!(
             "{}/catalog?type=MTX",
@@ -828,7 +834,7 @@ mod tests {
         serde_json::from_slice(&body).expect("json")
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_store_that_is_not_free_charges_each_mount_its_price() {
         let catalog = catalog_of(ShopConfig {
             free: false,
@@ -860,7 +866,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_closed_store_offers_nothing_and_the_account_keeps_what_it_got() {
         let settings = ShopConfig {
             enabled: false,
@@ -880,7 +886,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_catalog_and_each_store_have_a_working_etag() {
         for (path, list) in [
             (format!("{}/catalog?type=MTX", player("p")), "offers"),
@@ -950,7 +956,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn the_entitlements_hold_the_expansion_and_what_the_account_got() {
         for persona in [
             ACCOUNT.to_string(),
@@ -1042,7 +1048,20 @@ mod tests {
         assert!(body.is_empty());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
+    async fn the_catalog_and_the_stores_answer_after_the_screen_loaded() {
+        for path in [
+            format!("{}/catalog?type=MTX", player("p")),
+            format!("{}/stores/Featured", player("p")),
+        ] {
+            let asked = tokio::time::Instant::now();
+            let (status, _, _) = send("GET", &path, None).await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(asked.elapsed() >= CATALOG_REPLY_DELAY, "{path}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn other_games_and_paths_are_not_served() {
         for path in [
             "/players/p/games/other-game/platforms/steam/catalog",
