@@ -103,6 +103,11 @@ impl Gatherables {
     pub fn get(&self, crc: u32) -> Option<&Gatherable> {
         self.by_crc.get(&crc)
     }
+
+    /// Every gatherable, in no order.
+    pub fn iter(&self) -> impl Iterator<Item = &Gatherable> {
+        self.by_crc.values()
+    }
 }
 
 /// What a gather of a gatherable asks of the gatherer besides its tool.
@@ -575,6 +580,13 @@ mod tests {
         // Retail flint request: crc `a417137f`.
         let flint = gatherables.get(0xa417_137f).cloned().expect("flint");
         assert_eq!(flint.id, "SingleStone");
+        assert_eq!(
+            gatherables
+                .iter()
+                .map(|gatherable| gatherable.id.as_str())
+                .collect::<Vec<_>>(),
+            ["SingleStone"]
+        );
         assert_eq!(ms_of(0.25), 250);
     }
 

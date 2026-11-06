@@ -156,6 +156,16 @@ impl ShopCatalog {
         self.offers.is_empty()
     }
 
+    /// Whether an offer gives item `item` (any case).
+    pub fn sells(&self, item: &str) -> bool {
+        self.offers.values().any(|offer| {
+            offer
+                .item
+                .as_ref()
+                .is_some_and(|(given, _)| given.eq_ignore_ascii_case(item))
+        })
+    }
+
     /// The offer whose lowercase `ConversionID` has the CRC-32 `crc`.
     pub fn by_crc(&self, crc: u32) -> Option<&ShopOffer> {
         self.offers.get(&crc)
@@ -242,6 +252,14 @@ mod tests {
     fn the_retail_rows_become_offers_by_their_crc() {
         let rows = retail_rows();
         let catalog = ShopCatalog::of(&rows);
+        assert!(
+            catalog.sells("potioncleanseftw"),
+            "an offer's item, any case"
+        );
+        assert!(
+            !catalog.sells("AwardAchievement_Mount_Horse_2"),
+            "an achievement is no item"
+        );
         assert_eq!(catalog.len(), 4);
         let horse = catalog.by_crc(0x87c0_53c5).expect("the stable's horse");
         assert_eq!(horse.coins, 1_000_000);

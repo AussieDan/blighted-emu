@@ -53,6 +53,18 @@ impl PoiTags {
     pub fn of(&self, territory: u32) -> &[String] {
         self.by_territory.get(&territory).map_or(&[], Vec::as_slice)
     }
+
+    /// The territories that carry tag `tag` (any case), in id order.
+    pub fn territories_with(&self, tag: &str) -> Vec<u32> {
+        let mut territories: Vec<u32> = self
+            .by_territory
+            .iter()
+            .filter(|(_, tags)| tags.iter().any(|known| known.eq_ignore_ascii_case(tag)))
+            .map(|(territory, _)| *territory)
+            .collect();
+        territories.sort_unstable();
+        territories
+    }
 }
 
 #[cfg(test)]
@@ -74,5 +86,10 @@ mod tests {
         assert_eq!(tags.of(SHRINE), ["spiritshrine_20312", "fasttravel"]);
         assert!(tags.of(1).is_empty());
         assert!(tags.of(2).is_empty());
+        assert_eq!(tags.territories_with("FastTravel"), [SHRINE]);
+        assert!(
+            tags.territories_with("other").is_empty(),
+            "the first row of an id wins"
+        );
     }
 }

@@ -18,6 +18,7 @@ pub mod mobs;
 pub mod objectives;
 pub mod placed_points;
 pub mod player_content;
+pub mod quest_walk;
 pub mod run;
 pub mod saves;
 pub mod server;

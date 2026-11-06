@@ -80,7 +80,9 @@ pub fn parse_chart(bytes: &[u8]) -> Result<Vec<ChartNote>, MusicChartError> {
         .map(u32::from_le_bytes)
         .and_then(|count| usize::try_from(count).ok())
         .ok_or_else(size)?;
-    if count.checked_mul(NOTE_LEN).and_then(|notes| notes.checked_add(HEADER_LEN))
+    if count
+        .checked_mul(NOTE_LEN)
+        .and_then(|notes| notes.checked_add(HEADER_LEN))
         != Some(bytes.len())
     {
         return Err(size());

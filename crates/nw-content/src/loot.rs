@@ -630,6 +630,49 @@ impl LootTables {
         self.tables.contains_key(id)
     }
 
+    /// Whether a table or a bucket names item `item` (any case) as a drop.
+    pub fn drops_item(&self, item: &str) -> bool {
+        self.tables
+            .values()
+            .flat_map(|table| &table.entries)
+            .map(|entry| entry.item.as_str())
+            .chain(
+                self.buckets
+                    .values()
+                    .flatten()
+                    .map(|entry| entry.item.as_str()),
+            )
+            .any(|dropped| dropped.eq_ignore_ascii_case(item))
+    }
+
+    /// Whether table `table` can drop item `item` (any case): one of its entries, or of a
+    /// table or bucket it names, is the item.
+    pub fn table_drops(&self, table: &str, item: &str) -> bool {
+        self.drops_within(table, item, 0)
+    }
+
+    fn drops_within(&self, table: &str, item: &str, depth: u8) -> bool {
+        if depth > MAX_DEPTH {
+            return false;
+        }
+        let Some(rows) = self.tables.get(table) else {
+            return false;
+        };
+        rows.entries.iter().any(|entry| {
+            if let Some(inner) = entry.item.strip_prefix(TABLE_PREFIX) {
+                self.drops_within(inner, item, depth + 1)
+            } else if let Some(bucket) = entry.item.strip_prefix(BUCKET_PREFIX) {
+                self.buckets.get(bucket).is_some_and(|entries| {
+                    entries
+                        .iter()
+                        .any(|entry| entry.item.eq_ignore_ascii_case(item))
+                })
+            } else {
+                entry.item.eq_ignore_ascii_case(item)
+            }
+        })
+    }
+
     /// What loot table `table` drops in `context` and the limit visits it counts, with
     /// `below(n)` a random number below `n`.
     pub fn roll(
@@ -1131,6 +1174,29 @@ mod tests {
             .iter()
             .map(|item| ((*item).to_owned(), DropGearScore::default()))
             .collect()
+    }
+
+    #[test]
+    fn a_table_drops_the_items_of_the_tables_and_buckets_it_names() {
+        let mut rows = single("Outer", "[LTID]Inner", "AND", None);
+        rows.extend(single("Inner", "[LBID]Gems", "AND", None));
+        rows.extend(single("Other", "IronOreT1", "AND", None));
+        let tables = LootTables::build(LootSource {
+            rows,
+            bucket_items: vec![bucket_item("Gems", "AmberT1", "", false)],
+        });
+        assert!(
+            tables.table_drops("Outer", "ambert1"),
+            "through a table and a bucket"
+        );
+        assert!(
+            !tables.table_drops("Outer", "IronOreT1"),
+            "another table's item"
+        );
+        assert!(!tables.table_drops("Missing", "AmberT1"));
+        assert!(tables.drops_item("IRONORET1"));
+        assert!(tables.drops_item("AmberT1"), "a bucket's item");
+        assert!(!tables.drops_item("GoldOreT1"));
     }
 
     #[test]

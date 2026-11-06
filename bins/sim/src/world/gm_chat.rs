@@ -36,6 +36,18 @@ const NOT_HERE: &str = "That player is not on this server.";
 const UNKNOWN: &str = "Unknown command. Type !help for the list.";
 /// The answer when no event runs.
 const NO_EVENTS: &str = "No events are running.";
+/// The first word of each `!queststate` line.
+const QUEST_RUNNING: &str = "running";
+const QUEST_FINISHED: &str = "finished";
+const QUEST_DONE: &str = "done";
+const QUEST_NOT_TAKEN: &str = "not taken";
+const QUEST_STEP: &str = "step";
+/// The words of the `!state` line.
+const STATE_LINE: &str = "state";
+const STATE_ON: &str = "on";
+const STATE_PENDING: &str = "pending";
+const STATE_OFF: &str = "off";
+const STATE_NONE: &str = "none";
 
 /// One command word: its usage line and its reader of the words after it.
 struct Verb {
@@ -45,7 +57,7 @@ struct Verb {
 }
 
 /// Every command, in the order of `!help`.
-const VERBS: [Verb; 19] = [
+const VERBS: [Verb; 22] = [
     Verb {
         name: "help",
         usage: "!help",
@@ -205,6 +217,33 @@ const VERBS: [Verb; 19] = [
         },
     },
     Verb {
+        name: "queststate",
+        usage: "!queststate <objective id> [player]",
+        read: |words| {
+            let (words, target) = target(words, 1)?;
+            Some(Command::QuestState {
+                target,
+                objective: words[0].to_owned(),
+            })
+        },
+    },
+    Verb {
+        name: "questplan",
+        usage: "!questplan <objective id> [player]",
+        read: |words| {
+            let (words, target) = target(words, 1)?;
+            Some(Command::QuestPlan {
+                target,
+                objective: words[0].to_owned(),
+            })
+        },
+    },
+    Verb {
+        name: "state",
+        usage: "!state [player]",
+        read: |words| target(words, 0).map(|(_, target)| Command::State { target }),
+    },
+    Verb {
         name: "tp",
         usage: "!tp <x> <y> <z> [player] | !tp <player>",
         read: |words| match words {
@@ -302,6 +341,17 @@ enum Command {
         event: String,
     },
     Events,
+    QuestState {
+        target: Target,
+        objective: String,
+    },
+    QuestPlan {
+        target: Target,
+        objective: String,
+    },
+    State {
+        target: Target,
+    },
 }
 
 /// A command that changes one player: an admin action of that player.
@@ -409,6 +459,138 @@ pub enum GmChat {
 enum Outcome {
     Lines(Vec<String>),
     Kick(u64),
+}
+
+impl SimWorld {
+    /// The `!state` line of player `number`: its level (as the client shows it), experience,
+    /// coins, faction, PvP flag, bound inn, mount phase and quest counts.
+    fn state_line(&mut self, number: u64) -> String {
+        let running = self.quests_of_player(number).len();
+        let Some(player) = self
+            .player_by_number(number)
+            .and_then(|entity| self.world.get::<Player>(entity))
+        else {
+            return NOT_HERE.to_owned();
+        };
+        let pvp = match (player.pvp_flagged, player.pvp_wait.is_pending()) {
+            (true, _) => STATE_ON,
+            (false, true) => STATE_PENDING,
+            (false, false) => STATE_OFF,
+        };
+        format!(
+            "{STATE_LINE} level {} xp {} coins {} faction {} pvp {pvp} inn {} mount {} quests {running} done {}",
+            self.content
+                .progression
+                .level_of(player.experience)
+                .saturating_add(1),
+            player.experience,
+            player.coins,
+            player.faction.faction,
+            player
+                .travel
+                .bound_inn()
+                .map_or_else(|| STATE_NONE.to_owned(), |inn| format!("{inn:016x}")),
+            player.mount.phase_word(),
+            player.done_quests.len()
+        )
+    }
+
+    /// Why no NPC would offer quest `objective` to player `number`: its requirement or its
+    /// faction; `None` when one would.
+    fn offer_refusal(&mut self, number: u64, objective: &str) -> Option<String> {
+        let def = self.content.quests.quest(objective)?;
+        let entity = self.player_by_number(number)?;
+        let player = self.world.get::<Player>(entity)?;
+        let rules = &self.achievement_rules;
+        if let Some(requirement) = def.requirement.as_deref()
+            && !crate::player_content::requirement_met(requirement, |id| {
+                player.flow.has_achievement(rules, id)
+            })
+        {
+            let missing: Vec<String> = super::quest_walk::expression_names(requirement)
+                .into_iter()
+                .filter(|(name, negated)| !negated && !player.flow.has_achievement(rules, name))
+                .map(|(name, _)| name)
+                .collect();
+            let sources: Vec<String> = missing
+                .iter()
+                .filter_map(|name| {
+                    self.walk_achievement_source(&self.content.quest_guide, name)
+                        .map(|source| format!("{name} from {source}"))
+                })
+                .collect();
+            return Some(if sources.is_empty() {
+                format!("its requirement {requirement} is not met")
+            } else {
+                format!(
+                    "its requirement {requirement} is not met ({})",
+                    sources.join(", ")
+                )
+            });
+        }
+        let faction = player.faction.faction;
+        (!nw_content::factions::faction_requirement_met(def.required_faction.as_deref(), faction))
+            .then(|| {
+                format!(
+                    "its faction requirement {} is not met",
+                    def.required_faction.as_deref().unwrap_or_default()
+                )
+            })
+    }
+
+    /// The `!queststate` answer of player `number` for quest `objective`: whether it runs (and
+    /// each step it waits on, with its progress and what it waits for), waits for its turn-in,
+    /// is done, or was not taken.
+    fn quest_state_lines(&mut self, number: u64, objective: &str) -> Vec<String> {
+        if let Some(quest) = self
+            .quests_of_player(number)
+            .iter()
+            .find(|quest| quest.def.id.eq_ignore_ascii_case(objective))
+        {
+            let mut lines = vec![if quest.run.finished() {
+                format!(
+                    "{QUEST_FINISHED} {}: waits for its turn-in{}",
+                    quest.def.id,
+                    quest
+                        .def
+                        .turn_in
+                        .as_deref()
+                        .map(|npc| format!(" at {npc}"))
+                        .unwrap_or_default()
+                )
+            } else {
+                format!("{QUEST_RUNNING} {}", quest.def.id)
+            }];
+            lines.extend(
+                quest
+                    .run
+                    .waiting_steps()
+                    .into_iter()
+                    .map(|(task, kind, progress)| {
+                        format!("{QUEST_STEP} {task} {progress} {kind:?}")
+                    }),
+            );
+            return lines;
+        }
+        let done = self
+            .player_by_number(number)
+            .and_then(|entity| self.world.get::<Player>(entity))
+            .is_some_and(|player| {
+                player
+                    .done_quests
+                    .iter()
+                    .any(|done| done.eq_ignore_ascii_case(objective))
+            });
+        if done {
+            return vec![format!("{QUEST_DONE} {objective}")];
+        }
+        vec![format!(
+            "{QUEST_NOT_TAKEN} {objective}{}",
+            self.offer_refusal(number, objective)
+                .map(|why| format!(": {why}"))
+                .unwrap_or_default()
+        )]
+    }
 }
 
 impl SimWorld {
@@ -559,6 +741,18 @@ impl SimWorld {
                 self.answer_of(&AdminAction::StopEvent { event }, now_ms)
             }
             Command::Events => self.answer_of(&AdminAction::ListEvents, now_ms),
+            Command::QuestState { target, objective } => match self.gm_target(&target, number) {
+                Some(entity) => self.quest_state_lines(entity, &objective),
+                None => vec![NOT_HERE.to_owned()],
+            },
+            Command::State { target } => match self.gm_target(&target, number) {
+                Some(entity) => vec![self.state_line(entity)],
+                None => vec![NOT_HERE.to_owned()],
+            },
+            Command::QuestPlan { target, objective } => match self.gm_target(&target, number) {
+                Some(entity) => self.quest_plan_lines(entity, &objective),
+                None => vec![NOT_HERE.to_owned()],
+            },
         };
         Outcome::Lines(lines)
     }
@@ -830,6 +1024,89 @@ mod tests {
         assert_eq!(chat(&mut world, GM, "!heal Nobody"), Some(GmChat::Answered));
         let lines = answers(&mut world, GM);
         assert_eq!(lines[0].body, NOT_HERE);
+    }
+
+    #[test]
+    fn queststate_names_a_quest_not_taken_then_its_waiting_step() {
+        use crate::objectives::{TaskBook, TaskRow};
+        use crate::player_content::{ObjectiveRow, QuestBook};
+        const QUEST: &str = "q_state";
+        let mut world = world();
+        world.content = Arc::new(PlayerContent {
+            quests: QuestBook::build(
+                [
+                    ObjectiveRow {
+                        id: QUEST.to_owned(),
+                        root: "s_root".to_owned(),
+                        ..ObjectiveRow::default()
+                    },
+                    ObjectiveRow {
+                        id: "q_later".to_owned(),
+                        root: "s_root".to_owned(),
+                        requirement: Some("S_state_done".to_owned()),
+                        ..ObjectiveRow::default()
+                    },
+                ],
+                TaskBook::new(vec![
+                    TaskRow {
+                        task_id: "s_root".to_owned(),
+                        kind: "ConsecutiveTaskContainer".to_owned(),
+                        sub_tasks: vec!["s_emote".to_owned()],
+                        ..TaskRow::default()
+                    },
+                    TaskRow {
+                        task_id: "s_emote".to_owned(),
+                        kind: "TaskPerformEmote".to_owned(),
+                        ..TaskRow::default()
+                    },
+                ]),
+            ),
+            quest_guide: crate::world::QuestGuide {
+                achievement_sources: std::collections::HashMap::from([(
+                    "s_state_done".to_owned(),
+                    "the end of quest q_state".to_owned(),
+                )]),
+                ..crate::world::QuestGuide::default()
+            },
+            ..PlayerContent::default()
+        });
+        chat(&mut world, GM, "!queststate q_state");
+        assert_eq!(answers(&mut world, GM)[0].body, "not taken q_state");
+        chat(&mut world, GM, "!queststate q_later");
+        assert_eq!(
+            answers(&mut world, GM)[0].body,
+            "not taken q_later: its requirement S_state_done is not met (S_state_done from the end of quest q_state)"
+        );
+        world.start_quest(GM, QUEST, NOW).expect("start");
+        chat(&mut world, GM, "!queststate Q_STATE");
+        let lines: Vec<String> = answers(&mut world, GM)
+            .into_iter()
+            .map(|line| line.body)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "running q_state".to_owned(),
+                "step s_emote 0 NotRun(\"TaskPerformEmote\")".to_owned()
+            ]
+        );
+        chat(&mut world, GM, "!questplan q_state");
+        assert_eq!(
+            answers(&mut world, GM)[0].body,
+            "plan s_emote stop Broken: the server does not run step kind TaskPerformEmote"
+        );
+        chat(&mut world, GM, "!questplan q_other");
+        assert_eq!(answers(&mut world, GM)[0].body, "not running q_other");
+    }
+
+    #[test]
+    fn state_names_the_level_coins_flag_inn_and_mount() {
+        let mut world = world();
+        chat(&mut world, GM, "!state");
+        assert_eq!(
+            answers(&mut world, GM)[0].body,
+            "state level 1 xp 0 coins 0 faction 0 pvp off inn none mount foot quests 0 done 0"
+        );
     }
 
     #[test]

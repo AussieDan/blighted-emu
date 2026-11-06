@@ -163,6 +163,15 @@ pub(super) struct PlayerMount {
 }
 
 impl PlayerMount {
+    /// The mount phase in one word: `foot`, `summoning` or `riding`.
+    pub(super) const fn phase_word(&self) -> &'static str {
+        match self.phase {
+            Phase::Idle => "foot",
+            Phase::Summoning { .. } => "summoning",
+            Phase::Mounted { .. } => "riding",
+        }
+    }
+
     /// The mounts a join or a handoff carries, at `now_ms` (sim ms) and server time `server_ms`:
     /// on foot, unless the handoff carries a ride; a summon cooldown that runs goes on, and one
     /// that is over is 0 ([`Self::clear_ended_cooldown`]).

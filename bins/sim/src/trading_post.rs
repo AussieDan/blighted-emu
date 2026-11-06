@@ -27,7 +27,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::config::SimConfigError;
-use crate::travel_rules::capital_id;
+use nw_world::capitals::capital_id;
 
 /// Nanoseconds per millisecond: contract times are Unix nanoseconds.
 const NS_PER_MS: u64 = 1_000_000;

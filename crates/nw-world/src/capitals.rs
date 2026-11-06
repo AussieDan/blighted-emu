@@ -7,6 +7,17 @@ use serde::Deserialize;
 use crate::height::TerrainCookie;
 use crate::records::Capital;
 
+/// The tag of a capital's entity id: its low 3 bits (GDE id note, section 3).
+const CAPITAL_TAG: u64 = 3;
+/// The bit a capital's id clears before its tag.
+const CAPITAL_CLEARED_BIT: u64 = 4;
+/// Hex digits of one half of a capital's GUID.
+const GUID_HALF_DIGITS: usize = 16;
+/// Radix of a GUID's digits.
+const HEX_RADIX: u32 = 16;
+/// The GUID separator.
+const GUID_SEPARATOR: char = '-';
+
 /// The capitals of one file and the terrain cookies among them.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct CapitalsRead {
@@ -103,9 +114,32 @@ pub fn parse_capitals_and_cookies(bytes: &[u8]) -> Result<CapitalsRead, serde_js
     Ok(read)
 }
 
+/// The entity id of the capital of GUID text `guid`: `(hi ^ lo) & !4 | 3`, the halves read
+/// big-endian (GDE id note, section 3; all 7,584 tag-3 ids of the captures).
+pub fn capital_id(guid: &str) -> Option<u64> {
+    let digits: String = guid.chars().filter(|c| *c != GUID_SEPARATOR).collect();
+    if digits.len() != 2 * GUID_HALF_DIGITS {
+        return None;
+    }
+    let (high, low) = digits.split_at(GUID_HALF_DIGITS);
+    let high = u64::from_str_radix(high, HEX_RADIX).ok()?;
+    let low = u64::from_str_radix(low, HEX_RADIX).ok()?;
+    Some((high ^ low) & !CAPITAL_CLEARED_BIT | CAPITAL_TAG)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_capital_id_is_the_xor_of_its_guid_halves_tagged_3() {
+        // The start beach watchtower (newchar 2026-09-18).
+        assert_eq!(
+            capital_id("f6593b66-abc3-7460-7a4d-5afaeb8b2620"),
+            Some(0x8c14_619c_4048_5243)
+        );
+        assert_eq!(capital_id("not-a-guid"), None);
+    }
 
     const FULL: &str = r#"{"Capitals": [{
         "id": "79091f06-f24f-466f-2641-f8743605f9b7",

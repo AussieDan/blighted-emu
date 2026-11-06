@@ -118,6 +118,15 @@ impl InteractTags {
             .map_or(&[], Vec::as_slice)
     }
 
+    /// Whether an object or a gatherable variant of the level carries tag `tag` (any case).
+    pub fn knows(&self, tag: &str) -> bool {
+        self.by_key
+            .values()
+            .chain(self.by_gatherable.values())
+            .flatten()
+            .any(|known| known.eq_ignore_ascii_case(tag))
+    }
+
     /// The interact tags of the object with facet entity `facet`; empty for an object with none.
     pub fn of(&self, facet: u64) -> &[String] {
         self.by_key
@@ -151,6 +160,8 @@ mod tests {
         assert_eq!(tags.of(SETTLEMENT_FACET), ["SettlementStorage"]);
         assert_eq!(tags.of(JOURNAL_ID), ["IO_99B_MSQ_02_GalahadJournal"]);
         assert!(tags.of(1).is_empty());
+        assert!(tags.knows("settlementstorage"), "an object's tag, any case");
+        assert!(!tags.knows("NoSuchTag"));
     }
 
     #[test]
@@ -169,6 +180,7 @@ mod tests {
         )
         .with_gatherables([(lowercase_crc32(CROWN), CROWN_TAG.to_owned())]);
         let crown = Some(lowercase_crc32(CROWN));
+        assert!(tags.knows(CROWN_TAG), "a gatherable variant's tag");
         assert_eq!(tags.of_interaction(REGION_POINT_FACET, crown), [CROWN_TAG]);
         assert!(tags.of_interaction(REGION_POINT_FACET, None).is_empty());
         assert_eq!(

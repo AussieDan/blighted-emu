@@ -102,6 +102,7 @@ mod progression;
 mod projectile;
 mod quest_objects;
 mod quest_tracker;
+mod quest_walk;
 mod quick_course;
 mod repair;
 mod replica;
@@ -140,6 +141,8 @@ use members::{
 };
 use mob_timeline::{Animations, MobPose, MobTimelines, TreeEntry, TreePose, animations_of};
 use quest_tracker::{JournalRecord, QuestTracker, instance_of};
+pub use quest_walk::QuestGuide;
+pub(crate) use quest_walk::{Outcome, QuestWalk};
 use replica::{RemoteCandidate, Replica, ReplicaSource};
 use slots::Slots;
 use stamina::Stamina;

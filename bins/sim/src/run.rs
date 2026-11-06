@@ -10,7 +10,6 @@ use nw_ai::AiData;
 use nw_bus::{Bus, BusError};
 use nw_common::config::ConfigError;
 use nw_common::logging::{LoggingError, init_logging};
-use nw_content::music_charts::MusicCharts;
 use nw_content::ContentBundle;
 use nw_content::bundle::bundle_path;
 use nw_content::client_build::load_client_build;
@@ -21,6 +20,7 @@ use nw_content::datatable_overrides::{self, DatatableOverrideError};
 use nw_content::ftue_entities::FtueLevel;
 use nw_content::gameplay_config::GameplayConfig;
 use nw_content::mob_prefabs::MobPrefabs;
+use nw_content::music_charts::MusicCharts;
 use nw_content::player_abilities::PlayerAbilities;
 use nw_content::player_attacks::PlayerAttacks;
 use nw_content::player_sequences::PlayerSequences;
@@ -39,9 +39,10 @@ use nw_world::water::{WaterMap, water_file_path};
 use nw_world::world_file::world_file_path;
 
 use crate::asset_solids::AssetSolids;
+use crate::combat::CombatSettings;
 use crate::config::{SimConfig, SimConfigError, SimRole, load_sim_config};
 use crate::gameplay::{GameplayError, load_gameplay, load_shop};
-use crate::mob_ai::{LookAssets, MobAi, SliceVitals, resolve_ai};
+use crate::mob_ai::{LookAssets, MobAi, SliceVitals, SpawnAi, resolve_ai};
 use crate::mobs::{SpawnFilter, sim_spawns, spawns_of_level};
 use crate::player_content::{MobLooks, PlayerContent};
 use crate::server::{
@@ -49,6 +50,7 @@ use crate::server::{
     METRIC_SNAPSHOT_SECONDS, METRIC_TICK_PART_SECONDS, METRIC_TICK_SECONDS, ServeError,
     serve as serve_loop,
 };
+use crate::world::WorldSettings;
 
 /// Failure while starting or running `sim`.
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +85,15 @@ pub enum RunError {
     /// Logging could not start.
     #[error(transparent)]
     Logging(#[from] LoggingError),
+    /// The quest walk report cannot be written.
+    #[error("quest walk report: {0}")]
+    Report(#[source] std::io::Error),
+    /// The quest walk's bus id is not valid.
+    #[error("quest walk id: {0}")]
+    WalkId(#[source] nw_bus::BusIdError),
+    /// The world ids cannot be made.
+    #[error("world ids: {0}")]
+    WorldIds(#[source] getrandom::Error),
     /// The async runtime could not start.
     #[error("runtime failed")]
     Runtime(#[source] std::io::Error),
@@ -116,6 +127,36 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
         global: secret(&config.global_database_password_env)?,
     };
     init_logging(&config.log_filter)?;
+    let level = load_level(&config)?;
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(RunError::Runtime)?
+        .block_on(serve_async(config, passwords, level))
+}
+
+/// The data of the level a sim serves, read once at its start.
+pub struct LoadedLevel {
+    /// The ground: terrain, collision, water and roads.
+    pub ground: Arc<LevelGround<Arc<WorldFile>>>,
+    /// The combat rows of the configured mobs and the player attack tables.
+    pub combat: Arc<CombatData>,
+    /// The player content: kits, quests, items, places and rewards.
+    pub content: Arc<PlayerContent>,
+    /// The scripts and events of the level.
+    pub design: LevelDesign,
+    /// The mob AI data.
+    pub mob_ai: Arc<MobAi>,
+}
+
+/// Reads the world file, the level collision, the content bundle and the side tables of the
+/// level of `config`.
+///
+/// # Errors
+///
+/// Returns [`RunError`] when the client build file, the world file, the collision file, the
+/// gameplay values, the bundle or a combat row is missing or not valid.
+pub fn load_level(config: &SimConfig) -> Result<LoadedLevel, RunError> {
     let build = load_client_build(&config.client_build_config).map_err(RunError::ClientBuild)?;
     let path = world_file_path(&config.content_dir, &build, &config.level);
     let world_file = Arc::new(WorldFile::load(&path, &build)?);
@@ -363,6 +404,7 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
         "tutorial asset entities with solids"
     );
     content.quest_volumes = quest_volumes;
+    content.quest_guide = crate::quest_walk::quest_guide(&world_file, &bundle.tables, &content);
     tracing::info!(volumes = content.quest_volumes.len(), "level quest volumes");
     let content = Arc::new(content);
     tracing::info!(
@@ -393,20 +435,13 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
         events = design.events.len(),
         "design scripts and events"
     );
-    drop(bundle);
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .map_err(RunError::Runtime)?
-        .block_on(serve_async(
-            config,
-            passwords,
-            Arc::new(ground),
-            combat,
-            content,
-            design,
-            Arc::new(mob_ai),
-        ))
+    Ok(LoadedLevel {
+        ground: Arc::new(ground),
+        combat,
+        content,
+        design,
+        mob_ai: Arc::new(mob_ai),
+    })
 }
 
 /// Logs the gameplay values: those the sim applies, and those kept for systems it does not
@@ -450,14 +485,47 @@ fn secret(name: &str) -> Result<String, RunError> {
         .ok_or_else(|| RunError::MissingSecret(name.to_owned()))
 }
 
+/// The world settings, the combat settings and the design AI of the spawns of a sim.
+pub type WorldParts = (WorldSettings, CombatSettings, Arc<[Option<SpawnAi>]>);
+
+/// The world settings and the mobs of the sim of `config` on `level`: the level's spawns that
+/// its role runs, with their design AI.
+///
+/// # Errors
+///
+/// Returns [`RunError`] when the world settings of `config` are not valid.
+pub fn world_parts(config: &SimConfig, level: &LoadedLevel) -> Result<WorldParts, RunError> {
+    let world_file = level.ground.terrain();
+    let level_spawns = spawns_of_level(&config.level, &world_file.vitals);
+    let (spawns, spawn_ai) = sim_spawns(
+        &level_spawns,
+        &resolve_ai(world_file, &level.mob_ai),
+        SpawnFilter {
+            scripted: config.role == SimRole::Instance
+                && level.content.dungeon_scripts.has_level(&config.level),
+            open_map: config.role == SimRole::OpenMap,
+            kill_types: &level.content.kill_types,
+        },
+    );
+    tracing::info!(
+        spawns = spawns.len(),
+        left_out = level_spawns.len() - spawns.len(),
+        "mob spawns; the encounter spawns the open map does not run are left out"
+    );
+    let world = config.world_settings(
+        level_bounds(&world_file.level),
+        world_file.level.ocean_level,
+        &level.content.instances,
+    )?;
+    let combat =
+        config.combat_settings(Arc::clone(&level.combat), spawns, Arc::clone(&level.mob_ai));
+    Ok((world, combat, spawn_ai))
+}
+
 async fn serve_async(
     config: SimConfig,
     passwords: DatabasePasswords,
-    ground: Arc<LevelGround<Arc<WorldFile>>>,
-    combat: Arc<CombatData>,
-    content: Arc<PlayerContent>,
-    design: LevelDesign,
-    mob_ai: Arc<MobAi>,
+    level: LoadedLevel,
 ) -> Result<(), RunError> {
     let db = nw_db::connect(&config.world_database, &passwords.world)
         .await
@@ -494,43 +562,23 @@ async fn serve_async(
         })
         .and_then(PrometheusBuilder::install)
         .map_err(|error| RunError::Metrics(error.to_string()))?;
-    let world_file = ground.terrain();
     tracing::info!(sim = %config.sim_id, world = %config.world_id, level = %config.level, "serving");
-    let level_spawns = spawns_of_level(&config.level, &world_file.vitals);
-    let (spawns, spawn_ai) = sim_spawns(
-        &level_spawns,
-        &resolve_ai(world_file, &mob_ai),
-        SpawnFilter {
-            scripted: config.role == SimRole::Instance
-                && content.dungeon_scripts.has_level(&config.level),
-            open_map: config.role == SimRole::OpenMap,
-            kill_types: &content.kill_types,
-        },
-    );
-    tracing::info!(
-        spawns = spawns.len(),
-        left_out = level_spawns.len() - spawns.len(),
-        "mob spawns; the encounter spawns the open map does not run are left out"
-    );
+    let (world, combat, spawn_ai) = world_parts(&config, &level)?;
     let settings = LoopSettings {
         sim_id: config.sim_id.clone(),
         world_id: config.world_id,
         level: config.level.clone(),
-        world: config.world_settings(
-            level_bounds(&world_file.level),
-            world_file.level.ocean_level,
-            &content.instances,
-        )?,
+        world,
         handoff_timeout: std::time::Duration::from_millis(config.handoff_timeout_ms),
         forward_ttl_ms: config.forward_ttl_ms,
         save_interval: std::time::Duration::from_millis(config.save_interval_ms),
         heartbeat_interval: std::time::Duration::from_millis(config.heartbeat_interval_ms),
         heartbeat_misses: config.heartbeat_misses,
         mob_ai: spawn_ai,
-        combat: config.combat_settings(combat, spawns, mob_ai),
-        design: Arc::new(design),
+        combat,
+        design: Arc::new(level.design),
         leaderboard_calendar: config.leaderboard_calendar()?,
-        content,
+        content: level.content,
         snapshot_interval: (config.admin.snapshot_interval_ms != 0)
             .then(|| std::time::Duration::from_millis(config.admin.snapshot_interval_ms)),
     };
@@ -539,5 +587,5 @@ async fn serve_async(
         let _ = nw_common::shutdown::stop_signal().await;
     };
     let databases = Databases { world: db, global };
-    Ok(serve_loop(settings, ground, bus, databases, shutdown).await?)
+    Ok(serve_loop(settings, level.ground, bus, databases, shutdown).await?)
 }

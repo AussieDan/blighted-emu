@@ -22,6 +22,7 @@ use nw_content::gameplay_config::{FastTravelCostKeys, GameplayConfig, TravelKeys
 use nw_content::starter::StarterKits;
 use nw_formats::objectstream::lowercase_crc32;
 use nw_world::WorldFile;
+use nw_world::capitals::capital_id;
 use nw_world::records::{Capital, Landmark};
 use nw_world::travel_slices::{HousingPlot, Teleporter};
 
@@ -37,16 +38,6 @@ const OBSERVED_UNSTUCK_COOLDOWN_MS: u64 = 120_000;
 pub const OBSERVED_BREADCRUMBS: usize = 11;
 /// The spacing of the breadcrumbs when no layer sets it, metres (Inferred).
 pub const OBSERVED_BREADCRUMB_SPACING_M: f32 = 24.0;
-/// The tag of a capital's entity id: its low 3 bits (GDE id note, section 3).
-const CAPITAL_TAG: u64 = 3;
-/// The bit a capital's id clears before its tag.
-const CAPITAL_CLEARED_BIT: u64 = 4;
-/// Hex digits of one half of a capital's GUID.
-const GUID_HALF_DIGITS: usize = 16;
-/// Radix of a GUID's digits.
-const HEX_RADIX: u32 = 16;
-/// The GUID separator.
-const GUID_SEPARATOR: char = '-';
 
 /// Milliseconds in a minute.
 const MS_PER_MINUTE: u64 = 60_000;
@@ -405,19 +396,6 @@ fn millis(seconds: Option<f64>, observed: u64) -> u64 {
         .map_or(observed, |seconds| (seconds * MS_PER_SECOND).round() as u64)
 }
 
-/// The entity id of the capital of GUID text `guid`: `(hi ^ lo) & !4 | 3`, the halves read
-/// big-endian (GDE id note, section 3; all 7,584 tag-3 ids of the captures).
-pub fn capital_id(guid: &str) -> Option<u64> {
-    let digits: String = guid.chars().filter(|c| *c != GUID_SEPARATOR).collect();
-    if digits.len() != 2 * GUID_HALF_DIGITS {
-        return None;
-    }
-    let (high, low) = digits.split_at(GUID_HALF_DIGITS);
-    let high = u64::from_str_radix(high, HEX_RADIX).ok()?;
-    let low = u64::from_str_radix(low, HEX_RADIX).ok()?;
-    Some((high ^ low) & !CAPITAL_CLEARED_BIT | CAPITAL_TAG)
-}
-
 impl TravelRules {
     /// The rules of the level `level` with the tables `tables` and the remote config `keys`.
     pub fn of(
@@ -774,7 +752,6 @@ mod tests {
     #[test]
     fn a_capital_id_is_the_xor_of_its_guid_halves_tagged_3() {
         assert_eq!(capital_id(WATCHTOWER_GUID), Some(WATCHTOWER_ID));
-        assert_eq!(capital_id("not-a-guid"), None);
         assert_eq!(rules().spawn_point(WATCHTOWER_ID), Some(SHRINE));
         assert_eq!(rules().spawn_point(1), None);
     }

@@ -46,7 +46,7 @@ enum VolumeShape {
 /// A quest trigger volume of the level: the `TriggerAreaComponent` slice whose tag component
 /// names `tag`, the place and turn of its capital, and its shape.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct TriggerVolume {
+pub(crate) struct TriggerVolume {
     tag: &'static str,
     at: Position,
     /// The z and w of the capital's rotation (its x and y are 0: a turn about z).
@@ -342,7 +342,7 @@ const OPEN_WORLD_AREAS: [(&str, Position); 2] = [
 
 /// Where a trigger area task waits for the player.
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum TriggerArea {
+pub(crate) enum TriggerArea {
     /// The level's volume of its tag.
     Volume(TriggerVolume),
     /// [`TRIGGER_RADIUS_M`] around its `OverrideLocation`, for a tag without a known volume.
@@ -369,6 +369,14 @@ impl TriggerArea {
             })
             .map(|(_, at)| Self::Around(*at))
         })
+    }
+
+    /// A place in the area: the volume's capital, or the place it is around.
+    pub(crate) fn spot(&self) -> Position {
+        match self {
+            Self::Volume(volume) => volume.at,
+            Self::Around(at) => *at,
+        }
     }
 
     /// Whether `position` is in the area.
@@ -403,7 +411,7 @@ const LEAVE_AREA_TYPE: &str = "Leave";
 
 /// What a task waits for.
 #[derive(Debug, Clone, PartialEq)]
-enum TaskKind {
+pub(crate) enum TaskKind {
     /// Runs its children one after the other.
     Consecutive,
     /// Runs its children at once; done when one is done.
@@ -629,6 +637,17 @@ enum TaskKind {
     NotRun(String),
 }
 
+impl TaskKind {
+    /// The name of the kind (`KillContribution`), without what it waits for.
+    pub(crate) fn name(&self) -> String {
+        format!("{self:?}")
+            .split(|letter: char| !letter.is_alphanumeric())
+            .next()
+            .unwrap_or_default()
+            .to_owned()
+    }
+}
+
 /// A step of fishing that a fishing task counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FishingStep {
@@ -646,12 +665,12 @@ pub enum FishingStep {
 #[derive(Debug, Clone, PartialEq)]
 pub struct FishCatchRule {
     /// The item caught; `None`: any fish.
-    item: Option<String>,
+    pub(crate) item: Option<String>,
     /// The least length and weight (`TargetThreshold`).
-    min_length: Option<f32>,
-    min_weight: Option<f32>,
+    pub(crate) min_length: Option<f32>,
+    pub(crate) min_weight: Option<f32>,
     /// Only catches at a hotspot count.
-    hotspot: bool,
+    pub(crate) hotspot: bool,
     /// The quest fish the task's item is: it bites while the task waits.
     drop: Option<FishDrop>,
 }
@@ -692,22 +711,22 @@ struct FishDrop {
 /// The item a mission task adds when the player opens a container (a loot crate) in its place
 /// (`ChestDropProbability`, a mission's `TaskHaveAndReturnChestDropProbabilityOverride`).
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ChestDrop {
+pub(crate) struct ChestDrop {
     /// Its chance in percent.
-    percent: u32,
+    pub(crate) percent: u32,
     /// The `POITag` the container must be in; `None`: anywhere.
-    place: Option<String>,
+    pub(crate) place: Option<String>,
 }
 
 /// The item a gather task adds when the player skins a corpse of its enemy or gathers a quest
 /// object.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct QuestDrop {
+pub(crate) struct QuestDrop {
     /// `ItemDropVC`: the enemy type, as a kill task names one, or the `GatherableID` of a quest
     /// object (`MSQ_Treasure_A`).
-    enemy: String,
+    pub(crate) enemy: String,
     /// `ItemDropProbability`, in percent.
-    percent: u32,
+    pub(crate) percent: u32,
 }
 
 /// One task of a tree.
@@ -1122,9 +1141,7 @@ fn kind_of(row: &TaskRow) -> TaskKind {
         },
         "taskexitpoitag" => filled(&row.poi_tag).map_or(TaskKind::Empty, TaskKind::ExitPoi),
         "taskequipitem" => TaskKind::EquipItem(item()),
-        "taskgamemode" => {
-            filled(&row.game_mode_id).map_or(TaskKind::Empty, TaskKind::GameMode)
-        }
+        "taskgamemode" => filled(&row.game_mode_id).map_or(TaskKind::Empty, TaskKind::GameMode),
         "taskconversationstate" => filled(&row.item_name)
             .or_else(|| {
                 filled(&row.ui_screen_tag).and_then(|state| {
@@ -1148,12 +1165,9 @@ fn kind_of(row: &TaskRow) -> TaskKind {
             },
             _ => TaskKind::Empty,
         },
-        "taskuseitems" => filled(&row.item_name).map_or(TaskKind::Empty, |item| {
-            TaskKind::UseItems { item, count }
-        }),
-        "taskobjective" => {
-            filled(&row.item_name).map_or(TaskKind::Empty, TaskKind::Objective)
-        }
+        "taskuseitems" => filled(&row.item_name)
+            .map_or(TaskKind::Empty, |item| TaskKind::UseItems { item, count }),
+        "taskobjective" => filled(&row.item_name).map_or(TaskKind::Empty, TaskKind::Objective),
         "taskrequiregatheritems" => TaskKind::RequireGather {
             item: item(),
             count,
@@ -1212,9 +1226,8 @@ fn kind_of(row: &TaskRow) -> TaskKind {
                 taken: true,
             },
         },
-        "taskinteract" => filled(&row.interact_tag).map_or(TaskKind::Empty, |tag| {
-            TaskKind::Interact { tag, count }
-        }),
+        "taskinteract" => filled(&row.interact_tag)
+            .map_or(TaskKind::Empty, |tag| TaskKind::Interact { tag, count }),
         "taskconversationtopic" => {
             let topic = filled(&row.ui_screen_tag).unwrap_or_else(|| row.task_id.clone());
             TaskKind::ConversationTopic(lowercase_crc32(&topic))
@@ -1252,9 +1265,9 @@ fn kind_of(row: &TaskRow) -> TaskKind {
             hotspot: true,
             ..FishCatchRule::ANY
         }),
-        "tasksalvageitem" => filled(&row.item_name).map_or(TaskKind::Empty, |item| {
-            TaskKind::Salvage { item, count }
-        }),
+        "tasksalvageitem" => {
+            filled(&row.item_name).map_or(TaskKind::Empty, |item| TaskKind::Salvage { item, count })
+        }
         "taskcraftweaponfamily" => {
             filled(&row.crafting_recipe_id).map_or(TaskKind::Empty, |family| {
                 TaskKind::CraftFamily { family, count }
@@ -1266,9 +1279,7 @@ fn kind_of(row: &TaskRow) -> TaskKind {
                 count,
             }),
         "taskchoosefaction" => TaskKind::ChooseFaction,
-        "taskquickcourse" => {
-            filled(&row.item_name).map_or(TaskKind::Empty, TaskKind::QuickCourse)
-        }
+        "taskquickcourse" => filled(&row.item_name).map_or(TaskKind::Empty, TaskKind::QuickCourse),
         "taskquickcoursecheckpoint" => match (
             filled(&row.item_name),
             row.min_gear_score
@@ -1375,6 +1386,16 @@ impl ObjectiveTree {
     /// Whether the tree is empty.
     pub fn is_empty(&self) -> bool {
         self.tasks.is_empty()
+    }
+
+    /// The achievements its unlock tasks set, for good or until the objective ends.
+    pub(crate) fn unlocks(&self) -> impl Iterator<Item = &str> {
+        self.tasks.iter().filter_map(|task| match &task.kind {
+            TaskKind::UnlockAchievement(achievement) | TaskKind::TemporaryUnlock(achievement) => {
+                Some(achievement.as_str())
+            }
+            _ => None,
+        })
     }
 
     /// The items its gather-and-return tasks take back at the turn-in, with their counts.
@@ -1633,7 +1654,7 @@ pub struct ObjectiveRun {
 /// its categories or its vitals id, or the start of its vitals id (live-tutorial note:
 /// `Legion_Legionnaire` counts `Legion_Legionnaire_FTUE`), or its spawner's category or that
 /// category's group (`Barbary_Lion_16BS12`, `Periville`). Case does not matter.
-fn kills_count(
+pub(crate) fn kills_count(
     enemy: &str,
     vitals_id: &str,
     categories: &[String],
@@ -1864,6 +1885,23 @@ impl ObjectiveRun {
                     && matches!(&task.kind, TaskKind::GameEvent { event: wanted, .. }
                         if wanted.eq_ignore_ascii_case(event))
             })
+    }
+
+    /// The waiting tasks that are no container, with what each waits for and its progress so
+    /// far: what a player must do next.
+    pub(crate) fn waiting_steps(&self) -> Vec<(&str, &TaskKind, u32)> {
+        self.tree
+            .tasks
+            .iter()
+            .zip(&self.states)
+            .filter_map(|(task, state)| match (state, &task.kind) {
+                (_, TaskKind::Consecutive | TaskKind::Partial | TaskKind::Simple) => None,
+                (TaskState::Active { progress, .. }, kind) => {
+                    Some((task.id.as_str(), kind, *progress))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     /// Whether task `id` waits.
@@ -2621,6 +2659,56 @@ pub(crate) mod tests {
         assert!(!run.is_done("Enter"), "another game mode");
         run.event(Event::GameModeEntered("dungeonamrine"), 0);
         assert!(run.finished(), "entering its game mode ends it");
+    }
+
+    #[test]
+    fn a_run_names_its_waiting_steps_and_a_tree_its_unlocks() {
+        let rows = vec![
+            container(
+                "Root",
+                "ConsecutiveTaskContainer",
+                &["Unlock", "Both", "Last"],
+            ),
+            with_item("Unlock", "TaskUnlockAchievement", "Walk_Unlock"),
+            container("Both", "SimpleTaskContainer", &["Swap", "Kill"]),
+            with_item("Swap", "TaskTemporaryUnlockAchievement", "Walk_Swap"),
+            TaskRow {
+                kill_enemy_type: Some("Boar".to_owned()),
+                target_qty: Some(2),
+                ..row("Kill", "TaskKillContribution")
+            },
+            with_item("Last", "TaskEquipItem", "SwordT1"),
+        ];
+        let tree = Arc::new(TaskBook::new(rows).tree("Root").expect("tree"));
+        assert_eq!(
+            tree.unlocks().collect::<Vec<_>>(),
+            ["Walk_Unlock", "Walk_Swap"]
+        );
+        let (mut run, _) = ObjectiveRun::start(tree, 0);
+        let waiting = |run: &ObjectiveRun| -> Vec<(String, u32)> {
+            run.waiting_steps()
+                .into_iter()
+                .map(|(task, _, progress)| (task.to_owned(), progress))
+                .collect()
+        };
+        assert_eq!(
+            waiting(&run),
+            [("Kill".to_owned(), 0)],
+            "no container, no done step"
+        );
+        let boar = Event::Killed {
+            vitals_id: "Boar",
+            categories: &[],
+            spawn_categories: &[],
+        };
+        run.event(boar, 0);
+        assert_eq!(
+            waiting(&run),
+            [("Kill".to_owned(), 1)],
+            "its progress so far"
+        );
+        run.event(boar, 0);
+        assert_eq!(waiting(&run), [("Last".to_owned(), 0)], "the next step");
     }
 
     #[test]
@@ -4960,11 +5048,7 @@ pub(crate) mod tests {
     #[test]
     fn a_place_or_event_task_without_its_cell_is_empty() {
         for kind in ["TaskGoToPOITag", "TaskExitPOITag", "TaskTriggerGameEvent"] {
-            assert_eq!(
-                kind_of(&row("Empty", kind)),
-                TaskKind::Empty,
-                "{kind}"
-            );
+            assert_eq!(kind_of(&row("Empty", kind)), TaskKind::Empty, "{kind}");
         }
         assert_eq!(
             kind_of(&row("Pin", "TaskGameEvent")),

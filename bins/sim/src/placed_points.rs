@@ -22,7 +22,10 @@ pub struct PlacedPoints {
 }
 
 /// The grid cell of `position`.
-#[allow(clippy::cast_possible_truncation, reason = "level metres fit an i32 cell")]
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "level metres fit an i32 cell"
+)]
 fn cell_of(position: Position) -> (i32, i32) {
     (
         (position.x / CELL_M).floor() as i32,
@@ -43,6 +46,14 @@ impl PlacedPoints {
             index.points.push((kind, position));
         }
         index
+    }
+
+    /// The first point of kind `kind`, anywhere on the level.
+    pub fn first(&self, kind: u32) -> Option<Position> {
+        self.points
+            .iter()
+            .find(|(point_kind, _)| *point_kind == kind)
+            .map(|(_, position)| *position)
     }
 
     /// The points of kind `kind` within `reach_m` (at most [`CELL_M`]) of `at`, across the
@@ -92,8 +103,23 @@ mod tests {
             [(0, at(63.0, 0.0)), (1, at(70.0, 0.0))],
             "nearest first, across cells"
         );
-        assert_eq!(points.within(TREE, at(65.0, 3.0), REACH_M), [(2, at(65.0, 0.0))]);
-        assert!(points.within(FLINT, at(200.0, 0.0), REACH_M).is_empty(), "out of reach");
-        assert!(points.within(0x3333, at(63.0, 0.0), REACH_M).is_empty(), "no such kind");
+        assert_eq!(
+            points.within(TREE, at(65.0, 3.0), REACH_M),
+            [(2, at(65.0, 0.0))]
+        );
+        assert!(
+            points.within(FLINT, at(200.0, 0.0), REACH_M).is_empty(),
+            "out of reach"
+        );
+        assert!(
+            points.within(0x3333, at(63.0, 0.0), REACH_M).is_empty(),
+            "no such kind"
+        );
+        assert_eq!(
+            points.first(TREE),
+            Some(at(65.0, 0.0)),
+            "anywhere on the level"
+        );
+        assert_eq!(points.first(0x3333), None);
     }
 }

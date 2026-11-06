@@ -139,7 +139,7 @@ const INN_RESPAWN_LANDMARK: u8 = 20;
 /// `MaxLevel` 5, ranks `@ui_camping_reward_tier_N`); rank 0 places none.
 const CAMPING_PROGRESSION: &str = "Camping";
 /// The game event of a placed camp.
-const BIND_CAMP_EVENT: &str = "BindCamp";
+pub(super) const BIND_CAMP_EVENT: &str = "BindCamp";
 /// The 441 result of a placed structure (0 in all 5 retail answers).
 const PLACEMENT_PLACED: u8 = 0;
 /// The 441 result of a refused structure (best guess: the first value after success; the
@@ -267,6 +267,11 @@ pub(super) struct TravelState {
 
 impl TravelState {
     /// The state of a player with the saved state `saved`: its marker goes out after its card.
+    /// The inn the player is bound to (its capital's entity id).
+    pub(super) const fn bound_inn(&self) -> Option<u64> {
+        self.saved.inn
+    }
+
     pub(super) fn of(saved: PlayerTravel) -> Self {
         Self {
             waypoint_due: saved.waypoint.is_some(),

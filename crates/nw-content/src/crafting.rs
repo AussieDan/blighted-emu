@@ -410,6 +410,28 @@ impl Recipes {
         self.by_crc.get(&crc)
     }
 
+    /// Every recipe, in no order.
+    pub fn iter(&self) -> impl Iterator<Item = &Recipe> {
+        self.by_crc.values()
+    }
+
+    /// Whether a recipe's craft fires game event `event` (any case).
+    pub fn fires_event(&self, event: &str) -> bool {
+        self.details.values().any(|details| {
+            details
+                .game_event
+                .as_deref()
+                .is_some_and(|fired| fired.eq_ignore_ascii_case(event))
+        })
+    }
+
+    /// A recipe that makes item `item` (any case), if one does.
+    pub fn making(&self, item: &str) -> Option<&Recipe> {
+        self.by_crc
+            .values()
+            .find(|recipe| recipe.item.eq_ignore_ascii_case(item))
+    }
+
     /// The ingredients of every recipe made at a station whose type name, without its tier
     /// digits, has the lowercase CRC-32 `station` (the 7044 storage search: retail `smelting`
     /// for the `smelting1..5` stations).
@@ -593,6 +615,20 @@ mod tests {
             [("WoodT1".to_owned(), 5), ("FlintT1".to_owned(), 1)]
         );
         assert!(costs.of("").is_empty());
+    }
+
+    #[test]
+    fn a_recipe_is_found_by_the_item_it_makes() {
+        let recipes = recipes();
+        assert_eq!(
+            recipes
+                .making("foodhealthrecoveryt1")
+                .map(|recipe| recipe.id.as_str()),
+            Some("Procedural_HealthRecoveryT1"),
+            "the item, any case, not the recipe id"
+        );
+        assert!(recipes.making("Procedural_HealthRecoveryT1").is_none());
+        assert_eq!(recipes.iter().count(), 2);
     }
 
     /// The retail rows of the skinning knife and the Light Ration (build 25810808), with the

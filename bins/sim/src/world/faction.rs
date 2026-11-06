@@ -45,6 +45,13 @@ pub(super) struct PvpFlagWait {
     /// Whether the player is in a sanctuary (`hasSanctuary`); `None` before the first check.
     in_sanctuary: Option<bool>,
 }
+
+impl PvpFlagWait {
+    /// Whether the flag is on its way on.
+    pub(super) const fn is_pending(&self) -> bool {
+        self.pending
+    }
+}
 use crate::objectives::Event;
 
 impl SimWorld {

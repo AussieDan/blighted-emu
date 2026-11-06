@@ -571,8 +571,11 @@ pub(crate) mod tests {
                 max_level: 14,
             })
         );
-        assert_eq!(rules.territory_pool(lowercase_crc32(TABLE)), None, "a weapon pool");
+        assert_eq!(
+            rules.territory_pool(lowercase_crc32(TABLE)),
+            None,
+            "a weapon pool"
+        );
         assert_eq!(rules.territory_bonus(lowercase_crc32(UPGRADE)), None);
     }
-
 }

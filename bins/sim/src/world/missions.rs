@@ -22,7 +22,7 @@ use nw_sim_core::Position;
 
 /// The interact tags of a mission's turn-in task (`M_ReturnToGiver`, `CM_ReturnToGiver`,
 /// `M_ReturnToAnyGiver` of the templates).
-const TURN_IN_TAGS: [&str; 2] = ["ReturnToGiver", "ReturnToAnyGiver"];
+pub(super) const TURN_IN_TAGS: [&str; 2] = ["ReturnToGiver", "ReturnToAnyGiver"];
 
 impl SimWorld {
     /// Player `number` (`entity`) opens the town project board of `request` (its name `name`):

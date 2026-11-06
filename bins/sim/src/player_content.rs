@@ -29,8 +29,8 @@ use nw_content::loot::{LootTables, MobLoot, PlayerLootLevels};
 use nw_content::loot_limits::{LootLimitRules, LootLimits, ResetClock};
 use nw_content::meta_achievements::MetaAchievementRules;
 use nw_content::mounts::MountRules;
-use nw_content::music_charts::MusicCharts;
 use nw_content::music::MusicRules;
+use nw_content::music_charts::MusicCharts;
 use nw_content::mutations::MutationCatalog;
 use nw_content::objective_limits::ObjectiveLimitGroup;
 use nw_content::perk_effects::PerkEffects;
@@ -67,14 +67,15 @@ use nw_messages::{AlcState, AssetId, BundleMember, MemberState, VitalsState};
 
 use crate::asset_solids::AssetSolids;
 use crate::charting::ChartRules;
-use crate::placed_points::PlacedPoints;
 use crate::invite_rules::InviteRules;
 use crate::objectives::{
     KillTypes, ObjectiveTree, TaskBook, TaskRow, counted_game_events, task_rows,
 };
+use crate::placed_points::PlacedPoints;
 use crate::shop::ShopCatalog;
 use crate::trading_post::{Settlements, TradingCatalog, TradingPostConfig};
-use crate::travel_rules::{TravelRules, capital_id};
+use crate::travel_rules::TravelRules;
+use nw_world::capitals::capital_id;
 
 /// The tutorial quest's objective id (`Objectives`).
 pub const TUTORIAL_OBJECTIVE: &str = "01_SoleSurvivor2";
@@ -390,6 +391,32 @@ impl QuestBook {
             missions: HashMap::new(),
             mission_by_crc: HashMap::new(),
         }
+    }
+
+    /// Every objective's id and `Type`, then every mission's id and its template's `Type`,
+    /// each list sorted by id: every quest a player can run.
+    pub(crate) fn listing(&self) -> Vec<(String, String)> {
+        let mut objectives: Vec<(String, String)> = self
+            .objectives
+            .values()
+            .map(|row| (row.id.clone(), row.kind.clone()))
+            .collect();
+        objectives.sort();
+        let mut missions: Vec<(String, String)> = self
+            .missions
+            .values()
+            .map(|mission| {
+                let kind = self
+                    .objectives
+                    .get(&mission.objective.to_lowercase())
+                    .map(|template| template.kind.clone())
+                    .unwrap_or_default();
+                (mission.id.clone(), kind)
+            })
+            .collect();
+        missions.sort();
+        objectives.extend(missions);
+        objectives
     }
 
     /// The quest whose lowercase id has the CRC-32 `crc`, as [`QuestBook::quest`].
@@ -853,6 +880,8 @@ pub struct PlayerContent {
     /// The encounters and loot containers of each instance game mode's level script
     /// (`dungeon-scripts-<build>.json`).
     pub dungeon_scripts: DungeonScripts,
+    /// What the level holds that the quests' steps need, for `!questplan` and the quest walk.
+    pub quest_guide: crate::world::QuestGuide,
 }
 
 /// The lower-case start of an expedition entrance's slice name
@@ -1294,6 +1323,7 @@ impl PlayerContent {
             mutations: MutationCatalog::from_tables(tables),
             entrances: dungeon_entrances(level),
             dungeon_scripts: DungeonScripts::default(),
+            quest_guide: crate::world::QuestGuide::default(),
         }
     }
 
