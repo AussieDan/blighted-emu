@@ -387,6 +387,29 @@ impl Gear {
         self.unsaved = true;
     }
 
+    /// The worn items by paperdoll slot, without the emptied slots.
+    pub(super) fn worn_items(&self) -> Vec<(u32, String)> {
+        self.worn_stacks()
+            .map(|(slot_id, stack)| (slot_id, stack.item_id.clone()))
+            .collect()
+    }
+
+    /// Wears a new stack of one `item` in paperdoll slot `slot_id`; the item worn there goes
+    /// into the bag (refused when the bag is full).
+    pub(super) fn wear_new(&mut self, item: &KitItem, slot_id: u32) -> Result<(), EquipRefusal> {
+        if self.worn_item(slot_id).is_some() && !self.bag_has_room() {
+            return Err(EquipRefusal::BagFull);
+        }
+        let new = self.new_stack(item, 1);
+        if let Some(taken_off) = self.take_off(slot_id) {
+            self.put_in_bag(taken_off);
+        }
+        self.put_on(slot_id, new);
+        self.changed = true;
+        self.unsaved = true;
+        Ok(())
+    }
+
     /// The worn stacks, without the emptied slots.
     fn worn_stacks(&self) -> impl Iterator<Item = (u32, &Stack)> {
         self.worn
@@ -1247,6 +1270,24 @@ pub(crate) mod tests {
         );
         let weapons = gear.main_hand().count();
         assert!(weapons >= 2, "the kit's weapon and the staff");
+    }
+
+    #[test]
+    fn a_new_item_worn_in_a_slot_sends_the_old_one_to_the_bag() {
+        const LONGSWORD: &str = "Infix_Enrage_1hLongsword";
+        const TOP: u32 = 800;
+        let kits = kits_with(&[(LONGSWORD, "Weapon+EquippableMainHand+Sword+Melee")]);
+        let mut gear = Gear::starter(&kits, CHARACTER, Some(BACKSTORY)).expect("kit");
+        let mut longsword = kits.item(LONGSWORD).cloned().expect("item");
+        longsword.gear_score = TOP;
+        gear.wear_new(&longsword, slot::MAIN_HAND_OPTION_1)
+            .expect("worn");
+        assert_eq!(gear.main_weapon(), Some((LONGSWORD, TOP)));
+        assert_eq!(gear.bag_count(SWORD), 1, "the kit sword went into the bag");
+        assert!(
+            gear.worn_items()
+                .contains(&(slot::MAIN_HAND_OPTION_1, LONGSWORD.to_owned()))
+        );
     }
 
     /// [`kits`] with the master rows of `extra` items too: (item id, item class).

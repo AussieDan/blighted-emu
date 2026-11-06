@@ -57,7 +57,7 @@ struct Verb {
 }
 
 /// Every command, in the order of `!help`.
-const VERBS: [Verb; 22] = [
+const VERBS: [Verb; 23] = [
     Verb {
         name: "help",
         usage: "!help",
@@ -187,6 +187,16 @@ const VERBS: [Verb; 22] = [
                     item: words[0].to_owned(),
                     quantity: number(words[1])?,
                 },
+            })
+        },
+    },
+    Verb {
+        name: "gearup",
+        usage: "!gearup [player]",
+        read: |words| {
+            target(words, 0).map(|(_, target)| Command::Change {
+                target,
+                change: Change::GearUp,
             })
         },
     },
@@ -380,6 +390,7 @@ enum Change {
     Take {
         item: String,
     },
+    GearUp,
     Quest {
         objective: String,
     },
@@ -410,6 +421,7 @@ impl Change {
                 quantity,
             },
             Self::Take { item } => AdminAction::TakeItem { entity, item },
+            Self::GearUp => AdminAction::GearUp { entity },
             Self::Quest { objective } => AdminAction::StartQuest { entity, objective },
         }
     }

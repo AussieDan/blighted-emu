@@ -73,6 +73,12 @@ pub enum AdminAction {
         /// The objective id (`Objectives` `ObjectiveID`).
         objective: String,
     },
+    /// Wears, for each item the player wears, the best item of its kind (the same item classes)
+    /// at the highest gear score that item allows; each item taken off goes into the bag.
+    GearUp {
+        /// The player.
+        entity: u64,
+    },
     /// Takes every stack of an item from the player.
     TakeItem {
         /// The player.

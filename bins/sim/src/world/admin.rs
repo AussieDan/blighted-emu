@@ -3,6 +3,8 @@
 //! `Kick` needs the server loop (it saves and closes the connection): see
 //! [`SimWorld::connection_of`].
 
+use std::sync::Arc;
+
 use crate::mobs::ring;
 use bevy_ecs::component::Component;
 use nw_bus::{AdminAction, AdminCommand, AdminReply, ConnectionRef, Point};
@@ -42,6 +44,7 @@ impl SimWorld {
                 quantity,
             } => self.give_item(*entity, item, *quantity),
             AdminAction::TakeItem { entity, item } => self.admin_take_item(*entity, item),
+            AdminAction::GearUp { entity } => self.gear_up(*entity),
             AdminAction::StartQuest { entity, objective } => {
                 match self.start_quest(*entity, objective, now_ms) {
                     Ok(()) => AdminReply::Done,
@@ -246,6 +249,43 @@ impl SimWorld {
                 reason: "the bag is full".to_owned(),
             }
         }
+    }
+
+    /// Wears the best item of each worn item's kind at its highest gear score
+    /// ([`nw_content::item_rolls::ItemRolls::best_of_kind`]): a test bot at the top of the
+    /// game, so its gear never limits a kill.
+    fn gear_up(&mut self, entity: u64) -> AdminReply {
+        let Some(target) = self.player_by_number(entity) else {
+            return AdminReply::NotMine;
+        };
+        let content = Arc::clone(&self.content);
+        let Some(mut player) = self.world.get_mut::<Player>(target) else {
+            return AdminReply::NotMine;
+        };
+        let Some(gear) = player.gear.as_mut() else {
+            return AdminReply::Failed {
+                reason: NO_BAG.to_owned(),
+            };
+        };
+        for (slot_id, worn) in gear.worn_items() {
+            let Some(best) = content
+                .item_rolls
+                .best_of_kind(&worn)
+                .filter(|best| !best.item_id.eq_ignore_ascii_case(&worn))
+            else {
+                continue;
+            };
+            let Some(mut item) = content.kits.item(&best.item_id).cloned() else {
+                continue;
+            };
+            item.gear_score = content.item_rolls.clamp_gear_score(&best.item_id, u32::MAX);
+            if let Err(refusal) = gear.wear_new(&item, slot_id) {
+                return AdminReply::Failed {
+                    reason: format!("{} not worn: {refusal:?}", best.item_id),
+                };
+            }
+        }
+        AdminReply::Done
     }
 
     fn admin_take_item(&mut self, entity: u64, item_id: &str) -> AdminReply {
@@ -536,6 +576,71 @@ mod tests {
             ),
             AdminReply::Failed { .. }
         ));
+    }
+
+    #[test]
+    fn gear_up_wears_the_best_item_of_each_kind_at_its_top_gear_score() {
+        use nw_content::item_rolls::{ItemRollRow, ItemRolls};
+        use nw_content::perks::PerkTable;
+
+        use crate::player_content::PlayerContent;
+        use crate::world::gear::Gear;
+        use crate::world::gear::tests::{BACKSTORY, CHARACTER, SWORD, kits_with};
+
+        const LONGSWORD: &str = "Infix_Enrage_1hLongsword";
+        const TOP: u32 = 800;
+        const KIT_SWORD_TOP: u32 = 60;
+        let sword_classes = || {
+            ["EquippableMainHand", "Weapon", "Melee", "Sword"]
+                .map(str::to_owned)
+                .to_vec()
+        };
+        let mut world = admitted();
+        let gear_up = command(AdminAction::GearUp { entity: PLAYER });
+        assert_eq!(
+            world.admin(&gear_up, NOW),
+            AdminReply::Failed {
+                reason: NO_BAG.to_owned()
+            }
+        );
+        let kits = kits_with(&[(LONGSWORD, "Weapon+EquippableMainHand+Sword+Melee")]);
+        world.content = Arc::new(PlayerContent {
+            kits: kits.clone(),
+            item_rolls: ItemRolls::build(
+                [
+                    ItemRollRow {
+                        item_id: SWORD.to_owned(),
+                        classes: sword_classes(),
+                        max_gear_score: KIT_SWORD_TOP,
+                        ..ItemRollRow::default()
+                    },
+                    ItemRollRow {
+                        item_id: LONGSWORD.to_owned(),
+                        classes: sword_classes(),
+                        tier: 5,
+                        min_gear_score: 726,
+                        max_gear_score: TOP,
+                        ..ItemRollRow::default()
+                    },
+                ],
+                PerkTable::default(),
+            ),
+            ..PlayerContent::default()
+        });
+        let entity = world.player_by_number(PLAYER).expect("player");
+        world.world.get_mut::<Player>(entity).expect("player").gear =
+            Some(Gear::starter(&kits, CHARACTER, Some(BACKSTORY)).expect("kit"));
+        assert_eq!(world.admin(&gear_up, NOW), AdminReply::Done);
+        let player = world.world.get::<Player>(entity).expect("player");
+        let gear = player.gear.as_ref().expect("gear");
+        assert_eq!(gear.main_weapon(), Some((LONGSWORD, TOP)));
+        assert_eq!(gear.bag_count(SWORD), 1, "the kit sword went into the bag");
+        assert!(
+            gear.worn_items()
+                .iter()
+                .any(|(_, item)| item == "MysticArchetypeChest"),
+            "an item without a better one of its kind stays worn"
+        );
     }
 
     #[test]

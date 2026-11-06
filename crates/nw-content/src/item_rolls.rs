@@ -204,6 +204,22 @@ impl ItemRolls {
         self.items.get(&item_id.to_lowercase())
     }
 
+    /// The best item of `item_id`'s kind: of the items whose `ItemClass` holds the same classes
+    /// (the same slot, weapon type or armor weight) and whose gear score is not fixed (a fixed
+    /// `GearScoreOverride` marks the playtest and blank items), the one with the highest
+    /// `MaxGearScore`, the lowest id first on a tie; `None` for an unknown item.
+    pub fn best_of_kind(&self, item_id: &str) -> Option<&ItemRollRow> {
+        let kind = sorted_classes(&self.item(item_id)?.classes);
+        self.items
+            .values()
+            .filter(|row| row.gear_score_override.is_none() && sorted_classes(&row.classes) == kind)
+            .max_by(|a, b| {
+                a.max_gear_score
+                    .cmp(&b.max_gear_score)
+                    .then_with(|| b.item_id.to_lowercase().cmp(&a.item_id.to_lowercase()))
+            })
+    }
+
     /// The gear score `wanted` held to `item_id`'s range: its override when it has one, else at
     /// most its maximum gear score; `wanted` for an unknown item. The minimum is no floor
     /// (Observed: 1,060 retail item records of 300 ledgers lie below their item's
@@ -310,6 +326,13 @@ impl ItemRolls {
     }
 }
 
+/// `classes` in one order, to compare two items' kinds.
+fn sorted_classes(classes: &[String]) -> Vec<&str> {
+    let mut sorted: Vec<&str> = classes.iter().map(String::as_str).collect();
+    sorted.sort_unstable();
+    sorted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +402,36 @@ mod tests {
             }],
             table,
         )
+    }
+
+    #[test]
+    fn the_best_of_a_kind_has_the_highest_gear_score_of_its_classes_without_a_fixed_one() {
+        let row = |item_id: &str, classes: &str, max_gear_score, fixed: Option<u32>| ItemRollRow {
+            item_id: item_id.to_owned(),
+            classes: parts(Some(classes)),
+            max_gear_score,
+            gear_score_override: fixed,
+            ..ItemRollRow::default()
+        };
+        // The kit sword and the retail tier 5 longswords (`Infix_*_1hLongsword`, 726 to 800).
+        let rolls = ItemRolls::build(
+            [
+                row("1hSwordT2_FTUE", "EquippableMainHand+Weapon+Melee+Sword", 60, None),
+                row("Infix_Tenacity_1hLongsword", "Sword+Weapon+Melee+EquippableMainHand", 800, None),
+                row("Infix_Enrage_1hLongsword", "EquippableMainHand+Weapon+Melee+Sword", 800, None),
+                row("Omega_Longsword_Blank_800", "EquippableMainHand+Weapon+Melee+Sword", 800, Some(800)),
+                row("2hGreatSwordT5", "EquippableTwoHand+Weapon+Melee+GreatSword", 900, None),
+            ],
+            PerkTable::default(),
+        );
+        assert_eq!(
+            rolls
+                .best_of_kind("1hSwordT2_FTUE")
+                .map(|best| best.item_id.as_str()),
+            Some("Infix_Enrage_1hLongsword"),
+            "same classes in any order, highest gear score, lowest id on a tie, no fixed score"
+        );
+        assert!(rolls.best_of_kind("no_such_item").is_none());
     }
 
     #[test]
