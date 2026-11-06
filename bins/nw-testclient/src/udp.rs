@@ -130,7 +130,8 @@ pub async fn run_rep_on(
     loop {
         let held = hold.is_over(registered_at.map(|at| at.elapsed()));
         let waited = registered_at.is_none() && started.elapsed() >= timeout;
-        if outcome.closed_by_server || held || waited {
+        // A client that closed itself (`on_tick`, its work done) ends the run.
+        if outcome.closed_by_server || held || waited || client.is_closed() {
             break;
         }
         if let Some(at) = registered_at {

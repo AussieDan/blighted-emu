@@ -133,7 +133,7 @@ pub fn chat_lines(messages: &[Received]) -> Vec<ChatMessage> {
 }
 
 /// Whether `line` is a system line: it has no sender.
-fn is_system(line: &ChatMessage) -> bool {
+pub(crate) fn is_system(line: &ChatMessage) -> bool {
     line.sender_id.is_empty()
 }
 

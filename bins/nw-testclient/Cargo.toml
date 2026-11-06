@@ -14,6 +14,7 @@ nw-carrier.workspace = true
 nw-common.workspace = true
 nw-content.workspace = true
 nw-dtls.workspace = true
+nw-formats.workspace = true
 nw-login.workspace = true
 nw-messages.workspace = true
 nw-protocol.workspace = true

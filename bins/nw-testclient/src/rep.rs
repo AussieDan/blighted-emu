@@ -8,7 +8,7 @@
 use std::io::Write;
 
 use nw_capture::{CLIENT_TO_SERVER, LedgerWriter, SERVER_TO_CLIENT};
-use nw_carrier::{CarrierError, Connection, Event, MESSAGE_CHANNEL};
+use nw_carrier::{CarrierError, Connection, ConnectionState, Event, MESSAGE_CHANNEL};
 use nw_common::time::unix_ms;
 use nw_dtls::{DtlsClientConfig, DtlsError, DtlsSession};
 use nw_reflect::{
@@ -238,6 +238,11 @@ impl RepClient {
         Ok(())
     }
 
+    /// Whether the client closed its carrier ([`RepClient::close`]).
+    pub fn is_closed(&self) -> bool {
+        self.carrier.state() == ConnectionState::Closed
+    }
+
     /// Datagrams to send now: DTLS handshake flights, then carrier datagrams once DTLS is up.
     ///
     /// # Errors
@@ -382,6 +387,15 @@ pub(crate) mod tests {
             }
         }
         (events, envelopes)
+    }
+
+    #[test]
+    fn a_closed_client_says_so() {
+        let config = DtlsClientConfig::new(&IDENTITY.certificate_pem).expect("client config");
+        let mut client = RepClient::new(&config, MTU, token(), START_MS).expect("client");
+        assert!(!client.is_closed());
+        client.close().expect("close");
+        assert!(client.is_closed());
     }
 
     #[test]

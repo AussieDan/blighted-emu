@@ -4,7 +4,8 @@
 //! second time. `pair` runs two clients in the world (M4 spec section 9). `swarm` runs many bots
 //! across a sim border (M5 spec section 11). `hunt` runs many bots that fight mobs (M6-B spec
 //! section 9). `chat` says one line in area chat and waits for the server's answer (system lines
-//! for a GM chat command such as `!help` of a game master account, else the line itself). Prints one line per step; exits with
+//! for a GM chat command such as `!help` of a game master account, else the line itself). `play`
+//! plays quests with a game master's bot and writes a report. Prints one line per step; exits with
 //! 0 only when every step passed.
 
 use std::path::PathBuf;
@@ -21,6 +22,7 @@ use nw_content::client_build::load_client_build;
 use nw_content::gathering::{GatherRules, Gatherables};
 use nw_dtls::DtlsClientConfig;
 use nw_reflect::REGISTRATION_STATUS_AUTHORIZED;
+use nw_testclient::activity::{Activity, ActivityData, ActivityKind};
 use nw_testclient::chat::{ChatSettings, run_chat};
 use nw_testclient::config::{
     PASSWORD_ENV, SECOND_PASSWORD_ENV, SWARM_PASSWORD_ENV, TestClientConfig, load_testclient_config,
@@ -29,6 +31,7 @@ use nw_testclient::fleet::{NewClient, udp_receive_errors};
 use nw_testclient::gather::{GatherNode, run_gather};
 use nw_testclient::hunt::run_hunt;
 use nw_testclient::pair::{Check, PairSettings, run_pair};
+use nw_testclient::play::{PlaySettings, run_play};
 use nw_testclient::rep::{LedgerSlot, RepClient};
 use nw_testclient::swarm::run_swarm;
 use nw_testclient::udp::{Hold, run_rep};
@@ -40,6 +43,12 @@ use nw_world::world_file::world_file_path;
 const DEFAULT_CONFIG: &str = "config/nw-testclient.toml";
 /// The line of `chat` without `--line`: the GM command list.
 const DEFAULT_CHAT_LINE: &str = "!help";
+/// The longest play without `--minutes`.
+const DEFAULT_PLAY_MINUTES: u64 = 30;
+/// Seconds per minute.
+const SECONDS_PER_MINUTE: u64 = 60;
+/// The end of a play bot's character name after its account name.
+const PLAY_CHARACTER_MARK: &str = "Char";
 /// Bytes read from standard input at a time while waiting for its end.
 const INPUT_BUFFER_BYTES: usize = 256;
 /// The kernel's network counters (Linux).
@@ -98,6 +107,31 @@ enum Command {
         /// The line, as typed in the chat box.
         #[arg(long, default_value = DEFAULT_CHAT_LINE)]
         line: String,
+    },
+    /// One client (the first account, which needs the game master rank) plays quests on the
+    /// live servers through the client's calls and writes which quests end and where each other
+    /// one stops.
+    Play {
+        /// The quest ids, comma-separated, in the order to try them.
+        #[arg(long, value_delimiter = ',')]
+        quests: Vec<String>,
+        /// The activities to play after the quests, comma-separated.
+        #[arg(long, value_delimiter = ',', value_enum)]
+        activities: Vec<ActivityKind>,
+        /// The report file (Markdown).
+        #[arg(long)]
+        report: PathBuf,
+        /// Longest time in the world, in minutes.
+        #[arg(long, default_value_t = DEFAULT_PLAY_MINUTES)]
+        minutes: u64,
+        /// The bot's account instead of the first account (the same password); a new one is
+        /// registered. It needs the game master rank.
+        #[arg(long)]
+        account: Option<String>,
+        /// The archetype pick of a new character (`Archetype_Soldier`): it wears that starter
+        /// kit and has a bag.
+        #[arg(long)]
+        backstory: Option<String>,
     },
 }
 
@@ -174,6 +208,40 @@ async fn steps(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
         }
         Command::Chat { line } => {
             chat(&config, &http, &trusted, own(&config)?, line, &ledger).await
+        }
+        Command::Play {
+            quests,
+            activities,
+            report,
+            minutes,
+            account,
+            backstory,
+        } => {
+            let mut bot = own(&config)?;
+            if let Some(account) = account {
+                bot.character_name = format!("{}{PLAY_CHARACTER_MARK}", account);
+                bot.account = account;
+            }
+            if let Some(backstory) = backstory {
+                bot.creation_params = nw_login::look::bot_creation_params(&backstory)
+                    .ok_or("the creation settings of the backstory do not write")?;
+            }
+            let settings = PlaySettings {
+                account: bot,
+                quests,
+                hold: Duration::from_secs(minutes * SECONDS_PER_MINUTE),
+                registration_timeout: Duration::from_secs(config.registration_timeout_seconds),
+            };
+            play(
+                &config,
+                &http,
+                &trusted,
+                &settings,
+                &activities,
+                &report,
+                &ledger,
+            )
+            .await
         }
     }
 }
@@ -503,6 +571,55 @@ async fn chat(
         println!("the line came back as area chat");
     }
     Ok(print_checks(&report.checks()))
+}
+
+async fn play(
+    config: &TestClientConfig,
+    http: &reqwest::Client,
+    trusted: &DtlsClientConfig,
+    settings: &PlaySettings,
+    kinds: &[ActivityKind],
+    report_path: &std::path::Path,
+    ledger: &LedgerSlot,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let swarm = &config.swarm;
+    let build = load_client_build(&swarm.client_build_config)?;
+    let world = WorldFile::load(
+        &world_file_path(&swarm.content_dir, &build, &swarm.level),
+        &build,
+    )?;
+    let tables = ContentBundle::load(&bundle_path(&swarm.content_dir, &build), &build)?.tables;
+    let data = ActivityData {
+        world: &world,
+        tables: &tables,
+    };
+    let activities = kinds
+        .iter()
+        .map(|kind| Activity::of(*kind, &data))
+        .collect();
+    let nodes = world
+        .gatherables
+        .iter()
+        .map(|point| GatherNode {
+            gatherable: point.gatherable_id,
+            at: point.position,
+        })
+        .collect();
+    let report = run_play(
+        http,
+        settings,
+        activities,
+        nodes,
+        |token| RepClient::new(trusted, config.mtu, token, 0).map(|client| ledger.give(client)),
+        |line| println!("{line}"),
+    )
+    .await?;
+    std::fs::write(report_path, report.markdown())?;
+    for play in report.quests.iter().chain(&report.activities) {
+        println!("{}: {:?}", play.quest, play.verdict);
+    }
+    println!("report in {}", report_path.display());
+    Ok(report.quests.len() == settings.quests.len() && report.activities.len() == kinds.len())
 }
 
 async fn registration(

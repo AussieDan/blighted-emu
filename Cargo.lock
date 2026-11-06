@@ -3219,6 +3219,7 @@ dependencies = [
  "nw-common",
  "nw-content",
  "nw-dtls",
+ "nw-formats",
  "nw-login",
  "nw-messages",
  "nw-protocol",

@@ -271,6 +271,8 @@ pub struct CombatView {
     hits_dealt: u64,
     hits_taken: u64,
     deaths: u64,
+    /// Mobs in view whose vitals said they died.
+    mob_deaths: u64,
     /// The answers to the bot's interactions since the last [`CombatView::take_interactions`].
     interactions: Vec<InteractionAnswer>,
 }
@@ -305,7 +307,9 @@ impl CombatView {
                         self.mob_cards += 1;
                     }
                     if died(update) {
-                        self.mobs.remove(&entity);
+                        if self.mobs.remove(&entity).is_some() {
+                            self.mob_deaths += 1;
+                        }
                     } else if let Some(mob) = self.mobs.get_mut(&entity)
                         && update.position.is_some()
                     {
@@ -364,6 +368,11 @@ impl CombatView {
     /// 4299 messages for this bot's deaths.
     pub const fn deaths(&self) -> u64 {
         self.deaths
+    }
+
+    /// The mobs in view that died.
+    pub const fn mob_deaths(&self) -> u64 {
+        self.mob_deaths
     }
 }
 
@@ -767,6 +776,7 @@ mod tests {
         view.read(&mob_bundle(1, Vec::new(), vec![dead]))
             .expect("read");
         assert_eq!(view.mobs().count(), 0, "dead");
+        assert_eq!(view.mob_deaths(), 1);
         view.read(&mob_bundle(2, Vec::new(), vec![mob_at(MOB, 3.0, false)]))
             .expect("read");
         assert_eq!(view.mobs().count(), 0, "no card yet");
