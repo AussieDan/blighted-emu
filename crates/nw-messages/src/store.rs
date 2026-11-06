@@ -328,6 +328,17 @@ impl StoreCall {
         }
     }
 
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::SetIsInStore { .. } => SET_IS_IN_STORE_TYPE_INDEX,
+            Self::Purchase { .. } => INITIALIZE_TRANSACTION_TYPE_INDEX,
+            Self::ClaimEntitlement { .. } => CLAIM_ENTITLEMENT_TYPE_INDEX,
+            Self::PurchaseReward { .. } => PURCHASE_REWARD_TYPE_INDEX,
+            Self::ResetRewardTrack { .. } => RESET_REWARD_TRACK_TYPE_INDEX,
+        }
+    }
+
     /// The body bytes.
     ///
     /// # Errors
@@ -410,6 +421,7 @@ mod tests {
             let call = StoreCall::decode(type_index, &hex_bytes(hex))
                 .expect("a call")
                 .expect("decodes");
+            assert_eq!(call.type_index(), type_index);
             assert_eq!(
                 call.encode().expect("encode"),
                 hex_bytes(hex),

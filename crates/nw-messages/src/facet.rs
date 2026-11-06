@@ -880,6 +880,303 @@ impl ClientFacetMsg {
             _ => return None,
         })
     }
+
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::AckLevelInfo { .. } => ACK_LEVEL_INFO_TYPE_INDEX,
+            Self::CinematicStarted { .. } => CINEMATIC_STARTED_TYPE_INDEX,
+            Self::CinematicEnded { .. } => CINEMATIC_ENDED_TYPE_INDEX,
+            Self::RequestCutscene { .. } => REQUEST_CUTSCENE_TYPE_INDEX,
+            Self::CutsceneEnded { .. } => CUTSCENE_ENDED_TYPE_INDEX,
+            Self::CutsceneStarted { .. } => CUTSCENE_STARTED_TYPE_INDEX,
+            Self::UpdateTrackedObjectives { .. } => UPDATE_TRACKED_OBJECTIVES_TYPE_INDEX,
+            Self::AbandonObjective { .. } => ABANDON_SINGLE_OBJECTIVE_TYPE_INDEX,
+            Self::SetObjectiveAutoPin { .. } => SET_OBJECTIVE_AUTO_PIN_TYPE_INDEX,
+            Self::SetInputsThrottled { .. } => SET_INPUTS_THROTTLED_TYPE_INDEX,
+            Self::WhisperStarted { .. } => WHISPER_STARTED_TYPE_INDEX,
+            Self::TimeSyncRequest { .. } => TIME_SYNC_REQUEST_TYPE_INDEX,
+            Self::QteCompleted { .. } => QTE_COMPLETED_TYPE_INDEX,
+            Self::TriggerAreaPassthrough { .. } => TRIGGER_AREA_PASSTHROUGH_TYPE_INDEX,
+            Self::UiScreenOpened { .. } => UI_SCREEN_OPENED_TYPE_INDEX,
+            Self::TakeAllItems { .. } => TAKE_ALL_ITEMS_TYPE_INDEX,
+            Self::EquipItem { .. } => EQUIP_ITEM_TYPE_INDEX,
+            Self::SwapItems { .. } => SWAP_ITEMS_TYPE_INDEX,
+            Self::UnequipItem { .. } => UNEQUIP_ITEM_TYPE_INDEX,
+            Self::SetReplicateStorage { .. } => SET_REPLICATE_STORAGE_TYPE_INDEX,
+            Self::CancelInteraction { .. } => CANCEL_INTERACTION_TYPE_INDEX,
+            Self::LookingThroughLoadout { .. } => LOOKING_THROUGH_LOADOUT_TYPE_INDEX,
+            Self::ReturnToMainWorld { .. } => RETURN_TO_MAIN_WORLD_TYPE_INDEX,
+            Self::AcceptObjective { .. } => ACCEPT_OBJECTIVE_TYPE_INDEX,
+            Self::CompleteObjective { .. } => COMPLETE_OBJECTIVE_TYPE_INDEX,
+            Self::SetCraftingDetails { .. } => SET_CRAFTING_DETAILS_TYPE_INDEX,
+            Self::CancelCrafting { .. } => CANCEL_CRAFTING_TYPE_INDEX,
+            Self::InitiateSalvage { .. } => INITIATE_SALVAGE_TYPE_INDEX,
+            Self::SalvageItems { .. } => SALVAGE_ITEMS_TYPE_INDEX,
+            Self::SalvageByClass { .. } => SALVAGE_BY_CLASS_TYPE_INDEX,
+            Self::TerritoryEntered { .. } => TERRITORY_ENTERED_TYPE_INDEX,
+            Self::EnteredTerritoryFallback { .. } => ENTERED_TERRITORY_FALLBACK_TYPE_INDEX,
+            Self::ExitedTerritoryFallback { .. } => EXITED_TERRITORY_FALLBACK_TYPE_INDEX,
+            Self::TogglePvpFlag { .. } => TOGGLE_PVP_FLAG_TYPE_INDEX,
+            Self::SetFaction { .. } => SET_FACTION_TYPE_INDEX,
+            Self::TerritoryExited { .. } => TERRITORY_EXITED_TYPE_INDEX,
+        }
+    }
+
+    /// The body bytes, as the client sends them. The flags of 998 and 3970 go out as 0 or 1.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::CountTooLarge`] when a list with a one-byte count (the pins of
+    /// 1458, the flags of 2709, the perk items or the ingredients of 2997) has more than
+    /// `u8::MAX` elements.
+    pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
+        let mut writer = Writer::new();
+        match self {
+            Self::CutsceneEnded { header }
+            | Self::TimeSyncRequest { header }
+            | Self::CancelCrafting { header }
+            | Self::TogglePvpFlag { header } => header.write(&mut writer),
+            Self::AckLevelInfo {
+                header,
+                client_context: byte,
+            }
+            | Self::ReturnToMainWorld { header, flag: byte }
+            | Self::SetFaction {
+                header,
+                faction: byte,
+            } => {
+                header.write(&mut writer);
+                writer.u8(*byte);
+            }
+            Self::SetInputsThrottled {
+                header,
+                throttled: flag,
+            }
+            | Self::LookingThroughLoadout {
+                header,
+                looking: flag,
+            } => {
+                header.write(&mut writer);
+                writer.boolean(*flag);
+            }
+            Self::CinematicStarted {
+                header,
+                cinematic: id,
+            }
+            | Self::CinematicEnded {
+                header,
+                cinematic: id,
+            }
+            | Self::RequestCutscene {
+                header,
+                cutscene: id,
+            }
+            | Self::CutsceneStarted {
+                header,
+                cutscene: id,
+            }
+            | Self::WhisperStarted {
+                header,
+                whisper: id,
+            }
+            | Self::QteCompleted {
+                header,
+                sequence: id,
+            }
+            | Self::UiScreenOpened { header, screen: id }
+            | Self::AcceptObjective {
+                header,
+                objective: id,
+            }
+            | Self::CompleteObjective {
+                header,
+                objective: id,
+            } => {
+                header.write(&mut writer);
+                writer.u32(*id);
+            }
+            Self::AbandonObjective { header, instance } => {
+                header.write(&mut writer);
+                writer.u64(*instance);
+            }
+            Self::UpdateTrackedObjectives { header, objectives } => {
+                header.write(&mut writer);
+                writer.u8_count(objectives.len())?;
+                for objective in objectives {
+                    writer.u64(*objective);
+                }
+            }
+            Self::SetObjectiveAutoPin { header, flags } => {
+                header.write(&mut writer);
+                writer.u8_count(flags.len())?.bytes(flags);
+            }
+            Self::TriggerAreaPassthrough {
+                header,
+                entity: id,
+                entity_facet: entity,
+                extra,
+            }
+            | Self::TakeAllItems {
+                header,
+                container: id,
+                container_entity: entity,
+                extra,
+            }
+            | Self::CancelInteraction {
+                header,
+                target: id,
+                target_entity: entity,
+                interaction: extra,
+            } => {
+                header.write(&mut writer);
+                writer.bytes(id).u64(*entity).u64(*extra);
+            }
+            Self::EquipItem {
+                header,
+                bag_slot,
+                equip_slot,
+                quantity,
+                instance,
+                flag,
+            } => {
+                header.write(&mut writer);
+                writer
+                    .u32(*bag_slot)
+                    .u32(*equip_slot)
+                    .u32(*quantity)
+                    .bytes(instance)
+                    .u8(*flag);
+            }
+            Self::SwapItems {
+                header,
+                slot_a,
+                slot_b,
+                instance_a,
+                instance_b,
+                flag,
+            } => {
+                header.write(&mut writer);
+                writer
+                    .u32(*slot_a)
+                    .u32(*slot_b)
+                    .bytes(instance_a)
+                    .bytes(instance_b)
+                    .u8(*flag);
+            }
+            Self::UnequipItem {
+                header,
+                slot,
+                bag_slot,
+                quantity,
+                flag,
+            } => {
+                header.write(&mut writer);
+                writer.u32(*slot).u32(*bag_slot).u32(*quantity).u8(*flag);
+            }
+            Self::SetReplicateStorage { header, storage } => {
+                header.write(&mut writer);
+                writer.bytes(storage);
+            }
+            Self::SetCraftingDetails {
+                header,
+                recipe,
+                quantity,
+                fee,
+                gear_score,
+                perk_items,
+                unknown,
+                ingredients,
+            } => {
+                header.write(&mut writer);
+                writer
+                    .u32(*recipe)
+                    .u32(*quantity)
+                    .u32(*fee)
+                    .u16(*gear_score)
+                    .u8_count(perk_items.len())?;
+                for perk_item in perk_items {
+                    writer.u32(*perk_item);
+                }
+                writer.u8(*unknown).u8_count(ingredients.len())?;
+                for ingredient in ingredients {
+                    writer
+                        .u8(ingredient.kind)
+                        .u32(ingredient.quantity)
+                        .u32(ingredient.item);
+                }
+            }
+            Self::InitiateSalvage {
+                header,
+                first,
+                bag_slot,
+                instance,
+                unknown,
+                quantity,
+            } => {
+                header.write(&mut writer);
+                writer
+                    .u32(*first)
+                    .u32(*bag_slot)
+                    .bytes(instance)
+                    .u32(*unknown)
+                    .u32(*quantity);
+            }
+            Self::SalvageItems { header, bag_slots } => {
+                header.write(&mut writer);
+                // A `usize` count fits 64 bits.
+                writer.wide_prefixed(bag_slots.len() as u64);
+                for bag_slot in bag_slots {
+                    writer.u32(*bag_slot);
+                }
+            }
+            Self::SalvageByClass {
+                header,
+                container,
+                class,
+                rarities,
+            } => {
+                header.write(&mut writer);
+                writer.u32(*container).u64(*class).u8(*rarities);
+            }
+            Self::TerritoryEntered {
+                header,
+                area,
+                area_entity,
+                extra,
+                territory,
+                unknown,
+            } => {
+                header.write(&mut writer);
+                writer
+                    .bytes(area)
+                    .u64(*area_entity)
+                    .u64(*extra)
+                    .u16(*territory)
+                    .u32(*unknown);
+            }
+            Self::TerritoryExited {
+                header,
+                area,
+                area_entity,
+                extra,
+                territory,
+            } => {
+                header.write(&mut writer);
+                writer
+                    .bytes(area)
+                    .u64(*area_entity)
+                    .u64(*extra)
+                    .u16(*territory);
+            }
+            Self::EnteredTerritoryFallback { header, territory }
+            | Self::ExitedTerritoryFallback { header, territory } => {
+                header.write(&mut writer);
+                writer.u16(*territory);
+            }
+        }
+        Ok(writer.finish())
+    }
 }
 
 /// 6310: the phases of the player's sectors (the entries of its `LevelInfoChangedMsg`).
@@ -1615,6 +1912,15 @@ mod tests {
         FacetHeader::of(component, crate::entity_ids::number_of_facet(SOUL_ENTITY))
     }
 
+    /// Checks that the call of `type_index` in `body` names that index and writes back `body`.
+    fn assert_writes_back(type_index: u64, body: &[u8]) {
+        let call = ClientFacetMsg::decode(type_index, body)
+            .expect("a client call")
+            .expect("reads");
+        assert_eq!(call.type_index(), type_index);
+        assert_eq!(call.encode().expect("encode"), body);
+    }
+
     #[test]
     fn the_quest_calls_read_the_retail_bodies() {
         // Retail 3772 and 794 of 12_skinningknife (`f52332f7`), beach-quests note.
@@ -1638,6 +1944,8 @@ mod tests {
                 objective: SKINNING_KNIFE
             }))
         );
+        assert_writes_back(ACCEPT_OBJECTIVE_TYPE_INDEX, &hex(ACCEPT));
+        assert_writes_back(COMPLETE_OBJECTIVE_TYPE_INDEX, &hex(ACCEPT));
     }
 
     #[test]
@@ -1656,6 +1964,7 @@ mod tests {
                 storage,
             }))
         );
+        assert_writes_back(SET_REPLICATE_STORAGE_TYPE_INDEX, &body);
     }
 
     #[test]
@@ -1681,6 +1990,8 @@ mod tests {
                 looking: false
             }))
         );
+        assert_writes_back(LOOKING_THROUGH_LOADOUT_TYPE_INDEX, &hex(OPENED));
+        assert_writes_back(LOOKING_THROUGH_LOADOUT_TYPE_INDEX, &hex(CLOSED));
     }
 
     #[test]
@@ -1695,6 +2006,7 @@ mod tests {
             ClientFacetMsg::decode(SET_FACTION_TYPE_INDEX, &hex(BODY)),
             Some(Ok(ClientFacetMsg::SetFaction { header, faction: 3 }))
         );
+        assert_writes_back(SET_FACTION_TYPE_INDEX, &hex(BODY));
     }
 
     #[test]
@@ -1709,6 +2021,7 @@ mod tests {
             ClientFacetMsg::decode(TOGGLE_PVP_FLAG_TYPE_INDEX, &hex(BODY)),
             Some(Ok(ClientFacetMsg::TogglePvpFlag { header }))
         );
+        assert_writes_back(TOGGLE_PVP_FLAG_TYPE_INDEX, &hex(BODY));
     }
 
     #[test]
@@ -1750,6 +2063,8 @@ mod tests {
                 territory: WATCHTOWER,
             }))
         );
+        assert_writes_back(TERRITORY_ENTERED_TYPE_INDEX, &hex(ENTERED));
+        assert_writes_back(TERRITORY_EXITED_TYPE_INDEX, &hex(&ENTERED[..100]));
     }
 
     #[test]
@@ -1788,6 +2103,7 @@ mod tests {
                 rarities: 0x1f,
             }))
         );
+        assert_writes_back(SALVAGE_BY_CLASS_TYPE_INDEX, &hex(BY_CLASS));
         assert!(matches!(
             ClientFacetMsg::decode(SALVAGE_BY_CLASS_TYPE_INDEX, &hex(&BY_CLASS[..50])),
             Some(Err(_))
@@ -1834,6 +2150,8 @@ mod tests {
                 bag_slots: vec![10, 14, 15],
             }))
         );
+        assert_writes_back(INITIATE_SALVAGE_TYPE_INDEX, &hex(SALVAGE));
+        assert_writes_back(SALVAGE_ITEMS_TYPE_INDEX, &hex(SALVAGE_ITEMS));
         assert!(matches!(
             ClientFacetMsg::decode(INITIATE_SALVAGE_TYPE_INDEX, &hex(&SALVAGE[..40])),
             Some(Err(_))
@@ -1908,6 +2226,8 @@ mod tests {
             ClientFacetMsg::decode(CANCEL_CRAFTING_TYPE_INDEX, &hex(&IDLE[..32])),
             Some(Ok(ClientFacetMsg::CancelCrafting { header }))
         );
+        assert_writes_back(SET_CRAFTING_DETAILS_TYPE_INDEX, &hex(REQUEST));
+        assert_writes_back(CANCEL_CRAFTING_TYPE_INDEX, &hex(&IDLE[..32]));
         let crafted = CraftProgressMsg::crafted(header, b"1hSkinningKnifeT1".to_vec(), 1);
         assert_eq!(crafted.encode().expect("encode"), hex(CRAFTED));
         assert_eq!(
@@ -1954,6 +2274,7 @@ mod tests {
         assert_eq!(perk_items, [WHETSTONE]);
         assert_eq!(unknown, 0);
         assert_eq!(ingredients.len(), 1);
+        assert_writes_back(SET_CRAFTING_DETAILS_TYPE_INDEX, &hex(REQUEST));
     }
 
     #[test]
@@ -2044,6 +2365,14 @@ mod tests {
                 ..
             }))
         ));
+        for (type_index, body) in [
+            (CUTSCENE_STARTED_TYPE_INDEX, STARTED),
+            (UPDATE_TRACKED_OBJECTIVES_TYPE_INDEX, EMPTY_PIN),
+            (UPDATE_TRACKED_OBJECTIVES_TYPE_INDEX, ONE_PIN),
+            (ABANDON_SINGLE_OBJECTIVE_TYPE_INDEX, ABANDON),
+        ] {
+            assert_writes_back(type_index, &hex(body));
+        }
     }
 
     #[test]
@@ -2095,6 +2424,8 @@ mod tests {
                 ..
             }
         ));
+        assert_writes_back(SET_INPUTS_THROTTLED_TYPE_INDEX, &hex(THROTTLE));
+        assert_writes_back(WHISPER_STARTED_TYPE_INDEX, &hex(WHISPER));
     }
 
     #[test]
@@ -2181,6 +2512,7 @@ mod tests {
                 flag: 0,
             }))
         );
+        assert_writes_back(EQUIP_ITEM_TYPE_INDEX, &equip);
         let mut writer = Writer::new();
         soul(component::PLAYER).write(&mut writer);
         let area = [0xff; RAW_ID_LEN];
@@ -2308,5 +2640,200 @@ mod tests {
         // Two items announced, one there.
         cut[32] = 2;
         assert!(StorageSearchItemsMsg::decode(&cut).is_err());
+    }
+
+    #[test]
+    fn every_client_call_writes_what_it_reads() {
+        let header = soul(component::PLAYER);
+        let id = [0x5a; RAW_ID_LEN];
+        let other_id = [0xa5; RAW_ID_LEN];
+        let calls = [
+            ClientFacetMsg::AckLevelInfo {
+                header,
+                client_context: 7,
+            },
+            ClientFacetMsg::CinematicStarted {
+                header,
+                cinematic: 0x1111_2222,
+            },
+            ClientFacetMsg::CinematicEnded {
+                header,
+                cinematic: 0x3333_4444,
+            },
+            ClientFacetMsg::RequestCutscene {
+                header,
+                cutscene: 0x5555_6666,
+            },
+            ClientFacetMsg::CutsceneEnded { header },
+            ClientFacetMsg::CutsceneStarted {
+                header,
+                cutscene: 0xa81b_d1af,
+            },
+            ClientFacetMsg::UpdateTrackedObjectives {
+                header,
+                objectives: vec![0x4445_f704_683e_bc78, 0x0102_0304_0506_0708],
+            },
+            ClientFacetMsg::AbandonObjective {
+                header,
+                instance: 0x4846_a68b_74f8_f9ee,
+            },
+            ClientFacetMsg::SetObjectiveAutoPin {
+                header,
+                flags: vec![1, 0, 1],
+            },
+            ClientFacetMsg::SetInputsThrottled {
+                header,
+                throttled: true,
+            },
+            ClientFacetMsg::WhisperStarted {
+                header,
+                whisper: 0x52f3_6e05,
+            },
+            ClientFacetMsg::TimeSyncRequest {
+                header: soul(component::TIME),
+            },
+            ClientFacetMsg::QteCompleted {
+                header,
+                sequence: 0x7777_8888,
+            },
+            ClientFacetMsg::TriggerAreaPassthrough {
+                header,
+                entity: id,
+                entity_facet: 3,
+                extra: 4,
+            },
+            ClientFacetMsg::UiScreenOpened {
+                header,
+                screen: 0x9999_aaaa,
+            },
+            ClientFacetMsg::TakeAllItems {
+                header,
+                container: id,
+                container_entity: 5,
+                extra: 6,
+            },
+            ClientFacetMsg::EquipItem {
+                header,
+                bag_slot: 2,
+                equip_slot: 25,
+                quantity: 3,
+                instance: id,
+                flag: 1,
+            },
+            ClientFacetMsg::SwapItems {
+                header,
+                slot_a: 1,
+                slot_b: 2,
+                instance_a: id,
+                instance_b: other_id,
+                flag: 1,
+            },
+            ClientFacetMsg::UnequipItem {
+                header,
+                slot: 9,
+                bag_slot: u32::MAX,
+                quantity: 1,
+                flag: 1,
+            },
+            ClientFacetMsg::SetReplicateStorage {
+                header: soul(component::GLOBAL_STORAGE),
+                storage: id,
+            },
+            ClientFacetMsg::CancelInteraction {
+                header,
+                target: id,
+                target_entity: 7,
+                interaction: 8,
+            },
+            ClientFacetMsg::LookingThroughLoadout {
+                header,
+                looking: true,
+            },
+            ClientFacetMsg::ReturnToMainWorld { header, flag: 2 },
+            ClientFacetMsg::AcceptObjective {
+                header,
+                objective: 0xf523_32f7,
+            },
+            ClientFacetMsg::CompleteObjective {
+                header,
+                objective: 0x0c92_80c8,
+            },
+            ClientFacetMsg::SetCraftingDetails {
+                header: soul(component::CRAFTING),
+                recipe: 0xa546_f7c5,
+                quantity: 4,
+                fee: 0x5c,
+                gear_score: 420,
+                perk_items: vec![0x9979_b957, 0x0102_0304],
+                unknown: 9,
+                ingredients: vec![CraftIngredient {
+                    kind: INGREDIENT_ITEM,
+                    quantity: 2,
+                    item: 0x8a91_4427,
+                }],
+            },
+            ClientFacetMsg::CancelCrafting {
+                header: soul(component::CRAFTING),
+            },
+            ClientFacetMsg::InitiateSalvage {
+                header,
+                first: 1,
+                bag_slot: 0x13,
+                instance: id,
+                unknown: 5,
+                quantity: 2,
+            },
+            ClientFacetMsg::SalvageItems {
+                header,
+                // A count above one byte of the wide prefix code.
+                bag_slots: (0..200).collect(),
+            },
+            ClientFacetMsg::SalvageByClass {
+                header,
+                container: 1,
+                class: 0x48,
+                rarities: 0x1f,
+            },
+            ClientFacetMsg::TerritoryEntered {
+                header,
+                area: id,
+                area_entity: 10,
+                extra: 11,
+                territory: 40_148,
+                unknown: 12,
+            },
+            ClientFacetMsg::EnteredTerritoryFallback {
+                header,
+                territory: 1_000,
+            },
+            ClientFacetMsg::ExitedTerritoryFallback {
+                header,
+                territory: 1_001,
+            },
+            ClientFacetMsg::TogglePvpFlag { header },
+            ClientFacetMsg::SetFaction { header, faction: 3 },
+            ClientFacetMsg::TerritoryExited {
+                header,
+                area: other_id,
+                area_entity: 13,
+                extra: 14,
+                territory: 40_149,
+            },
+        ];
+        for call in calls {
+            let body = call.encode().expect("encode");
+            assert_eq!(
+                ClientFacetMsg::decode(call.type_index(), &body),
+                Some(Ok(call))
+            );
+        }
+        let too_many = ClientFacetMsg::SetObjectiveAutoPin {
+            header,
+            flags: vec![1; usize::from(u8::MAX) + 1],
+        };
+        assert!(matches!(
+            too_many.encode(),
+            Err(MessageError::CountTooLarge { .. })
+        ));
     }
 }

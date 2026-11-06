@@ -108,6 +108,44 @@ impl LookupRequest {
         }
     }
 
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::Contracts { .. } => LOOKUP_CONTRACTS_TYPE_INDEX,
+            Self::SubArmies { .. } => REQUEST_SUB_ARMIES_TYPE_INDEX,
+            Self::PendingMetaAchievements { .. } => REQUEST_PENDING_META_ACHIEVEMENTS_TYPE_INDEX,
+            Self::LobbyCounts { .. } => REQUEST_LOBBY_COUNTS_TYPE_INDEX,
+        }
+    }
+
+    /// The body bytes, as the client sends them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::CountTooLarge`] when a list of the contracts query is too long.
+    pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
+        let mut writer = Writer::new();
+        match self {
+            Self::Contracts {
+                header,
+                query,
+                lookup,
+            } => {
+                header.write(&mut writer);
+                query.write(&mut writer)?;
+                writer.bytes(lookup);
+            }
+            Self::SubArmies { header } | Self::PendingMetaAchievements { header } => {
+                header.write(&mut writer);
+            }
+            Self::LobbyCounts { header, activity } => {
+                header.write(&mut writer);
+                writer.u8(*activity);
+            }
+        }
+        Ok(writer.finish())
+    }
+
     /// The answer retail sent to a player with no streamer group, waiting reward or open
     /// lobby; `None` for the contracts lookup, which the trading post answers.
     pub fn answer(&self) -> Option<ServerMessage> {
@@ -264,11 +302,20 @@ mod tests {
             .collect()
     }
 
-    fn answer_of(type_index: u64, request: &str) -> Vec<u8> {
-        let request = LookupRequest::decode(type_index, &bytes(request))
+    /// Decodes the lookup of `type_index` in the bytes of `request` and checks that it names
+    /// that index and writes back those bytes.
+    fn lookup(type_index: u64, request: &str) -> LookupRequest {
+        let body = bytes(request);
+        let lookup = LookupRequest::decode(type_index, &body)
             .expect("a lookup")
             .expect("decodes");
-        request
+        assert_eq!(lookup.type_index(), type_index);
+        assert_eq!(lookup.encode().expect("encodes"), body);
+        lookup
+    }
+
+    fn answer_of(type_index: u64, request: &str) -> Vec<u8> {
+        lookup(type_index, request)
             .answer()
             .expect("an answer")
             .encode()
@@ -276,25 +323,27 @@ mod tests {
     }
 
     fn contracts_query(request: &str) -> (FacetHeader, ParticipantQuery, [u8; RAW_ID_LEN]) {
-        let Some(Ok(LookupRequest::Contracts {
+        let LookupRequest::Contracts {
             header,
             query,
             lookup,
-        })) = LookupRequest::decode(LOOKUP_CONTRACTS_TYPE_INDEX, &bytes(request))
+        } = lookup(LOOKUP_CONTRACTS_TYPE_INDEX, request)
         else {
             panic!("a contracts lookup");
         };
         (header, query, lookup)
     }
 
+    /// Retail 2026-09-18, 9117 ms: the first contracts lookup.
+    const FIRST_CONTRACTS_LOOKUP: &str = "b39cd7472ccfb38e2715f9bca18fdececede8fa1bcf915277764e12f21bd772800000000000000010000000100000000000a0100000001010009883e449578cc43b3a08879f64b511b7e";
+
     /// Retail 2026-09-18, 9117 and 9180 ms: the first lookup (the player's open sell orders, ten
     /// per page) and the answer of a player with none.
     #[test]
     fn a_contracts_lookup_reads_its_query_and_the_empty_answer_has_the_retail_bytes() {
-        const REQUEST: &str = "b39cd7472ccfb38e2715f9bca18fdececede8fa1bcf915277764e12f21bd772800000000000000010000000100000000000a0100000001010009883e449578cc43b3a08879f64b511b7e";
         const ANSWER: &str =
             "b39cd7472ccfb38e2715f9bca18fdece883e449578cc43b3a08879f64b511b7e000000000000";
-        let (header, query, lookup) = contracts_query(REQUEST);
+        let (header, query, lookup) = contracts_query(FIRST_CONTRACTS_LOOKUP);
         assert_eq!(query.participant.kind, 0);
         assert_eq!(
             (
@@ -392,5 +441,38 @@ mod tests {
             ),
             Some(Err(_))
         ));
+    }
+
+    #[test]
+    fn every_lookup_writes_what_it_reads() {
+        let header = FacetHeader {
+            target: 0xb39c_d747_2ccf_b38e,
+            entity: 0x2715_f9bc_a18f_dece,
+        };
+        let (_, query, _) = contracts_query(FIRST_CONTRACTS_LOOKUP);
+        let calls = [
+            LookupRequest::Contracts {
+                header,
+                query: ParticipantQuery {
+                    page: 3,
+                    kinds: vec![1, 2],
+                    ..query
+                },
+                lookup: [0x88; RAW_ID_LEN],
+            },
+            LookupRequest::SubArmies { header },
+            LookupRequest::PendingMetaAchievements { header },
+            LookupRequest::LobbyCounts {
+                header,
+                activity: 2,
+            },
+        ];
+        for call in calls {
+            let body = call.encode().expect("encodes");
+            assert_eq!(
+                LookupRequest::decode(call.type_index(), &body),
+                Some(Ok(call))
+            );
+        }
     }
 }

@@ -256,6 +256,82 @@ impl PlayerCall {
         };
         Some(call)
     }
+
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::Search { .. } => SEARCH_PLAYERS_TYPE_INDEX,
+            Self::PhaseId { .. } => PLAYER_PHASE_ID_TYPE_INDEX,
+            Self::PhaseData { .. } => PLAYER_PHASE_DATA_TYPE_INDEX,
+            Self::StreamerMode { .. } => STREAMER_MODE_SYNC_TYPE_INDEX,
+            Self::Crossplay { .. } => CROSSPLAY_SYNC_TYPE_INDEX,
+            Self::ChattingState { .. } => SET_CHATTING_STATE_TYPE_INDEX,
+            Self::Block { .. } => SET_SOCIAL_BLOCK_TYPE_INDEX,
+            Self::Unblock { .. } => CLEAR_SOCIAL_BLOCK_TYPE_INDEX,
+            Self::Report { .. } => REPORT_PLAYER_TYPE_INDEX,
+            Self::Friend { .. } => FRIEND_STATUS_CHANGE_TYPE_INDEX,
+        }
+    }
+
+    /// The body of the call to the social facet `header`, as [`crate::social::SocialCall::decode`]
+    /// reads it (a test client's call).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when a text does not fit its prefix.
+    pub fn encode(&self, header: FacetHeader) -> Result<Vec<u8>, MessageError> {
+        let mut writer = Writer::new();
+        header.write(&mut writer);
+        match self {
+            Self::Search {
+                request,
+                name,
+                limit,
+            } => {
+                writer.bytes(request);
+                write_text(&mut writer, name)?;
+                writer.u32(*limit);
+            }
+            Self::PhaseId { request, character } | Self::PhaseData { request, character } => {
+                writer.bytes(request);
+                write_text(&mut writer, character)?;
+            }
+            Self::StreamerMode { settings } => {
+                writer.bytes(settings);
+            }
+            Self::Crossplay { permissions } => {
+                writer.bytes(permissions);
+            }
+            Self::ChattingState { state } => {
+                writer.u32(*state);
+            }
+            Self::Block { character } | Self::Unblock { character } => {
+                write_text(&mut writer, character)?;
+            }
+            Self::Report {
+                reason,
+                character,
+                comment,
+                name,
+                category,
+                detail,
+                locale,
+            } => {
+                writer.u32(*reason);
+                write_text(&mut writer, character)?;
+                write_text(&mut writer, comment)?;
+                write_text(&mut writer, name)?;
+                writer.u32(*category);
+                write_text(&mut writer, detail)?;
+                write_text(&mut writer, locale)?;
+            }
+            Self::Friend { request, character } => {
+                writer.u32(*request);
+                write_text(&mut writer, character)?;
+            }
+        }
+        Ok(writer.finish())
+    }
 }
 
 /// 1926: a look-up or search found no player (every retail 1926 has [`FAILURE_NO_DATA`]).
@@ -463,11 +539,16 @@ mod tests {
     const REQUEST: &str = "c035bb6b0d984dfcb658da0273ed6916";
     const CHARACTER: &str = "00000000-0000-4000-8000-000000000002";
 
+    /// The call of the retail body of `type_index` with arguments `args`; its encode gives the
+    /// same body back.
     fn call(type_index: u64, args: &str) -> PlayerCall {
-        let (header, call) = SocialCall::decode(type_index, &hex(&format!("{HEADER}{args}")))
+        let body = hex(&format!("{HEADER}{args}"));
+        let (header, call) = SocialCall::decode(type_index, &body)
             .expect("a social call")
             .expect("reads");
         assert_eq!(header.target, 0xc2a7_dec3_a310_d6b4);
+        assert_eq!(call.type_index(), type_index);
+        assert_eq!(call.encode(header).expect("encode"), body);
         let SocialCall::Player(call) = call else {
             panic!("a players call: {call:?}");
         };
@@ -636,5 +717,56 @@ mod tests {
             SocialPush::decode_args(PLAYER_DATA_RESPONSE_TYPE_INDEX, &args),
             Some(Ok(push))
         );
+    }
+
+    /// A header of synthetic ids.
+    const ROUND_TRIP_HEADER: FacetHeader = FacetHeader {
+        target: 0x0102_0304_0506_0708,
+        entity: 0x1112_1314_1516_1718,
+    };
+
+    #[test]
+    fn every_call_encodes_and_reads_back() {
+        let calls = [
+            PlayerCall::Search {
+                request: [1; RAW_ID_LEN],
+                name: "arv".to_owned(),
+                limit: 25,
+            },
+            PlayerCall::PhaseId {
+                request: [2; RAW_ID_LEN],
+                character: CHARACTER.to_owned(),
+            },
+            PlayerCall::PhaseData {
+                request: [3; RAW_ID_LEN],
+                character: CHARACTER.to_owned(),
+            },
+            PlayerCall::StreamerMode { settings: [1, 2] },
+            PlayerCall::Crossplay {
+                permissions: [1, 1, 2, 3, 4, 5, 6, 7, 8, 9],
+            },
+            PlayerCall::ChattingState { state: 3 },
+            PlayerCall::Block {
+                character: CHARACTER.to_owned(),
+            },
+            PlayerCall::Unblock {
+                character: CHARACTER.to_owned(),
+            },
+            PlayerCall::Report {
+                reason: 4,
+                character: CHARACTER.to_owned(),
+                comment: "spam".to_owned(),
+                name: "Bob".to_owned(),
+                category: 2,
+                detail: "chat".to_owned(),
+                locale: "en-US".to_owned(),
+            },
+            PlayerCall::Friend {
+                request: 2,
+                character: CHARACTER.to_owned(),
+            },
+        ]
+        .map(SocialCall::Player);
+        crate::social::assert_calls_round_trip(ROUND_TRIP_HEADER, &calls);
     }
 }

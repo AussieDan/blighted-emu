@@ -145,6 +145,33 @@ impl SocialCall {
         }))
     }
 
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::Chat(call) => call.type_index(),
+            Self::Player(call) => call.type_index(),
+            Self::Group(call) => call.type_index(),
+            Self::Guild(call) => call.type_index(),
+            Self::Voice(call) => call.type_index(),
+        }
+    }
+
+    /// The body of the call to the facet `header`, as [`SocialCall::decode`] reads it (a test
+    /// client's call).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when a value does not fit its field.
+    pub fn encode(&self, header: FacetHeader) -> Result<Vec<u8>, MessageError> {
+        match self {
+            Self::Chat(call) => call.encode(header),
+            Self::Player(call) => call.encode(header),
+            Self::Group(call) => call.encode(header),
+            Self::Guild(call) => call.encode(header),
+            Self::Voice(call) => call.encode(header),
+        }
+    }
+
     /// Whether `type_index` is a social call of the client.
     pub fn is_call(type_index: u64) -> bool {
         chat::CALL_TYPES.contains(&type_index)
@@ -261,6 +288,20 @@ pub fn push_envelope(
     header.write(&mut writer);
     writer.bytes(args);
     Ok(Envelope::message(TypeId::FileSlot(type_index), writer.finish()).encode()?)
+}
+
+/// Checks that each of `calls`, encoded to the facet `header`, reads back to the same header and
+/// call.
+#[cfg(test)]
+pub(crate) fn assert_calls_round_trip(header: FacetHeader, calls: &[SocialCall]) {
+    for call in calls {
+        let body = call.encode(header).expect("encode");
+        assert_eq!(
+            SocialCall::decode(call.type_index(), &body),
+            Some(Ok((header, call.clone()))),
+            "{call:?}"
+        );
+    }
 }
 
 #[cfg(test)]

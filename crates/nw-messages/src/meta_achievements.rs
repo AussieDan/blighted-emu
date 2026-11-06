@@ -116,6 +116,15 @@ impl MetaAchievementRequest {
         }
     }
 
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::Summary { .. } => REQUEST_SUMMARY_TYPE_INDEX,
+            Self::CategoryProgress { .. } => REQUEST_CATEGORY_PROGRESS_TYPE_INDEX,
+            Self::ClearPending { .. } => CLEAR_PENDING_TYPE_INDEX,
+        }
+    }
+
     /// The body bytes, as the client sends them.
     pub fn encode(&self) -> Vec<u8> {
         let mut writer = Writer::new();
@@ -422,6 +431,8 @@ mod tests {
             .expect("a call")
             .expect("reads");
         assert_eq!(summary, MetaAchievementRequest::Summary { header: HEADER });
+        assert_eq!(summary.type_index(), REQUEST_SUMMARY_TYPE_INDEX);
+        assert_eq!(summary.encode(), with_header(&[]));
         let tab = with_header(&[0xa5, 0xaa, 0x3c, 0x61]);
         let category = MetaAchievementRequest::decode(REQUEST_CATEGORY_PROGRESS_TYPE_INDEX, &tab)
             .expect("a call")
@@ -433,11 +444,13 @@ mod tests {
                 category: 0xa5aa_3c61,
             }
         );
+        assert_eq!(category.type_index(), REQUEST_CATEGORY_PROGRESS_TYPE_INDEX);
         assert_eq!(category.encode(), tab);
         let clear = MetaAchievementRequest::decode(CLEAR_PENDING_TYPE_INDEX, &with_header(&[0]))
             .expect("a call")
             .expect("reads");
         assert_eq!(clear.header(), HEADER);
+        assert_eq!(clear.type_index(), CLEAR_PENDING_TYPE_INDEX);
         assert_eq!(clear.encode(), with_header(&[0]));
         assert!(MetaAchievementRequest::decode(1, &with_header(&[])).is_none());
         assert!(matches!(

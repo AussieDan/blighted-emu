@@ -49,6 +49,34 @@ impl EconomyCall {
         }
         InviteCall::decode(type_index, body).map(|call| call.map(Self::Invite))
     }
+
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::Contract(call) => call.type_index(),
+            Self::Trade(call) => call.type_index(),
+            Self::Seasons(call) => call.type_index(),
+            Self::Store(call) => call.type_index(),
+            Self::Shop(_) => crate::shop::PURCHASE_ITEM_TYPE_INDEX,
+            Self::Invite(call) => call.type_index(),
+        }
+    }
+
+    /// The body bytes, as the client sends them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when a contract, trade, store or invite call does not encode.
+    pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
+        match self {
+            Self::Contract(call) => call.encode(),
+            Self::Trade(call) => call.encode(),
+            Self::Seasons(call) => Ok(call.encode()),
+            Self::Store(call) => call.encode(),
+            Self::Shop(call) => Ok(call.encode()),
+            Self::Invite(call) => call.encode(),
+        }
+    }
 }
 
 /// One economy message of the server.
@@ -162,5 +190,43 @@ mod tests {
             Some(Ok(EconomyCall::Shop(purchase)))
         );
         assert!(EconomyCall::decode(u64::from(u16::MAX), &header_only).is_none());
+    }
+
+    #[test]
+    fn every_kind_of_call_writes_what_it_reads() {
+        let calls = [
+            EconomyCall::Contract(ContractCall::TransferCheck {
+                header: HEADER,
+                lookup: [0x2b; crate::wire::RAW_ID_LEN],
+            }),
+            EconomyCall::Trade(TradeCall::UpdateCoin {
+                header: HEADER,
+                coin: 12_345,
+            }),
+            EconomyCall::Seasons(SeasonsCall::Redeem {
+                header: HEADER,
+                reward: 0xa17b_8b9a_2221_5ad9,
+            }),
+            EconomyCall::Store(StoreCall::ClaimEntitlement {
+                header: HEADER,
+                entitlement: 0x0102_0304,
+            }),
+            EconomyCall::Shop(ShopPurchaseCall {
+                header: HEADER,
+                conversion: 0x87c0_53c5,
+                count: 3,
+            }),
+            EconomyCall::Invite(InviteCall::Reply {
+                header: HEADER,
+                accept: true,
+            }),
+        ];
+        for call in calls {
+            let body = call.encode().expect("encode");
+            assert_eq!(
+                EconomyCall::decode(call.type_index(), &body),
+                Some(Ok(call))
+            );
+        }
     }
 }

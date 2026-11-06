@@ -353,6 +353,19 @@ impl Writer {
         self.bytes(&value.to_be_bytes())
     }
 
+    /// Adds the one-byte count of a list of `len` elements.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::CountTooLarge`] when `len` is above `u8::MAX`.
+    pub fn u8_count(&mut self, len: usize) -> Result<&mut Self, MessageError> {
+        let count = u8::try_from(len).map_err(|_| MessageError::CountTooLarge {
+            count: u64::try_from(len).unwrap_or(u64::MAX),
+            limit: u64::from(u8::MAX),
+        })?;
+        Ok(self.u8(count))
+    }
+
     /// Adds a prefix-coded integer in its shortest form.
     ///
     /// # Errors
@@ -478,6 +491,22 @@ mod tests {
             assert_eq!(reader.prefixed(), Ok(value));
             assert_eq!(reader.finish(), Ok(()));
         }
+    }
+
+    #[test]
+    fn a_one_byte_count_fits_up_to_its_limit() {
+        let largest = usize::from(u8::MAX);
+        assert_eq!(
+            Writer::new().u8_count(largest).expect("fits").finish(),
+            [u8::MAX]
+        );
+        assert_eq!(
+            Writer::new().u8_count(largest + 1).map(|_| ()),
+            Err(MessageError::CountTooLarge {
+                count: u64::from(u8::MAX) + 1,
+                limit: u64::from(u8::MAX),
+            })
+        );
     }
 
     #[test]

@@ -13,7 +13,7 @@
 
 use crate::facet::FacetHeader;
 use crate::item_calls::ItemRef;
-use crate::wire::{MessageError, Reader};
+use crate::wire::{MessageError, Reader, Writer};
 
 /// Type index of `ItemRepairComponentServerFacet_InitiateRepair`.
 pub const INITIATE_REPAIR_TYPE_INDEX: u64 = 3003;
@@ -98,6 +98,48 @@ impl ItemRepairMsg {
             _ => return None,
         })
     }
+
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::InitiateRepair { .. } => INITIATE_REPAIR_TYPE_INDEX,
+            Self::RepairAllEquipment { .. } => REPAIR_ALL_EQUIPMENT_TYPE_INDEX,
+            Self::RepairAllItemClass { .. } => REPAIR_ALL_ITEM_CLASS_TYPE_INDEX,
+            Self::UpgradeGearScore { .. } => UPGRADE_GEAR_SCORE_TYPE_INDEX,
+        }
+    }
+
+    /// The body bytes, as the client sends them.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        match self {
+            Self::InitiateRepair {
+                header,
+                item,
+                use_kit,
+            } => {
+                header.write(&mut writer);
+                item.write(&mut writer);
+                writer.boolean(*use_kit);
+            }
+            Self::RepairAllEquipment { header } => header.write(&mut writer),
+            Self::RepairAllItemClass { header, item_class } => {
+                header.write(&mut writer);
+                writer.u64(*item_class);
+            }
+            Self::UpgradeGearScore {
+                header,
+                item,
+                from,
+                to,
+            } => {
+                header.write(&mut writer);
+                item.write(&mut writer);
+                writer.u16(*from).u16(*to);
+            }
+        }
+        writer.finish()
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +179,8 @@ mod tests {
         assert_eq!((item.location, item.slot), (LOCATION_BAG, 32));
         assert_eq!(item.instance, [0x11; RAW_ID_LEN]);
         assert_eq!((from, to), (700, 701));
+        assert_eq!(message.type_index(), UPGRADE_GEAR_SCORE_TYPE_INDEX);
+        assert_eq!(message.encode(), bytes);
     }
 
     #[test]
@@ -162,5 +206,43 @@ mod tests {
             Some(Err(_))
         ));
         assert!(ItemRepairMsg::decode(1, &all).is_none());
+    }
+
+    #[test]
+    fn every_repair_call_writes_what_it_reads() {
+        let header = FacetHeader {
+            target: 0x9bcb_f835_d6df_0039,
+            entity: 0xf7da_088c_a2d1_6c7c,
+        };
+        let item = ItemRef {
+            location: LOCATION_BAG,
+            slot: 32,
+            instance: [0x11; RAW_ID_LEN],
+            extra: 5,
+        };
+        let calls = [
+            ItemRepairMsg::InitiateRepair {
+                header,
+                item,
+                use_kit: true,
+            },
+            ItemRepairMsg::RepairAllEquipment { header },
+            ItemRepairMsg::RepairAllItemClass {
+                header,
+                item_class: 71,
+            },
+            ItemRepairMsg::UpgradeGearScore {
+                header,
+                item,
+                from: 700,
+                to: 701,
+            },
+        ];
+        for call in calls {
+            assert_eq!(
+                ItemRepairMsg::decode(call.type_index(), &call.encode()),
+                Some(Ok(call))
+            );
+        }
     }
 }

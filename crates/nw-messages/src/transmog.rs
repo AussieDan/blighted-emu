@@ -223,6 +223,81 @@ impl TransmogClientMsg {
             _ => return None,
         })
     }
+
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::EnableItemSkin { .. } => ENABLE_ITEM_SKIN_TYPE_INDEX,
+            Self::DisableItemSkin { .. } => DISABLE_ITEM_SKIN_TYPE_INDEX,
+            Self::SetPreviewActive { .. } => SET_PREVIEW_ACTIVE_TYPE_INDEX,
+            Self::SetHidingSkinOnSlot { .. } => SET_HIDING_SKIN_ON_SLOT_TYPE_INDEX,
+            Self::TransmogScreenOpen { .. } => TRANSMOG_SCREEN_OPEN_TYPE_INDEX,
+            Self::TransmogStationScreenOpen { .. } => TRANSMOG_STATION_SCREEN_OPEN_TYPE_INDEX,
+            Self::ArmorDyeingOpen { .. } => ARMOR_DYEING_OPEN_TYPE_INDEX,
+            Self::PaperdollDye { .. } => PAPERDOLL_DYE_TYPE_INDEX,
+        }
+    }
+
+    /// The body bytes, as the client sends them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::CountTooLarge`] when a dye request has more entries than the
+    /// reader takes or more than `u8::MAX` bag slots.
+    pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
+        let mut writer = Writer::new();
+        match self {
+            Self::EnableItemSkin { header, slot, skin } => {
+                header.write(&mut writer);
+                writer.u32(*slot).u32(*skin);
+            }
+            Self::DisableItemSkin { header, slot } => {
+                header.write(&mut writer);
+                writer.u32(*slot);
+            }
+            Self::SetPreviewActive {
+                header,
+                active: flag,
+            }
+            | Self::TransmogScreenOpen { header, open: flag }
+            | Self::TransmogStationScreenOpen { header, open: flag }
+            | Self::ArmorDyeingOpen { header, open: flag } => {
+                header.write(&mut writer);
+                writer.boolean(*flag);
+            }
+            Self::SetHidingSkinOnSlot { header, slot, hide } => {
+                header.write(&mut writer);
+                writer.u32(*slot).boolean(*hide);
+            }
+            Self::PaperdollDye {
+                header,
+                entries,
+                extra,
+                bag_slots,
+            } => {
+                if entries.len() > usize::from(MAX_DYE_ENTRIES) {
+                    return Err(MessageError::CountTooLarge {
+                        count: u64::try_from(entries.len()).unwrap_or(u64::MAX),
+                        limit: u64::from(MAX_DYE_ENTRIES),
+                    });
+                }
+                header.write(&mut writer);
+                writer.u8_count(entries.len())?;
+                for entry in entries {
+                    writer.u32(entry.slot).bytes(&entry.dye);
+                    match entry.skin {
+                        Some(skin) => writer.boolean(true).u32(skin),
+                        None => writer.boolean(false),
+                    };
+                }
+                writer.u32(*extra).u8_count(bag_slots.len())?;
+                for bag_slot in bag_slots {
+                    writer.u32(*bag_slot);
+                }
+            }
+        }
+        Ok(writer.finish())
+    }
 }
 
 /// A transmog answer of the server.
@@ -351,10 +426,16 @@ mod tests {
     const RETAIL_TRANSMOG_TARGET: u64 = 0x4ce3_ed1a_188f_038f;
     const SKIN: u32 = 0xb051_8525;
 
+    /// Decodes the call of `type_index` in the bytes of `text` and checks that it names that
+    /// index and writes back those bytes.
     fn decode(type_index: u64, text: &str) -> TransmogClientMsg {
-        TransmogClientMsg::decode(type_index, &hex(text))
+        let body = hex(text);
+        let call = TransmogClientMsg::decode(type_index, &body)
             .expect("a transmog call")
-            .expect("reads")
+            .expect("reads");
+        assert_eq!(call.type_index(), type_index);
+        assert_eq!(call.encode().expect("encode"), body);
+        call
     }
 
     #[test]
@@ -429,6 +510,75 @@ mod tests {
         );
         assert_eq!(extra, 0);
         assert_eq!(bag_slots, [0x52, 0x50, 0x3a, 0x51, 0x53]);
+    }
+
+    #[test]
+    fn every_transmog_call_writes_what_it_reads() {
+        let header = FacetHeader {
+            target: RETAIL_TRANSMOG_TARGET,
+            entity: PLAYER_FACET,
+        };
+        let calls = [
+            TransmogClientMsg::EnableItemSkin {
+                header,
+                slot: 24,
+                skin: SKIN,
+            },
+            TransmogClientMsg::DisableItemSkin { header, slot: 3 },
+            TransmogClientMsg::SetPreviewActive {
+                header,
+                active: true,
+            },
+            TransmogClientMsg::SetHidingSkinOnSlot {
+                header,
+                slot: 4,
+                hide: true,
+            },
+            TransmogClientMsg::TransmogScreenOpen { header, open: true },
+            TransmogClientMsg::TransmogStationScreenOpen { header, open: true },
+            TransmogClientMsg::ArmorDyeingOpen { header, open: true },
+            TransmogClientMsg::PaperdollDye {
+                header,
+                entries: vec![
+                    DyeEntry {
+                        slot: 1,
+                        dye: [1, 2, 3, 4],
+                        skin: Some(SKIN),
+                    },
+                    DyeEntry {
+                        slot: 27,
+                        dye: [5, 6, 7, 8],
+                        skin: None,
+                    },
+                ],
+                extra: 9,
+                bag_slots: vec![0x52, 0x53],
+            },
+        ];
+        for call in calls {
+            let body = call.encode().expect("encode");
+            assert_eq!(
+                TransmogClientMsg::decode(call.type_index(), &body),
+                Some(Ok(call))
+            );
+        }
+        let too_many = TransmogClientMsg::PaperdollDye {
+            header,
+            entries: vec![
+                DyeEntry {
+                    slot: 0,
+                    dye: [0; DYE_BYTES],
+                    skin: None,
+                };
+                usize::from(MAX_DYE_ENTRIES) + 1
+            ],
+            extra: 0,
+            bag_slots: Vec::new(),
+        };
+        assert!(matches!(
+            too_many.encode(),
+            Err(MessageError::CountTooLarge { .. })
+        ));
     }
 
     /// Retail `rafflebones2`: a transmog skin unlock.

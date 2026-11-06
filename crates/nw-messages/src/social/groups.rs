@@ -10,7 +10,8 @@
 //! reason [`REMOVED_LEFT`]. An invite of an offline player gets a 3453 with
 //! [`ERROR_INVITEE_OFFLINE`] and the invitee.
 
-use crate::social::text::{CharacterRef, read_text};
+use crate::facet::FacetHeader;
+use crate::social::text::{CharacterRef, read_text, write_text};
 use crate::wire::{MessageError, RAW_ID_LEN, Reader, Writer};
 
 /// `GroupsComponentServerFacet_RequestGroupInvite`.
@@ -170,6 +171,62 @@ impl GroupCall {
             _ => return None,
         };
         Some(call)
+    }
+
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::Invite { .. } => GROUP_INVITE_TYPE_INDEX,
+            Self::Reply { .. } => REPLY_TO_INVITE_TYPE_INDEX,
+            Self::Leave { .. } => LEAVE_GROUP_TYPE_INDEX,
+            Self::SetLeader { .. } => SET_GROUP_LEADER_TYPE_INDEX,
+            Self::KickVote { .. } => KICK_VOTE_TYPE_INDEX,
+            Self::Ping { .. } => GROUP_PING_TYPE_INDEX,
+            Self::MoveRaidMember { .. } => MOVE_RAID_MEMBER_TYPE_INDEX,
+            Self::SwapRaidMembers { .. } => SWAP_RAID_MEMBERS_TYPE_INDEX,
+        }
+    }
+
+    /// The body of the call to the groups facet `header`, as [`crate::social::SocialCall::decode`]
+    /// reads it (a test client's call).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when a text does not fit its prefix.
+    pub fn encode(&self, header: FacetHeader) -> Result<Vec<u8>, MessageError> {
+        let mut writer = Writer::new();
+        header.write(&mut writer);
+        match self {
+            Self::Invite {
+                character,
+                extra,
+                flag,
+            } => {
+                write_text(&mut writer, character)?;
+                writer.bytes(extra).u8(*flag);
+            }
+            Self::Reply { invite, answer } => {
+                writer.bytes(invite).u32(*answer);
+            }
+            Self::Leave { value } => {
+                writer.u32(*value);
+            }
+            Self::SetLeader { character } | Self::KickVote { character } => {
+                write_text(&mut writer, character)?;
+            }
+            Self::Ping { data } => {
+                writer.bytes(data);
+            }
+            Self::MoveRaidMember { character, group } => {
+                write_text(&mut writer, character)?;
+                writer.u8(*group);
+            }
+            Self::SwapRaidMembers { first, second } => {
+                write_text(&mut writer, first)?;
+                write_text(&mut writer, second)?;
+            }
+        }
+        Ok(writer.finish())
     }
 }
 
@@ -339,7 +396,6 @@ impl GroupPush {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::social::text::write_text;
     use crate::social::{SocialCall, SocialPush};
 
     fn text_bytes(text: &str) -> Vec<u8> {
@@ -359,10 +415,16 @@ mod tests {
     const CHARACTER: &str = "00000000-0000-4000-8000-000000000003";
     const INVITE: &str = "63f5b7c17a794a4fab110a31c021e598";
 
+    /// The call of the retail body of `type_index` with arguments `args`; its encode gives the
+    /// same body back.
     fn call(type_index: u64, args: &[u8]) -> GroupCall {
         let body = [hex(HEADER), args.to_vec()].concat();
         match SocialCall::decode(type_index, &body).expect("a social call") {
-            Ok((_, SocialCall::Group(call))) => call,
+            Ok((header, SocialCall::Group(call))) => {
+                assert_eq!(call.type_index(), type_index);
+                assert_eq!(call.encode(header).expect("encode"), body);
+                call
+            }
             other => panic!("a group call: {other:?}"),
         }
     }
@@ -512,5 +574,46 @@ mod tests {
                 Some(Ok(push))
             );
         }
+    }
+
+    /// A header of synthetic ids.
+    const ROUND_TRIP_HEADER: FacetHeader = FacetHeader {
+        target: 0x0102_0304_0506_0708,
+        entity: 0x1112_1314_1516_1718,
+    };
+
+    #[test]
+    fn every_call_encodes_and_reads_back() {
+        let calls = [
+            GroupCall::Invite {
+                character: CHARACTER.to_owned(),
+                extra: [7; INVITE_EXTRA_LEN],
+                flag: 1,
+            },
+            GroupCall::Reply {
+                invite: [8; RAW_ID_LEN],
+                answer: 1,
+            },
+            GroupCall::Leave { value: 2 },
+            GroupCall::SetLeader {
+                character: CHARACTER.to_owned(),
+            },
+            GroupCall::KickVote {
+                character: CHARACTER.to_owned(),
+            },
+            GroupCall::Ping {
+                data: [5; PING_DATA_LEN],
+            },
+            GroupCall::MoveRaidMember {
+                character: CHARACTER.to_owned(),
+                group: 2,
+            },
+            GroupCall::SwapRaidMembers {
+                first: CHARACTER.to_owned(),
+                second: "00000000-0000-4000-8000-000000000009".to_owned(),
+            },
+        ]
+        .map(SocialCall::Group);
+        crate::social::assert_calls_round_trip(ROUND_TRIP_HEADER, &calls);
     }
 }

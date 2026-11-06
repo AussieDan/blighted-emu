@@ -126,6 +126,10 @@ impl ContainerRef {
             extra: reader.u64()?,
         })
     }
+
+    fn write(&self, writer: &mut Writer) {
+        writer.bytes(&self.id).u64(self.entity).u64(self.extra);
+    }
 }
 
 /// An item reference (28 bytes, 2549 and 5579): a location, a slot of it, the instance id and a
@@ -155,6 +159,15 @@ impl ItemRef {
             instance: reader.raw_id()?,
             extra: reader.u32()?,
         })
+    }
+
+    /// Writes the item reference.
+    pub(crate) fn write(&self, writer: &mut Writer) {
+        writer
+            .u32(self.location)
+            .u32(self.slot)
+            .bytes(&self.instance)
+            .u32(self.extra);
     }
 }
 
@@ -421,6 +434,15 @@ fn entries(reader: &mut Reader<'_>, limit: u64) -> Result<u64, MessageError> {
     Ok(count)
 }
 
+/// The count of `len` list entries, refused above `limit` as the reader refuses it.
+fn entries_count(len: usize, limit: u64) -> Result<u64, MessageError> {
+    let count = u64::try_from(len).unwrap_or(u64::MAX);
+    if count > limit {
+        return Err(MessageError::CountTooLarge { count, limit });
+    }
+    Ok(count)
+}
+
 impl ItemCallMsg {
     /// Decodes `body` when `type_index` is an item call; `None` otherwise.
     pub fn decode(type_index: u64, body: &[u8]) -> Option<Result<Self, MessageError>> {
@@ -625,6 +647,238 @@ impl ItemCallMsg {
             _ => return None,
         })
     }
+
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::UseItem { .. } => USE_ITEM_TYPE_INDEX,
+            Self::DropInventoryItems { .. } => DROP_INVENTORY_ITEMS_TYPE_INDEX,
+            Self::DropPaperdollItem { .. } => DROP_PAPERDOLL_ITEM_TYPE_INDEX,
+            Self::GiveItem { .. } => GIVE_ITEM_TYPE_INDEX,
+            Self::TakeItem { .. } => TAKE_ITEM_TYPE_INDEX,
+            Self::TradeEquipItem { .. } => TRADE_EQUIP_ITEM_TYPE_INDEX,
+            Self::TradeUnequipItem { .. } => TRADE_UNEQUIP_ITEM_TYPE_INDEX,
+            Self::UpdateStorageSession { .. } => UPDATE_STORAGE_SESSION_TYPE_INDEX,
+            Self::LoadoutPanelOpen { .. } => LOADOUT_PANEL_OPEN_TYPE_INDEX,
+            Self::AddItemToLoadouts { .. } => ADD_ITEM_TO_LOADOUTS_TYPE_INDEX,
+            Self::SwitchToLoadout { .. } => SWITCH_TO_LOADOUT_TYPE_INDEX,
+            Self::SavePaperdollToLoadout { .. } => SAVE_PAPERDOLL_TO_LOADOUT_TYPE_INDEX,
+            Self::RemoveAllItemsFromLoadout { .. } => REMOVE_ALL_ITEMS_FROM_LOADOUT_TYPE_INDEX,
+            Self::RenameLoadout { .. } => RENAME_LOADOUT_TYPE_INDEX,
+            Self::RemoveItemFromAllLoadouts { .. } => REMOVE_ITEM_FROM_ALL_LOADOUTS_TYPE_INDEX,
+            Self::RemoveItemFromLoadout { .. } => REMOVE_ITEM_FROM_LOADOUT_TYPE_INDEX,
+            Self::SetLockState { .. } => SET_LOCK_STATE_TYPE_INDEX,
+            Self::SlotItemWithCharm { .. } => SLOT_ITEM_WITH_CHARM_TYPE_INDEX,
+            Self::ClearCharmRequests { .. } => CLEAR_CHARM_REQUESTS_TYPE_INDEX,
+            Self::DropItemsByClass { .. } => DROP_INVENTORY_ITEMS_BY_CLASS_TYPE_INDEX,
+            Self::GiveItemsByClass { .. } => GIVE_ITEMS_BY_CLASS_TYPE_INDEX,
+            Self::TakeItemsByClass { .. } => TAKE_ITEMS_BY_CLASS_TYPE_INDEX,
+            Self::SearchStorage { .. } => REQUEST_SEARCH_STORAGE_TYPE_INDEX,
+            Self::ReplicateSearchResults { .. } => REPLICATE_SEARCH_RESULTS_TYPE_INDEX,
+        }
+    }
+
+    /// The body bytes, as the client sends them.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::CountTooLarge`] when the stacks of 1838 are more than the reader
+    /// takes, the paperdoll slot of 5579 does not fit its byte, or the name of 5487 is longer
+    /// than the reader takes.
+    pub fn encode(&self) -> Result<Vec<u8>, MessageError> {
+        let mut writer = Writer::new();
+        match self {
+            Self::ClearCharmRequests { header } | Self::ReplicateSearchResults { header } => {
+                header.write(&mut writer);
+            }
+            Self::UseItem { header, bag_slot } => {
+                header.write(&mut writer);
+                writer.u32(*bag_slot);
+            }
+            Self::DropInventoryItems { header, entries } => {
+                header.write(&mut writer);
+                writer.wide_prefixed(entries_count(entries.len(), MAX_CALL_ENTRIES)?);
+                for entry in entries {
+                    writer
+                        .u32(entry.bag_slot)
+                        .bytes(&entry.instance)
+                        .u32(entry.extra)
+                        .u32(entry.quantity);
+                }
+            }
+            Self::DropPaperdollItem {
+                header,
+                slot,
+                quantity,
+            } => {
+                header.write(&mut writer);
+                writer.u32(*slot).u32(*quantity);
+            }
+            Self::GiveItem {
+                header,
+                container,
+                instance,
+                quantity,
+            }
+            | Self::TakeItem {
+                header,
+                container,
+                instance,
+                quantity,
+            } => {
+                header.write(&mut writer);
+                container.write(&mut writer);
+                writer.bytes(instance).u32(*quantity);
+            }
+            Self::TradeEquipItem {
+                header,
+                container,
+                slot,
+                instance,
+                quantity,
+                flag,
+            } => {
+                header.write(&mut writer);
+                container.write(&mut writer);
+                writer.u32(*slot).bytes(instance).u32(*quantity).u8(*flag);
+            }
+            Self::TradeUnequipItem {
+                header,
+                container,
+                slot,
+                instance,
+                quantity,
+            } => {
+                header.write(&mut writer);
+                container.write(&mut writer);
+                writer.u32(*slot).bytes(instance).u32(*quantity);
+            }
+            Self::UpdateStorageSession { header, storage } => {
+                header.write(&mut writer);
+                writer.bytes(storage);
+            }
+            Self::LoadoutPanelOpen { header, open } => {
+                header.write(&mut writer);
+                writer.boolean(*open);
+            }
+            Self::AddItemToLoadouts {
+                header,
+                item,
+                quantity,
+                slot,
+                loadouts,
+            } => {
+                let slot_byte = u8::try_from(*slot).map_err(|_| MessageError::CountTooLarge {
+                    count: u64::from(*slot),
+                    limit: u64::from(u8::MAX),
+                })?;
+                header.write(&mut writer);
+                item.write(&mut writer);
+                writer.u32(*quantity).u8(slot_byte).bytes(loadouts);
+            }
+            Self::SwitchToLoadout { header, loadout }
+            | Self::SavePaperdollToLoadout { header, loadout } => {
+                header.write(&mut writer);
+                writer.u8(*loadout);
+            }
+            Self::RemoveAllItemsFromLoadout {
+                header,
+                loadout,
+                flag,
+            } => {
+                header.write(&mut writer);
+                writer.u8(*loadout).u8(*flag);
+            }
+            Self::RenameLoadout {
+                header,
+                loadout,
+                name,
+            } => {
+                header.write(&mut writer);
+                writer
+                    .u8(*loadout)
+                    .wide_prefixed(entries_count(name.len(), MAX_NAME_BYTES)?)
+                    .bytes(name);
+            }
+            Self::RemoveItemFromAllLoadouts { header, key } => {
+                header.write(&mut writer);
+                writer.u16(*key);
+            }
+            Self::RemoveItemFromLoadout {
+                header,
+                loadout,
+                key,
+                slot,
+            } => {
+                header.write(&mut writer);
+                writer.u8(*loadout).u16(*key).u32(*slot);
+            }
+            Self::SetLockState {
+                header,
+                item,
+                locked,
+            } => {
+                header.write(&mut writer);
+                item.write(&mut writer);
+                writer.boolean(*locked);
+            }
+            Self::SlotItemWithCharm {
+                header,
+                target,
+                charm,
+                perk_index,
+                extra,
+            } => {
+                header.write(&mut writer);
+                target.write(&mut writer);
+                charm.write(&mut writer);
+                writer.u32(*perk_index).u32(*extra);
+            }
+            Self::DropItemsByClass {
+                header,
+                class,
+                flag,
+            } => {
+                header.write(&mut writer);
+                writer.u64(*class).boolean(*flag);
+            }
+            Self::GiveItemsByClass {
+                header,
+                container,
+                class,
+            }
+            | Self::TakeItemsByClass {
+                header,
+                container,
+                class,
+            } => {
+                header.write(&mut writer);
+                container.write(&mut writer);
+                writer.u64(*class);
+            }
+            Self::SearchStorage {
+                header,
+                search,
+                lead,
+                filter,
+                extra,
+                station,
+                tail,
+                refresh,
+            } => {
+                header.write(&mut writer);
+                writer
+                    .bytes(search)
+                    .u8(*lead)
+                    .u32(*filter)
+                    .u32(*extra)
+                    .u32(*station)
+                    .u8(*tail)
+                    .boolean(*refresh);
+            }
+        }
+        Ok(writer.finish())
+    }
 }
 
 /// 5497: the result of a loadout call: an `eLoadoutStatusCode` and the loadout index (retail
@@ -704,10 +958,16 @@ mod tests {
     const PLAYER_FACET: u64 = 0xe34e_14f3_44a9_74cc;
     const LOADOUT: u8 = 5;
 
+    /// Decodes the call of `type_index` in the bytes of `text` and checks that it names that
+    /// index and writes back those bytes.
     fn decode(type_index: u64, text: &str) -> ItemCallMsg {
-        ItemCallMsg::decode(type_index, &hex(text))
+        let body = hex(text);
+        let call = ItemCallMsg::decode(type_index, &body)
             .expect("an item call")
-            .expect("reads")
+            .expect("reads");
+        assert_eq!(call.type_index(), type_index);
+        assert_eq!(call.encode().expect("encode"), body);
+        call
     }
 
     #[test]
@@ -903,5 +1163,178 @@ mod tests {
         let retail = hex(RETAIL_STATUS);
         assert_eq!(status.encode().expect("encode"), retail);
         assert_eq!(LoadoutStatusMsg::decode(&retail), Ok(status));
+    }
+
+    #[test]
+    fn every_item_call_writes_what_it_reads() {
+        let header = FacetHeader {
+            target: 0x7547_0b15_9dd8_7c55,
+            entity: PLAYER_FACET,
+        };
+        let instance = [0x3c; RAW_ID_LEN];
+        let container = ContainerRef {
+            id: [0x4d; RAW_ID_LEN],
+            entity: 0xb3ac_442d_2430_908c,
+            extra: 0x0102_0304_0506_0708,
+        };
+        let item = ItemRef {
+            location: LOCATION_BAG,
+            slot: 402,
+            instance,
+            extra: 3,
+        };
+        let charm = ItemRef {
+            location: LOCATION_BAG,
+            slot: 120,
+            instance: [0x5e; RAW_ID_LEN],
+            extra: 4,
+        };
+        let calls = [
+            ItemCallMsg::UseItem {
+                header,
+                bag_slot: 7,
+            },
+            ItemCallMsg::DropInventoryItems {
+                header,
+                entries: vec![
+                    DropEntry {
+                        bag_slot: 365,
+                        instance,
+                        extra: u32::MAX,
+                        quantity: 1,
+                    },
+                    DropEntry {
+                        bag_slot: 366,
+                        instance: [0x6f; RAW_ID_LEN],
+                        extra: 5,
+                        quantity: 2,
+                    },
+                ],
+            },
+            ItemCallMsg::DropPaperdollItem {
+                header,
+                slot: 24,
+                quantity: 3,
+            },
+            ItemCallMsg::GiveItem {
+                header,
+                container,
+                instance,
+                quantity: 87,
+            },
+            ItemCallMsg::TakeItem {
+                header,
+                container,
+                instance,
+                quantity: 88,
+            },
+            ItemCallMsg::TradeEquipItem {
+                header,
+                container,
+                slot: 25,
+                instance,
+                quantity: 1,
+                flag: 2,
+            },
+            ItemCallMsg::TradeUnequipItem {
+                header,
+                container,
+                slot: 26,
+                instance,
+                quantity: 4,
+            },
+            ItemCallMsg::UpdateStorageSession {
+                header,
+                storage: [0x7a; RAW_ID_LEN],
+            },
+            ItemCallMsg::LoadoutPanelOpen { header, open: true },
+            ItemCallMsg::AddItemToLoadouts {
+                header,
+                item,
+                quantity: 1,
+                slot: 9,
+                loadouts: vec![LOADOUT, 1],
+            },
+            ItemCallMsg::SwitchToLoadout { header, loadout: 2 },
+            ItemCallMsg::SavePaperdollToLoadout { header, loadout: 3 },
+            ItemCallMsg::RemoveAllItemsFromLoadout {
+                header,
+                loadout: 4,
+                flag: 1,
+            },
+            ItemCallMsg::RenameLoadout {
+                header,
+                loadout: LOADOUT,
+                // A name longer than one byte of the wide prefix code.
+                name: vec![b'a'; 200],
+            },
+            ItemCallMsg::RemoveItemFromAllLoadouts { header, key: 11 },
+            ItemCallMsg::RemoveItemFromLoadout {
+                header,
+                loadout: 1,
+                key: 12,
+                slot: 13,
+            },
+            ItemCallMsg::SetLockState {
+                header,
+                item,
+                locked: true,
+            },
+            ItemCallMsg::SlotItemWithCharm {
+                header,
+                target: ItemRef {
+                    location: LOCATION_PAPERDOLL_SLOT,
+                    ..item
+                },
+                charm,
+                perk_index: 1,
+                extra: 1,
+            },
+            ItemCallMsg::ClearCharmRequests { header },
+            ItemCallMsg::DropItemsByClass {
+                header,
+                class: UI_REFINING,
+                flag: true,
+            },
+            ItemCallMsg::GiveItemsByClass {
+                header,
+                container,
+                class: UI_REFINING,
+            },
+            ItemCallMsg::TakeItemsByClass {
+                header,
+                container,
+                class: 71,
+            },
+            ItemCallMsg::SearchStorage {
+                header,
+                search: [0x1b; RAW_ID_LEN],
+                lead: 1,
+                filter: SEARCH_FILTER_HOUSING,
+                extra: 2,
+                station: SMELTING_CRC,
+                tail: 3,
+                refresh: true,
+            },
+            ItemCallMsg::ReplicateSearchResults { header },
+        ];
+        for call in calls {
+            let body = call.encode().expect("encode");
+            assert_eq!(
+                ItemCallMsg::decode(call.type_index(), &body),
+                Some(Ok(call))
+            );
+        }
+        let wide_slot = ItemCallMsg::AddItemToLoadouts {
+            header,
+            item,
+            quantity: 1,
+            slot: u32::from(u8::MAX) + 1,
+            loadouts: Vec::new(),
+        };
+        assert!(matches!(
+            wide_slot.encode(),
+            Err(MessageError::CountTooLarge { .. })
+        ));
     }
 }

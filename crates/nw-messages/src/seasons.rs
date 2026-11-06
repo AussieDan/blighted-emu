@@ -112,6 +112,37 @@ impl SeasonsCall {
         }
     }
 
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::StampSquare { .. } => STAMP_SQUARE_TYPE_INDEX,
+            Self::NewCard { .. } => NEW_CARD_TYPE_INDEX,
+            Self::Reroll { .. } => REROLL_TYPE_INDEX,
+            Self::Redeem { .. } => REDEEM_REWARD_TYPE_INDEX,
+        }
+    }
+
+    /// The body bytes, as the client sends them.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = Writer::new();
+        match self {
+            Self::StampSquare {
+                header,
+                card,
+                square,
+            } => {
+                header.write(&mut writer);
+                writer.u32(*card).bytes(square);
+            }
+            Self::NewCard { header } | Self::Reroll { header } => header.write(&mut writer),
+            Self::Redeem { header, reward } => {
+                header.write(&mut writer);
+                writer.u64(*reward);
+            }
+        }
+        writer.finish()
+    }
+
     /// The answer to the call with `result` (a [`response`] value).
     pub const fn answer(&self, result: u32) -> SeasonsMessage {
         match *self {
@@ -330,14 +361,23 @@ mod tests {
     const HEADER: &str = "e5fe5c07dc18f1c3e34e14f344a974cc";
 
     /// Retail `Hive_Seasons_Rewards` 23847 ms and 23885 ms: a stamp and its answer.
+    /// Decodes the call of `type_index` in `body` and checks that it names that index and
+    /// writes back `body`.
+    fn decode_call(type_index: u64, body: &[u8]) -> SeasonsCall {
+        let call = SeasonsCall::decode(type_index, body)
+            .expect("a call")
+            .expect("decodes");
+        assert_eq!(call.type_index(), type_index);
+        assert_eq!(call.encode(), body);
+        call
+    }
+
     #[test]
     fn a_retail_stamp_gets_the_retail_answer_form() {
-        let call = SeasonsCall::decode(
+        let call = decode_call(
             STAMP_SQUARE_TYPE_INDEX,
             &hex_bytes(&format!("{HEADER}0000001a00020001")),
-        )
-        .expect("a call")
-        .expect("decodes");
+        );
         let SeasonsCall::StampSquare { card, square, .. } = call else {
             panic!("stamp");
         };
@@ -350,12 +390,10 @@ mod tests {
     /// Retail `Hive_Seasons_Rewards` 49498 ms and 49636 ms: a redeem and its answer.
     #[test]
     fn a_retail_redeem_repeats_its_reward() {
-        let call = SeasonsCall::decode(
+        let call = decode_call(
             REDEEM_REWARD_TYPE_INDEX,
             &hex_bytes(&format!("{HEADER}a17b8b9a22215ad9")),
-        )
-        .expect("a call")
-        .expect("decodes");
+        );
         let answer = call.answer(response::SUCCESS);
         let body = hex_bytes(&format!("{HEADER}a17b8b9a22215ad900000001"));
         assert_eq!(answer.encode(), body);
@@ -366,12 +404,36 @@ mod tests {
     }
 
     #[test]
+    fn every_season_call_writes_what_it_reads() {
+        let header = FacetHeader {
+            target: 0xe5fe_5c07_dc18_f1c3,
+            entity: 0xe34e_14f3_44a9_74cc,
+        };
+        let calls = [
+            SeasonsCall::StampSquare {
+                header,
+                card: 29,
+                square: [0x11, 1, 0, 0],
+            },
+            SeasonsCall::NewCard { header },
+            SeasonsCall::Reroll { header },
+            SeasonsCall::Redeem {
+                header,
+                reward: 0xa17b_8b9a_2221_5ad9,
+            },
+        ];
+        for call in calls {
+            assert_eq!(
+                SeasonsCall::decode(call.type_index(), &call.encode()),
+                Some(Ok(call))
+            );
+        }
+    }
+
+    #[test]
     fn calls_without_arguments_have_no_body_after_the_header() {
         for type_index in [NEW_CARD_TYPE_INDEX, REROLL_TYPE_INDEX] {
-            assert!(matches!(
-                SeasonsCall::decode(type_index, &hex_bytes(HEADER)),
-                Some(Ok(_))
-            ));
+            decode_call(type_index, &hex_bytes(HEADER));
             assert!(matches!(
                 SeasonsCall::decode(type_index, &hex_bytes(&format!("{HEADER}00"))),
                 Some(Err(_))

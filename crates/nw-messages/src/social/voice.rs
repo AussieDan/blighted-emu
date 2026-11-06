@@ -10,6 +10,7 @@
 //! gets the group channel (4200); 4203 gets a transcription token (kind
 //! [`TOKEN_TRANSCRIPTION`]). Every token answer repeats the call's request number.
 
+use crate::facet::FacetHeader;
 use crate::social::text::{read_count, read_text, write_count, write_text};
 use crate::wire::{MessageError, Reader, Writer};
 
@@ -135,6 +136,60 @@ impl VoiceCall {
             _ => return None,
         };
         Some(call)
+    }
+
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::Register => REGISTER_TYPE_INDEX,
+            Self::LoginToken { .. } => LOGIN_TOKEN_TYPE_INDEX,
+            Self::JoinToken { .. } => JOIN_TOKEN_TYPE_INDEX,
+            Self::TranscriptionToken { .. } => TRANSCRIPTION_TOKEN_TYPE_INDEX,
+            Self::ActivationState { .. } => ACTIVATION_STATE_TYPE_INDEX,
+            Self::WorldChannels => WORLD_CHANNELS_TYPE_INDEX,
+            Self::GroupChannel => GROUP_CHANNEL_TYPE_INDEX,
+            Self::ReportError { .. } => REPORT_ERROR_TYPE_INDEX,
+        }
+    }
+
+    /// The body of the call to the voice chat facet `header`, as
+    /// [`crate::social::SocialCall::decode`] reads it (a test client's call).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when a text does not fit its prefix.
+    pub fn encode(&self, header: FacetHeader) -> Result<Vec<u8>, MessageError> {
+        let mut writer = Writer::new();
+        header.write(&mut writer);
+        match self {
+            Self::Register | Self::WorldChannels | Self::GroupChannel => {}
+            Self::LoginToken { request } => {
+                writer.u16(*request);
+            }
+            Self::JoinToken {
+                request,
+                channel,
+                kind,
+            } => {
+                writer.u16(*request);
+                write_text(&mut writer, channel)?;
+                writer.u32(*kind);
+            }
+            Self::TranscriptionToken {
+                request,
+                channel_uri,
+            } => {
+                writer.u16(*request);
+                write_text(&mut writer, channel_uri)?;
+            }
+            Self::ActivationState { active } => {
+                writer.boolean(*active);
+            }
+            Self::ReportError { error } => {
+                writer.u32(*error);
+            }
+        }
+        Ok(writer.finish())
     }
 }
 
@@ -280,9 +335,16 @@ mod tests {
 
     const HEADER: &str = "403a00e443bf7ef02715f9bca18fdece";
 
+    /// The call of the retail body of `type_index` with arguments `args`; its encode gives the
+    /// same body back.
     fn call(type_index: u64, args: &str) -> VoiceCall {
-        match SocialCall::decode(type_index, &hex(&format!("{HEADER}{args}"))).expect("a call") {
-            Ok((_, SocialCall::Voice(call))) => call,
+        let body = hex(&format!("{HEADER}{args}"));
+        match SocialCall::decode(type_index, &body).expect("a call") {
+            Ok((header, SocialCall::Voice(call))) => {
+                assert_eq!(call.type_index(), type_index);
+                assert_eq!(call.encode(header).expect("encode"), body);
+                call
+            }
             other => panic!("a voice call: {other:?}"),
         }
     }
@@ -394,5 +456,34 @@ mod tests {
             token.encode_args().expect("encode"),
             hex("0174000000010001")
         );
+    }
+
+    /// A header of synthetic ids.
+    const ROUND_TRIP_HEADER: FacetHeader = FacetHeader {
+        target: 0x0102_0304_0506_0708,
+        entity: 0x1112_1314_1516_1718,
+    };
+
+    #[test]
+    fn every_call_encodes_and_reads_back() {
+        let calls = [
+            VoiceCall::Register,
+            VoiceCall::LoginToken { request: 1 },
+            VoiceCall::JoinToken {
+                request: 2,
+                channel: "013008_0".to_owned(),
+                kind: CHANNEL_POSITIONAL,
+            },
+            VoiceCall::TranscriptionToken {
+                request: 3,
+                channel_uri: "sip:x".to_owned(),
+            },
+            VoiceCall::ActivationState { active: true },
+            VoiceCall::WorldChannels,
+            VoiceCall::GroupChannel,
+            VoiceCall::ReportError { error: 2 },
+        ]
+        .map(SocialCall::Voice);
+        crate::social::assert_calls_round_trip(ROUND_TRIP_HEADER, &calls);
     }
 }

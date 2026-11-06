@@ -222,40 +222,188 @@ pub struct InteractionRequest {
     pub gatherable: Option<u32>,
 }
 
+/// The fields of a bit-8 body that the client fills by the kind of its interaction, not from
+/// the object (retail, every type 1589 body of the own and open-world ledgers: 4,964 gathers,
+/// 2 water gathers, 165 crafting stations, 1,767 loot bags, 115 revives, 46 triggers, 199 lore
+/// notes, 45 town boards, 2,552 talks, 97 dungeon exits).
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct KindShape {
+    /// Whether the body names the kind a second time (step 5) and sets the flag of step 10.
+    /// Observed: the two go together; both are clear on every dungeon exit and on 29 of the
+    /// 46 triggers, set on every other body. Their meaning is Unknown.
+    names_kind: bool,
+    /// The `f32` of step 15 (Observed: 3.0 on every revive, 0.5 on every dungeon exit, 0.0 on
+    /// every body of the other kinds here). Its meaning is Unknown.
+    step_15: f32,
+    /// The `u32` after the first five bytes of steps 19 to 25. Observed: one value per kind on
+    /// 4,964 of 4,964 gathers, 157 of 165 crafting stations, 1,743 of 1,767 loot bags and every
+    /// body of the other kinds here. It is the CRC-32 of a lowercase action name where one is
+    /// known: `openconversation` (talk), `readlore` (lore), `exitdungeon` (dungeon exit).
+    action_crc: u32,
+}
+
+/// The shape of a kind not in [`KIND_SHAPES`]: the kind named twice, a zero step 15 and a zero
+/// action CRC. Inferred: such a kind has no one retail shape (the 46 triggers show three step 15
+/// values and seven action CRCs, one per object) or no name in this crate.
+const DEFAULT_SHAPE: KindShape = KindShape {
+    names_kind: true,
+    step_15: 0.0,
+    action_crc: 0,
+};
+
+/// The retail shape of each kind with one shape in the captures (see [`KindShape`]).
+const KIND_SHAPES: [(u8, KindShape); 9] = [
+    (
+        GATHER_KIND,
+        KindShape {
+            action_crc: 0xa6e4_c280,
+            ..DEFAULT_SHAPE
+        },
+    ),
+    (
+        WATER_GATHER_KIND,
+        KindShape {
+            action_crc: 0xa973_ea31,
+            ..DEFAULT_SHAPE
+        },
+    ),
+    (
+        CRAFTING_STATION_KIND,
+        KindShape {
+            action_crc: 0xb09a_0ccc,
+            ..DEFAULT_SHAPE
+        },
+    ),
+    (
+        LOOT_KIND,
+        KindShape {
+            action_crc: 0xe9fb_092e,
+            ..DEFAULT_SHAPE
+        },
+    ),
+    (
+        REVIVE_PLAYER_KIND,
+        KindShape {
+            step_15: 3.0,
+            action_crc: 0x813f_c3ce,
+            ..DEFAULT_SHAPE
+        },
+    ),
+    (
+        LORE_KIND,
+        KindShape {
+            action_crc: 0xef69_6db1,
+            ..DEFAULT_SHAPE
+        },
+    ),
+    (
+        TOWN_BOARD_KIND,
+        KindShape {
+            action_crc: 0xd183_d760,
+            ..DEFAULT_SHAPE
+        },
+    ),
+    (
+        TALK_KIND,
+        KindShape {
+            action_crc: 0x507c_ac68,
+            ..DEFAULT_SHAPE
+        },
+    ),
+    (
+        EXIT_DUNGEON_KIND,
+        KindShape {
+            names_kind: false,
+            step_15: 0.5,
+            action_crc: 0xd5d6_2681,
+        },
+    ),
+];
+
+/// The second kind (step 5) of a body that does not name its kind twice (Observed: every
+/// dungeon exit and 29 of 46 triggers).
+const NO_SECOND_KIND: u8 = 0;
+/// Bytes of steps 19 to 25 before the action CRC: a `u32` and a `u8`.
+const LONG_COUNTERS_BEFORE_ACTION: usize = 5;
+/// Bytes of steps 19 to 25 after the action CRC: four `u32`.
+const LONG_COUNTERS_AFTER_ACTION: usize = 16;
+/// Bytes of step 33 (after its string) and step 34 before their last `u32`: a `u32`, a `u64`.
+const LONG_TAIL_BEFORE_ECHO: usize = 12;
+
+impl KindShape {
+    /// The shape the client writes for `kind`.
+    fn of(kind: u8) -> Self {
+        KIND_SHAPES
+            .iter()
+            .find(|(shaped, _)| *shaped == kind)
+            .map_or(DEFAULT_SHAPE, |(_, shape)| *shape)
+    }
+}
+
 impl Bit8 {
-    /// The body of a gather of the object `target` (facet entity `target_entity`) of gatherable
-    /// `gatherable` (CRC-32 of its lowercase `GatherableID`), interaction `interaction`, laid
-    /// out as the retail flint request starts (gather note, newchar 739603: the object, its
-    /// facet entity, the interaction id, the kind twice, the facet entity again and the
-    /// gatherable), with the rest of the long body empty: no name, no strings, no vectors, zero
-    /// counters.
-    pub fn gather(
-        target: [u8; RAW_ID_LEN],
-        target_entity: u64,
-        interaction: u64,
-        gatherable: u32,
-    ) -> Result<Self, MessageError> {
+    /// The long body of interaction `request` with the object named `name` (the talk name like
+    /// `@01_Grace`, the lore title, a loot bag's `@ui_loot`; empty for an object with none),
+    /// laid out as the retail requests are (see [`KindShape`] for the fields the kind sets):
+    ///
+    /// - the object, its facet entity, the interaction id and the kind (the request);
+    /// - the kind again, then the facet entity again. Observed: a gather's second entity is
+    ///   its facet entity (4,848 of 4,964); the other kinds write an entity id close to it
+    ///   that the request does not hold. Inferred: the facet entity for every kind; the
+    ///   server does not read it;
+    /// - the gatherable CRC (step 7), written again as the last `u32` of step 34 (Observed on
+    ///   the retail gathers); 0 for a request without one (Observed on the other kinds but
+    ///   the crafting stations, whose `u32` here has an Unknown source);
+    /// - an empty step 8 string and zero steps 8 and 9, the step 10 flag, the name (step 11),
+    ///   empty steps 12 to 14, no vectors, zero counters but the action CRC, and empty or zero
+    ///   steps 26 to 35. Observed on most retail bodies; the set values have an Unknown
+    ///   meaning, for example other counters of steps 19 to 25 on 1,913 of 4,964 gathers, the
+    ///   last `u32` of step 34 (`ef5b4fe0`) on 1,440 of 2,552 talks, a step 29 string on 93
+    ///   gathers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError::CountTooLarge`] when `name` is longer than the decoder's longest
+    /// string (`MAX_STRING`).
+    pub fn of_interaction(request: InteractionRequest, name: &[u8]) -> Result<Self, MessageError> {
         const EMPTY: u64 = 0;
+        let name_len = u64::try_from(name.len()).unwrap_or(u64::MAX);
+        if name_len > MAX_STRING {
+            return Err(MessageError::CountTooLarge {
+                count: name_len,
+                limit: MAX_STRING,
+            });
+        }
+        let shape = KindShape::of(request.kind);
+        let gatherable = request.gatherable.unwrap_or_default();
+        let second_kind = if shape.names_kind {
+            request.kind
+        } else {
+            NO_SECOND_KIND
+        };
         let mut writer = Writer::new();
         writer
-            .bytes(&target)
-            .u64(target_entity)
-            .u64(interaction)
-            .u8(GATHER_KIND)
-            .u8(GATHER_KIND)
-            .u64(target_entity)
+            .bytes(&request.target)
+            .u64(request.target_entity)
+            .u64(request.interaction)
+            .u8(request.kind)
+            .u8(second_kind)
+            .u64(request.target_entity)
             .u32(gatherable)
             .prefixed(EMPTY)?
             .bytes(&[0; LONG_AFTER_NAME_LEN])
-            .boolean(false);
-        for _ in 0..LONG_STRINGS_11_TO_14 {
+            .boolean(shape.names_kind)
+            .prefixed(name_len)?
+            .bytes(name);
+        for _ in 1..LONG_STRINGS_11_TO_14 {
             writer.prefixed(EMPTY)?;
         }
         writer
-            .f32(0.0)
+            .f32(shape.step_15)
             .boolean(false)
             .boolean(false)
-            .bytes(&[0; LONG_COUNTERS_LEN])
+            .bytes(&[0; LONG_COUNTERS_BEFORE_ACTION])
+            .u32(shape.action_crc)
+            .bytes(&[0; LONG_COUNTERS_AFTER_ACTION])
             .prefixed(EMPTY)?
             .u32(0)
             .prefixed(EMPTY)?
@@ -264,9 +412,31 @@ impl Bit8 {
             .boolean(false)
             .u32(0)
             .prefixed(EMPTY)?
-            .bytes(&[0; LONG_TAIL_LEN])
+            .bytes(&[0; LONG_TAIL_BEFORE_ECHO])
+            .u32(gatherable)
             .boolean(false);
         Ok(Self::Body(writer.finish()))
+    }
+
+    /// The body of a gather of the object `target` (facet entity `target_entity`) of gatherable
+    /// `gatherable` (CRC-32 of its lowercase `GatherableID`), interaction `interaction`, with
+    /// no name ([`Bit8::of_interaction`]; retail flint request, gather note, newchar 739603).
+    pub fn gather(
+        target: [u8; RAW_ID_LEN],
+        target_entity: u64,
+        interaction: u64,
+        gatherable: u32,
+    ) -> Result<Self, MessageError> {
+        Self::of_interaction(
+            InteractionRequest {
+                target,
+                target_entity,
+                interaction,
+                kind: GATHER_KIND,
+                gatherable: Some(gatherable),
+            },
+            &[],
+        )
     }
 
     /// The interaction of a body; `None` for an empty one or a body too short.
@@ -750,11 +920,16 @@ const SECOND_STATE_SHIFT: u32 = 16;
 
 /// The slots of a record with only `bit` of value `value` set.
 fn one_action(value: usize, bit: u32) -> InputSlots {
-    let mut values = vec![0; usize::from(ACTION_SLOTS).div_ceil(2)];
-    values[value] = 1 << bit;
+    let mut slots = no_action();
+    slots.values[value] = 1 << bit;
+    slots
+}
+
+/// The action slots of a record with no key held.
+fn no_action() -> InputSlots {
     InputSlots {
         count: ACTION_SLOTS,
-        values,
+        values: vec![0; usize::from(ACTION_SLOTS).div_ceil(2)],
         bytes: NEUTRAL_SLOT_BYTES,
     }
 }
@@ -800,6 +975,26 @@ impl ClientInputMsg {
                     one_action(ATTACK_RELEASE_VALUE, ATTACK_RELEASE_BIT),
                 ),
                 record(counter, one_action(ATTACK_PRESS_VALUE, ATTACK_PRESS_BIT)),
+            ],
+            ..Self::default()
+        }
+    }
+
+    /// A press of the summon mount key at `position`: the press in the record of counter
+    /// `counter`, a record with no key in the next, newest first (the sim summons, or dismounts
+    /// a rider, on a record that holds the key).
+    pub fn summon_mount(position: InputPosition, counter: u16) -> Self {
+        let record = |counter, slots| InputRecord {
+            mask: 1 << BIT_7,
+            u16_after_mask: counter,
+            bit_7: Some(position),
+            slots,
+            ..InputRecord::default()
+        };
+        Self {
+            records: vec![
+                record(counter.wrapping_add(1), no_action()),
+                record(counter, one_action(SUMMON_MOUNT_KEY.0, SUMMON_MOUNT_KEY.1)),
             ],
             ..Self::default()
         }
@@ -1336,11 +1531,11 @@ const LONG_AFTER_NAME_LEN: usize = 12;
 /// Step 17: two groups of three `f32`, when step 16 is 1.
 const LONG_VECTORS_LEN: usize = 24;
 /// Steps 19 to 25: a `u32`, a `u8`, five `u32`.
-const LONG_COUNTERS_LEN: usize = 25;
+const LONG_COUNTERS_LEN: usize = LONG_COUNTERS_BEFORE_ACTION + CRC_LEN + LONG_COUNTERS_AFTER_ACTION;
 /// Steps 30 and 31: a `u32` and a `u8`.
 const LONG_STEPS_30_31_LEN: usize = 5;
 /// Step 33 after its string, and step 34: a `u32`, a `u64`, a `u32`.
-const LONG_TAIL_LEN: usize = 16;
+const LONG_TAIL_LEN: usize = LONG_TAIL_BEFORE_ECHO + CRC_LEN;
 /// Steps 11 to 14 are strings.
 const LONG_STRINGS_11_TO_14: usize = 4;
 
@@ -1931,6 +2126,20 @@ mod tests {
     }
 
     #[test]
+    fn a_summon_input_holds_the_key_in_its_older_record_only() {
+        const COUNTER: u16 = 7;
+        let input = ClientInputMsg::summon_mount(position(), COUNTER);
+        let decoded = ClientInputMsg::decode(&input.encode().expect("encode")).expect("decode");
+        assert_eq!(decoded, input);
+        let [later, press] = decoded.records.as_slice() else {
+            panic!("two records");
+        };
+        assert!(press.summon_mount_pressed() && press.u16_after_mask == COUNTER);
+        assert!(!later.summon_mount_pressed() && later.u16_after_mask == COUNTER + 1);
+        assert!(!press.attack_pressed(), "no other key");
+    }
+
+    #[test]
     fn a_looking_input_carries_its_view_in_every_record() {
         const VIEW: [f32; 2] = [1.5, -0.25];
         let input = ClientInputMsg::attack(position(), 1).looking(VIEW);
@@ -2050,7 +2259,7 @@ mod tests {
             .expect("a request");
         assert_eq!(request.kind, GATHER_KIND);
         assert_eq!(request.target_entity, 0x5489_ec38_c63e_125b);
-        assert_eq!(request.gatherable, Some(0xa417_137f), "SingleStone");
+        assert_eq!(request.gatherable, Some(SINGLE_STONE), "SingleStone");
         let cut = Bit8::Body(RETAIL_START[..40].to_vec())
             .interaction()
             .expect("a request");
@@ -2062,7 +2271,6 @@ mod tests {
         const TARGET: [u8; RAW_ID_LEN] = [7; RAW_ID_LEN];
         const ENTITY: u64 = 0x5489_ec38_c63e_125b;
         const INTERACTION: u64 = 0x053c_aadb_ccbb_f4e5;
-        const SINGLE_STONE: u32 = 0xa417_137f;
         let body = Bit8::gather(TARGET, ENTITY, INTERACTION, SINGLE_STONE).expect("body");
         let input =
             ClientInputMsg::position(InputPosition::from_metres(10.0, 20.0, 30.0).expect("finite"))
@@ -2080,6 +2288,185 @@ mod tests {
         );
     }
 
+    /// Where a bit-8 body holds its second entity (after the kind twice).
+    const SECOND_ENTITY_AT: usize = 34;
+    /// Bytes of an entity id.
+    const ENTITY_LEN: usize = 8;
+    /// The CRC-32 of `singlestone` (gather note: retail flint).
+    const SINGLE_STONE: u32 = 0xa417_137f;
+    /// Retail flint gather (gather note, newchar 739603): byte for byte with the facet entity again.
+    const RETAIL_FLINT: &str = concat!(
+        "5b123ec638ec89549e70d26a6694afc55489ec38c63e125b053caadbccbbf4e5",
+        "0e0e5489ec38c63e125ba417137f000000000000000000000000000100000000",
+        "0000000000000000000000a6e4c2800000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000a41713",
+        "7f00",
+    );
+    /// Retail talk to `@01_Grace` (newchar 2026-09-18).
+    const RETAIL_TALK: &str = concat!(
+        "2f7f8926885248cd0570d26a6694afc5cd48528826897f2f0260c7b9d9284cbb",
+        "3f3fcd4856ac668f276500000000000000000000000000000000000109403031",
+        "5f47726163650000000000000000000000000000507cac680000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000000000000000000000",
+    );
+    /// Retail loot bag `@ui_loot` (newchar 2026-09-18).
+    const RETAIL_LOOT: &str = concat!(
+        "b88319b3219d456295f52fb304838f5c62459d21b31983b88b99702182c0e875",
+        "1c1c6247ed4bf88cf6f300000000000000000000000000000000000108407569",
+        "5f6c6f6f740000000000000000000000000000e9fb092e000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000",
+    );
+    /// Retail town project board (open-world playthrough, part 4).
+    const RETAIL_BOARD: &str = concat!(
+        "c754a9fd18028a950000000000000000958a0218fda954c786e96522076d657c",
+        "3333958a0222fda954c700000000000000000000000000000000000120407569",
+        "5f7465727269746f72795f626f6172645f746f776e5f70726f6a656374000000",
+        "0000000000000000000000d183d7600000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000",
+    );
+    /// Retail dungeon exit (open-world Soul Trial): byte for byte with the facet entity again.
+    const RETAIL_EXIT: &str = concat!(
+        "7ae43afa2f4d105ad75531b633178dad5a104d2ffa3ae47a728dea1ad79f8323",
+        "4a005a104d2ffa3ae47a00000000000000000000000000000000000000000000",
+        "3f00000000000000000000d5d626810000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000",
+    );
+    /// Retail revive of a downed player (open world), its ids made up: the object, facet entity, interaction id and second entity.
+    const RETAIL_REVIVE: &str = concat!(
+        "0000000000000001000000000000000200000000000000030000000000000004",
+        "1e1e000000000000000500000000000000000000000000000000000100000000",
+        "4040000000000000000000813fc3ce0000000000000000000000000000000000",
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "0000",
+    );
+
+    fn from_hex(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).expect("hex"))
+            .collect()
+    }
+
+    /// `body` with its facet entity written again as its second entity, as the builder writes
+    /// it.
+    fn with_facet_entity_again(body: &[u8]) -> Vec<u8> {
+        let mut body = body.to_vec();
+        let facet: [u8; ENTITY_LEN] = body[RAW_ID_LEN..RAW_ID_LEN + ENTITY_LEN]
+            .try_into()
+            .expect("facet entity");
+        body[SECOND_ENTITY_AT..SECOND_ENTITY_AT + ENTITY_LEN].copy_from_slice(&facet);
+        body
+    }
+
+    /// The body the builder writes from the request and the name that `body` decodes to.
+    fn built_from_decoded(body: &[u8]) -> Vec<u8> {
+        let retail = Bit8::Body(body.to_vec());
+        let request = retail.interaction().expect("a request");
+        let name = retail.interaction_name().expect("a name");
+        match Bit8::of_interaction(request, &name).expect("body") {
+            Bit8::Body(built) => built,
+            Bit8::Empty => panic!("a long body"),
+        }
+    }
+
+    #[test]
+    fn every_kind_reads_back_as_the_request_and_name_it_was_built_from() {
+        /// A kind without a retail shape in this crate (the sim's first mount screen kind).
+        const UNSHAPED_KIND: u8 = 76;
+        /// The CRC-32 of the gatherable of a retail large supplies crate.
+        const SUPPLIES_LARGE: u32 = 0xaaa7_69a5;
+        let cases: [(u8, Option<u32>, &[u8]); 12] = [
+            (GATHER_KIND, Some(SINGLE_STONE), b""),
+            (
+                GATHER_KIND,
+                Some(SUPPLIES_LARGE),
+                b"@LootContainer_SuppliesLarge_DisplayName",
+            ),
+            (WATER_GATHER_KIND, None, b""),
+            (LOOT_KIND, None, b"@ui_loot"),
+            (CRAFTING_STATION_KIND, None, b"@ui_watcherscampfire"),
+            (TALK_KIND, None, b"@12_JeongIseul"),
+            (TOWN_BOARD_KIND, None, b"@ui_territory_board_town_project"),
+            (REVIVE_PLAYER_KIND, None, b""),
+            (TRIGGER_KIND, None, b"Dropper_T1_FireBarrel"),
+            (EXIT_DUNGEON_KIND, None, b""),
+            (LORE_KIND, None, b"@00_Aeternum_Title_31_01"),
+            (UNSHAPED_KIND, None, b""),
+        ];
+        for (number, (kind, gatherable, name)) in (1_u64..).zip(cases) {
+            let request = InteractionRequest {
+                target: [7; RAW_ID_LEN],
+                target_entity: 0x5489_ec38_c63e_125b,
+                interaction: number,
+                kind,
+                gatherable,
+            };
+            let body = Bit8::of_interaction(request, name).expect("body");
+            let input = ClientInputMsg::position(position()).interacting(body);
+            let read = ClientInputMsg::decode(&input.encode().expect("encode")).expect("decode");
+            assert_eq!(read.interaction(), Some(request), "kind {kind}");
+            assert_eq!(read.interaction_name(), name, "kind {kind}");
+        }
+    }
+
+    #[test]
+    fn retail_bodies_are_built_again_from_their_request_and_name() {
+        for (retail, second_entity_is_facet) in [
+            (RETAIL_FLINT, true),
+            (RETAIL_TALK, false),
+            (RETAIL_LOOT, false),
+            (RETAIL_BOARD, false),
+            (RETAIL_EXIT, true),
+            (RETAIL_REVIVE, false),
+        ] {
+            let body = from_hex(retail);
+            assert_eq!(
+                body == with_facet_entity_again(&body),
+                second_entity_is_facet,
+                "{retail}"
+            );
+            assert_eq!(
+                built_from_decoded(&body),
+                with_facet_entity_again(&body),
+                "{retail}"
+            );
+        }
+        let flint = Bit8::Body(from_hex(RETAIL_FLINT));
+        let request = flint.interaction().expect("a request");
+        assert_eq!(
+            Bit8::gather(
+                request.target,
+                request.target_entity,
+                request.interaction,
+                SINGLE_STONE
+            ),
+            Ok(flint)
+        );
+    }
+
+    #[test]
+    fn a_name_longer_than_the_longest_string_is_refused() {
+        let request = InteractionRequest {
+            target: [7; RAW_ID_LEN],
+            target_entity: 1,
+            interaction: 2,
+            kind: TALK_KIND,
+            gatherable: None,
+        };
+        let name = vec![b'a'; MAX_STRING as usize + 1];
+        assert_eq!(
+            Bit8::of_interaction(request, &name),
+            Err(MessageError::CountTooLarge {
+                count: MAX_STRING + 1,
+                limit: MAX_STRING,
+            })
+        );
+    }
+
     #[test]
     fn a_lore_note_names_its_title() {
         // Retail lore read (2026-09-18, 19:21:17): the first 89 of its 158 bytes.
@@ -2088,10 +2475,12 @@ mod tests {
             "2f2fee589625a77a19530000000000000000000000000000000000",
             "011c404b7562696b6972697342757264656e5f5469746c655f30315f3031"
         );
-        let body: Vec<u8> = (0..RETAIL_LORE.len())
-            .step_by(2)
-            .map(|at| u8::from_str_radix(&RETAIL_LORE[at..at + 2], 16).expect("hex"))
-            .collect();
+        let body = from_hex(RETAIL_LORE);
+        assert_eq!(
+            built_from_decoded(&body)[..body.len()],
+            with_facet_entity_again(&body),
+            "the builder writes the retail start"
+        );
         let lore = Bit8::Body(body.clone());
         assert_eq!(
             lore.interaction().map(|request| request.kind),

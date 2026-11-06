@@ -10,6 +10,7 @@
 //! is opaque to the client the same way).
 
 use crate::buildables::GuildCrest;
+use crate::facet::FacetHeader;
 use crate::guild_lookup::UnorderedGuildsMsg;
 use crate::social::text::{CharacterRef, read_text, write_text};
 use crate::wire::{BodyCodec, MessageError, RAW_ID_LEN, Reader, Writer};
@@ -304,6 +305,93 @@ impl GuildCall {
         };
         Some(call)
     }
+
+    /// The type index of the call.
+    pub const fn type_index(&self) -> u64 {
+        match self {
+            Self::NameAvailability { .. } => NAME_AVAILABILITY_TYPE_INDEX,
+            Self::Create { .. } => CREATE_GUILD_TYPE_INDEX,
+            Self::Refresh => REFRESH_GUILD_DATA_TYPE_INDEX,
+            Self::Invite { .. } => CREATE_INVITE_TYPE_INDEX,
+            Self::RespondToInvite { .. } => RESPOND_TO_INVITE_TYPE_INDEX,
+            Self::Leave => LEAVE_GUILD_TYPE_INDEX,
+            Self::RemoveMember { .. } => REMOVE_MEMBER_TYPE_INDEX,
+            Self::SetRank { .. } => SET_MEMBER_RANK_TYPE_INDEX,
+            Self::Deposit { .. } => DEPOSIT_TYPE_INDEX,
+            Self::Withdraw { .. } => WITHDRAW_TYPE_INDEX,
+            Self::SetWithdrawalLimit { .. } => SET_WITHDRAWAL_LIMIT_TYPE_INDEX,
+            Self::EditMotd { .. } => EDIT_MOTD_TYPE_INDEX,
+            Self::EditCrest { .. } => EDIT_ICON_TYPE_INDEX,
+            Self::EditName { .. } => EDIT_NAME_TYPE_INDEX,
+            Self::SetSiegeWindow { .. } => SET_SIEGE_WINDOW_TYPE_INDEX,
+            Self::List { order, .. } => match order {
+                ListOrder::Name => LIST_BY_NAME_TYPE_INDEX,
+                ListOrder::Members => LIST_BY_MEMBERS_TYPE_INDEX,
+                ListOrder::Claims => LIST_BY_CLAIMS_TYPE_INDEX,
+            },
+        }
+    }
+
+    /// The body of the call to the guilds facet `header`, as [`crate::social::SocialCall::decode`]
+    /// reads it (a test client's call).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MessageError`] when a text does not fit its prefix.
+    pub fn encode(&self, header: FacetHeader) -> Result<Vec<u8>, MessageError> {
+        let mut writer = Writer::new();
+        header.write(&mut writer);
+        match self {
+            Self::NameAvailability { request, name } => {
+                writer.bytes(request);
+                write_text(&mut writer, name)?;
+            }
+            Self::Create { name, crest } => {
+                write_text(&mut writer, name)?;
+                crest.write(&mut writer);
+            }
+            Self::Refresh | Self::Leave => {}
+            Self::Invite { character } | Self::RemoveMember { character } => {
+                write_text(&mut writer, character)?;
+            }
+            Self::RespondToInvite { guild, accept } => {
+                writer.bytes(guild).boolean(*accept);
+            }
+            Self::SetRank { character, rank } => {
+                write_text(&mut writer, character)?;
+                writer.u8(*rank);
+            }
+            Self::Deposit { amount } | Self::Withdraw { amount } => {
+                writer.u64(*amount);
+            }
+            Self::SetWithdrawalLimit { limit } => {
+                writer.u64(*limit);
+            }
+            Self::EditMotd { text } => {
+                write_text(&mut writer, text)?;
+            }
+            Self::EditCrest { crest } => {
+                crest.write(&mut writer);
+            }
+            Self::EditName { name } => {
+                write_text(&mut writer, name)?;
+            }
+            Self::SetSiegeWindow { hour } => {
+                writer.f32(*hour);
+            }
+            Self::List {
+                request,
+                descending,
+                page_size,
+                token,
+                ..
+            } => {
+                writer.bytes(request).boolean(*descending).u16(*page_size);
+                write_text(&mut writer, token)?;
+            }
+        }
+        Ok(writer.finish())
+    }
 }
 
 /// A company push of the server.
@@ -461,7 +549,6 @@ impl GuildPush {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::facet::FacetHeader;
     use crate::social::{SocialCall, SocialPush};
 
     fn hex(text: &str) -> Vec<u8> {
@@ -481,9 +568,16 @@ mod tests {
     /// The crest of the retail 3611 (`creating_a_company`).
     const CREST: &str = "00ec3f0787883e48c8ca3f53d3d53f800000001c3eb0b0b13ef8f8fa3f3cbcbd3f800000";
 
+    /// The call of the retail body of `type_index` with arguments `args`; its encode gives the
+    /// same body back.
     fn call(type_index: u64, args: &str) -> GuildCall {
-        match SocialCall::decode(type_index, &hex(&format!("{HEADER}{args}"))).expect("a call") {
-            Ok((_, SocialCall::Guild(call))) => call,
+        let body = hex(&format!("{HEADER}{args}"));
+        match SocialCall::decode(type_index, &body).expect("a call") {
+            Ok((header, SocialCall::Guild(call))) => {
+                assert_eq!(call.type_index(), type_index);
+                assert_eq!(call.encode(header).expect("encode"), body);
+                call
+            }
             other => panic!("a company call: {other:?}"),
         }
     }
@@ -624,5 +718,65 @@ mod tests {
         let args = push.encode_args().expect("encode");
         let body = listing.encode().expect("encode");
         assert_eq!(args, [&body[HEADER_LEN..], &[2, b'p', b'1']].concat());
+    }
+
+    /// A header of synthetic ids.
+    const ROUND_TRIP_HEADER: FacetHeader = FacetHeader {
+        target: 0x0102_0304_0506_0708,
+        entity: 0x1112_1314_1516_1718,
+    };
+
+    #[test]
+    fn every_call_encodes_and_reads_back() {
+        let crest = crest_of_bytes(&hex(CREST).try_into().expect("36 bytes"));
+        let list = |order| GuildCall::List {
+            order,
+            request: [6; RAW_ID_LEN],
+            descending: true,
+            page_size: LIST_PAGE_SIZE,
+            token: "p2".to_owned(),
+        };
+        let calls = [
+            GuildCall::NameAvailability {
+                request: [1; RAW_ID_LEN],
+                name: "Open".to_owned(),
+            },
+            GuildCall::Create {
+                name: "Test".to_owned(),
+                crest,
+            },
+            GuildCall::Refresh,
+            GuildCall::Invite {
+                character: CHARACTER.to_owned(),
+            },
+            GuildCall::RespondToInvite {
+                guild: [2; RAW_ID_LEN],
+                accept: true,
+            },
+            GuildCall::Leave,
+            GuildCall::RemoveMember {
+                character: CHARACTER.to_owned(),
+            },
+            GuildCall::SetRank {
+                character: CHARACTER.to_owned(),
+                rank: 2,
+            },
+            GuildCall::Deposit { amount: 50_000 },
+            GuildCall::Withdraw { amount: 40_000 },
+            GuildCall::SetWithdrawalLimit { limit: 30_000 },
+            GuildCall::EditMotd {
+                text: "hi".to_owned(),
+            },
+            GuildCall::EditCrest { crest },
+            GuildCall::EditName {
+                name: "Renamed".to_owned(),
+            },
+            GuildCall::SetSiegeWindow { hour: 18.0 },
+            list(ListOrder::Name),
+            list(ListOrder::Members),
+            list(ListOrder::Claims),
+        ]
+        .map(SocialCall::Guild);
+        crate::social::assert_calls_round_trip(ROUND_TRIP_HEADER, &calls);
     }
 }
