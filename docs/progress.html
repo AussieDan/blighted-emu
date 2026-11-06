@@ -98,7 +98,7 @@
 <body>
 <main>
   <h1>Blighted New World Emulator: Progress</h1>
-  <p class="sub">Status on 2026-11-05. Client build 25810808. Last commit <code>b85a348f</code>.</p>
+  <p class="sub">Status on 2026-11-06. Client build 25810808. Last commit <code>607a0857</code>.</p>
 
   <div class="cards" id="summary"></div>
 
@@ -123,6 +123,8 @@
 
   <h2>What to do next (in order)</h2>
   <ol class="next">
+    <li><strong>Test bots at level 65 in good gear.</strong>
+      <div class="why">The quest bots must be level 65 in good gear, so level and stats never limit a kill or the bot's life. A player's hit is its weapon's base damage times a scale of the weapon's gear score; level and attributes do not change it. A starter weapon hits a level 34 bear (8,776 health) for 42. Not built yet. Notes: section 7 of <code>local-data/findings/2026-11-06-quest-walk-and-play-bot.md</code>.</div></li>
     <li><strong>Fix the quests the quest walk found broken.</strong>
       <div class="why">The walk (2026-11-06) played all 18,441 quests and missions: 16,976 end, 1,173 do not. The biggest cause by far (698 quests) looks like one server gap: a normal quest's "have and return items" step keeps no item source, so the item never drops (a mission's step keeps it). Prove it on a retail capture first, then fix. Next come 297 kill steps with no matching open world mob, 47 step kinds the server does not run, and the beach chain for a character that skipped the tutorial (it waits for an achievement no open world step gives). The list with each quest's stop is in <code>local-data/reports/quest-walk-all.md</code>; the causes are in <code>local-data/findings/2026-11-06-quest-walk-and-play-bot.md</code>. The 6 quests the play bot reported broken (and the walk did not) were each a fault of the bot, not of the quest (2026-11-06): after the bot fixes, 5 of them were turned in over the network, and the sixth passed its old stop and waits at a step the bot does not play yet.</div></li>
     <li><strong>Windows test of the three reroutes, and a look at the empty shop screen.</strong>
