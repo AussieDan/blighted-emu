@@ -63,7 +63,7 @@ const HOUSING_FIELD: &str = "player housing";
 const HOME_FIELD: &str = "player home";
 const CAMPING_FIELD: &str = "camping";
 
-fn read_text(reader: &mut Reader<'_>) -> Result<Vec<u8>, MessageError> {
+pub(crate) fn read_text(reader: &mut Reader<'_>) -> Result<Vec<u8>, MessageError> {
     let len = reader.wide_prefixed()?;
     if len > MAX_TEXT {
         return Err(MessageError::CountTooLarge {
@@ -75,7 +75,7 @@ fn read_text(reader: &mut Reader<'_>) -> Result<Vec<u8>, MessageError> {
     Ok(reader.bytes(len as usize)?.to_vec())
 }
 
-fn write_text(writer: &mut Writer, text: &[u8]) {
+pub(crate) fn write_text(writer: &mut Writer, text: &[u8]) {
     // A `usize` length fits 64 bits.
     writer.wide_prefixed(text.len() as u64).bytes(text);
 }

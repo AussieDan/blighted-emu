@@ -84,6 +84,7 @@ pub(crate) mod instances;
 mod invites;
 mod item_calls;
 mod kill_rewards;
+mod land_claims;
 mod level_assets;
 mod level_flow;
 mod loot_bag;
@@ -815,6 +816,8 @@ struct Player {
     game_mode: game_mode::GameModePlayer,
     /// The weekly mutations its client has ([`mutations`]).
     mutation_view: mutations::ScheduleView,
+    /// Whether its client has the slot-2 world entity and its claims ([`land_claims`]).
+    slot_2_spawned: bool,
     frozen: bool,
     handoffs: u64,
     no_handoff_before_ms: u64,
@@ -4567,6 +4570,7 @@ impl SimWorld {
                     arena: instances::ArenaPlayer::of(arrival.progression.arena.clone()),
                     game_mode: game_mode::GameModePlayer::default(),
                     mutation_view: mutations::ScheduleView::default(),
+                    slot_2_spawned: false,
                     frozen: false,
                     handoffs,
                     no_handoff_before_ms,
@@ -5032,6 +5036,9 @@ impl Neighbourhood<'_> {
                 OwnTeleport::of(player.teleports, clock, player.move_facing, step)
             });
             let mut groups: Vec<BundleGroup> = Vec::new();
+            // The slot-2 entity's groups go last: the claims state is larger than a datagram
+            // and takes a bundle of its own (retail sends it over several chunks).
+            let mut slot_2_groups: Vec<BundleGroup> = Vec::new();
             if own_sent {
                 // The whole gear and achievements go with the first card; later the
                 // achievements send their changes, and the gear its whole states again after a
@@ -5327,13 +5334,22 @@ impl Neighbourhood<'_> {
                     }
                     groups.push(group);
                 }
-                // The weekly mutations (slot 2), once the client spawned and at each new week.
-                if vitals.spawned {
-                    groups.extend(mutations::schedule_group(
+                // The slot-2 world entity, once the client spawned and the other entities may
+                // go out (its card is another entity's card; retail sends it 9 s after the first
+                // bundle): the weekly mutations (again at each new week), and once its card,
+                // position and territory claims.
+                if vitals.spawned && !hold_others {
+                    let mut slot_2 = mutations::schedule_group(
                         self.mutations,
                         self.mutation_unix_s,
                         &mut player.mutation_view,
-                    )?);
+                    )?;
+                    if let Some(spawn) =
+                        land_claims::spawn_members_once(&mut player.slot_2_spawned)?
+                    {
+                        slot_2 = Some(land_claims::with_slot_2_members(slot_2, spawn));
+                    }
+                    slot_2_groups.extend(slot_2);
                 }
             }
             if let Some(level_info) = player.flow.level_info_due(self.now_ms) {
@@ -5467,6 +5483,7 @@ impl Neighbourhood<'_> {
                     },
                 });
             }
+            groups.append(&mut slot_2_groups);
             counted += groups
                 .iter()
                 .map(|group| group.members.len() as u64)
@@ -6205,7 +6222,8 @@ mod tests {
             .map(|(entity, _)| *entity)
     }
 
-    /// The groups of `bundle` of `who`, each with the entity of its slot.
+    /// The groups of `bundle` of `who`, each with the entity of its slot; the never-carded
+    /// slot-2 entity (the mutations and the territory claims) is left out.
     fn groups_in(
         world: &SimWorld,
         who: &ConnectionRef,
@@ -6215,6 +6233,7 @@ mod tests {
             .expect("read")
             .updates
             .into_iter()
+            .filter(|update| u64::from(update.interest) != nw_messages::LAND_CLAIM_MANAGER_INTEREST)
             .map(|update| {
                 let entity = update
                     .entity
@@ -6565,17 +6584,22 @@ mod tests {
 
     #[test]
     fn bundle_members_count_self_and_others() {
+        const PLAYERS: u64 = 3;
         let mut world = world_with_spawns(Vec::new());
         world.set_table(&table(&["sim-a", "sim-b"])).expect("table");
-        for number in 1..=3 {
+        for number in 1..=PLAYERS {
             join(&mut world, number, CELL_M / 2.0 + number as f32);
         }
-        // The world has no weekly mutations, so no scheduler group; the arrival's arena state
-        // takes the place of the card's own.
+        // The world has no weekly mutations, so no scheduler group, but each client gets the
+        // slot-2 entity once (its position, card and claims); the arrival's arena state takes
+        // the place of the card's own.
+        const SLOT_2_SPAWN_MEMBERS: u64 = 3;
         assert_eq!(
             tick(&mut world, NOW + OWN_CARD_DELAY_MS).bundle_members,
-            9 * (2 + PLAYER_EMPTY_COMPONENTS.len() as u64),
-            "3 bundles of 3 groups, each a card, the empty player components and a position"
+            PLAYERS * PLAYERS * (2 + PLAYER_EMPTY_COMPONENTS.len() as u64)
+                + PLAYERS * SLOT_2_SPAWN_MEMBERS,
+            "3 bundles of 3 groups, each a card, the empty player components and a position, \
+             and the slot-2 entity of each player"
         );
     }
 
@@ -12440,9 +12464,21 @@ mod tests {
             .filter(|out| out.connection == viewer && out.channel == REPLICATION_CHANNEL)
             .count();
         assert!(bundles > 1);
+        // Every bundle but the territory claims' (slot 2), which retail also sends over several
+        // chunks.
+        let carries_claims = |out: &&Outgoing| {
+            SlotRead::of(&bundle_in(&out.envelopes[0]))
+                .expect("read")
+                .updates
+                .iter()
+                .any(|update| {
+                    u64::from(update.interest) == nw_messages::LAND_CLAIM_MANAGER_INTEREST
+                })
+        };
         for out in outgoing
             .iter()
             .filter(|out| out.channel == REPLICATION_CHANNEL)
+            .filter(|out| !carries_claims(out))
         {
             let payload = encode_server_messages(&[&out.envelopes[0]]).expect("payload");
             assert!(payload.len() <= MAX_CHUNK_PAYLOAD, "{}", payload.len());
