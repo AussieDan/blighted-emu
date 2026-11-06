@@ -1739,9 +1739,7 @@ mod tests {
     use nw_content::poi_tags::PoiTags;
     use nw_sim_core::test_support::NoGround;
 
-    use super::super::tests::{
-        CELL_M, MANY, MAX_PLAYERS, NOW, settings, slot, table, test_spawn,
-    };
+    use super::super::tests::{CELL_M, MANY, MAX_PLAYERS, NOW, settings, slot, table, test_spawn};
     use super::*;
     use crate::combat::test_support::{TEST_LEVEL, TEST_MOB};
     use crate::combat::tests::test_combat;

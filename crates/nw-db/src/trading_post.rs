@@ -1781,8 +1781,8 @@ mod infra_tests {
                 },
             )
             .await
-                .expect("post")
-                .expect("posted");
+            .expect("post")
+            .expect("posted");
             cancel_order(pool, kept.id, seller, NOW_MS)
                 .await
                 .expect("cancel")

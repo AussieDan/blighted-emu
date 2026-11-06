@@ -416,11 +416,36 @@ mod tests {
         // The kit sword and the retail tier 5 longswords (`Infix_*_1hLongsword`, 726 to 800).
         let rolls = ItemRolls::build(
             [
-                row("1hSwordT2_FTUE", "EquippableMainHand+Weapon+Melee+Sword", 60, None),
-                row("Infix_Tenacity_1hLongsword", "Sword+Weapon+Melee+EquippableMainHand", 800, None),
-                row("Infix_Enrage_1hLongsword", "EquippableMainHand+Weapon+Melee+Sword", 800, None),
-                row("Omega_Longsword_Blank_800", "EquippableMainHand+Weapon+Melee+Sword", 800, Some(800)),
-                row("2hGreatSwordT5", "EquippableTwoHand+Weapon+Melee+GreatSword", 900, None),
+                row(
+                    "1hSwordT2_FTUE",
+                    "EquippableMainHand+Weapon+Melee+Sword",
+                    60,
+                    None,
+                ),
+                row(
+                    "Infix_Tenacity_1hLongsword",
+                    "Sword+Weapon+Melee+EquippableMainHand",
+                    800,
+                    None,
+                ),
+                row(
+                    "Infix_Enrage_1hLongsword",
+                    "EquippableMainHand+Weapon+Melee+Sword",
+                    800,
+                    None,
+                ),
+                row(
+                    "Omega_Longsword_Blank_800",
+                    "EquippableMainHand+Weapon+Melee+Sword",
+                    800,
+                    Some(800),
+                ),
+                row(
+                    "2hGreatSwordT5",
+                    "EquippableTwoHand+Weapon+Melee+GreatSword",
+                    900,
+                    None,
+                ),
             ],
             PerkTable::default(),
         );
