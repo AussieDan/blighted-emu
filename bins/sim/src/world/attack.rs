@@ -2168,6 +2168,13 @@ impl SimWorld {
                 return None;
             }
             let damage = self.mobs.get_mut(target)?.health.take(amount);
+            tracing::debug!(
+                mob = target,
+                attacker,
+                amount,
+                left = self.mobs.health(target),
+                "mob hurt"
+            );
             let outcome = match damage {
                 Damage::Killed => {
                     self.mobs.died(target, now_ms);

@@ -651,6 +651,7 @@ impl TickView<'_> {
         step.sleeps &= mind.target().is_none();
         if thought.healed {
             mob.health.refill();
+            tracing::debug!(mob = mob_entity(index), "mob healed at the end of its reset");
         }
         step.acquired = thought.acquired;
         step.ticked = thought.ticked;
