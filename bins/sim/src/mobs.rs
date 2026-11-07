@@ -137,7 +137,14 @@ pub struct Mob {
     near_ms: u64,
     /// It stands on the floor under its spawn: the world file's spawn heights are not on it
     /// (live login-world-entry-01: a boar spawned 1.42 m under the terrain stayed in it until
-    /// it moved).
+    /// it moved). The spawn lands on the floor at any height under it, not only within
+    /// [`crate::mob_ai::MAX_STEP_DOWN_M`]: 5,088 of the 115,965 open world spawns are more than
+    /// 3 m over the floor, and retail mobs stand on it (2026-11-07, the timber wolves of spawn
+    /// 26015 near Prydwen, 3.32 m over the floor: retail cards of the same vitals there were
+    /// 0.10 m over it, monarchs ledger at 4397039 ms; live, the wolves walked in the air). All 10
+    /// retail tutorial mob cards of the newchar capture are within 1 m of the floor, the ship's
+    /// deck included; 8 of 6,377 retail open world cards of 9 ledgers stood more than 3 m over
+    /// it (a structure our floor lacks), and such a mob now stands under it.
     grounded: bool,
     /// Its corpse went (`SimWorld::bury_corpses`): it is not shown until its respawn.
     buried: bool,
@@ -644,7 +651,8 @@ impl TickView<'_> {
             held: self.held.get(&mob_entity(index)),
         };
         if !mob.grounded {
-            mob.position.z = height_after_move(self.ground, mob.position);
+            let at = mob.position;
+            mob.position.z = self.ground.floor_at(at.x, at.y, at.z).unwrap_or(at.z);
             mob.grounded = true;
         }
         let thought = mind.step(self.ai, &mut mob.position, &around);
@@ -2339,6 +2347,18 @@ mod tests {
     }
 
     #[test]
+    fn a_mob_spawned_high_over_the_floor_lands_on_it_at_its_first_step() {
+        // Spawn 26015 near Prydwen: 3.32 m over the floor, beyond the walk's step down.
+        const OVER_M: f32 = 3.32;
+        let mut spawn = spawn_at(SPAWN_X, TEST_MOB, TEST_LEVEL);
+        spawn.position[2] = HEIGHT + OVER_M;
+        let mut mobs = mobs(vec![spawn]);
+        mobs.set_cells(every);
+        run(&mut mobs, &[player_at(SPAWN_X + 10.0)], 0, 0);
+        assert_eq!(at(&mobs, 0).z, HEIGHT);
+    }
+
+    #[test]
     fn a_buried_corpse_is_not_shown_until_its_respawn() {
         let mut mobs = mobs(vec![spawn_at(SPAWN_X, TEST_MOB, TEST_LEVEL)]);
         mobs.set_cells(every);
@@ -2450,6 +2470,8 @@ mod tests {
         assert_eq!(at(&mobs, 0), landed);
     }
 
+    /// A mob that stands on a deck the ground does not hold keeps its height while it runs (the
+    /// walk's step down); the test ground has no deck, so the mob starts there landed.
     #[test]
     fn a_mob_on_a_deck_keeps_its_height() {
         const DECK: f32 = 90.0;
@@ -2457,6 +2479,7 @@ mod tests {
         spawn.position[2] = DECK;
         let mut mobs = mobs(vec![spawn]);
         mobs.set_cells(every);
+        mobs.get_mut(mob_entity(0)).expect("mob").grounded = true;
         let mut player = player_at(SPAWN_X + 10.0);
         player.position.z = DECK;
         run(&mut mobs, &[player], 0, 1_000);
