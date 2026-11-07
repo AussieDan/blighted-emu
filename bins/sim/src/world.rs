@@ -1306,10 +1306,11 @@ impl SimWorld {
             number: admit.entity,
             // A saved spot can be in the air or under the ground (a save during a jump, or a
             // height from another world file); the player arrives on the ground.
-            position: self
-                .settings
-                .limits
-                .onto_ground(&*self.ground, Position::from(admit.position)),
+            position: self.settings.limits.onto_ground(
+                &*self.ground,
+                Position::from(admit.position),
+                self.settings.ocean_level_m,
+            ),
             health: Health::full(
                 self.player_max_health(admit.progression.experience, &admit.progression.attributes),
             ),
@@ -1464,7 +1465,11 @@ impl SimWorld {
             backstory: offer.backstory.clone(),
             number: offer.entity,
             position: if enters {
-                self.settings.limits.onto_ground(&*self.ground, position)
+                self.settings.limits.onto_ground(
+                    &*self.ground,
+                    position,
+                    self.settings.ocean_level_m,
+                )
             } else {
                 position
             },
@@ -1896,7 +1901,9 @@ impl SimWorld {
 
     /// The server puts player `entity` at `to` at `now_ms`, facing `facing` when given: its
     /// next own state moves its client there ([`OwnTeleport`]), a push on it ends, and its body
-    /// lands as `placement` says.
+    /// lands as `placement` says. The last grounded place is the new one when it stands there,
+    /// none when it drops: a later move back never goes to where it stood before (live
+    /// 2026-11-07: refused moves after a fast travel put the player back at the shrine it left).
     fn place_player(
         &mut self,
         entity: Entity,
@@ -1912,9 +1919,16 @@ impl SimWorld {
             player.moved = true;
             player.move_facing = facing;
             player.push = None;
+            player.refused_since_ms = None;
             match placement {
-                Placement::Stand => player.tracked.stand_at(to),
-                Placement::Drop => player.tracked.drop_at(to),
+                Placement::Stand => {
+                    player.tracked.stand_at(to);
+                    player.last_grounded = Some(to);
+                }
+                Placement::Drop => {
+                    player.tracked.drop_at(to);
+                    player.last_grounded = None;
+                }
             }
         }
     }
@@ -3655,6 +3669,7 @@ impl SimWorld {
             // shrines 40293, 40295 and 40183 were charted at an entry after their discovery).
             ClientFacetMsg::TerritoryEntered { territory, .. } => {
                 self.territory_changed(entity, *territory, true);
+                self.visit_town(entity, *territory);
                 if !self.discover_territory(entity, *territory) {
                     self.chart_area(entity, number, *territory, now_ms);
                 }
@@ -6856,6 +6871,50 @@ mod tests {
             !next.contains(&ROTATION_CHILD) && !next.contains(&LOOK_DIR_CHILD),
             "an unchanged view is not sent again: {next:?}"
         );
+    }
+
+    #[test]
+    fn the_kneel_goes_out_in_the_next_own_state() {
+        /// The own `slayerStateIdStarted` and `slayerSequenceId` children.
+        const STARTED_CHILD: usize = 14;
+        const SEQUENCE_CHILD: usize = 15;
+        let mut world = world_with_spawns(Vec::new());
+        world.set_table(&table(&["sim-a", "sim-b"])).expect("table");
+        world
+            .admit(&admit_at(1, CELL_M / 2.0, true), NOW, SERVER_TIME)
+            .expect("admit");
+        let entity = world.player_by_number(1).expect("player");
+        let card_at = NOW + OWN_CARD_DELAY_MS;
+        tick(&mut world, card_at);
+        world.heard_from(&connection(1));
+        tick(&mut world, card_at + 33);
+        tick(&mut world, card_at + 66);
+        world
+            .world
+            .get_mut::<Player>(entity)
+            .expect("player")
+            .slayer
+            .kneel(slayer::KneelFrom::State);
+        let messages = tick(&mut world, card_at + 99).messages;
+        let children: Vec<(usize, Vec<u8>)> = bundle_of(&messages, &connection(1))
+            .map(|bundle| SlotRead::of(&bundle).expect("read").updates)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(SlotUpdate::is_local_player)
+            .flat_map(|update| update.members)
+            .filter_map(|member| match member.state {
+                MemberState::Alc(alc) => alc.slot0_children().ok(),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        assert!(
+            children
+                .iter()
+                .any(|(child, bytes)| *child == SEQUENCE_CHILD && bytes == &[5]),
+            "{children:?}"
+        );
+        assert!(children.iter().any(|(child, _)| *child == STARTED_CHILD));
     }
 
     #[test]

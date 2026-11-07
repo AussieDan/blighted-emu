@@ -425,11 +425,16 @@ pub mod home_point_kind {
     pub const HOUSE: u32 = 5;
     /// An inn (`@NN_InnName`, a 900 s cooldown in 449 of 449 retail elements).
     pub const INN: u32 = 6;
+    /// A town or outpost the player has been in (`@Respawn_OutpostName`: 22 of 22 retail
+    /// points). The world map asks for a point of this kind in a territory first, then for a
+    /// spirit shrine (`FUN_143589fe0`).
+    pub const TOWN: u32 = 7;
     /// A player's camp (`@CampTn_MasterName`, a 1 s cooldown).
     pub const CAMP: u32 = 9;
-    /// A charted spirit shrine (`@ui_spirit_shrine`, no cooldown: 63 of 63 retail elements). The
-    /// world map counts a shrine charted when the player has a point of this kind in its
-    /// territory (`HasFastTravelPointInTerritory`, `FUN_143589fe0`).
+    /// A charted spirit shrine (`@ui_spirit_shrine`, no cooldown: 131 of 131 retail points) or
+    /// crow's nest (no name: 3 of 3). The world map counts a shrine charted when the player has
+    /// a point of this kind in its territory (`HasFastTravelPointInTerritory`,
+    /// `FUN_143589fe0`).
     pub const SPIRIT_SHRINE: u32 = 11;
 }
 

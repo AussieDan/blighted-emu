@@ -65,6 +65,20 @@ impl EquipSlot {
     }
 }
 
+/// The `ItemClass` parts of the main-hand weapons that draw the off-hand shield with them
+/// (2026-11-07, the paperdoll maps of 1,085 retail ledgers: slot 27 drawn and attached with a
+/// longsword or a flail, from option 24 or 25; kept sheathed with a hatchet, spear, staff,
+/// musket or warhammer). Unknown: a rapier (`Rapier`, no `Sword` part).
+const SHIELD_WEAPON_CLASSES: [&str; 2] = ["Sword", "Flail"];
+
+/// Whether an `ItemClass` cell such as `Weapon+EquippableMainHand+Sword+Melee` is of a weapon
+/// that draws the shield with it ([`SHIELD_WEAPON_CLASSES`]).
+pub fn draws_shield(item_class: &str) -> bool {
+    item_class
+        .split(ITEM_CLASS_SEPARATOR)
+        .any(|part| SHIELD_WEAPON_CLASSES.contains(&part))
+}
+
 /// One `MasterItemDefinitions` row, as the kit needs it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ItemRow {
@@ -206,6 +220,8 @@ pub struct KitItem {
     pub perk_ids: Vec<String>,
     /// Its fixed perks as wire perk indexes, in slot order (0: empty).
     pub perks: [u32; PERK_SLOTS],
+    /// A main-hand weapon that draws the off-hand shield with it ([`draws_shield`]).
+    pub draws_shield: bool,
 }
 
 /// The kits of one backstory.
@@ -256,6 +272,7 @@ impl StarterKits {
                 max_stack,
                 perk_ids: Vec::new(),
                 perks: [0; PERK_SLOTS],
+                draws_shield: false,
             });
         }
         self
@@ -289,6 +306,7 @@ impl StarterKits {
                     max_stack: row.max_stack,
                     perk_ids: row.perks.clone(),
                     perks: perk_slots(&source.perk_indexes, &row.perks),
+                    draws_shield: row.item_class.as_deref().is_some_and(draws_shield),
                 };
                 (row.item_id.clone(), item)
             })

@@ -117,6 +117,7 @@ impl ReplicaSource {
             drawn: self.hands.drawn,
             active: self.hands.active,
             attached: self.hands.attached,
+            off_hand: self.hands.off_hand,
             looking_through_loadout: self.looking_through_loadout,
             mount: self.mount,
             items,
@@ -192,6 +193,7 @@ impl ReplicaSource {
                 drawn: ghost.drawn,
                 active: ghost.active,
                 attached: ghost.attached,
+                off_hand: ghost.off_hand,
                 ammo: [None; 2],
             },
             // A ghost's fight is its own sim's: near, it goes every tick anyway.

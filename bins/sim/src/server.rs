@@ -2182,6 +2182,7 @@ fn saved_travel(travel: &nw_bus::PlayerTravel) -> SavedTravel {
             rotation: camp.rotation,
             blueprint: camp.blueprint,
         }),
+        visited_towns: travel.visited_towns.clone(),
     }
 }
 

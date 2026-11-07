@@ -671,6 +671,10 @@ pub struct PlayerTravel {
     pub inn_recalled_ms: u64,
     /// The camp it placed (2236).
     pub placed_camp: Option<PlacedCamp>,
+    /// The territory ids of the towns and outposts it has been in (2297): each one gives it the
+    /// town's home point. Empty in a state saved before it existed.
+    #[serde(default)]
+    pub visited_towns: Vec<u16>,
 }
 
 /// A camp a player placed.
@@ -941,6 +945,8 @@ pub struct PlayerGhost {
     pub active: Option<u32>,
     /// The drawn weapon is in the hand.
     pub attached: bool,
+    /// The off-hand option slot drawn with the main-hand weapon (a shield).
+    pub off_hand: Option<u32>,
     /// It has its inventory open (`lookingThroughLoadout`).
     pub looking_through_loadout: bool,
     /// The mount it rides, as other players see it.
@@ -1455,6 +1461,7 @@ mod tests {
                 rotation: [0, 0, 0x3f5f_dd61, 0xbef8_5bf1],
                 blueprint: 0x5e2a_0c11,
             }),
+            visited_towns: vec![53_010, 40_406],
         }
     }
 
@@ -1761,6 +1768,7 @@ mod tests {
                 drawn: Some(u32::MAX),
                 active: Some(u32::MAX),
                 attached: true,
+                off_hand: Some(u32::MAX),
                 looking_through_loadout: true,
                 mount: GhostMount {
                     mount_id: u32::MAX,

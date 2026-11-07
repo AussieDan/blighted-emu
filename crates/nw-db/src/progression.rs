@@ -655,6 +655,7 @@ mod infra_tests {
                 rotation: [0, 0, 0x3f5f_dd61, 0xbef8_5bf1],
                 blueprint: 0x5e2a_0c11,
             }),
+            visited_towns: vec![53_010, 40_406],
         }
     }
 

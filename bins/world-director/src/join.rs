@@ -646,6 +646,7 @@ fn player_travel(saved: SavedTravel) -> PlayerTravel {
             rotation: camp.rotation,
             blueprint: camp.blueprint,
         }),
+        visited_towns: saved.visited_towns,
     }
 }
 
@@ -993,6 +994,8 @@ mod tests {
     const CAMP_ROTATION: [u32; 4] = [0, 0, 0x3f5f_dd61, 0xbef8_5bf1];
     /// Any blueprint CRC.
     const CAMP_BLUEPRINT: u32 = 0x5e2a_0c11;
+    /// A town territory (Edengrove's settlement row).
+    const VISITED_TOWN: u16 = 53_010;
     /// What it had left then (retail `target-lock-test`: 303.5 s).
     const FOOD_LEFT_NS: u64 = 303_500_000_000;
     /// When its next heal came.
@@ -1056,6 +1059,7 @@ mod tests {
                 rotation: CAMP_ROTATION,
                 blueprint: CAMP_BLUEPRINT,
             }),
+            visited_towns: vec![VISITED_TOWN],
         };
         let travel = player_travel(saved);
         assert_eq!(travel.waypoint.map(StoredPoint::bits), Some(position));
@@ -1107,6 +1111,7 @@ mod tests {
                 blueprint: CAMP_BLUEPRINT,
             })
         );
+        assert_eq!(travel.visited_towns, [VISITED_TOWN]);
     }
 
     #[test]

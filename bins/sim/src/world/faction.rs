@@ -431,7 +431,7 @@ mod tests {
             vec![crate::travel_rules::TravelLandmark {
                 landmark_type: SHRINE_LANDMARK_TYPE,
                 position: [SHRINE_X_M, 0.0, 50.0],
-                radius: 0.0,
+                areas: Vec::new(),
                 territory: None,
             }],
             std::collections::HashMap::new(),

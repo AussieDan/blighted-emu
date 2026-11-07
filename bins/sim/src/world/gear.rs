@@ -133,6 +133,9 @@ struct Stack {
     /// The sync reason of its bag record: the reason of its last change in the bag (retail
     /// marks a craft's stacks, [`nw_messages::items::SYNC_CRAFTED`]).
     reason: u8,
+    /// A main-hand weapon that draws the off-hand shield with it
+    /// ([`nw_content::starter::draws_shield`]).
+    draws_shield: bool,
 }
 
 /// Why an equip request was refused.
@@ -497,7 +500,7 @@ impl Gear {
 
     /// The perks of the worn items that apply, each with its item's gear score: those of every
     /// worn item but the weapons of the main-hand and off-hand options not in the hand (an
-    /// off-hand option goes with its main-hand option: 27 with 24, 29 with 26).
+    /// off-hand option goes with its main-hand option: [`off_hand_of`]).
     pub(super) fn worn_perks(&self) -> Vec<(&str, u32)> {
         let held = self.held_option();
         let in_hand = |slot_id: u32| match slot_id {
@@ -807,10 +810,19 @@ impl Gear {
 
     /// The weapon in the hand and the ammo.
     pub(super) fn hands(&self) -> Hands {
+        let off_hand = self
+            .drawn
+            .filter(|drawn| {
+                self.main_hand()
+                    .any(|(slot_id, stack)| slot_id == *drawn && stack.draws_shield)
+            })
+            .and_then(off_hand_of)
+            .filter(|off_hand| self.worn_item(*off_hand).is_some());
         Hands {
             drawn: self.drawn,
             active: Some(self.active),
             attached: self.attached,
+            off_hand,
             ammo: self.ammo.map(|ammo| {
                 Some(LoadedAmmo {
                     count: ammo.loaded,
@@ -1150,11 +1162,13 @@ impl Gear {
     }
 }
 
-/// The off-hand option slot that goes with main-hand option slot `option`: 27 with 24, 29
-/// with 26.
+/// The off-hand option slot that goes with main-hand option slot `option`: 27 with 24 and 25
+/// (retail paperdoll maps, 2026-11-07: the shield of slot 27 drawn with the flail of option 25
+/// in `general-other-01`, and with the longsword of option 24), 29 with 26 (Unknown: no capture
+/// draws option 26).
 const fn off_hand_of(option: u32) -> Option<u32> {
     match option {
-        slot::MAIN_HAND_OPTION_1 => Some(slot::OFF_HAND_OPTION_1),
+        slot::MAIN_HAND_OPTION_1 | slot::MAIN_HAND_OPTION_2 => Some(slot::OFF_HAND_OPTION_1),
         slot::MAIN_HAND_OPTION_3 => Some(slot::OFF_HAND_OPTION_3),
         _ => None,
     }
@@ -1182,6 +1196,7 @@ fn stack(character: Uuid, item: &KitItem, quantity: u32) -> Stack {
         max_stack: item.max_stack,
         perks: item.perk_ids.clone(),
         reason: SYNC_MOVED,
+        draws_shield: item.draws_shield,
     }
 }
 
@@ -1236,6 +1251,50 @@ pub(crate) mod tests {
         )
         .expect("staff");
         gear
+    }
+
+    #[test]
+    fn a_sword_draws_the_shield_with_it_and_a_staff_does_not() {
+        const SHIELD: &str = "1hRoundShieldT2";
+        let kits = kits_with(&[(SHIELD, "Weapon+EquippableOffHand+Shield+RoundShield")]);
+        let mut gear = Gear::starter(&kits, CHARACTER, Some(BACKSTORY)).expect("kit");
+        for item in kits.bag(BACKSTORY) {
+            assert!(gear.add(item, 1));
+        }
+        assert!(gear.add(kits.item(SHIELD).expect("shield"), 1));
+        let bag_slot = |gear: &Gear, item_id: &str| {
+            gear.bag
+                .iter()
+                .position(|stack| stack.as_ref().is_some_and(|stack| stack.item_id == item_id))
+                .and_then(|slot_id| u32::try_from(slot_id).ok())
+                .expect("in the bag")
+        };
+        for (item_id, slot_id) in [
+            (SHIELD, slot::OFF_HAND_OPTION_1),
+            (STAFF, slot::MAIN_HAND_OPTION_2),
+        ] {
+            gear.equip(
+                bag_slot(&gear, item_id),
+                slot_id,
+                1,
+                instance(item_id),
+                none_disabled,
+            )
+            .expect("worn");
+        }
+        assert_eq!(gear.hands().off_hand, None, "all sheathed");
+        gear.take_in_hand(slot::MAIN_HAND_OPTION_1, 0);
+        assert_eq!(
+            gear.hands().off_hand,
+            Some(slot::OFF_HAND_OPTION_1),
+            "with the sword"
+        );
+        gear.take_in_hand(slot::MAIN_HAND_OPTION_2, 0);
+        assert_eq!(
+            gear.hands().off_hand,
+            None,
+            "the staff leaves it on the back"
+        );
     }
 
     #[test]
@@ -1537,6 +1596,7 @@ pub(crate) mod tests {
                 drawn: None,
                 active: Some(slot::MAIN_HAND_OPTION_1),
                 attached: false,
+                off_hand: None,
                 ammo: [
                     Some(LoadedAmmo {
                         count: 0,

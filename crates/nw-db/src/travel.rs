@@ -1,8 +1,9 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //! The travel and housing state of a character (world migrations 0010 and 0020): its map
 //! marker, the inn and the respawn camp it is bound to, its camp skin, its unstuck cooldown, the
-//! homes it owns and their furniture, its played time, its last inn recall and its placed camp. It is part of the progression ([`crate::SavedProgression`]): it loads and
-//! saves with it, in the same transaction.
+//! homes it owns and their furniture, its played time, its last inn recall, its placed camp and
+//! the towns it has been in (migration 0033). It is part of the progression
+//! ([`crate::SavedProgression`]): it loads and saves with it, in the same transaction.
 //!
 //! A position or a rotation is kept as the bit patterns of its `f32`s, and a `u64` entity id as
 //! its 64 bits: the column holds the same bits as a signed number, so a save gives back every bit.
@@ -108,10 +109,14 @@ pub struct SavedTravel {
     pub inn_recalled_ms: u64,
     /// The placed camp.
     pub placed_camp: Option<SavedCamp>,
+    /// The territory ids of the towns and outposts it has been in (migration 0033).
+    pub visited_towns: Vec<u16>,
 }
 
 type TravelRow = (Option<Vec<i32>>, Option<i64>, Option<i64>, Option<i64>, i64);
 type TimeRow = (i64, i64, Option<Vec<i32>>, Option<i16>, Option<i64>);
+/// The camp rotation, the camp blueprint and the visited towns.
+type ShapeRow = (Option<Vec<i32>>, Option<i64>, Vec<i32>);
 type HomeRow = (
     Vec<u8>,
     Vec<i32>,
@@ -183,13 +188,18 @@ pub(crate) async fn character_travel(
     .await?;
     let (played_ms, inn_recalled_ms, camp_position, camp_tier, camp_placed_ms) =
         times.ok_or(DbError::NoSuchCharacter)?;
-    let shape: Option<(Option<Vec<i32>>, Option<i64>)> = sqlx::query_as(
-        "SELECT camp_rotation_bits, camp_blueprint FROM player_character WHERE character_id = $1",
+    let shape: Option<ShapeRow> = sqlx::query_as(
+        "SELECT camp_rotation_bits, camp_blueprint, visited_towns FROM player_character \
+         WHERE character_id = $1",
     )
     .bind(character_id)
     .fetch_optional(world)
     .await?;
-    let (camp_rotation, camp_blueprint) = shape.ok_or(DbError::NoSuchCharacter)?;
+    let (camp_rotation, camp_blueprint, visited_towns) = shape.ok_or(DbError::NoSuchCharacter)?;
+    let visited_towns = visited_towns
+        .into_iter()
+        .map(|territory| from_column(i64::from(territory), "visited_towns"))
+        .collect::<Result<Vec<u16>, DbError>>()?;
     let placed_camp = match (camp_position, camp_tier, camp_placed_ms) {
         (Some(position), Some(tier), Some(placed_ms)) => Some(SavedCamp {
             position: bits_array(&position, "camp position")?,
@@ -290,6 +300,7 @@ pub(crate) async fn character_travel(
         played_ms: from_column(played_ms, "played_ms")?,
         inn_recalled_ms: from_column(inn_recalled_ms, "inn_recalled_ms")?,
         placed_camp,
+        visited_towns,
     })
 }
 
@@ -316,7 +327,8 @@ pub(crate) async fn save_character_travel(
     sqlx::query(
         "UPDATE player_character SET played_ms = $2, inn_recalled_ms = $3, \
          camp_position_bits = $4, camp_tier = $5, camp_placed_ms = $6, \
-         camp_rotation_bits = $7, camp_blueprint = $8 WHERE character_id = $1",
+         camp_rotation_bits = $7, camp_blueprint = $8, visited_towns = $9 \
+         WHERE character_id = $1",
     )
     .bind(character_id)
     .bind(to_column(travel.played_ms, "played_ms")?)
@@ -329,6 +341,13 @@ pub(crate) async fn save_character_travel(
     )
     .bind(camp.map(|camp| bits_list(&camp.rotation)))
     .bind(camp.map(|camp| i64::from(camp.blueprint)))
+    .bind(
+        travel
+            .visited_towns
+            .iter()
+            .map(|territory| i32::from(*territory))
+            .collect::<Vec<i32>>(),
+    )
     .execute(&mut **transaction)
     .await?;
     // The items go with their homes (ON DELETE CASCADE).

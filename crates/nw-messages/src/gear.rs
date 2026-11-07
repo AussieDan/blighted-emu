@@ -268,23 +268,32 @@ pub struct Hands {
     pub active: Option<u32>,
     /// The drawn weapon is in the hand (retail 331 to 418 ms after the key).
     pub attached: bool,
+    /// The off-hand option slot drawn with the main-hand weapon (a shield), in the hand with it
+    /// (retail `general-other-01` at 1792964468728: the flail of slot 25 drawn with the shield
+    /// of slot 27, sheathe map `0x35`; at 1792964469230 the attached map `0x0a`).
+    pub off_hand: Option<u32>,
     /// The ammo of main-hand options 1 and 2; `None` before the server knows it.
     pub ammo: [Option<LoadedAmmo>; 2],
 }
 
 impl Hands {
-    /// The sheathed map: every weapon slot but the drawn one.
+    /// The sheathed map: every weapon slot but the drawn one and the off-hand drawn with it.
     fn sheathed(&self) -> SlotBits {
         SlotBits::of(
             std::iter::once(slot::GATHERABLE_HAND)
                 .chain(slot::MAIN_HAND_OPTION_1..=slot::OFF_HAND_OPTION_3)
-                .filter(|slot_id| Some(*slot_id) != self.drawn),
+                .filter(|slot_id| Some(*slot_id) != self.drawn && Some(*slot_id) != self.off_hand),
         )
     }
 
-    /// The attached map: the drawn weapon once it is in the hand.
+    /// The attached map: the drawn weapon and the off-hand drawn with it, once in the hand.
     fn attached(&self) -> SlotBits {
-        SlotBits::of(self.drawn.filter(|_| self.attached))
+        SlotBits::of(
+            [self.drawn, self.off_hand]
+                .into_iter()
+                .flatten()
+                .filter(|_| self.attached),
+        )
     }
 
     /// The active map: the selected main-hand option (else the drawn one, else the first) and
@@ -561,6 +570,7 @@ pub(crate) mod tests {
             drawn: Some(slot::MAIN_HAND_OPTION_1 + 1),
             active: None,
             attached: false,
+            off_hand: None,
             ammo: [None; 2],
         };
         assert_eq!(
@@ -603,6 +613,34 @@ pub(crate) mod tests {
         );
     }
 
+    #[test]
+    fn a_shield_drawn_with_the_weapon_gives_the_retail_maps() {
+        // Retail `general-other-01` at 1792964468728: the flail of slot 25 drawn with the
+        // shield of slot 27, sheathe `.. 35 ..`, active `.. 0a ..`; at 1792964469230 both in
+        // the hand, attach `.. 0a ..`.
+        let drawn = Hands {
+            drawn: Some(slot::MAIN_HAND_OPTION_2),
+            active: Some(slot::MAIN_HAND_OPTION_2),
+            attached: false,
+            off_hand: Some(slot::OFF_HAND_OPTION_1),
+            ammo: [None; 2],
+        };
+        assert_eq!(
+            drawn.sheathed().0,
+            [0x00, 0x02, 0x00, 0x35, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(drawn.active().0, [0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00]);
+        assert_eq!(drawn.attached().0, [0; 7]);
+        let held = Hands {
+            attached: true,
+            ..drawn
+        };
+        assert_eq!(
+            held.attached().0,
+            [0x00, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00]
+        );
+    }
+
     /// The paperdoll bytes of `gear`.
     fn paperdoll_bytes(gear: &PlayerGear) -> Vec<u8> {
         let mut writer = Writer::new();
@@ -626,6 +664,7 @@ pub(crate) mod tests {
             drawn: None,
             active: Some(slot::MAIN_HAND_OPTION_1),
             attached: false,
+            off_hand: None,
             ammo: [empty(0), empty(0)],
         };
         let drawn = Hands {
@@ -659,6 +698,7 @@ pub(crate) mod tests {
             drawn: Some(slot::MAIN_HAND_OPTION_2),
             active: Some(slot::MAIN_HAND_OPTION_2),
             attached: false,
+            off_hand: None,
             ammo: [None; 2],
         };
         let attach = PlayerGear::hands_change(

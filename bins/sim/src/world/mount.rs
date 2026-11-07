@@ -844,6 +844,20 @@ impl SimWorld {
         );
     }
 
+    /// Player `entity` starts a fast travel's channel at `now_ms`: a rider gets off at once with
+    /// 5937 reason 0 (2026-11-07: after all 23 retail 3713 of a rider, in the ms of the channel's
+    /// start). `true` when it got off.
+    pub(super) fn mount_fast_travel(&mut self, entity: Entity, now_ms: u64) -> bool {
+        let riding = self
+            .world
+            .get::<Player>(entity)
+            .is_some_and(|player| matches!(player.mount.phase, Phase::Mounted { .. }));
+        if riding {
+            self.dismount(entity, DismountReason::Voluntary, true, now_ms);
+        }
+        riding
+    }
+
     /// Player `entity` opened its inventory: a summon ends (`MountSummoning`:
     /// `toggleInventoryWindow` while the mount choice window is closed).
     pub(super) fn mount_inventory_opened(&mut self, entity: Entity, now_ms: u64) {
@@ -2246,6 +2260,46 @@ mod tests {
             );
             let again = press(&mut world, 4, off_ms + COOLDOWN_MS + TICK_MS);
             assert!(matches!(again[..], [MountServerMsg::SummonPending { .. }]));
+        }
+
+        #[test]
+        fn a_fast_travel_gets_a_rider_off_with_reason_0_and_a_walker_stays() {
+            let mut world = world_with(vec![UNLOCK_BIT, GIFT_BIT]);
+            ticked(&mut world, NOW);
+            ticked(&mut world, NOW + TICK_MS);
+            let entity = world.player_by_number(PLAYER).expect("player");
+            assert!(!world.mount_fast_travel(entity, NOW + TICK_MS), "on foot");
+            let start = NOW + 2 * TICK_MS;
+            press(&mut world, 1, start);
+            ticked(&mut world, start + u64::from(SUMMON_MS));
+            let mounted_ms = start + u64::from(SUMMON_MS) + TICK_MS;
+            world.mount_call(
+                &connection(PLAYER),
+                MountClientMsg::CompleteSummon {
+                    header: FacetHeader::of(MOUNT_FACET, PLAYER),
+                },
+                mounted_ms,
+            );
+            assert!(world.mount_fast_travel(entity, mounted_ms + TICK_MS));
+            let off = ticked(&mut world, mounted_ms + TICK_MS);
+            assert!(
+                matches!(
+                    off[..],
+                    [MountServerMsg::DismountNotification {
+                        reason: DismountReason::Voluntary,
+                        ..
+                    }]
+                ),
+                "{off:?}"
+            );
+            assert!(
+                !world
+                    .world
+                    .get::<Player>(entity)
+                    .expect("player")
+                    .tracked
+                    .is_mounted()
+            );
         }
 
         #[test]

@@ -86,6 +86,8 @@ use crate::travel_rules::{HousingRules, ShrinePoint, TravelRules};
 
 use super::camps::{CampEntity, CampPlacement};
 use super::quest_objects::gain_experience;
+use super::slayer::KneelFrom;
+use super::statics::interaction_enabled;
 use super::{
     Body, Placement, Player, REFUSED_RESYNC_MS, SimWorld, Vitals, gather_answer, send_now, unix_ns,
 };
@@ -156,8 +158,11 @@ const CAMP_BIND_COOLDOWN_MS: u64 = 60_000;
 const CAMP_COOLDOWN_NS: u64 = 1_000_000_000;
 /// The name of a house home point (all 1,042 retail ones).
 const HOUSE_POINT_NAME: &[u8] = b"House";
-/// The name of a spirit shrine home point (Observed: 63 of 63 retail shrine points).
+/// The name of a spirit shrine home point (Observed: 131 of 131 retail shrine points; a crow's
+/// nest point has none).
 const SPIRIT_SHRINE_POINT_NAME: &[u8] = b"@ui_spirit_shrine";
+/// The name of a town or outpost home point (Observed: 22 of 22 retail points).
+const TOWN_POINT_NAME: &[u8] = b"@Respawn_OutpostName";
 /// The index of a single home point of an entity (every inn, house and camp of retail).
 const SINGLE_POINT: u32 = 0;
 /// `lastHouseRequestResponse` (0 in every retail body).
@@ -430,12 +435,7 @@ impl SimWorld {
                 let found = self
                     .content
                     .travel
-                    .landmark(
-                        landmark.landmark_type,
-                        landmark.position[0],
-                        landmark.position[1],
-                    )
-                    .copied();
+                    .arrival(landmark.landmark_type, landmark.territory);
                 let discovered = self
                     .content
                     .travel
@@ -448,10 +448,9 @@ impl SimWorld {
                         })
                     });
                 match found.filter(|_| discovered) {
-                    Some(found) => {
-                        let [x, y, z] = found.position;
+                    Some(([x, y, z], territory)) => {
                         let to = Position { x, y, z };
-                        let azoth = self.fast_travel_cost(entity, to, found.territory);
+                        let azoth = self.fast_travel_cost(entity, to, territory);
                         self.start_channel(entity, number, to, now_ms, Purpose::Landmark { azoth });
                     }
                     None => {
@@ -619,19 +618,21 @@ impl SimWorld {
             number,
             to,
             None,
-            now_ms.saturating_add(delay_ms),
+            (now_ms, now_ms.saturating_add(delay_ms)),
             purpose,
         );
     }
 
-    /// [`Self::start_channel`] facing `facing` at the end, due at `due_ms`.
+    /// [`Self::start_channel`] facing `facing` at the end, from `now_ms` to `due_ms`. A fast
+    /// travel (not a teleporter) gets a rider off its mount and starts the kneel
+    /// ([`SlayerTrack::kneel`](super::slayer::SlayerTrack::kneel)).
     fn start_channel_after(
         &mut self,
         entity: Entity,
         number: u64,
         to: Position,
         facing: Option<f32>,
-        due_ms: u64,
+        (now_ms, due_ms): (u64, u64),
         purpose: Purpose,
     ) {
         let dead = self
@@ -665,6 +666,17 @@ impl SimWorld {
                 ?purpose,
                 "fast travel channels"
             );
+            if purpose != Purpose::Teleporter {
+                let from = if self.mount_fast_travel(entity, now_ms) {
+                    KneelFrom::Dismount
+                } else {
+                    KneelFrom::State
+                };
+                if let Some(mut player) = self.world.get_mut::<Player>(entity) {
+                    player.slayer.kneel(from);
+                    player.extra_members.push(interaction_enabled(false));
+                }
+            }
         } else {
             tracing::info!(player = number, dead, encumbered, "fast travel refused");
             let failed = match purpose {
@@ -676,6 +688,20 @@ impl SimWorld {
                 _ => housing(number, fast_travel_failed),
             };
             self.send_travel(entity, &[failed]);
+        }
+    }
+
+    /// The channel of a fast travel (not a teleporter's) of player `entity` ended, arrived or
+    /// cancelled: it may interact again and stands still ([`interaction_enabled`],
+    /// [`SlayerTrack::stand`](super::slayer::SlayerTrack::stand)). Inferred for a cancel: no
+    /// retail capture cancels a channel.
+    fn end_kneel(&mut self, entity: Entity, purpose: Purpose) {
+        if purpose == Purpose::Teleporter {
+            return;
+        }
+        if let Some(mut player) = self.world.get_mut::<Player>(entity) {
+            player.slayer.stand();
+            player.extra_members.push(interaction_enabled(true));
         }
     }
 
@@ -707,15 +733,12 @@ impl SimWorld {
 
     /// Ends the channel of player `number` (`entity`), when it has one, with 3042.
     fn cancel_channel(&mut self, entity: Entity, number: u64) {
-        let cancelled = self
-            .world
-            .get_mut::<Player>(entity)
-            .and_then(|mut player| {
-                player.travel.due.housing = true;
-                player.travel.channel.take()
-            })
-            .is_some();
-        if cancelled {
+        let cancelled = self.world.get_mut::<Player>(entity).and_then(|mut player| {
+            player.travel.due.housing = true;
+            player.travel.channel.take()
+        });
+        if let Some(channel) = cancelled {
+            self.end_kneel(entity, channel.purpose);
             tracing::info!(player = number, "fast travel cancelled");
             self.send_travel(entity, &[housing(number, fast_travel_failed)]);
         }
@@ -975,6 +998,7 @@ impl SimWorld {
     /// The end of a fast travel's channel: what it was for (the cost, the inn and home
     /// cooldowns), the loading screen, the end of the channel, the move.
     fn complete_channel(&mut self, entity: Entity, number: u64, channel: Channel, now_ms: u64) {
+        self.end_kneel(entity, channel.purpose);
         let unix_ms = self.unix_ms();
         let paid = match channel.purpose {
             Purpose::Landmark { azoth } => self.spend_azoth(entity, azoth),
@@ -1109,6 +1133,24 @@ impl SimWorld {
         false
     }
 
+    /// Player `entity` came into territory `territory`: a town or outpost it was not in before
+    /// gives it the town's fast travel point, and the home points go out again
+    /// ([`crate::retail_home_points`]).
+    pub(super) fn visit_town(&mut self, entity: Entity, territory: u16) {
+        if !self.content.travel.is_town(territory) {
+            return;
+        }
+        let Some(mut player) = self.world.get_mut::<Player>(entity) else {
+            return;
+        };
+        if player.travel.saved.visited_towns.contains(&territory) {
+            return;
+        }
+        player.travel.saved.visited_towns.push(territory);
+        player.travel.due.homes = true;
+        tracing::info!(player = player.number, territory, "town visited");
+    }
+
     /// Player `number` (`entity`) came into area `area` at `now_ms`: a chartable one it has not
     /// charted is charted ([`crate::charting`]): its `ChartedAchievement` is set, and the
     /// `Chart_Location` game event gives its experience (the event's `UniversalExpAmount`
@@ -1206,7 +1248,7 @@ impl SimWorld {
                             number,
                             Position { x, y, z },
                             Some(teleporter.yaw_rad),
-                            now_ms.saturating_add(teleporter.delay_ms),
+                            (now_ms, now_ms.saturating_add(teleporter.delay_ms)),
                             Purpose::Teleporter,
                         );
                     }
@@ -1980,8 +2022,9 @@ fn housing_state(travel: &TravelState) -> PlayerHousingState {
     }
 }
 
-/// The home points of `travel`: its bound inn, its houses, its camp's respawn point and the
-/// spirit shrines it charted (`shrines`), and the bound inn's id as the chosen point.
+/// The home points of `travel`: its bound inn, its houses, its camp's respawn point, the spirit
+/// shrines and crow's nests it charted (`shrines`) and the towns and outposts it has been in, and
+/// the bound inn's id as the chosen point.
 fn home_state(
     travel: &TravelState,
     rules: &TravelRules,
@@ -2002,12 +2045,15 @@ fn home_state(
             index: SINGLE_POINT,
         };
     let inn = saved.inn.and_then(|inn| {
-        // An inn's name (`@NN_InnName`) is its slice's, which the level data does not carry
-        // here; retail sends shrines with an empty name too.
+        // An inn's name (`@NN_InnName`) is retail's for its point; the level data does not carry
+        // it ([`crate::retail_home_points::INN_POINTS`]).
+        let position = rules.spawn_point(inn)?;
         Some(point(
             inn,
-            Vec::new(),
-            rules.spawn_point(inn)?,
+            crate::retail_home_points::inn_name(position)
+                .map(|name| name.as_bytes().to_vec())
+                .unwrap_or_default(),
+            position,
             rules.inn_cooldown_ms.saturating_mul(NS_PER_MS),
             unix_ms_ns(saved.inn_recalled_ms),
             home_point_kind::INN,
@@ -2043,17 +2089,36 @@ fn home_state(
             )
         }
     });
-    // Retail sends a shrine's point with the name `@ui_spirit_shrine` and no cooldown.
+    // Retail sends a shrine's point with the name `@ui_spirit_shrine`, a crow's nest's with none,
+    // and neither with a cooldown.
     let shrines = shrines.iter().map(|shrine| {
+        let name = if shrine.crows_nest {
+            Vec::new()
+        } else {
+            SPIRIT_SHRINE_POINT_NAME.to_vec()
+        };
         point(
             shrine.entity,
-            SPIRIT_SHRINE_POINT_NAME.to_vec(),
+            name,
             shrine.position,
             0,
             0,
             home_point_kind::SPIRIT_SHRINE,
         )
     });
+    let towns = rules
+        .visited_town_points(&saved.visited_towns)
+        .into_iter()
+        .map(|town| {
+            point(
+                town.entity,
+                TOWN_POINT_NAME.to_vec(),
+                town.position,
+                town.cooldown_ns,
+                0,
+                home_point_kind::TOWN,
+            )
+        });
     PlayerHomeState {
         home_points: Some(FullList {
             version: Some(travel.homes_version),
@@ -2062,6 +2127,7 @@ fn home_state(
                 .chain(houses)
                 .chain(camp)
                 .chain(shrines)
+                .chain(towns)
                 .collect(),
         }),
         home_point_id: saved.inn.map(|inn| home_point_id(inn, SINGLE_POINT)),
@@ -2120,7 +2186,11 @@ mod tests {
     const SHRINE_TYPE: u8 = 27;
     const SHRINE_TERRITORY: u16 = 20_422;
     const SHRINE: [f32; 3] = [500.0, 10.0, 60.0];
-    const SHRINE_RADIUS_M: f32 = 6.0;
+    /// How far from the shrine the client's 3713 position lies (the largest offset of 406
+    /// retail shrine travels; the level radius of a shrine is 0 m).
+    const CLIENT_OFFSET_M: f32 = 3.4;
+    /// An area no landmark of the test level has.
+    const UNKNOWN_AREA: u16 = 40_282;
     /// A discoverable territory of the test level and its achievement.
     const HIDDEN_TERRITORY: u16 = 40_406;
     const DISCOVERED: &str = "Discovered_40406";
@@ -2180,7 +2250,7 @@ mod tests {
             vec![TravelLandmark {
                 landmark_type: SHRINE_TYPE,
                 position: SHRINE,
-                radius: SHRINE_RADIUS_M,
+                areas: vec![TERRITORY, SHRINE_TERRITORY, HIDDEN_TERRITORY],
                 territory: Some(u32::from(TERRITORY)),
             }],
             HashMap::from([(u32::from(HIDDEN_TERRITORY), DISCOVERED.to_owned())]),
@@ -2288,13 +2358,15 @@ mod tests {
         world.travel_call(&connection(PLAYER), call, now_ms);
     }
 
-    fn landmark(territory: u16, x: f32) -> TravelClientMsg {
+    /// A 3713 to the shrine landmark of area `territory`, from a position off the shrine as
+    /// retail's are.
+    fn landmark(territory: u16) -> TravelClientMsg {
         TravelClientMsg::FastTravelLandmark {
             header: header(component::PLAYER_HOUSING, PLAYER),
             landmark: LandmarkRef {
                 territory,
                 landmark_type: SHRINE_TYPE,
-                position: [x, SHRINE[1], 0.0],
+                position: [SHRINE[0] + CLIENT_OFFSET_M, SHRINE[1], 0.0],
             },
         }
     }
@@ -2371,8 +2443,19 @@ mod tests {
 
     #[test]
     fn a_fast_travel_channels_then_moves_the_player_after_the_loading_screen() {
+        /// The number of the own state after the call.
+        const KNEEL_STATE_NUMBER: u16 = 0x3fcc;
         let mut world = world();
-        call(&mut world, landmark(SHRINE_TERRITORY, SHRINE[0] + 1.0), NOW);
+        call(&mut world, landmark(SHRINE_TERRITORY), NOW);
+        let entity = entity(&mut world);
+        let mut player = world.world.get_mut::<Player>(entity).expect("player");
+        player.slayer.advance(KNEEL_STATE_NUMBER, NOW);
+        let kneel = player.slayer.take_due().state.expect("the kneel");
+        assert_eq!(
+            (kneel.state, kneel.started),
+            (None, Some(KNEEL_STATE_NUMBER)),
+            "the channel kneels in the state that goes on"
+        );
         assert!(travel_answers(&mut world, NOW + CHANNEL_MS - 1).is_empty());
         assert!(
             (body(&mut world).x - START_X).abs() < f32::EPSILON,
@@ -2391,27 +2474,55 @@ mod tests {
         ));
         let at = body(&mut world);
         assert_eq!([at.x, at.y], [SHRINE[0], SHRINE[1]], "at the shrine");
-        let entity = entity(&mut world);
         assert!(moved_by_server(
             world.world.get::<Player>(entity).expect("player")
         ));
+        assert!(
+            world
+                .world
+                .get::<Player>(entity)
+                .expect("player")
+                .last_grounded
+                .is_none_or(|grounded| [grounded.x, grounded.y] == [SHRINE[0], SHRINE[1]]),
+            "a move back goes to the shrine, not to where the travel started"
+        );
     }
 
     #[test]
     fn a_movement_key_or_a_cancel_ends_the_channel_with_3042() {
         let mut world = world();
-        call(&mut world, landmark(SHRINE_TERRITORY, SHRINE[0]), NOW);
+        call(&mut world, landmark(SHRINE_TERRITORY), NOW);
+        let interaction = |world: &mut SimWorld| {
+            let entity = entity(world);
+            world
+                .world
+                .get::<Player>(entity)
+                .expect("player")
+                .extra_members
+                .iter()
+                .filter_map(|member| match member.state {
+                    MemberState::Interactor(state) => state.enabled,
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            interaction(&mut world),
+            [false],
+            "no interaction while it kneels"
+        );
         world.travel_input(&connection(PLAYER), &[forward_record()], NOW + 1);
+        assert_eq!(
+            interaction(&mut world),
+            [false, true],
+            "the end lets it interact again"
+        );
         assert!(matches!(
             travel_answers(&mut world, NOW + 2).as_slice(),
             [TravelServerMsg::FastTravelFailed { .. }]
         ));
         assert!(travel_answers(&mut world, NOW + CHANNEL_MS).is_empty());
-        call(
-            &mut world,
-            landmark(SHRINE_TERRITORY, SHRINE[0]),
-            NOW + CHANNEL_MS,
-        );
+        call(&mut world, landmark(SHRINE_TERRITORY), NOW + CHANNEL_MS);
         call(
             &mut world,
             TravelClientMsg::CancelFastTravel {
@@ -2429,7 +2540,7 @@ mod tests {
     fn a_landmark_travel_takes_retails_20_azoth_or_10_within_the_territory() {
         let mut world = world();
         let travel = |world: &mut SimWorld, now_ms: u64| {
-            call(world, landmark(SHRINE_TERRITORY, SHRINE[0]), now_ms);
+            call(world, landmark(SHRINE_TERRITORY), now_ms);
             answers(world, now_ms + CHANNEL_MS)
         };
         assert!(matches!(
@@ -2478,23 +2589,19 @@ mod tests {
     #[test]
     fn an_unknown_landmark_or_an_undiscovered_territory_is_refused_until_discovered() {
         let mut world = world();
-        call(
-            &mut world,
-            landmark(SHRINE_TERRITORY, SHRINE[0] + 20.0),
-            NOW,
-        );
+        call(&mut world, landmark(UNKNOWN_AREA), NOW);
         assert!(matches!(
             travel_answers(&mut world, NOW + 1).as_slice(),
             [TravelServerMsg::FastTravelFailed { .. }]
         ));
-        call(&mut world, landmark(HIDDEN_TERRITORY, SHRINE[0]), NOW + 2);
+        call(&mut world, landmark(HIDDEN_TERRITORY), NOW + 2);
         assert!(matches!(
             travel_answers(&mut world, NOW + 3).as_slice(),
             [TravelServerMsg::FastTravelFailed { .. }]
         ));
         let entity = entity(&mut world);
         world.discover_territory(entity, HIDDEN_TERRITORY);
-        call(&mut world, landmark(HIDDEN_TERRITORY, SHRINE[0]), NOW + 4);
+        call(&mut world, landmark(HIDDEN_TERRITORY), NOW + 4);
         assert!(travel_answers(&mut world, NOW + 5).is_empty(), "channels");
         let progression = world.departures()[0].progression.clone().expect("saved");
         assert!(progression.achievements.contains(&DISCOVERED_BIT));
@@ -3346,13 +3453,24 @@ mod tests {
     fn a_charted_shrine_is_a_spirit_shrine_home_point() {
         const SHRINE_ENTITY: u64 = 6_465_088_412_215_028_035;
         const SHRINE_POINT: [f32; 3] = [10_697.668, 7_510.114_7, 304.479_74];
+        const CROWS_NEST_ENTITY: u64 = 0x4821_9718_6d17_f7cb;
         let shrine = ShrinePoint {
             entity: SHRINE_ENTITY,
             position: SHRINE_POINT,
+            crows_nest: false,
         };
-        let state = home_state(&TravelState::default(), &TravelRules::default(), &[shrine]);
+        let crows_nest = ShrinePoint {
+            entity: CROWS_NEST_ENTITY,
+            crows_nest: true,
+            ..shrine
+        };
+        let state = home_state(
+            &TravelState::default(),
+            &TravelRules::default(),
+            &[shrine, crows_nest],
+        );
         let points = state.home_points.expect("list").elements;
-        assert_eq!(points.len(), 1);
+        assert_eq!(points.len(), 2);
         let point = &points[0];
         assert_eq!(point.kind, home_point_kind::SPIRIT_SHRINE);
         assert_eq!(point.name, SPIRIT_SHRINE_POINT_NAME);
@@ -3361,6 +3479,94 @@ mod tests {
         assert_eq!(point.entity.facet, SHRINE_ENTITY);
         assert_eq!(point.id, home_point_id(SHRINE_ENTITY, SINGLE_POINT));
         assert_eq!(state.home_point_id, None, "a shrine is no bound inn");
+        assert_eq!(points[1].kind, home_point_kind::SPIRIT_SHRINE);
+        assert!(
+            points[1].name.is_empty(),
+            "retail names a crow's nest nothing"
+        );
+    }
+
+    /// The retail Mountainhome outpost: its territory, its point's entity, position and cooldown.
+    const MOUNTAINHOME: u16 = 40_406;
+    const MOUNTAINHOME_ENTITY: u64 = 0x3cb2_f251_16d4_ba5b;
+    const MOUNTAINHOME_POINT: [f32; 3] = [9_248.369, 9_066.466, 617.107_24];
+    const OUTPOST_COOLDOWN_NS: u64 = 30_000_000_000;
+
+    /// Travel rules whose level has the Mountainhome outpost.
+    fn town_rules() -> TravelRules {
+        TravelRules::build(
+            Vec::new(),
+            HashMap::new(),
+            HashMap::from([(MOUNTAINHOME_ENTITY, MOUNTAINHOME_POINT)]),
+            None,
+            TravelKeys::default(),
+        )
+        .with_towns()
+    }
+
+    #[test]
+    fn a_visited_town_is_a_town_home_point() {
+        let state = TravelState::of(PlayerTravel {
+            visited_towns: vec![MOUNTAINHOME],
+            ..PlayerTravel::default()
+        });
+        let points = home_state(&state, &town_rules(), &[])
+            .home_points
+            .expect("list")
+            .elements;
+        assert_eq!(points.len(), 1);
+        let point = &points[0];
+        assert_eq!(point.kind, home_point_kind::TOWN);
+        assert_eq!(point.name, TOWN_POINT_NAME);
+        assert_eq!(point.position, MOUNTAINHOME_POINT);
+        assert_eq!(point.cooldown_ns, OUTPOST_COOLDOWN_NS);
+        assert_eq!(point.entity.facet, MOUNTAINHOME_ENTITY);
+        assert_eq!(point.id, home_point_id(MOUNTAINHOME_ENTITY, SINGLE_POINT));
+    }
+
+    #[test]
+    fn coming_into_a_town_keeps_it_once_and_sends_the_home_points() {
+        let mut world = world();
+        let mut content = (*world.content).clone();
+        content.travel = town_rules();
+        world.content = Arc::new(content);
+        let entity = entity(&mut world);
+        let entered = |territory| nw_messages::ClientFacetMsg::TerritoryEntered {
+            header: nw_messages::FacetHeader::of(0, PLAYER),
+            area: [0; nw_messages::wire::RAW_ID_LEN],
+            area_entity: 0,
+            extra: 0,
+            territory,
+            unknown: 0,
+        };
+        let visited = |world: &SimWorld| {
+            let player = world.world.get::<Player>(entity).expect("player");
+            (
+                player.travel.saved.visited_towns.clone(),
+                player.travel.due.homes,
+            )
+        };
+        if let Some(mut player) = world.world.get_mut::<Player>(entity) {
+            player.travel.due.homes = false;
+        }
+        world
+            .facet_message(&connection(PLAYER), entered(MOUNTAINHOME), NOW)
+            .expect("entered");
+        assert_eq!(visited(&world), (vec![MOUNTAINHOME], true));
+        if let Some(mut player) = world.world.get_mut::<Player>(entity) {
+            player.travel.due.homes = false;
+        }
+        world
+            .facet_message(&connection(PLAYER), entered(MOUNTAINHOME), NOW + 1)
+            .expect("entered again");
+        world
+            .facet_message(&connection(PLAYER), entered(9_011), NOW + 2)
+            .expect("entered the beach");
+        assert_eq!(
+            visited(&world),
+            (vec![MOUNTAINHOME], false),
+            "a town is kept once, and another territory is no town"
+        );
     }
 
     #[test]

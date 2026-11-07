@@ -270,17 +270,36 @@ impl MoveLimits {
         (height - self.ground_tolerance_m..=height + self.max_height_above_ground_m).contains(&z)
     }
 
-    /// `position` with its height on the ground of `ground` when it is under the ground or too
-    /// far above it, so an arriving player neither falls nor starts in the terrain. Unchanged
-    /// where the level has no height data.
-    pub fn onto_ground(&self, ground: &(impl Ground + ?Sized), position: Position) -> Position {
-        match ground.height_at(position.x, position.y) {
-            Some(height) if !self.near_ground(height, position.z) => Position {
-                z: height,
-                ..position
-            },
-            _ => position,
-        }
+    /// `position` standing where an arriving player starts on `ground`, with the sea at
+    /// `sea_level_m`: on the floor under it (the terrain, or a structure's floor), or at the
+    /// swim height where water is over that floor; from the terrain when it is under the
+    /// terrain or too far above it. Unchanged where the level has no height data.
+    ///
+    /// Observed (2026-11-07): retail's first own position at a login is 0.00 to 0.08 m over the
+    /// floor (`general-other-01` at 501 ms, a store-horse capture at 4302 ms on a structure 9.7 m
+    /// over the terrain), while the saved spot is the last client position, in the air in 930 of
+    /// 75,478 on-foot samples of `general-other-01` (up to 8.7 m): live, a login dropped the
+    /// player a few feet.
+    pub fn onto_ground(
+        &self,
+        ground: &(impl Ground + ?Sized),
+        position: Position,
+        sea_level_m: f32,
+    ) -> Position {
+        let Some(terrain) = ground.height_at(position.x, position.y) else {
+            return position;
+        };
+        let from = if self.near_ground(terrain, position.z) {
+            position.z
+        } else {
+            terrain
+        };
+        let floor = ground
+            .floor_at(position.x, position.y, from)
+            .unwrap_or(terrain);
+        let z = crate::character::swim_floor_at(ground, position.x, position.y, sea_level_m)
+            .map_or(floor, |swim| swim.max(floor));
+        Position { z, ..position }
     }
 }
 
@@ -670,29 +689,74 @@ mod tests {
         );
     }
 
+    /// Flat ground with a roof over part of it, and the sea over the ground east of it.
+    struct Roofed;
+
+    /// The roof's height over [`GROUND_HEIGHT`], and where the roof and the sea start.
+    const ROOF_M: f32 = 9.7;
+    const ROOF_FROM_X: f32 = 20.0;
+    const SEA_FROM_X: f32 = 40.0;
+    /// The sea's level over [`GROUND_HEIGHT`].
+    const SEA_DEPTH_M: f32 = 5.0;
+
+    impl Ground for Roofed {
+        fn height_at(&self, x: f32, y: f32) -> Option<f32> {
+            Flat.height_at(x, y)
+        }
+
+        fn floor_at(&self, x: f32, y: f32, z: f32) -> Option<f32> {
+            let roof = GROUND_HEIGHT + ROOF_M;
+            if (ROOF_FROM_X..SEA_FROM_X).contains(&x) && z >= roof {
+                Some(roof)
+            } else {
+                self.height_at(x, y)
+            }
+        }
+
+        fn water_surface(&self, x: f32, _y: f32, sea_level_m: f32) -> Option<f32> {
+            (x >= SEA_FROM_X).then_some(sea_level_m)
+        }
+    }
+
     #[test]
-    fn an_arrival_off_the_ground_is_put_on_it() {
+    fn an_arrival_stands_on_the_floor_under_it() {
         let limits = limits();
+        let sea = GROUND_HEIGHT + SEA_DEPTH_M;
         let fallen = at(10.0, GROUND_HEIGHT - BELOW - 0.5);
-        assert_eq!(limits.onto_ground(&Flat, fallen), at(10.0, GROUND_HEIGHT));
-        let in_the_air = at(10.0, GROUND_HEIGHT + ABOVE + 0.5);
         assert_eq!(
-            limits.onto_ground(&Flat, in_the_air),
+            limits.onto_ground(&Roofed, fallen, sea),
+            at(10.0, GROUND_HEIGHT)
+        );
+        let far_up = at(10.0, GROUND_HEIGHT + ABOVE + 0.5);
+        assert_eq!(
+            limits.onto_ground(&Roofed, far_up, sea),
             at(10.0, GROUND_HEIGHT)
         );
         let not_finite = at(10.0, f32::NAN);
         assert_eq!(
-            limits.onto_ground(&Flat, not_finite),
+            limits.onto_ground(&Roofed, not_finite, sea),
             at(10.0, GROUND_HEIGHT)
         );
-        let roof = at(10.0, GROUND_HEIGHT + ABOVE - 1.0);
+        let jumped = at(10.0, GROUND_HEIGHT + 1.0);
         assert_eq!(
-            limits.onto_ground(&Flat, roof),
-            roof,
-            "a roof or bridge stays"
+            limits.onto_ground(&Roofed, jumped, sea),
+            at(10.0, GROUND_HEIGHT),
+            "a save during a jump lands"
+        );
+        let over_the_roof = at(ROOF_FROM_X + 1.0, GROUND_HEIGHT + ROOF_M + 1.0);
+        assert_eq!(
+            limits.onto_ground(&Roofed, over_the_roof, sea),
+            at(ROOF_FROM_X + 1.0, GROUND_HEIGHT + ROOF_M),
+            "a roof or bridge holds it"
+        );
+        let swimming = at(SEA_FROM_X + 1.0, sea);
+        assert_eq!(
+            limits.onto_ground(&Roofed, swimming, sea),
+            at(SEA_FROM_X + 1.0, crate::character::swim_floor(sea)),
+            "in the sea it floats"
         );
         let no_data = at(1000.0, GROUND_HEIGHT + ABOVE * 2.0);
-        assert_eq!(limits.onto_ground(&Flat, no_data), no_data);
+        assert_eq!(limits.onto_ground(&Roofed, no_data, sea), no_data);
     }
 
     #[test]

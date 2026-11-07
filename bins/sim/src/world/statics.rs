@@ -278,6 +278,19 @@ pub(super) const fn interactor_target(facet: u64) -> BundleMember {
     }
 }
 
+/// The player's interactor state that lets it interact or not: retail turns it off when a fast
+/// travel's channel starts and on again after the arrival (2026-11-07, `general-other-01` at
+/// 619407 ms off and `Playthrough_Part_09` at 1386950 ms on, 36 to 104 ms after the 3696).
+pub(super) const fn interaction_enabled(enabled: bool) -> BundleMember {
+    BundleMember {
+        component: INTERACTOR_COMPONENT,
+        state: MemberState::Interactor(InteractorState {
+            target: None,
+            enabled: Some(enabled),
+        }),
+    }
+}
+
 /// The counters of a gather grow by one with each of its two states (retail chest: 1 at the
 /// start, 2 at the end; open-world gathers count on over the session).
 const STATES_PER_GATHER: u32 = 2;
@@ -557,6 +570,7 @@ mod tests {
             max_stack: Some(1),
             perk_ids: Vec::new(),
             perks: [0; nw_messages::items::PERK_SLOTS],
+            draws_shield: false,
         };
         let weapon = |item_id: &str, item_index| KitItem {
             perk_ids: vec!["PerkID_StatSwap_BaseDamage".to_owned()],

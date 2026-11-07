@@ -73,6 +73,18 @@ mod pull {
     pub(super) const LENGTH_MS: u64 = 1_133;
 }
 
+/// The kneel of a fast travel's channel (2026-11-07, the first slayer change in the 400 ms after
+/// each retail 3713 and 3712 of `captures/own` and `captures/open-world`): the sequence alone,
+/// started in the own state 40 to 80 ms after the call, with no state (`14=3fcc 15=05`), in 461
+/// of the 3713 and 30 of 30 of the 3712. A rider first got off its mount: 5937 with reason 0
+/// after all 23 such 3713, then the kneel with standing still (`13=1f 15=05`) in 11 of them; the
+/// other 12 first played one of three dismount sequences (`13=0f` with `8721`, `882d` or `a90d`;
+/// Unknown: the rule that picks one), so the kneel stands the rider still at once.
+mod kneel {
+    /// `slayerSequenceId` of the kneel: `05`.
+    pub(super) const SEQUENCE: u64 = 5;
+}
+
 /// The slayer states the server sends when the player falls or swims (retail newchar 2026-09-18,
 /// capture check 2026-09-24): `13=0d 15=9d3c` at the fall, `13=06 15=a021` once at the water
 /// entry, then only the sequence (child 15, no 13 and no 14) while the player swims: `b621`
@@ -326,6 +338,15 @@ enum Pending {
     State(u64, u64),
 }
 
+/// What the kneel of a fast travel's channel starts from ([`kneel`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum KneelFrom {
+    /// The state the player is in goes on: the sequence alone.
+    State,
+    /// The player just got off its mount: the kneel stands it still.
+    Dismount,
+}
+
 /// The weapon in the player's hand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct HeldWeapon {
@@ -431,6 +452,12 @@ pub(super) struct SlayerTrack {
     pull_due: bool,
     /// When the pull ends and the player stands still again, while it is pulled.
     pull_ends_ms: Option<u64>,
+    /// A fast travel's channel started: the kneel starts in the next own state, from the state
+    /// that goes on or, after a dismount, standing still ([`kneel`]).
+    kneel_due: Option<KneelFrom>,
+    /// A fast travel's channel ended: the next own state stands the player still, unless a
+    /// state of its own records starts there ([`kneel`]).
+    stand_due: bool,
     /// The newest slayer state, and how many more own states carry it.
     current: Option<SlayerState>,
     repeats: u8,
@@ -682,6 +709,22 @@ impl SlayerTrack {
         self.pull_ends_ms = Some(now_ms.saturating_add(pull::LENGTH_MS));
     }
 
+    /// A fast travel's channel started from `from`: the next own state starts the kneel, and
+    /// the player stands still under it ([`kneel`]).
+    pub(super) fn kneel(&mut self, from: KneelFrom) {
+        self.kneel_due = Some(from);
+        self.locomotion = Locomotion::Idle;
+    }
+
+    /// A fast travel's channel ended (arrived or cancelled): the next own state stands the
+    /// player still with the second slot cleared, unless a state of its records starts there
+    /// ([`kneel`]).
+    pub(super) fn stand(&mut self) {
+        self.kneel_due = None;
+        self.stand_due = true;
+        self.locomotion = Locomotion::Idle;
+    }
+
     /// The client opened its inventory in record `started` at `now_ms`: the second slot plays the
     /// open sequence ([`loadout`]).
     pub(super) fn open_loadout(&mut self, started: u16, now_ms: u64) {
@@ -830,9 +873,17 @@ impl SlayerTrack {
     /// The slayer state of the own state numbered `number`, and the frame time of the record that
     /// started it when it starts there.
     fn next(&mut self, number: u16) -> (Option<SlayerState>, Option<f32>) {
+        let stand = std::mem::take(&mut self.stand_due);
         if std::mem::take(&mut self.pull_due) {
             self.sequence_s = self.newest_frame_s;
             return (self.start(pulled_state(number)), Some(self.newest_frame_s));
+        }
+        if let Some(from) = self.kneel_due.take() {
+            self.sequence_s = self.newest_frame_s;
+            return (
+                self.start(kneel_state(number, from)),
+                Some(self.newest_frame_s),
+            );
         }
         if let Some((pending, counter, frame_s)) = self.pending.take() {
             let state = match pending {
@@ -855,6 +906,10 @@ impl SlayerTrack {
                 }
             };
             return (self.start(state), Some(frame_s));
+        }
+        if stand {
+            self.sequence_s = self.newest_frame_s;
+            return (self.start(stand_state(number)), Some(self.newest_frame_s));
         }
         if let Some(sequence) = self.follow_up.take() {
             self.sequence_s = self.newest_frame_s;
@@ -915,6 +970,38 @@ const fn pulled_state(started: u16) -> SlayerState {
             started,
             playing: None,
             stopped: true,
+        }),
+    }
+}
+
+/// The kneel of a fast travel's channel in the own state numbered `started`, from `from`
+/// ([`kneel`]).
+const fn kneel_state(started: u16, from: KneelFrom) -> SlayerState {
+    SlayerState {
+        state: match from {
+            KneelFrom::State => None,
+            KneelFrom::Dismount => Some(movement::IDLE_STATE),
+        },
+        started: Some(started),
+        sequence: kneel::SEQUENCE,
+        second: None,
+    }
+}
+
+/// Standing still with the second slot cleared (`16=2d 18=00`), in the own state numbered
+/// `started`: the state after a fast travel's channel. The first slayer change after 65 of the
+/// retail 3696 (fast travel completed) of the kneel's captures was `13=1f 15=b910 16=2d 18=00`.
+/// Without it the client kept the channel's pose after the loading screen (live 2026-11-07: the
+/// sword and shield showed in the hands while the server held them sheathed).
+const fn stand_state(started: u16) -> SlayerState {
+    SlayerState {
+        state: Some(movement::IDLE_STATE),
+        started: Some(started),
+        sequence: movement::IDLE_SEQUENCE,
+        second: Some(SecondSlayerState {
+            started,
+            playing: Some((loadout::CLOSED_STATE, 0)),
+            stopped: false,
         }),
     }
 }
@@ -1695,6 +1782,100 @@ mod tests {
             idle.map(|idle| (idle.state, idle.sequence)),
             Some((Some(movement::IDLE_STATE), movement::IDLE_SEQUENCE)),
             "standing still once the pull is over"
+        );
+    }
+
+    #[test]
+    fn a_fast_travel_kneels_in_the_state_that_goes_on_and_a_key_moves_again() {
+        /// The retail kneel's own state number (`14=3fcc`), as this test's tick number.
+        const KNEELS_IN: u16 = 0x3fcc;
+        let table = table();
+        let forward = Intent::of_keys(true, false, false, false);
+        let mut track = spawned();
+        // A stop in progress must not stand the player over the kneel.
+        track.record(quiet_record(KNEELS_IN - 3, forward), &table);
+        own_state(&mut track, KNEELS_IN - 3);
+        track.record(quiet_record(KNEELS_IN - 2, Intent::default()), &table);
+        own_state(&mut track, KNEELS_IN - 2);
+        own_state(&mut track, KNEELS_IN - 1);
+        track.kneel(KneelFrom::State);
+        let kneel = own_state(&mut track, KNEELS_IN).state;
+        assert_eq!(
+            kneel,
+            Some(SlayerState {
+                state: None,
+                started: Some(KNEELS_IN),
+                sequence: kneel::SEQUENCE,
+                second: None,
+            })
+        );
+        assert_eq!(
+            own_state(&mut track, KNEELS_IN + 1).state,
+            kneel,
+            "it echoes once"
+        );
+        for number in KNEELS_IN + 2..KNEELS_IN + 2 + movement::STOP_RECORDS {
+            track.record(quiet_record(number, Intent::default()), &table);
+            assert_eq!(
+                own_state(&mut track, number).state,
+                None,
+                "kneeling at {number}"
+            );
+        }
+        let moved_in = KNEELS_IN + 2 + movement::STOP_RECORDS;
+        track.record(quiet_record(moved_in, forward), &table);
+        let moved = own_state(&mut track, moved_in).state.expect("a start");
+        assert_eq!(
+            (moved.state, moved.sequence),
+            (Some(movement::START_STATE), movement::START_SEQUENCE)
+        );
+    }
+
+    #[test]
+    fn the_end_of_a_channel_stands_the_player_still_unless_it_moves() {
+        /// The retail arrival's state (`13=1f 14=409b 15=b910 16=2d 17=409b 18=00`).
+        const STANDS_IN: u16 = 0x409b;
+        let table = table();
+        let mut track = spawned();
+        track.kneel(KneelFrom::State);
+        own_state(&mut track, STANDS_IN - 2);
+        track.stand();
+        assert_eq!(
+            own_state(&mut track, STANDS_IN).state,
+            Some(SlayerState {
+                state: Some(movement::IDLE_STATE),
+                started: Some(STANDS_IN),
+                sequence: movement::IDLE_SEQUENCE,
+                second: Some(SecondSlayerState {
+                    started: STANDS_IN,
+                    playing: Some((loadout::CLOSED_STATE, 0)),
+                    stopped: false,
+                }),
+            })
+        );
+        track.stand();
+        let moved_in = STANDS_IN + 5;
+        track.record(
+            quiet_record(moved_in, Intent::of_keys(true, false, false, false)),
+            &table,
+        );
+        let moved = own_state(&mut track, moved_in).state.expect("a start");
+        assert_eq!(
+            moved.state,
+            Some(movement::START_STATE),
+            "a cancel by a key moves"
+        );
+    }
+
+    #[test]
+    fn a_rider_kneels_standing_still() {
+        const KNEELS_IN: u16 = 0x46aa;
+        let mut track = spawned();
+        track.kneel(KneelFrom::Dismount);
+        let kneel = own_state(&mut track, KNEELS_IN).state.expect("a kneel");
+        assert_eq!(
+            (kneel.state, kneel.started, kneel.sequence),
+            (Some(movement::IDLE_STATE), Some(KNEELS_IN), kneel::SEQUENCE)
         );
     }
 
