@@ -892,6 +892,23 @@ impl SimWorld {
         })
     }
 
+    /// Sets the azoth of the player `entity`, at most the azoth cap (the top of the
+    /// `Azoth_Currency` progression).
+    pub(super) fn set_azoth(&mut self, entity: u64, azoth: u32) -> AdminReply {
+        let Some(currency) = self
+            .content
+            .progression
+            .categorical(AZOTH_PROGRESSION)
+            .cloned()
+        else {
+            return unknown_mastery(AZOTH_PROGRESSION);
+        };
+        self.with_player(entity, |player| {
+            player.masteries.set(&currency, azoth);
+            AdminReply::Done
+        })
+    }
+
     /// Runs `change` on the player `entity`; [`AdminReply::NotMine`] when it is not here.
     fn with_player(
         &mut self,
@@ -1533,9 +1550,13 @@ mod tests {
 
     /// A world with the test progression and one player, outside the tutorial.
     fn admitted() -> SimWorld {
+        admitted_with(progression())
+    }
+
+    fn admitted_with(progression: Progression) -> SimWorld {
         let mut world = world_with_spawns(Vec::new());
         world.content = Arc::new(PlayerContent {
-            progression: progression(),
+            progression,
             ..PlayerContent::default()
         });
         world
@@ -1628,6 +1649,36 @@ mod tests {
             None,
             "experience stops at the top level's start"
         );
+    }
+
+    #[test]
+    fn set_azoth_sets_the_balance_up_to_the_cap() {
+        const AZOTH: u32 = 77;
+        let progression = with_tree();
+        let cap = progression
+            .categorical(AZOTH_PROGRESSION)
+            .expect("azoth")
+            .max_experience();
+        let mut world = admitted_with(progression);
+        let set = |world: &mut SimWorld, azoth| {
+            world.admin(
+                &command(AdminAction::SetAzoth {
+                    entity: PLAYER,
+                    azoth,
+                }),
+                NOW,
+            )
+        };
+        assert_eq!(set(&mut world, AZOTH), AdminReply::Done);
+        let progress = saved_progress(&mut world).expect("a save");
+        assert_eq!(progress.masteries.get(AZOTH_PROGRESSION), Some(&AZOTH));
+        assert_eq!(set(&mut world, u32::MAX), AdminReply::Done);
+        let progress = saved_progress(&mut world).expect("a save");
+        assert_eq!(progress.masteries.get(AZOTH_PROGRESSION), Some(&cap));
+        assert!(matches!(
+            set(&mut admitted(), AZOTH),
+            AdminReply::Failed { .. }
+        ));
     }
 
     #[test]

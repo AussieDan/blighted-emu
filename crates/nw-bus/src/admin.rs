@@ -155,6 +155,13 @@ pub enum AdminAction {
         /// The coins.
         coins: u64,
     },
+    /// Sets the player's azoth; above the azoth cap it is the cap.
+    SetAzoth {
+        /// The player.
+        entity: u64,
+        /// The azoth.
+        azoth: u32,
+    },
 }
 
 /// One running event of a sim.
@@ -265,6 +272,10 @@ mod tests {
             AdminAction::SetCoins {
                 entity: 7,
                 coins: 1_000_000,
+            },
+            AdminAction::SetAzoth {
+                entity: 7,
+                azoth: 2_500,
             },
         ] {
             let command = AdminCommand {

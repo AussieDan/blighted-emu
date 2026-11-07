@@ -252,6 +252,15 @@ restless_shore = 1.0
 brimstone_sands = 1.0
 nighthaven = 1.0
 
+# Fast travel. free = true: a fast travel to a settlement or a shrine costs no azoth.
+# free = false: the retail cost (20 azoth, 10 within your own territory). An inn recall and a
+# home travel never cost azoth. The server sends this value to the game (remote config
+# javelin.playtest-disable-fast-travel-costs, publicGameplay-ProductId layer) and the sims use the
+# same value, so the cost the map shows and the azoth the server takes match. Left out is
+# false. Restart edge-http and the sims after a change.
+[fast_travel]
+free = false
+
 [[world]]
 id = "8d0f4c2e-0000-4000-8000-000000000001"
 name = "Aeternum"

@@ -18,6 +18,7 @@ use uuid::Uuid;
 use crate::analytics::AnalyticsConfig;
 use crate::discord::is_discord_user_id;
 use crate::experience::ExperienceConfig;
+use crate::fast_travel::FastTravelConfig;
 use crate::game::API_REGION;
 use crate::secrets::SECRET_ENV_PREFIX;
 
@@ -106,6 +107,9 @@ pub struct EdgeConfig {
     /// The experience multipliers; normal experience when left out.
     #[serde(default)]
     pub experience: ExperienceConfig,
+    /// Whether fast travel costs azoth; the retail cost when left out.
+    #[serde(default)]
+    pub fast_travel: FastTravelConfig,
     /// The store; an empty store when left out.
     #[serde(default)]
     pub shop: ShopConfig,
@@ -687,6 +691,7 @@ max_connections = 5
     fn valid_file_loads() {
         let config = valid();
         assert_eq!(config.experience, ExperienceConfig::default());
+        assert_eq!(config.fast_travel, FastTravelConfig::default());
         assert_eq!(config.shop, ShopConfig::default());
         assert!(config.shop.enabled && config.shop.free);
         assert_eq!(config.login_host(), "login.example.org");
@@ -810,6 +815,14 @@ max_connections = 5
             ),
             "world.max_characters_per_account",
         );
+    }
+
+    #[test]
+    fn fast_travel_is_free_only_when_set() {
+        assert!(!valid().fast_travel.free);
+        let free = load(&VALID.replace("[cms]", "[fast_travel]\nfree = true\n\n[cms]"))
+            .expect("free fast travel");
+        assert!(free.fast_travel.free);
     }
 
     #[test]

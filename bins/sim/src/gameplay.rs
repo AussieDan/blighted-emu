@@ -199,6 +199,25 @@ mod tests {
     }
 
     #[test]
+    fn free_fast_travel_of_the_edge_config_reaches_the_sim() {
+        let folder = std::env::temp_dir().join(format!("sim-gameplay-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&folder).expect("folder");
+        let paid = load_gameplay(&committed_edge_config(&folder, &AS_COMMITTED), world())
+            .expect("gameplay");
+        assert_eq!(paid.fast_travel_costs.disabled, Some(false));
+        let edge = committed_edge_config(
+            &folder,
+            &[(
+                "[fast_travel]\nfree = false\n",
+                "[fast_travel]\nfree = true\n",
+            )],
+        );
+        let free = load_gameplay(&edge, world()).expect("gameplay");
+        assert_eq!(free.fast_travel_costs.disabled, Some(true));
+        std::fs::remove_dir_all(&folder).expect("removed");
+    }
+
+    #[test]
     fn the_two_applications_set_no_key_to_different_values() {
         let folder = std::env::temp_dir().join(format!("sim-gameplay-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&folder).expect("folder");

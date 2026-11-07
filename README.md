@@ -179,6 +179,8 @@ The game's store sells the store mounts of the game data. `[shop]` in `config/ed
 
 Experience is normal by default: 1.0 for every gain, as retail without an event. The `[experience]` section of `config/edge.toml` sets each kind on its own: `character`, `umbral_crystals`, one value per trade skill (`[experience.trade_skills]`), per weapon mastery (`[experience.weapon_masteries]`) and per territory's standing (`[experience.territory_standing]`). A comment above each setting says what it changes. The server sends these values to the game, and the sims use the same values. Restart `edge-http` and the sims after a change.
 
+Fast travel costs azoth by default, as on retail (20 azoth to a settlement or a shrine, 10 within your own territory). Set `free = true` in the `[fast_travel]` section of `config/edge.toml` to make every fast travel free. The server sends this setting to the game (`javelin.playtest-disable-fast-travel-costs`), and the sims use the same value. Restart `edge-http` and the sims after a change.
+
 For a release build, `setcap` takes `target/release/edge-http`. Run `setcap` again after each build, because a new file loses the right.
 
 In Discord mode, add `https://login.<domain>/launcher/discord/callback` as a redirect URL of your Discord application. The server asks Discord for the scopes `identify email`, and saves the Discord username and email of each Discord login (written again at every login) so staff can help a player get an account back. To let in only the members of one Discord server, set `[discord] guild_id` to its server id; the login then also asks for `guilds.members.read` and refuses users outside that server.
@@ -502,6 +504,7 @@ The client has no menu or console command for its GM calls, so a game master typ
 | `!level <level> [player]` | Sets the level |
 | `!xp <amount> [player]` | Gives experience |
 | `!coins <amount> [player]` | Sets the coins |
+| `!azoth <amount> [player]` | Sets the azoth (at most the azoth cap) |
 | `!mastery <progression id\|all> <rank> [player]` | Sets the rank of one weapon mastery, or of all of them |
 | `!masteryxp <mastery id> <amount> [player]` | Gives weapon mastery experience |
 | `!heal [player]` / `!kill [player]` | Fills or takes all health (heal also revives) |

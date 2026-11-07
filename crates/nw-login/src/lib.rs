@@ -11,6 +11,7 @@ pub mod config;
 pub mod discord;
 pub mod error;
 pub mod experience;
+pub mod fast_travel;
 pub mod game;
 pub mod host;
 pub mod keys;

@@ -57,7 +57,7 @@ struct Verb {
 }
 
 /// Every command, in the order of `!help`.
-const VERBS: [Verb; 23] = [
+const VERBS: [Verb; 24] = [
     Verb {
         name: "help",
         usage: "!help",
@@ -99,6 +99,17 @@ const VERBS: [Verb; 23] = [
             Some(Command::Change {
                 target,
                 change: Change::Coins(number(words[0])?),
+            })
+        },
+    },
+    Verb {
+        name: "azoth",
+        usage: "!azoth <amount> [player]",
+        read: |words| {
+            let (words, target) = target(words, 1)?;
+            Some(Command::Change {
+                target,
+                change: Change::Azoth(number(words[0])?),
             })
         },
     },
@@ -371,6 +382,7 @@ enum Change {
     Level(u32),
     Experience(u32),
     Coins(u64),
+    Azoth(u32),
     /// `None` is every weapon mastery; the rank is zero-based.
     MasteryRank {
         mastery: Option<String>,
@@ -402,6 +414,7 @@ impl Change {
             Self::Level(level) => AdminAction::SetLevel { entity, level },
             Self::Experience(amount) => AdminAction::GiveExperience { entity, amount },
             Self::Coins(coins) => AdminAction::SetCoins { entity, coins },
+            Self::Azoth(azoth) => AdminAction::SetAzoth { entity, azoth },
             Self::MasteryRank { mastery, rank } => AdminAction::SetMasteryRank {
                 entity,
                 mastery,
@@ -934,6 +947,13 @@ mod tests {
                     item: "IronIngotT2".to_owned(),
                     quantity: 5,
                 },
+            }))
+        );
+        assert_eq!(
+            read("!azoth 1000 Bob"),
+            Some(Ok(Command::Change {
+                target: Target::Named("Bob".to_owned()),
+                change: Change::Azoth(1_000),
             }))
         );
         assert_eq!(

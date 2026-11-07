@@ -17,7 +17,6 @@ use axum::Router;
 use serde_json::{Map, Value};
 
 use crate::config::EdgeConfig;
-use crate::experience::ExperienceConfig;
 use crate::game::CLUSTER_ID;
 use crate::s3::{S3Objects, s3_router};
 
@@ -45,12 +44,19 @@ pub const GAME_HOST_ENDPOINTS: [(&[&str], &str); 5] = [
 ];
 /// Between the parts of a key path in an error message.
 const KEY_PATH_SEPARATOR: &str = ".";
-/// The application of the layer that gets the experience multipliers of `[experience]`: its
-/// lowest layer, `ProductId` (retail sets them there, and again in `CognitoId`).
-pub const EXPERIENCE_APPLICATION: &str = "publicGameplay";
-/// The object that holds the experience multipliers, and its key in it.
-const XP_PARENT: &str = "javelin";
+/// The application of the layer that gets the keys the server fills from `config/edge.toml`
+/// (the experience multipliers of `[experience]` and the free fast travel switch of
+/// `[fast_travel]`): its lowest layer, `ProductId` (retail sets the multipliers there, and again
+/// in `CognitoId`).
+pub const SERVER_KEYS_APPLICATION: &str = "publicGameplay";
+/// The object that holds the keys the server fills.
+const JAVELIN: &str = "javelin";
+/// Its key of the experience multipliers.
 const XP_MULTIPLIERS: &str = "xp-multipliers";
+/// Its key of the free fast travel switch, a bool (client cvar `FUN_140169720`).
+const FAST_TRAVEL_FREE: &str = "playtest-disable-fast-travel-costs";
+/// The keys of [`JAVELIN`] the server fills, which no file may set.
+const SERVER_KEYS: [&str; 2] = [XP_MULTIPLIERS, FAST_TRAVEL_FREE];
 /// Its character experience multiplier, a number.
 const XP_CHARACTER: &str = "character";
 /// Its list of `<CategoricalProgressionId>:<multiplier>` entries.
@@ -174,10 +180,11 @@ pub enum RemoteConfigError {
         /// What is wrong.
         reason: String,
     },
-    /// A file sets `javelin.xp-multipliers`, which the server fills from `[experience]`, or the
-    /// experience layer's `javelin` is no object.
+    /// A file sets a key the server fills (`javelin.xp-multipliers` from `[experience]`,
+    /// `javelin.playtest-disable-fast-travel-costs` from `[fast_travel]`), or the server keys
+    /// layer's `javelin` is no object.
     #[error("remote config {key}: {reason}")]
-    Experience {
+    ServerKey {
         /// The key.
         key: String,
         /// What is wrong.
@@ -196,12 +203,13 @@ impl RemoteConfigSets {
     /// from its file in `[remote_config] directory` ([`layer_file_name`]). Each must be a JSON
     /// object, and the folder may hold no other file. The [`GAME_HOST_ENDPOINTS`] of the
     /// [`ENDPOINTS_APPLICATION`] `RegionId` layer are set to `game.<domain>`, and the
-    /// [`EXPERIENCE_APPLICATION`] `ProductId` layer gets `javelin.xp-multipliers` from
-    /// `[experience]`, which no file may set; other layers are served byte for byte.
+    /// [`SERVER_KEYS_APPLICATION`] `ProductId` layer gets `javelin.xp-multipliers` from
+    /// `[experience]` and `javelin.playtest-disable-fast-travel-costs` from `[fast_travel]`,
+    /// which no file may set; other layers are served byte for byte.
     pub fn load(config: &EdgeConfig) -> Result<Self, RemoteConfigError> {
         let root = &config.remote_config.directory;
-        let experience_key = object_key(
-            EXPERIENCE_APPLICATION,
+        let server_keys_key = object_key(
+            SERVER_KEYS_APPLICATION,
             Dimension::ProductId,
             PRODUCT_ID,
             VERSIONLESS,
@@ -234,18 +242,18 @@ impl RemoteConfigSets {
                 let Ok(Value::Object(object)) = serde_json::from_slice::<Value>(&bytes) else {
                     return Err(RemoteConfigError::NotObject { key });
                 };
-                if sets_experience(&object) {
-                    return Err(RemoteConfigError::Experience {
+                if let Some(name) = server_key_set(&object) {
+                    return Err(RemoteConfigError::ServerKey {
                         key,
                         reason: format!(
-                            "sets {XP_PARENT}{KEY_PATH_SEPARATOR}{XP_MULTIPLIERS}, which the server fills from [experience]"
+                            "sets {JAVELIN}{KEY_PATH_SEPARATOR}{name}, which the server fills from config/edge.toml"
                         ),
                     });
                 }
                 let body = if key == endpoints_key {
                     with_game_host_endpoints(object, &config.game_authority(), &key)?
-                } else if key == experience_key {
-                    with_experience(object, &config.experience, &key)?
+                } else if key == server_keys_key {
+                    with_server_keys(object, config, &key)?
                 } else {
                     bytes
                 };
@@ -311,28 +319,30 @@ fn with_game_host_endpoints(
     serde_json::to_vec_pretty(&Value::Object(object)).map_err(|error| fail(error.to_string()))
 }
 
-/// Whether `object` sets `javelin.xp-multipliers` or a key in it, nested or written flat
-/// (the key stack of the sims reads both).
-fn sets_experience(object: &Map<String, Value>) -> bool {
-    let flat = format!("{XP_PARENT}{KEY_PATH_SEPARATOR}{XP_MULTIPLIERS}");
+/// The first of the [`SERVER_KEYS`] that `object` sets, itself or a key in it, nested or written
+/// flat (the key stack of the sims reads both).
+fn server_key_set(object: &Map<String, Value>) -> Option<&'static str> {
     let names = |name: &str, prefix: &str| {
         name == prefix || name.starts_with(&format!("{prefix}{KEY_PATH_SEPARATOR}"))
     };
-    object.keys().any(|name| names(name, &flat))
-        || object
-            .get(XP_PARENT)
-            .and_then(Value::as_object)
-            .is_some_and(|parent| parent.keys().any(|name| names(name, XP_MULTIPLIERS)))
+    let nested = object.get(JAVELIN).and_then(Value::as_object);
+    SERVER_KEYS.into_iter().find(|server_key| {
+        let flat = format!("{JAVELIN}{KEY_PATH_SEPARATOR}{server_key}");
+        object.keys().any(|name| names(name, &flat))
+            || nested.is_some_and(|parent| parent.keys().any(|name| names(name, server_key)))
+    })
 }
 
-/// `object` with `javelin.xp-multipliers` from `experience`, as JSON text: the `character`
-/// number and one `<CategoricalProgressionId>:<multiplier>` entry for each progression.
-fn with_experience(
+/// `object` with the [`SERVER_KEYS`] from `config`, as JSON text: `javelin.xp-multipliers` from
+/// `[experience]` (the `character` number and one `<CategoricalProgressionId>:<multiplier>` entry
+/// for each progression) and `javelin.playtest-disable-fast-travel-costs` from `[fast_travel]`.
+fn with_server_keys(
     mut object: Map<String, Value>,
-    experience: &ExperienceConfig,
+    config: &EdgeConfig,
     key: &str,
 ) -> Result<Vec<u8>, RemoteConfigError> {
-    let fail = |reason: String| RemoteConfigError::Experience {
+    let experience = &config.experience;
+    let fail = |reason: String| RemoteConfigError::ServerKey {
         key: key.to_owned(),
         reason,
     };
@@ -344,12 +354,16 @@ fn with_experience(
     let mut multipliers = Map::new();
     multipliers.insert(XP_CHARACTER.to_owned(), Value::from(experience.character));
     multipliers.insert(XP_PROGRESSION.to_owned(), Value::Array(progression));
-    object
-        .entry(XP_PARENT)
+    let javelin = object
+        .entry(JAVELIN)
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
-        .ok_or_else(|| fail(format!("{XP_PARENT} is not an object")))?
-        .insert(XP_MULTIPLIERS.to_owned(), Value::Object(multipliers));
+        .ok_or_else(|| fail(format!("{JAVELIN} is not an object")))?;
+    javelin.insert(XP_MULTIPLIERS.to_owned(), Value::Object(multipliers));
+    javelin.insert(
+        FAST_TRAVEL_FREE.to_owned(),
+        Value::Bool(config.fast_travel.free),
+    );
     serde_json::to_vec_pretty(&Value::Object(object)).map_err(|error| fail(error.to_string()))
 }
 
@@ -369,7 +383,7 @@ pub(crate) mod tests {
 
     use super::*;
     use crate::config::tests::valid;
-    use crate::experience::NORMAL_EXPERIENCE;
+    use crate::experience::{ExperienceConfig, NORMAL_EXPERIENCE};
     use crate::s3::{
         ANY_ETAG, ERROR_CONTENT_TYPE, HOST_ID_HEADER, OBJECT_CONTENT_TYPE, REQUEST_ID_BYTES,
         REQUEST_ID_HEADER,
@@ -403,8 +417,8 @@ pub(crate) mod tests {
     /// asks for (`analytics/enable` and seven `javelin` keys of the publicGameplay `RegionId`
     /// layer; leaderboards note section 1), plus the shop service keys `omni/fcs/*` and the
     /// privacy settings keys `omni/privacy-settings/*` that retail leaves to the client's defaults
-    /// (shop note). The experience multipliers are served once, in
-    /// the `ProductId` layer, from `[experience]`.
+    /// (shop note). The experience multipliers and the free fast travel switch are served once,
+    /// in the `ProductId` layer, from `[experience]` and `[fast_travel]`.
     const SERVED_KEY_PATHS: [(&str, Dimension, &[&str]); 8] = [
         (
             "public",
@@ -439,6 +453,7 @@ pub(crate) mod tests {
             "publicGameplay",
             Dimension::ProductId,
             &[
+                "javelin/playtest-disable-fast-travel-costs",
                 "javelin/xp-multipliers/character",
                 "javelin/xp-multipliers/progression",
             ],
@@ -726,15 +741,20 @@ pub(crate) mod tests {
         }
     }
 
-    /// The served `javelin.xp-multipliers` object of `sets`.
-    fn served_experience(sets: &RemoteConfigSets) -> Value {
+    /// The served `javelin` object of the server keys layer of `sets`.
+    fn served_javelin(sets: &RemoteConfigSets) -> Value {
         let key = object_key(
-            EXPERIENCE_APPLICATION,
+            SERVER_KEYS_APPLICATION,
             Dimension::ProductId,
             PRODUCT_ID,
             VERSIONLESS,
         );
-        served_json(sets, &key)["javelin"]["xp-multipliers"].clone()
+        served_json(sets, &key)[JAVELIN].clone()
+    }
+
+    /// The served `javelin.xp-multipliers` object of `sets`.
+    fn served_experience(sets: &RemoteConfigSets) -> Value {
+        served_javelin(sets)[XP_MULTIPLIERS].clone()
     }
 
     /// The served progression entries.
@@ -805,15 +825,28 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_file_must_not_set_the_experience_multipliers() {
+    fn fast_travel_is_paid_by_default_and_free_when_set() {
+        assert_eq!(
+            served_javelin(&sets())[FAST_TRAVEL_FREE],
+            Value::Bool(false)
+        );
+        let (_dir, mut config) = copied_sets();
+        config.fast_travel.free = true;
+        let served = served_javelin(&RemoteConfigSets::load(&config).expect("sets"));
+        assert_eq!(served[FAST_TRAVEL_FREE], Value::Bool(true));
+    }
+
+    #[test]
+    fn a_file_must_not_set_a_server_key() {
         for (application, dimension, id) in [
-            (EXPERIENCE_APPLICATION, Dimension::ProductId, PRODUCT_ID),
-            (EXPERIENCE_APPLICATION, Dimension::CognitoId, COGNITO_ID),
+            (SERVER_KEYS_APPLICATION, Dimension::ProductId, PRODUCT_ID),
+            (SERVER_KEYS_APPLICATION, Dimension::CognitoId, COGNITO_ID),
             ("public", Dimension::WorldId, WORLD_ID),
         ] {
             for javelin in [
                 serde_json::json!({"xp-multipliers": {"character": 2}}),
                 serde_json::json!({"xp-multipliers.progression": ["Riding:2"]}),
+                serde_json::json!({"playtest-disable-fast-travel-costs": true}),
             ] {
                 let (dir, config) = copied_sets();
                 let path = dir.path().join(layer_file_name(application, dimension, id));
@@ -825,7 +858,7 @@ pub(crate) mod tests {
                 assert!(
                     matches!(
                         RemoteConfigSets::load(&config),
-                        Err(RemoteConfigError::Experience { key: found, .. }) if found == key
+                        Err(RemoteConfigError::ServerKey { key: found, .. }) if found == key
                     ),
                     "{key}"
                 );
