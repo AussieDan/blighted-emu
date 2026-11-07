@@ -649,6 +649,7 @@ pub(crate) mod tests {
             territories: vec![1],
             faction: 1,
             position: [100.0, 100.0],
+            instanced: false,
         }
     }
 

@@ -9,6 +9,7 @@ publish.workspace = true
 
 [dependencies]
 clap.workspace = true
+data-encoding.workspace = true
 nw-capture.workspace = true
 nw-carrier.workspace = true
 nw-common.workspace = true
@@ -23,6 +24,7 @@ nw-sim-core.workspace = true
 nw-world.workspace = true
 reqwest.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 sim.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-std", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }

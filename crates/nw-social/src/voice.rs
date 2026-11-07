@@ -11,12 +11,25 @@
 //! - A channel's address is `sip:confctl-<kind>-<issuer>.<channel><suffix>@<domain host>`, kind
 //!   `d` for a positional channel, `g` for a group channel; the suffix is the same for every
 //!   channel of a world.
-//! - A positional channel is named by its place, `<x><y>_0` with three digits each; a group
-//!   channel by a 43-character base64url id.
+//! - A positional channel is named by its place and its layer, `<x><y>_<layer>` with three digits
+//!   each; a group channel by a 43-character base64url id.
+//!
+//! Observed (2026-11-07, the 7,404 retail 405 of 556 ledgers of `captures/`, probe `voicerooms`):
+//! - Every 405 answered a 2805 within 1 s (7,387 of 7,404; the rest followed a 2805 the capture
+//!   cut): the server sends the channels only when asked. The client asks each time the player
+//!   crosses a line of half a place (the positions of its 2805 sit on them).
+//! - A 405 lists 1 to 11 channels, mostly 4 (3,526) or 2 (2,786): the places around the player.
+//!   The places a box of one place's size centred on the player overlaps hold the list in 5,697
+//!   of 6,270 open-world 405 with a known position, and are the list in 2,795 of them (a box of
+//!   448 m: 3,185); the own place alone was the list in 496. The exact rule is Unknown (the
+//!   lists also keep a place the player came from).
+//! - The layer is `0` in the open world and a 16-digit hex id in an instance (a dungeon, a race,
+//!   a story instance): 507 ledgers sent `0`, and 113 switched between `0` and an id when the
+//!   player went into an instance and out.
 
 use data_encoding::BASE64URL_NOPAD;
 use hmac::{Hmac, KeyInit, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 /// The empty JSON header of every token, base64url.
@@ -35,6 +48,8 @@ const KIND_POSITIONAL: &str = "d";
 const KIND_GROUP: &str = "g";
 /// The layer of an open-world positional channel (every retail open-world name ends `_0`).
 const OPEN_WORLD_LAYER: &str = "0";
+/// Bytes of an instance's layer id: 8, which hex makes the retail 16 digits.
+const INSTANCE_LAYER_BYTES: usize = 8;
 /// Random bytes of a group channel id: 32, which base64url makes 43 characters.
 const GROUP_CHANNEL_BYTES: usize = 32;
 /// Digits of each place number of a positional channel name.
@@ -44,10 +59,28 @@ const MAX_PLACE: i64 = 999;
 
 /// The places on each side of a player's own place whose positional channels it may join.
 const NEAR_PLACES: i64 = 1;
+/// The share of a place on each side of the player that the listed places cover: the box of one
+/// place's size centred on the player (module note).
+const LISTED_HALF_SHARE: f32 = 0.5;
+/// How far short of its far side the box ends, metres: it covers its near side, not its far one.
+const BOX_END_M: f32 = 0.001;
 
-/// The name of the positional channel of place (`east`, `north`).
-fn place_channel(east: i64, north: i64) -> String {
-    format!("{east:0PLACE_DIGITS$}{north:0PLACE_DIGITS$}_{OPEN_WORLD_LAYER}")
+/// The name of the positional channel of place (`east`, `north`) on layer `layer`.
+fn place_channel(east: i64, north: i64, layer: &str) -> String {
+    format!("{east:0PLACE_DIGITS$}{north:0PLACE_DIGITS$}_{layer}")
+}
+
+/// The layer of the positional channels of a player on sim `sim`, `instanced` or not: `0` in
+/// the open world, else an id of the sim (an instance runs on a sim of its own), 16 hex digits.
+pub fn channel_layer(instanced: bool, sim: &str) -> String {
+    if !instanced {
+        return OPEN_WORLD_LAYER.to_owned();
+    }
+    Sha256::digest(sim.as_bytes())
+        .iter()
+        .take(INSTANCE_LAYER_BYTES)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The voice service a community runs, from the social service's configuration.
@@ -111,30 +144,58 @@ impl VoiceService {
         )
     }
 
-    /// The name of the positional channel at `position` (metres east, north).
-    pub fn positional_channel(&self, position: [f32; 2]) -> String {
-        let (east, north) = self.place_of(position);
-        place_channel(east, north)
+    /// The positional channels listed to a player at `position` (metres east, north) on layer
+    /// `layer` (405): its own place first, then the other places that the box of one place's
+    /// size centred on it overlaps (module note).
+    pub fn positional_channels(&self, position: [f32; 2], layer: &str) -> Vec<String> {
+        let own = self.place_of(position);
+        let half_m = self.cell_size_m * LISTED_HALF_SHARE;
+        // The box covers [position - half, position + half): a box that ends on a line between
+        // two places does not reach into the next one.
+        let span = |axis: usize| {
+            let low = self.place_of_metres(position[axis] - half_m);
+            let high = self
+                .place_of_metres(position[axis] + half_m - BOX_END_M)
+                .max(low);
+            low..=high
+        };
+        let mut places = vec![own];
+        for east in span(0) {
+            for north in span(1) {
+                if (east, north) != own {
+                    places.push((east, north));
+                }
+            }
+        }
+        places
+            .into_iter()
+            .map(|(east, north)| place_channel(east, north, layer))
+            .collect()
     }
 
-    /// The positional channels a player at `position` may join: its own place and the
-    /// [`NEAR_PLACES`] around it. Inferred: the client joins the channel of its channel list
-    /// (its own place), and a player that crossed into the next place between the list and the
-    /// join still joins its old one; retail's rule is Unknown.
-    pub fn positional_channels_near(&self, position: [f32; 2]) -> Vec<String> {
+    /// The positional channels a player at `position` on layer `layer` may join: its own place
+    /// and the [`NEAR_PLACES`] around it, which hold every listed one. Inferred: a player that
+    /// crossed into the next place between the list and the join still joins its old one;
+    /// retail's rule is Unknown.
+    pub fn positional_channels_near(&self, position: [f32; 2], layer: &str) -> Vec<String> {
         let (east, north) = self.place_of(position);
         let span = |place: i64| (place - NEAR_PLACES).max(0)..=(place + NEAR_PLACES).min(MAX_PLACE);
         span(east)
-            .flat_map(|east| span(north).map(move |north| place_channel(east, north)))
+            .flat_map(|east| span(north).map(move |north| place_channel(east, north, layer)))
             .collect()
     }
 
     fn place_of(&self, position: [f32; 2]) -> (i64, i64) {
-        let place = |metres: f32| -> i64 {
-            // A finite position over a positive cell size is a small number.
-            ((metres / self.cell_size_m).floor() as i64).clamp(0, MAX_PLACE)
-        };
-        (place(position[0]), place(position[1]))
+        (
+            self.place_of_metres(position[0]),
+            self.place_of_metres(position[1]),
+        )
+    }
+
+    /// The place number of `metres` along one axis.
+    fn place_of_metres(&self, metres: f32) -> i64 {
+        // A finite position over a positive cell size is a small number.
+        ((metres / self.cell_size_m).floor() as i64).clamp(0, MAX_PLACE)
     }
 
     /// A token of `action` for `character` with request number `request` at Unix seconds
@@ -224,18 +285,49 @@ mod tests {
                 .group_uri("abc")
                 .starts_with("sip:confctl-g-issuer-1.abc")
         );
-        assert_eq!(service.positional_channel([6700.0, 3600.0]), "013007_0");
-        let near = service.positional_channels_near([6700.0, 3600.0]);
+        let near = service.positional_channels_near([6700.0, 3600.0], OPEN_WORLD_LAYER);
         assert_eq!(near.len(), 9);
         assert!(near.contains(&"012006_0".to_owned()) && near.contains(&"014008_0".to_owned()));
         assert!(!near.contains(&"015007_0".to_owned()));
         assert_eq!(
-            service.positional_channels_near([0.0, 0.0]),
+            service.positional_channels_near([0.0, 0.0], OPEN_WORLD_LAYER),
             ["000000_0", "000001_0", "001000_0", "001001_0"],
             "no place below 0"
         );
         assert_eq!(service.domain_text(), "@voice.example");
         assert_eq!(new_group_channel().len(), 43);
+    }
+
+    #[test]
+    fn the_listed_channels_are_the_places_around_the_player_as_retail() {
+        let service = service();
+        // Retail `MSQ22-lv67` at 1.461 s: the player at (9219.44, 9057.035), 405 `017018_0`,
+        // `017017_0`, `018017_0`, `018018_0`.
+        let listed = service.positional_channels([9_219.44, 9_057.035], OPEN_WORLD_LAYER);
+        assert_eq!(listed[0], "018017_0", "the own place first");
+        let mut sorted = listed.clone();
+        sorted.sort();
+        assert_eq!(sorted, ["017017_0", "017018_0", "018017_0", "018018_0"]);
+        // In the middle of a place on one axis: two places.
+        let two = service.positional_channels([18.1 * 512.0, 17.5 * 512.0], OPEN_WORLD_LAYER);
+        assert_eq!(two, ["018017_0", "017017_0"]);
+        let near = service.positional_channels_near([9_219.44, 9_057.035], OPEN_WORLD_LAYER);
+        assert!(listed.iter().all(|channel| near.contains(channel)));
+        assert_eq!(
+            service.positional_channels([10.0, 10.0], "a5b5ccc46aa972b9"),
+            ["000000_a5b5ccc46aa972b9"],
+            "no place below 0, and the layer goes in the name"
+        );
+    }
+
+    #[test]
+    fn the_open_world_is_layer_0_and_an_instance_has_its_own() {
+        assert_eq!(channel_layer(false, "sim-1"), OPEN_WORLD_LAYER);
+        let dungeon = channel_layer(true, "instance-1");
+        assert_eq!(dungeon.len(), 2 * INSTANCE_LAYER_BYTES);
+        assert!(dungeon.chars().all(|digit| digit.is_ascii_hexdigit()));
+        assert_ne!(dungeon, channel_layer(true, "instance-2"));
+        assert_eq!(dungeon, channel_layer(true, "instance-1"));
     }
 
     #[test]

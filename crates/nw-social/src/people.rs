@@ -27,7 +27,7 @@ use uuid::Uuid;
 
 use crate::effects::StoreOp;
 use crate::privacy::Audience;
-use crate::voice::{TokenAction, VoiceService};
+use crate::voice::{TokenAction, VoiceService, channel_layer};
 use crate::world::{METRIC_CALLS, REFUSED, RESULT_LABEL, SocialWorld};
 
 /// The pronoun of a character of this server: it has no pronoun choice (0 is the value of 251
@@ -385,18 +385,23 @@ impl SocialWorld {
                 }
             }
             VoiceCall::WorldChannels => {
-                let Some(position) = self
+                let Some(online) = self
                     .people
                     .get(&character)
                     .and_then(|person| person.online.as_ref())
-                    .map(|online| online.position)
                 else {
                     return;
                 };
-                let channel = service.positional_channel(position);
-                let uri = service.positional_uri(&channel);
+                let layer = channel_layer(online.instanced, online.sim.as_str());
                 VoicePush::WorldChannels {
-                    channels: vec![(channel, uri)],
+                    channels: service
+                        .positional_channels(online.position, &layer)
+                        .into_iter()
+                        .map(|channel| {
+                            let uri = service.positional_uri(&channel);
+                            (channel, uri)
+                        })
+                        .collect(),
                 }
             }
             VoiceCall::GroupChannel => {
@@ -439,7 +444,10 @@ impl SocialWorld {
         let near = voice == Audience::Everyone
             && person.online.as_ref().is_some_and(|online| {
                 service
-                    .positional_channels_near(online.position)
+                    .positional_channels_near(
+                        online.position,
+                        &channel_layer(online.instanced, online.sim.as_str()),
+                    )
                     .iter()
                     .any(|channel| service.positional_uri(channel) == uri)
             });

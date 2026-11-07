@@ -3214,6 +3214,7 @@ name = "nw-testclient"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "data-encoding",
  "nw-capture",
  "nw-carrier",
  "nw-common",
@@ -3228,6 +3229,7 @@ dependencies = [
  "nw-world",
  "reqwest",
  "serde",
+ "serde_json",
  "sim",
  "thiserror 2.0.21",
  "tokio",

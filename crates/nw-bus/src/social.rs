@@ -59,6 +59,9 @@ pub struct SocialPlayer {
     pub faction: u8,
     /// Where the player is, in metres (east, north): its positional voice channel.
     pub position: [f32; 2],
+    /// The player is in an instance (a dungeon, a trial, the tutorial), not the open world: its
+    /// positional voice channels are the instance's own.
+    pub instanced: bool,
 }
 
 /// Why a player left a sim.
@@ -248,6 +251,7 @@ mod tests {
                     territories: vec![3, 7],
                     faction: 1,
                     position: [10.0, 20.0],
+                    instanced: true,
                 }),
                 SocialInput::Call {
                     character,

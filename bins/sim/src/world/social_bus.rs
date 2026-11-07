@@ -50,6 +50,8 @@ impl SimWorld {
             territories: player.territories.clone(),
             faction: player.faction.faction,
             position: [at.x, at.y],
+            instanced: self.settings.instance_role
+                || self.settings.level.folder == nw_sim_core::TUTORIAL_FOLDER,
         })
     }
 

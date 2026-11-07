@@ -4,7 +4,9 @@
 //! second time. `pair` runs two clients in the world (M4 spec section 9). `swarm` runs many bots
 //! across a sim border (M5 spec section 11). `hunt` runs many bots that fight mobs (M6-B spec
 //! section 9). `chat` says one line in area chat and waits for the server's answer (system lines
-//! for a GM chat command such as `!help` of a game master account, else the line itself). `play`
+//! for a GM chat command such as `!help` of a game master account, else the line itself). `voice`
+//! sets up the voice chat and checks the retail answers (it needs a `[voice]` service in the
+//! social service's configuration). `play`
 //! plays quests with a game master's bot and writes a report. Prints one line per step; exits with
 //! 0 only when every step passed.
 
@@ -35,6 +37,7 @@ use nw_testclient::play::{PlaySettings, run_play};
 use nw_testclient::rep::{LedgerSlot, RepClient};
 use nw_testclient::swarm::run_swarm;
 use nw_testclient::udp::{Hold, run_rep};
+use nw_testclient::voice::{VoiceSettings, run_voice};
 use nw_testclient::walk::{CHARACTER_CREATION_PARAMS, WalkSettings, login_token, walk};
 use nw_world::WorldFile;
 use nw_world::world_file::world_file_path;
@@ -108,6 +111,9 @@ enum Command {
         #[arg(long, default_value = DEFAULT_CHAT_LINE)]
         line: String,
     },
+    /// One client (the first account) sets up its voice chat: the service, a login token, the
+    /// positional channels and a join token for the first one, each in the retail form.
+    Voice,
     /// One client (the first account, which needs the game master rank) plays quests on the
     /// live servers through the client's calls and writes which quests end and where each other
     /// one stops.
@@ -206,6 +212,7 @@ async fn steps(cli: Cli) -> Result<bool, Box<dyn std::error::Error>> {
             }
             gather(&config, &http, trusted, ledger).await
         }
+        Command::Voice => voice(&config, &http, &trusted, own(&config)?, &ledger).await,
         Command::Chat { line } => {
             chat(&config, &http, &trusted, own(&config)?, line, &ledger).await
         }
@@ -569,6 +576,34 @@ async fn chat(
     }
     if report.echoed {
         println!("the line came back as area chat");
+    }
+    Ok(print_checks(&report.checks()))
+}
+
+async fn voice(
+    config: &TestClientConfig,
+    http: &reqwest::Client,
+    trusted: &DtlsClientConfig,
+    account: WalkSettings,
+    ledger: &LedgerSlot,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let settings = VoiceSettings {
+        account,
+        hold: Duration::from_secs(config.hold_seconds),
+        registration_timeout: Duration::from_secs(config.registration_timeout_seconds),
+    };
+    let report = run_voice(
+        http,
+        &settings,
+        |token| RepClient::new(trusted, config.mtu, token, 0).map(|client| ledger.give(client)),
+        |line| println!("{line}"),
+    )
+    .await?;
+    if let Some(service) = &report.service {
+        println!("voice service: {service}");
+    }
+    for (name, uri) in &report.channels {
+        println!("channel {name}: {uri}");
     }
     Ok(print_checks(&report.checks()))
 }

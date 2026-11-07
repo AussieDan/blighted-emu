@@ -16,4 +16,5 @@ pub mod swarm;
 pub mod sync;
 pub mod udp;
 pub mod view;
+pub mod voice;
 pub mod walk;
