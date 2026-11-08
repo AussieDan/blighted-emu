@@ -261,6 +261,17 @@ nighthaven = 1.0
 [fast_travel]
 free = false
 
+# The community's voice service. The social service's [voice] api_url
+# (https://game.<domain>/vivox/api2/) leads the game's voice SDK here first: this server answers
+# its prelogin with the hosts below. Left out, the prelogin is not served and voice stays off.
+# [voice]
+# realm = "voice.example.org"            # the social service's [voice] domain
+# xmpp_host = "game.example.org"         # the voice server that signs players in
+# xmpp_port = 5223
+# xmpp_tls = true
+# ws_xmpp_url = "wss://game.example.org:443/ws-xmpp"
+# telemetry_url = "https://game.example.org"
+
 [[world]]
 id = "8d0f4c2e-0000-4000-8000-000000000001"
 name = "Aeternum"

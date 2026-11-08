@@ -40,6 +40,7 @@ mod test_http;
 pub mod test_support;
 pub mod time;
 pub mod valkey;
+pub mod voice;
 
 /// Installs the `ring` TLS crypto provider for this process. HTTPS serving and the Discord client
 /// both use it. A second call has no effect.

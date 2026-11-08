@@ -227,14 +227,77 @@ impl VoiceService {
             "{TOKEN_HEADER}.{}",
             BASE64URL_NOPAD.encode(claims.as_bytes())
         );
-        let signature = <Hmac<Sha256> as KeyInit>::new_from_slice(&self.key)
-            .map(|mut mac| {
-                mac.update(signed.as_bytes());
-                BASE64URL_NOPAD.encode(&mac.finalize().into_bytes())
-            })
+        let signature = signature_mac(&self.key, &signed)
+            .map(|mac| BASE64URL_NOPAD.encode(&mac.finalize().into_bytes()))
             .unwrap_or_default();
         format!("{signed}.{signature}")
     }
+}
+
+/// The HMAC-SHA256 of `signed` (`e30.<claims>`) under `key`, ready to finish or verify; `None`
+/// for a key the HMAC refuses.
+fn signature_mac(key: &[u8], signed: &str) -> Option<Hmac<Sha256>> {
+    let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key).ok()?;
+    mac.update(signed.as_bytes());
+    Some(mac)
+}
+
+/// The claims of a token ([`VoiceService::token`]) that a voice service checks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenClaims {
+    /// `iss`: the issuer.
+    pub issuer: String,
+    /// `exp`: Unix seconds after which it is no longer valid.
+    pub expires_s: u64,
+    /// `vxa`: `login`, `join` or `trxn`.
+    pub action: String,
+    /// `f`: the player's address.
+    pub from: String,
+    /// `t`: the channel's address, for a join or a transcription.
+    pub target: Option<String>,
+}
+
+impl TokenClaims {
+    /// Whether these are the claims of a login token from `issuer` for `from` that is still
+    /// valid at Unix seconds `now_s`.
+    pub fn allow_login(&self, issuer: &str, from: &str, now_s: u64) -> bool {
+        self.allows(ACTION_LOGIN, issuer, from, now_s)
+    }
+
+    /// Whether these are the claims of a join token from `issuer` for `from` to channel address
+    /// `target` that is still valid at Unix seconds `now_s`.
+    pub fn allow_join(&self, issuer: &str, from: &str, target: &str, now_s: u64) -> bool {
+        self.allows(ACTION_JOIN, issuer, from, now_s) && self.target.as_deref() == Some(target)
+    }
+
+    fn allows(&self, action: &str, issuer: &str, from: &str, now_s: u64) -> bool {
+        self.action == action
+            && self.issuer == issuer
+            && self.from == from
+            && now_s <= self.expires_s
+    }
+}
+
+/// The claims of `token` when `key` signed it (`e30.<claims>.<signature>`); `None` for another
+/// form, a wrong signature or claims without `iss`, `exp`, `vxa` and `f`.
+pub fn verified_claims(key: &[u8], token: &str) -> Option<TokenClaims> {
+    let (signed, signature) = token.rsplit_once('.')?;
+    let (header, claims) = signed.split_once('.')?;
+    if header != TOKEN_HEADER {
+        return None;
+    }
+    let signature = BASE64URL_NOPAD.decode(signature.as_bytes()).ok()?;
+    signature_mac(key, signed)?.verify_slice(&signature).ok()?;
+    let claims = BASE64URL_NOPAD.decode(claims.as_bytes()).ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&claims).ok()?;
+    let text = |name: &str| claims.get(name)?.as_str().map(str::to_owned);
+    Some(TokenClaims {
+        issuer: text("iss")?,
+        expires_s: claims.get("exp")?.as_u64()?,
+        action: text("vxa")?,
+        from: text("f")?,
+        target: text("t"),
+    })
 }
 
 /// A JSON string of `text`.
@@ -328,6 +391,44 @@ mod tests {
         assert!(dungeon.chars().all(|digit| digit.is_ascii_hexdigit()));
         assert_ne!(dungeon, channel_layer(true, "instance-2"));
         assert_eq!(dungeon, channel_layer(true, "instance-1"));
+    }
+
+    #[test]
+    fn a_signed_login_token_verifies_and_a_changed_one_does_not() {
+        let service = service();
+        let character = Uuid::from_u128(1);
+        let token = service.token(TokenAction::Login, character, 1, None, 1_000);
+        let claims = verified_claims(b"secret", &token).expect("verified");
+        let from = service.user_uri(character);
+        assert!(claims.allow_login("issuer-1", &from, 1_000 + TOKEN_LIFETIME_S));
+        assert!(
+            !claims.allow_login("issuer-1", &from, 1_001 + TOKEN_LIFETIME_S),
+            "expired"
+        );
+        assert!(
+            !claims.allow_login("issuer-2", &from, 1_000),
+            "another issuer"
+        );
+        assert!(verified_claims(b"other key", &token).is_none());
+        let mut forged = token.clone();
+        forged.insert(10, 'x');
+        assert!(verified_claims(b"secret", &forged).is_none());
+        let join = service.token(TokenAction::Join, character, 2, Some("sip:t"), 1_000);
+        let join = verified_claims(b"secret", &join).expect("verified");
+        assert!(
+            !join.allow_login("issuer-1", &from, 1_000),
+            "a join token is no login"
+        );
+        assert_eq!(join.target.as_deref(), Some("sip:t"));
+        assert!(join.allow_join("issuer-1", &from, "sip:t", 1_000));
+        assert!(
+            !join.allow_join("issuer-1", &from, "sip:other", 1_000),
+            "another channel"
+        );
+        assert!(
+            !claims.allow_join("issuer-1", &from, "sip:t", 1_000),
+            "a login token joins nothing"
+        );
     }
 
     #[test]
