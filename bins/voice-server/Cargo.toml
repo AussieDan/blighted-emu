@@ -1,0 +1,28 @@
+[package]
+name = "voice-server"
+version = "0.1.0"
+description = "Voice service of the Blighted New World emulator: the XMPP sign-in of the game's voice SDK."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+data-encoding.workspace = true
+nw-common.workspace = true
+nw-login.workspace = true
+nw-social.workspace = true
+rustls.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls.workspace = true
+tracing.workspace = true
+
+
+[dev-dependencies]
+uuid.workspace = true
+
+[lints]
+workspace = true

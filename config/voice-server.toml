@@ -1,0 +1,32 @@
+# voice-server: the community's voice service for the game's voice SDK. edge-http's [voice]
+# section names this server to the game (xmpp_host and xmpp_port), and the social service's
+# [voice] gives the game the tokens it signs in with. It checks the game's sign-in, keeps the
+# voice rooms, answers the call setup and relays the audio between the players of a room.
+
+log = "info"
+
+# The XMPP listener: edge-http's [voice] xmpp_port.
+xmpp_listen = "0.0.0.0:5223"
+
+# The SIP realm: edge-http's [voice] realm (the social service's [voice] domain).
+realm = "voice.example.org"
+
+# The token issuer and the variable that holds the token key: the social service's [voice]
+# issuer and key_env. The game signs in with the login token the social service gives it.
+issuer = "community-1"
+key_env = "NW_SECRET_VOICE_KEY"
+
+# The certificate of the XMPP host. The edge-http certificate fits when xmpp_host is
+# game.<domain>. Keep the files in local-data/, never in git.
+certificate_pem_path = "local-data/edge-http/tls/fullchain.pem"
+private_key_pem_path = "local-data/edge-http/tls/privkey.pem"
+
+# The audio relay: one UDP port per player's call, from port_min to port_max. address is the IP
+# the game sends its audio to (this server's public address); bind is where the ports listen.
+# echo = true: a player also hears itself (a test with one player).
+[media]
+address = "203.0.113.10"
+bind = "0.0.0.0"
+port_min = 40000
+port_max = 40999
+echo = false
