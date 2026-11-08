@@ -449,9 +449,14 @@ pub struct HomePoint {
     pub position: [f32; POSITION_LEN],
     /// Its cooldown, ns.
     pub cooldown_ns: u64,
-    /// Unix ns: an inn's or a camp's last use (in the past in every retail element), a house's
-    /// cooldown end (in the future); 0 for none.
-    pub used_ns: u64,
+    /// When its cooldown ends, on the client's clock (ns since 2000-01-01, the clock of
+    /// `TimeSynchMsg`); 0 for none. The client reads it into the point's cooldown end (+0x80,
+    /// `FUN_1434dc760`) and compares it with its clock as it is (`FUN_1434f1270`); a Unix time
+    /// here showed a 10,956 day recall countdown (live 2026-11-08). Retail sends a Unix time in
+    /// 3,983 of 22,982 inn elements: a cooldown end (163 values of 40 ledgers lay 131 minutes
+    /// before to 11 minutes after the capture's record); how its client reads a Unix time here is
+    /// Unknown.
+    pub cooldown_end_ns: u64,
     /// Its kind ([`home_point_kind`]).
     pub kind: u32,
     /// A flag (0 in every retail element).
@@ -471,7 +476,7 @@ impl HomePoint {
             name: read_text(reader)?,
             position: read_position(reader)?,
             cooldown_ns: reader.u64()?,
-            used_ns: reader.u64()?,
+            cooldown_end_ns: reader.u64()?,
             kind: reader.u32()?,
             flag: reader.boolean()?,
             extra: reader.u8()?,
@@ -486,7 +491,7 @@ impl HomePoint {
         write_position(writer, &self.position);
         writer
             .u64(self.cooldown_ns)
-            .u64(self.used_ns)
+            .u64(self.cooldown_end_ns)
             .u32(self.kind)
             .boolean(self.flag)
             .u8(self.extra);
@@ -502,12 +507,15 @@ pub fn home_point_id(entity: u64, index: u32) -> Vec<u8> {
 }
 
 /// `MB::PlayerHomeComponentReplicatedState` (`FUN_1434e3e80`): the player's home points and the
-/// id of the one it is bound to.
+/// id of a point it used.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct PlayerHomeState {
     /// Child 0 `homePointList`.
     pub home_points: Option<FullList<HomePoint>>,
-    /// Child 1 `homePointId`: the bound home point's id text (146 of 477 retail bodies).
+    /// Child 1 `homePointId`: the id text of a point the player used. When it changes, the
+    /// client starts that point's cooldown from its clock's now (`FUN_1434f11e0` ->
+    /// `FUN_1434fc0f0`). Retail sends it in 16 of 1,573 first bodies of a ledger and never names
+    /// an inn (0 of 4,347 bodies with it; it names kinds 10, 4, 11, 12, 8, 7 or no listed point).
     pub home_point_id: Option<Vec<u8>>,
 }
 
@@ -768,7 +776,7 @@ mod tests {
             name: b"@12_InnName".to_vec(),
             position: [7_383.5, 3_732.5, 112.7],
             cooldown_ns: INN_COOLDOWN_NS,
-            used_ns: 0,
+            cooldown_end_ns: 0,
             kind: home_point_kind::INN,
             flag: false,
             extra: 0,

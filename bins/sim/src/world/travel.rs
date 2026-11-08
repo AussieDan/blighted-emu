@@ -16,7 +16,8 @@
 //!   after the wait (2190) to the oldest of its breadcrumbs (Inferred: 31 retail landings were on
 //!   the player's own trail, 39 to 264 m back); it is denied (2774) while dead, while one runs, on
 //!   cooldown, or without breadcrumbs, with the cooldown left. A failed move ends the cooldown
-//!   (retail asked again 54 s after one and was accepted).
+//!   (retail asked again 54 s after one and was accepted). The player kneels while it waits and
+//!   may not interact, and stands up at the move ([`super::slayer`]'s unstuck kneel).
 //! - A map marker (2728) comes back as the waypoints state (4321) in the next bundle.
 //! - Binding a respawn camp (interaction 73) demolishes the player's own camp (6760, every one of
 //!   8 retail binds; its entity goes and the save forgets it) and is accepted (3743); checking in
@@ -86,7 +87,6 @@ use crate::travel_rules::{HousingRules, ShrinePoint, TravelRules};
 
 use super::camps::{CampEntity, CampPlacement};
 use super::quest_objects::gain_experience;
-use super::slayer::KneelFrom;
 use super::statics::interaction_enabled;
 use super::{
     Body, Placement, Player, REFUSED_RESYNC_MS, SimWorld, Vitals, gather_answer, send_now, unix_ns,
@@ -390,6 +390,17 @@ const fn unix_ms_ns(ms: u64) -> u64 {
     ms.saturating_mul(NS_PER_MS)
 }
 
+/// The client's clock (ns since 2000-01-01, [`crate::server::SERVER_EPOCH_UNIX_MS`]) at Unix
+/// milliseconds `ms`; 0 stays 0 (none). A home point's cooldown end is on this clock
+/// ([`HomePoint::cooldown_end_ns`]).
+const fn client_clock_ns(ms: u64) -> u64 {
+    if ms == 0 {
+        return 0;
+    }
+    ms.saturating_sub(crate::server::SERVER_EPOCH_UNIX_MS)
+        .saturating_mul(NS_PER_MS)
+}
+
 /// The header of a call to the travel component `component` of player `number`.
 fn header(component: u64, number: u64) -> FacetHeader {
     FacetHeader::of(component, number)
@@ -577,8 +588,9 @@ impl SimWorld {
         costs.cost(f64::from(distance), self.bag_load(entity), in_territory)
     }
 
-    /// A recall of player `number` (`entity`) to the inn it checked in at: refused without one or
-    /// while the inn's cooldown runs.
+    /// A recall of player `number` (`entity`) to the inn it checked in at, in front of its
+    /// innkeeper ([`TravelRules::inn_landing`]): refused without one or while the inn's cooldown
+    /// runs.
     fn inn_recall(&mut self, entity: Entity, number: u64, now_ms: u64) {
         let unix_ms = self.unix_ms();
         let cooldown_ms = self.content.travel.inn_cooldown_ms;
@@ -588,7 +600,7 @@ impl SimWorld {
                 || saved.inn_recalled_ms == 0;
             saved.inn.filter(|_| ready)
         });
-        match inn.and_then(|inn| self.content.travel.spawn_point(inn)) {
+        match inn.and_then(|inn| self.content.travel.inn_landing(inn)) {
             Some([x, y, z]) => {
                 self.start_channel(entity, number, Position { x, y, z }, now_ms, Purpose::Inn);
             }
@@ -625,7 +637,12 @@ impl SimWorld {
 
     /// [`Self::start_channel`] facing `facing` at the end, from `now_ms` to `due_ms`. A fast
     /// travel (not a teleporter) gets a rider off its mount and starts the kneel
-    /// ([`SlayerTrack::kneel`](super::slayer::SlayerTrack::kneel)).
+    /// ([`SlayerTrack::kneel`](super::slayer::SlayerTrack::kneel)) with an unstuck's accept
+    /// (3980, the channel's wait): the client plays its kneel for that accept (live 2026-11-08,
+    /// before the sim sent any unstuck pose), and not for the channel flag of the housing state,
+    /// though the flag reached it (client trace: `FUN_14359ed60` set the fast travel teleporting
+    /// byte to 1 at the channel's start), nor for the same pose (the user's call: copy the
+    /// unstuck).
     fn start_channel_after(
         &mut self,
         entity: Entity,
@@ -667,15 +684,15 @@ impl SimWorld {
                 "fast travel channels"
             );
             if purpose != Purpose::Teleporter {
-                let from = if self.mount_fast_travel(entity, now_ms) {
-                    KneelFrom::Dismount
-                } else {
-                    KneelFrom::State
-                };
-                if let Some(mut player) = self.world.get_mut::<Player>(entity) {
-                    player.slayer.kneel(from);
-                    player.extra_members.push(interaction_enabled(false));
-                }
+                self.mount_fast_travel(entity, now_ms);
+                self.kneel_down(entity);
+                self.send_travel(
+                    entity,
+                    &[ServerMessage::Travel(TravelServerMsg::UnstuckAccepted {
+                        header: header(component::UNSTUCK, number),
+                        delay_ns: due_ms.saturating_sub(now_ms).saturating_mul(NS_PER_MS),
+                    })],
+                );
             }
         } else {
             tracing::info!(player = number, dead, encumbered, "fast travel refused");
@@ -691,14 +708,34 @@ impl SimWorld {
         }
     }
 
-    /// The channel of a fast travel (not a teleporter's) of player `entity` ended, arrived or
-    /// cancelled: it may interact again and stands still ([`interaction_enabled`],
-    /// [`SlayerTrack::stand`](super::slayer::SlayerTrack::stand)). Inferred for a cancel: no
-    /// retail capture cancels a channel.
-    fn end_kneel(&mut self, entity: Entity, purpose: Purpose) {
-        if purpose == Purpose::Teleporter {
-            return;
+    /// The channel of a fast travel (not a teleporter's) of player `number` (`entity`) ended,
+    /// arrived or cancelled: it may interact again and stands still ([`interaction_enabled`],
+    /// [`SlayerTrack::stand`](super::slayer::SlayerTrack::stand)), and its client's unstuck kneel
+    /// ends (2190). Inferred for a cancel: no retail capture cancels a channel.
+    fn end_kneel(&mut self, entity: Entity, number: u64, purpose: Purpose) {
+        if purpose != Purpose::Teleporter {
+            self.stand_up(entity);
+            self.send_travel(
+                entity,
+                &[ServerMessage::Travel(TravelServerMsg::UnstuckCompleted {
+                    header: header(component::UNSTUCK, number),
+                })],
+            );
         }
+    }
+
+    /// Player `entity` kneels and may not interact until it stands up
+    /// ([`interaction_enabled`], [`SlayerTrack::kneel`](super::slayer::SlayerTrack::kneel)).
+    fn kneel_down(&mut self, entity: Entity) {
+        if let Some(mut player) = self.world.get_mut::<Player>(entity) {
+            player.slayer.kneel();
+            player.extra_members.push(interaction_enabled(false));
+        }
+    }
+
+    /// Player `entity` stands up from its kneel and may interact again
+    /// ([`interaction_enabled`], [`SlayerTrack::stand`](super::slayer::SlayerTrack::stand)).
+    fn stand_up(&mut self, entity: Entity) {
         if let Some(mut player) = self.world.get_mut::<Player>(entity) {
             player.slayer.stand();
             player.extra_members.push(interaction_enabled(true));
@@ -738,7 +775,7 @@ impl SimWorld {
             player.travel.channel.take()
         });
         if let Some(channel) = cancelled {
-            self.end_kneel(entity, channel.purpose);
+            self.end_kneel(entity, number, channel.purpose);
             tracing::info!(player = number, "fast travel cancelled");
             self.send_travel(entity, &[housing(number, fast_travel_failed)]);
         }
@@ -854,7 +891,11 @@ impl SimWorld {
         }) else {
             return;
         };
+        let accepted = matches!(answer, TravelServerMsg::UnstuckAccepted { .. });
         self.send_travel(entity, &[ServerMessage::Travel(answer)]);
+        if accepted {
+            self.kneel_down(entity);
+        }
     }
 
     /// The channels, unstuck moves and markers due at `now_ms`, the travel states due, and the
@@ -998,7 +1039,7 @@ impl SimWorld {
     /// The end of a fast travel's channel: what it was for (the cost, the inn and home
     /// cooldowns), the loading screen, the end of the channel, the move.
     fn complete_channel(&mut self, entity: Entity, number: u64, channel: Channel, now_ms: u64) {
-        self.end_kneel(entity, channel.purpose);
+        self.end_kneel(entity, number, channel.purpose);
         let unix_ms = self.unix_ms();
         let paid = match channel.purpose {
             Purpose::Landmark { azoth } => self.spend_azoth(entity, azoth),
@@ -1071,7 +1112,8 @@ impl SimWorld {
     }
 
     /// The move of an accepted unstuck to `target`; `None` fails it (2774 teleport failed, and
-    /// the cooldown ends).
+    /// the cooldown ends). Either way the player stands up from the unstuck's kneel (retail: the
+    /// stand 10 ms before the 2190; Inferred for a failed move), unless it died.
     fn complete_unstuck(
         &mut self,
         entity: Entity,
@@ -1081,7 +1123,18 @@ impl SimWorld {
     ) {
         let unstuck = header(component::UNSTUCK, number);
         let Some(to) = target else {
+            let dead = self
+                .world
+                .get::<Vitals>(entity)
+                .is_none_or(|vitals| vitals.health.is_dead());
+            if !dead {
+                self.stand_up(entity);
+            }
             if let Some(mut player) = self.world.get_mut::<Player>(entity) {
+                if dead {
+                    // A dead player keeps its death pose; it only may interact again.
+                    player.extra_members.push(interaction_enabled(true));
+                }
                 player.travel.saved.unstuck_ready_ms = 0;
             }
             tracing::info!(player = number, "unstuck move failed");
@@ -1101,6 +1154,7 @@ impl SimWorld {
         tracing::info!(player = number, x = to.x, y = to.y, "unstuck");
         self.mount_teleported(entity, now_ms);
         self.place_player(entity, to, None, Placement::Stand, now_ms);
+        self.stand_up(entity);
         self.send_travel(
             entity,
             &[ServerMessage::Travel(TravelServerMsg::UnstuckCompleted {
@@ -2023,8 +2077,10 @@ fn housing_state(travel: &TravelState) -> PlayerHousingState {
 }
 
 /// The home points of `travel`: its bound inn, its houses, its camp's respawn point, the spirit
-/// shrines and crow's nests it charted (`shrines`) and the towns and outposts it has been in, and
-/// the bound inn's id as the chosen point.
+/// shrines and crow's nests it charted (`shrines`) and the towns and outposts it has been in. The
+/// state names no used point ([`PlayerHomeState::home_point_id`]): a named inn starts its 900 s
+/// recall cooldown again in the client at each send (live 2026-11-08: the end was the login's
+/// time sync plus 900 s, and the recall stayed grey), and retail never names an inn.
 fn home_state(
     travel: &TravelState,
     rules: &TravelRules,
@@ -2032,17 +2088,19 @@ fn home_state(
 ) -> PlayerHomeState {
     let saved = &travel.saved;
     let point =
-        |entity: u64, name: Vec<u8>, position: [f32; 3], cooldown_ns, used_ns, kind| HomePoint {
-            entity: entity_ref(entity),
-            name,
-            position,
-            cooldown_ns,
-            used_ns,
-            kind,
-            flag: false,
-            extra: 0,
-            id: home_point_id(entity, SINGLE_POINT),
-            index: SINGLE_POINT,
+        |entity: u64, name: Vec<u8>, position: [f32; 3], cooldown_ns, cooldown_end_ns, kind| {
+            HomePoint {
+                entity: entity_ref(entity),
+                name,
+                position,
+                cooldown_ns,
+                cooldown_end_ns,
+                kind,
+                flag: false,
+                extra: 0,
+                id: home_point_id(entity, SINGLE_POINT),
+                index: SINGLE_POINT,
+            }
         };
     let inn = saved.inn.and_then(|inn| {
         // An inn's name (`@NN_InnName`) is retail's for its point; the level data does not carry
@@ -2055,7 +2113,7 @@ fn home_state(
                 .unwrap_or_default(),
             position,
             rules.inn_cooldown_ms.saturating_mul(NS_PER_MS),
-            unix_ms_ns(saved.inn_recalled_ms),
+            inn_cooldown_end_ns(saved.inn_recalled_ms, rules.inn_cooldown_ms),
             home_point_kind::INN,
         ))
     });
@@ -2066,7 +2124,7 @@ fn home_state(
             HOUSE_POINT_NAME.to_vec(),
             [x, y, z],
             0,
-            unix_ms_ns(home.record.fast_travel_ready_ms),
+            client_clock_ns(home.record.fast_travel_ready_ms),
             home_point_kind::HOUSE,
         )
     });
@@ -2130,8 +2188,17 @@ fn home_state(
                 .chain(towns)
                 .collect(),
         }),
-        home_point_id: saved.inn.map(|inn| home_point_id(inn, SINGLE_POINT)),
+        home_point_id: None,
     }
+}
+
+/// The end of the inn recall cooldown on the client's clock ([`client_clock_ns`]) after a
+/// recall at Unix ms `recalled_ms` with a cooldown of `cooldown_ms`; 0 when it never recalled.
+const fn inn_cooldown_end_ns(recalled_ms: u64, cooldown_ms: u64) -> u64 {
+    if recalled_ms == 0 {
+        return 0;
+    }
+    client_clock_ns(recalled_ms.saturating_add(cooldown_ms))
 }
 
 /// Whether `player` waits for the own states of a server move (a fast travel's or an unstuck's
@@ -2216,6 +2283,8 @@ mod tests {
     const INN_AT: [f32; 3] = [700.0, 10.0, 60.0];
     /// The retail inn recall cooldown.
     const INN_COOLDOWN_MS: u64 = 900_000;
+    /// How far in front of the innkeeper a retail inn recall lands.
+    const INN_LANDING_FORWARD_M: f32 = 3.0;
     /// Where the test player stands, and the plot there.
     const HERE: [f32; 3] = [START_X, 10.0, 50.0];
     /// A territory that allows camps and houses (the Hive house plot's).
@@ -2387,6 +2456,22 @@ mod tests {
             .collect()
     }
 
+    /// The interactor states the player's next bundle carries: whether it may interact.
+    fn interactions(world: &mut SimWorld) -> Vec<bool> {
+        let entity = entity(world);
+        world
+            .world
+            .get::<Player>(entity)
+            .expect("player")
+            .extra_members
+            .iter()
+            .filter_map(|member| match member.state {
+                MemberState::Interactor(state) => state.enabled,
+                _ => None,
+            })
+            .collect()
+    }
+
     fn travel_answers(world: &mut SimWorld, now_ms: u64) -> Vec<TravelServerMsg> {
         answers(world, now_ms)
             .into_iter()
@@ -2445,6 +2530,8 @@ mod tests {
     fn a_fast_travel_channels_then_moves_the_player_after_the_loading_screen() {
         /// The number of the own state after the call.
         const KNEEL_STATE_NUMBER: u16 = 0x3fcc;
+        /// `slayerStateId` of the unstuck's kneel (`13=19`), which a fast travel plays too.
+        const KNEEL_STATE: u64 = 0x19;
         let mut world = world();
         call(&mut world, landmark(SHRINE_TERRITORY), NOW);
         let entity = entity(&mut world);
@@ -2453,10 +2540,17 @@ mod tests {
         let kneel = player.slayer.take_due().state.expect("the kneel");
         assert_eq!(
             (kneel.state, kneel.started),
-            (None, Some(KNEEL_STATE_NUMBER)),
-            "the channel kneels in the state that goes on"
+            (Some(KNEEL_STATE), Some(KNEEL_STATE_NUMBER)),
+            "the channel kneels as an unstuck"
         );
-        assert!(travel_answers(&mut world, NOW + CHANNEL_MS - 1).is_empty());
+        assert_eq!(
+            travel_answers(&mut world, NOW + CHANNEL_MS - 1),
+            [TravelServerMsg::UnstuckAccepted {
+                header: header(component::UNSTUCK, PLAYER),
+                delay_ns: CHANNEL_MS * NS_PER_MS,
+            }],
+            "the client kneels for an unstuck's accept over the channel"
+        );
         assert!(
             (body(&mut world).x - START_X).abs() < f32::EPSILON,
             "still channels"
@@ -2465,6 +2559,7 @@ mod tests {
         assert!(matches!(
             messages.as_slice(),
             [
+                ServerMessage::Travel(TravelServerMsg::UnstuckCompleted { .. }),
                 ServerMessage::TeleportWithLoadingScreen(TeleportWithLoadingScreenMsg {
                     flag: true,
                     ..
@@ -2492,34 +2587,24 @@ mod tests {
     fn a_movement_key_or_a_cancel_ends_the_channel_with_3042() {
         let mut world = world();
         call(&mut world, landmark(SHRINE_TERRITORY), NOW);
-        let interaction = |world: &mut SimWorld| {
-            let entity = entity(world);
-            world
-                .world
-                .get::<Player>(entity)
-                .expect("player")
-                .extra_members
-                .iter()
-                .filter_map(|member| match member.state {
-                    MemberState::Interactor(state) => state.enabled,
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
         assert_eq!(
-            interaction(&mut world),
+            interactions(&mut world),
             [false],
             "no interaction while it kneels"
         );
         world.travel_input(&connection(PLAYER), &[forward_record()], NOW + 1);
         assert_eq!(
-            interaction(&mut world),
+            interactions(&mut world),
             [false, true],
             "the end lets it interact again"
         );
         assert!(matches!(
             travel_answers(&mut world, NOW + 2).as_slice(),
-            [TravelServerMsg::FastTravelFailed { .. }]
+            [
+                TravelServerMsg::UnstuckAccepted { .. },
+                TravelServerMsg::UnstuckCompleted { .. },
+                TravelServerMsg::FastTravelFailed { .. }
+            ]
         ));
         assert!(travel_answers(&mut world, NOW + CHANNEL_MS).is_empty());
         call(&mut world, landmark(SHRINE_TERRITORY), NOW + CHANNEL_MS);
@@ -2532,7 +2617,11 @@ mod tests {
         );
         assert!(matches!(
             travel_answers(&mut world, NOW + CHANNEL_MS + 2).as_slice(),
-            [TravelServerMsg::FastTravelFailed { .. }]
+            [
+                TravelServerMsg::UnstuckAccepted { .. },
+                TravelServerMsg::UnstuckCompleted { .. },
+                TravelServerMsg::FastTravelFailed { .. }
+            ]
         ));
     }
 
@@ -2546,6 +2635,8 @@ mod tests {
         assert!(matches!(
             travel(&mut world, NOW).as_slice(),
             [
+                ServerMessage::Travel(TravelServerMsg::UnstuckAccepted { .. }),
+                ServerMessage::Travel(TravelServerMsg::UnstuckCompleted { .. }),
                 ServerMessage::TeleportWithLoadingScreen(_),
                 ServerMessage::Travel(TravelServerMsg::FastTravelCompleted { .. })
             ]
@@ -2575,9 +2666,11 @@ mod tests {
         );
         assert!(matches!(
             travel(&mut world, NOW + 4 * CHANNEL_MS).as_slice(),
-            [ServerMessage::Travel(
-                TravelServerMsg::FastTravelFailed { .. }
-            )]
+            [
+                ServerMessage::Travel(TravelServerMsg::UnstuckAccepted { .. }),
+                ServerMessage::Travel(TravelServerMsg::UnstuckCompleted { .. }),
+                ServerMessage::Travel(TravelServerMsg::FastTravelFailed { .. })
+            ]
         ));
         assert_eq!(azoth(&mut world), short);
         assert!(
@@ -2602,7 +2695,13 @@ mod tests {
         let entity = entity(&mut world);
         world.discover_territory(entity, HIDDEN_TERRITORY);
         call(&mut world, landmark(HIDDEN_TERRITORY), NOW + 4);
-        assert!(travel_answers(&mut world, NOW + 5).is_empty(), "channels");
+        assert!(
+            matches!(
+                travel_answers(&mut world, NOW + 5).as_slice(),
+                [TravelServerMsg::UnstuckAccepted { .. }]
+            ),
+            "channels"
+        );
         let progression = world.departures()[0].progression.clone().expect("saved");
         assert!(progression.achievements.contains(&DISCOVERED_BIT));
     }
@@ -2823,6 +2922,104 @@ mod tests {
         );
         let saved = world.departures()[0].progression.clone().expect("saved");
         assert!(saved.travel.unstuck_ready_ms > 0, "the cooldown is saved");
+    }
+
+    #[test]
+    fn an_accepted_unstuck_kneels_until_the_move_stands_it_up() {
+        /// Retail's unstuck kneel: `13=19 15=b247`.
+        const UNSTUCK_KNEEL: (u64, u64) = (0x19, 4594);
+        /// `slayerStateId` of standing still (`13=1f`).
+        const IDLE_STATE: u64 = 0x1f;
+        /// The own state number after the call (retail `14=00ef`).
+        const KNEEL_STATE_NUMBER: u16 = 0x00ef;
+        /// After the own card, which starts the slayer track afresh.
+        const AFTER_CARD_MS: u64 = NOW + crate::world::OWN_CARD_DELAY_MS;
+        let mut world = world();
+        let entity = entity(&mut world);
+        let first = Position {
+            x: START_X,
+            y: 10.0,
+            z: 50.0,
+        };
+        let later = Position {
+            x: START_X + 30.0,
+            ..first
+        };
+        for (at, now_ms) in [(first, AFTER_CARD_MS), (later, AFTER_CARD_MS + 1)] {
+            world
+                .world
+                .get_mut::<Player>(entity)
+                .expect("player")
+                .last_grounded = Some(at);
+            tick(&mut world, now_ms);
+        }
+        let unstuck = TravelClientMsg::Unstuck {
+            header: header(component::UNSTUCK, PLAYER),
+        };
+        call(&mut world, unstuck, AFTER_CARD_MS + 2);
+        let kneel = {
+            let mut player = world.world.get_mut::<Player>(entity).expect("player");
+            player.slayer.advance(KNEEL_STATE_NUMBER, AFTER_CARD_MS + 2);
+            player.slayer.take_due().state.expect("the kneel")
+        };
+        assert_eq!(
+            (kneel.state, kneel.sequence, kneel.started),
+            (
+                Some(UNSTUCK_KNEEL.0),
+                UNSTUCK_KNEEL.1,
+                Some(KNEEL_STATE_NUMBER)
+            ),
+            "the wait kneels"
+        );
+        assert_eq!(
+            interactions(&mut world),
+            [false],
+            "no interaction while it kneels"
+        );
+        assert!(matches!(
+            travel_answers(&mut world, AFTER_CARD_MS + 3).as_slice(),
+            [TravelServerMsg::UnstuckAccepted { .. }]
+        ));
+        // The tick at the wait's end moves it (the unstuck test above); here the move alone.
+        world.complete_unstuck(entity, PLAYER, Some(first), AFTER_CARD_MS + 4);
+        assert_eq!(
+            interactions(&mut world),
+            [true],
+            "the move lets it interact again"
+        );
+        // The tick's own state takes the stand.
+        tick(&mut world, AFTER_CARD_MS + 5);
+        let stand = world
+            .world
+            .get::<Player>(entity)
+            .expect("player")
+            .slayer
+            .current()
+            .expect("a slayer state");
+        assert_eq!(
+            stand.state,
+            Some(IDLE_STATE),
+            "the move stands it up, not in the kneel's pose"
+        );
+    }
+
+    #[test]
+    fn an_inn_cooldown_end_goes_out_on_the_client_clock() {
+        /// A recall at 2026-11-08 18:00 UTC, Unix ms.
+        const RECALLED_MS: u64 = 1_794_160_800_000;
+        /// Its cooldown end on the client's clock: ns since 2000-01-01.
+        const END_NS: u64 =
+            (RECALLED_MS + INN_COOLDOWN_MS - crate::server::SERVER_EPOCH_UNIX_MS) * NS_PER_MS;
+        assert_eq!(
+            inn_cooldown_end_ns(0, INN_COOLDOWN_MS),
+            0,
+            "a never used inn is ready"
+        );
+        assert_eq!(
+            inn_cooldown_end_ns(RECALLED_MS, INN_COOLDOWN_MS),
+            END_NS,
+            "not a Unix time, which the client shows as a 10,956 day countdown"
+        );
     }
 
     #[test]
@@ -3232,7 +3429,11 @@ mod tests {
         call(&mut world, recall(TERRITORY), NOW + 3);
         answers(&mut world, NOW + 3 + CHANNEL_MS);
         let at = body(&mut world);
-        assert_eq!([at.x, at.y], [INN_AT[0], INN_AT[1]], "at the inn");
+        assert_eq!(
+            [at.x, at.y],
+            [INN_AT[0], INN_AT[1] + INN_LANDING_FORWARD_M],
+            "in front of the unturned innkeeper"
+        );
         call(&mut world, recall(TERRITORY), NOW + 4 + CHANNEL_MS);
         assert!(matches!(
             travel_answers(&mut world, NOW + 5 + CHANNEL_MS).as_slice(),
@@ -3402,7 +3603,15 @@ mod tests {
                 home_point_id(INN, SINGLE_POINT)
             )
         );
-        assert_eq!(homes.home_point_id, Some(home_point_id(INN, SINGLE_POINT)));
+        assert_eq!(
+            homes.home_point_id, None,
+            "a named inn starts its recall cooldown again in the client"
+        );
+        assert_eq!(
+            (points[0].cooldown_ns, points[0].cooldown_end_ns),
+            (INN_COOLDOWN_MS * NS_PER_MS, 0),
+            "a never used inn is ready"
+        );
         assert_eq!(
             housing_state(&player.travel).is_fast_travel_channeling,
             Some(false)
@@ -3475,10 +3684,10 @@ mod tests {
         assert_eq!(point.kind, home_point_kind::SPIRIT_SHRINE);
         assert_eq!(point.name, SPIRIT_SHRINE_POINT_NAME);
         assert_eq!(point.position, SHRINE_POINT);
-        assert_eq!((point.cooldown_ns, point.used_ns), (0, 0));
+        assert_eq!((point.cooldown_ns, point.cooldown_end_ns), (0, 0));
         assert_eq!(point.entity.facet, SHRINE_ENTITY);
         assert_eq!(point.id, home_point_id(SHRINE_ENTITY, SINGLE_POINT));
-        assert_eq!(state.home_point_id, None, "a shrine is no bound inn");
+        assert_eq!(state.home_point_id, None, "the state names no used point");
         assert_eq!(points[1].kind, home_point_kind::SPIRIT_SHRINE);
         assert!(
             points[1].name.is_empty(),

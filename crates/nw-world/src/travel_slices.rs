@@ -293,7 +293,7 @@ impl TeleporterSlice {
 }
 
 /// `vector` rotated by the unit quaternion `rotation` (x, y, z, w).
-pub(crate) fn rotate(rotation: [f32; 4], vector: [f32; AXES]) -> [f32; AXES] {
+pub fn rotate(rotation: [f32; 4], vector: [f32; AXES]) -> [f32; AXES] {
     let [x, y, z, w] = rotation;
     let [ux, uy, uz] = vector;
     let (tx, ty, tz) = (

@@ -5284,11 +5284,20 @@ impl Neighbourhood<'_> {
                 // client and moved the camera the estimate follows (run 21).
                 let plain_tick = own_card != OwnCard::Spawn && teleport.is_none();
                 let hold_throttle = std::mem::take(&mut player.defer_throttle_clear);
+                let slayer = player.slayer.take_due();
+                if let Some(state) = slayer.state {
+                    tracing::debug!(
+                        player = player.number,
+                        ?state,
+                        time = ?slayer.time,
+                        "own slayer state"
+                    );
+                }
                 let tick = OwnTick {
                     clock,
                     with_position: player.refused_since_ms.is_none() || player.push.is_some(),
                     clear_throttle: plain_tick && !player.throttle_cleared && !hold_throttle,
-                    slayer: player.slayer.take_due(),
+                    slayer,
                     // Retail sent `rotation` and `lookDir` in most own states; the lock holds
                     // only while the client has a current look (lock-on note, section 15.2).
                     view: player.view.filter(|view| Some(*view) != player.view_sent),
@@ -6878,6 +6887,8 @@ mod tests {
         /// The own `slayerStateIdStarted` and `slayerSequenceId` children.
         const STARTED_CHILD: usize = 14;
         const SEQUENCE_CHILD: usize = 15;
+        /// The kneel's sequence on the wire (retail unstuck `15=b247`).
+        const KNEEL_SEQUENCE_BYTES: [u8; 2] = [0xb2, 0x47];
         let mut world = world_with_spawns(Vec::new());
         world.set_table(&table(&["sim-a", "sim-b"])).expect("table");
         world
@@ -6894,7 +6905,7 @@ mod tests {
             .get_mut::<Player>(entity)
             .expect("player")
             .slayer
-            .kneel(slayer::KneelFrom::State);
+            .kneel();
         let messages = tick(&mut world, card_at + 99).messages;
         let children: Vec<(usize, Vec<u8>)> = bundle_of(&messages, &connection(1))
             .map(|bundle| SlotRead::of(&bundle).expect("read").updates)
@@ -6911,7 +6922,7 @@ mod tests {
         assert!(
             children
                 .iter()
-                .any(|(child, bytes)| *child == SEQUENCE_CHILD && bytes == &[5]),
+                .any(|(child, bytes)| *child == SEQUENCE_CHILD && *bytes == KNEEL_SEQUENCE_BYTES),
             "{children:?}"
         );
         assert!(children.iter().any(|(child, _)| *child == STARTED_CHILD));

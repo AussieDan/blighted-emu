@@ -24,7 +24,7 @@ use nw_formats::objectstream::lowercase_crc32;
 use nw_world::WorldFile;
 use nw_world::capitals::capital_id;
 use nw_world::records::{Capital, Landmark};
-use nw_world::travel_slices::{HousingPlot, Teleporter};
+use nw_world::travel_slices::{HousingPlot, Teleporter, rotate};
 
 use crate::retail_home_points::{FAST_TRAVEL_POINTS, RetailTownPoint, TOWN_POINTS};
 
@@ -109,6 +109,14 @@ const BEST_GUESS_SCORE_PER_POINT: f64 = 100.0;
 /// The inn recall cooldown: the cooldown of every retail inn home point (449 of 449 elements of
 /// type 3652: 900 s).
 const OBSERVED_INN_COOLDOWN_MS: u64 = 900_000;
+/// How far in front of the inn's capital (the innkeeper) an inn recall lands, along the
+/// capital's facing (its local +y), at its height. Observed 2026-11-08: the landings of retail
+/// inn recalls (probes `ftafter` and `innfront`) lay 3.00 m in front of the innkeeper at
+/// 0.00 m height difference for 9 of the 10 innkeepers with one (Prydwen: (7380.902, 3731.0)
+/// twice); `NPC_1681_Innkeep`'s 4 lay 1.00 m in front (why is Unknown).
+const OBSERVED_INN_LANDING_FORWARD_M: f32 = 3.0;
+/// No rotation (x, y, z, w).
+const NO_ROTATION: [f32; 4] = [0.0, 0.0, 0.0, 1.0];
 /// How far from a plot's slice origin a player may stand to name it when its id is not a level
 /// plot's (best guess: the plots of a street are 20 to 40 m apart).
 const BEST_GUESS_PLOT_REACH_M: f32 = 30.0;
@@ -374,6 +382,8 @@ pub struct TravelRules {
     /// The position of each capital of the level, by its entity id (respawn points, inns and
     /// respawn camps are capitals: retail's 1938 named the ids of the bound ones).
     capitals: HashMap<u64, [f32; 3]>,
+    /// The rotation (x, y, z, w) of each capital of the level, by its entity id.
+    capital_rotations: HashMap<u64, [f32; 4]>,
     /// The player's encumbrance limit (`EncumbranceBaseMax` of the player container).
     pub encumbrance_max: Option<f64>,
     /// The channel of a fast travel, milliseconds.
@@ -489,6 +499,7 @@ impl TravelRules {
         .with_housing(house_types(tables), &level.plots, furniture(tables, kits))
         .with_teleporters(&level.teleporters);
         rules.camp_territories = camp_territories;
+        rules.capital_rotations = by_capital_id(&level.capitals, |capital| capital.rotation);
         rules.territories = territories;
         rules.shrine_points = shrine_points(tables, &level.landmarks, &rules.capitals);
         rules = rules.with_towns();
@@ -618,6 +629,7 @@ impl TravelRules {
             landmarks,
             discovered,
             capitals,
+            capital_rotations: HashMap::new(),
             encumbrance_max,
             channel_ms: millis(keys.fast_travel_channeling_seconds, OBSERVED_CHANNEL_MS),
             unstuck_delay_ms: millis(keys.unstuck_delay_seconds, OBSERVED_UNSTUCK_DELAY_MS),
@@ -749,6 +761,19 @@ impl TravelRules {
     /// The position of the capital of entity id `id` (a respawn point, an inn, a respawn camp).
     pub fn spawn_point(&self, id: u64) -> Option<[f32; 3]> {
         self.capitals.get(&id).copied()
+    }
+
+    /// Where an inn recall to the inn of capital `id` (its innkeeper) lands: in front of it
+    /// ([`OBSERVED_INN_LANDING_FORWARD_M`]).
+    pub fn inn_landing(&self, id: u64) -> Option<[f32; 3]> {
+        let [x, y, z] = self.spawn_point(id)?;
+        let rotation = self
+            .capital_rotations
+            .get(&id)
+            .copied()
+            .unwrap_or(NO_ROTATION);
+        let [dx, dy, dz] = rotate(rotation, [0.0, OBSERVED_INN_LANDING_FORWARD_M, 0.0]);
+        Some([x + dx, y + dy, z + dz])
     }
 }
 
@@ -889,9 +914,14 @@ fn distance(a: [f32; 3], b: [f32; 3]) -> f32 {
 /// The position of each capital by its entity id; a capital whose GUID does not read is left
 /// out.
 fn capitals(capitals: &[Capital]) -> HashMap<u64, [f32; 3]> {
+    by_capital_id(capitals, |capital| capital.position)
+}
+
+/// `value` of each of `capitals`, by its entity id.
+fn by_capital_id<T>(capitals: &[Capital], value: impl Fn(&Capital) -> T) -> HashMap<u64, T> {
     capitals
         .iter()
-        .filter_map(|capital| Some((capital_id(&capital.id)?, capital.position)))
+        .filter_map(|capital| Some((capital_id(&capital.id)?, value(capital))))
         .collect()
 }
 
@@ -940,6 +970,36 @@ mod tests {
             Some(1_000.0),
             TravelKeys::default(),
         )
+    }
+
+    #[test]
+    fn an_inn_recall_lands_in_front_of_the_innkeeper_as_retail() {
+        /// The Prydwen innkeeper capital (`NPC_1222_Innkeep`): id, place and rotation.
+        const PRYDWEN_INN: u64 = 17_680_737_194_352_937_251;
+        const PRYDWEN_INNKEEPER: [f32; 3] = [7_383.5, 3_732.5, 112.669];
+        const PRYDWEN_ROTATION: [f32; 4] = [0.0, 0.0, 0.866_025_4, 0.499_999_97];
+        /// Where retail's two Prydwen inn recalls landed.
+        const RETAIL_LANDING: [f32; 3] = [7_380.902, 3_731.0, 112.669];
+        /// Rounding of the capital's f32 rotation.
+        const TOLERANCE_M: f32 = 0.01;
+        let mut rules = TravelRules::build(
+            Vec::new(),
+            HashMap::new(),
+            HashMap::from([(PRYDWEN_INN, PRYDWEN_INNKEEPER)]),
+            None,
+            TravelKeys::default(),
+        );
+        rules.capital_rotations = HashMap::from([(PRYDWEN_INN, PRYDWEN_ROTATION)]);
+        let landing = rules.inn_landing(PRYDWEN_INN).expect("the inn");
+        for (ours, retail) in landing.iter().zip(RETAIL_LANDING) {
+            assert!((ours - retail).abs() < TOLERANCE_M, "{landing:?}");
+        }
+        assert_eq!(
+            rules.spawn_point(PRYDWEN_INN),
+            Some(PRYDWEN_INNKEEPER),
+            "the inn's home point stays on the innkeeper"
+        );
+        assert_eq!(rules.inn_landing(1), None);
     }
 
     #[test]
