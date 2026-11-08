@@ -50,9 +50,10 @@ max_connections = 4
 # max_connections = 2
 
 # A Vivox-compatible voice service the community runs. Without this section voice calls stay
-# unanswered and the client keeps its voice chat off.
+# unanswered and the client keeps its voice chat off. With edge-http's [voice], api_url is
+# https://game.<domain>/vivox/api2/: edge-http answers the voice SDK's first call there.
 # [voice]
-# api_url = "https://voice.example.org/api2/"
+# api_url = "https://game.example.org/vivox/api2/"
 # issuer = "community-1"
 # domain = "voice.example.org"
 # key_env = "NW_SECRET_VOICE_KEY"
