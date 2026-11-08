@@ -34,6 +34,7 @@ use crate::stats::{StatsState, stats_router};
 use crate::store::{
     AccountStore, CharacterStore, DiscordStateStore, GameSessionStore, RateLimiter,
 };
+use crate::voice::{VoiceConfig, voice_router};
 
 const PORT_SEPARATOR: char = ':';
 /// A fully qualified host name may end in a dot.
@@ -70,12 +71,16 @@ pub struct ServiceRouters {
     pub cms: CmsRouters,
     /// The privacy settings service ([`crate::privacy::privacy_router`]), on `game.<domain>`.
     pub privacy: Router,
+    /// The voice prelogin ([`crate::voice::voice_router`]), on `game.<domain>`; no route without
+    /// a `[voice]` section.
+    pub voice: Router,
 }
 
 impl ServiceRouters {
     /// The services over the migrated global database `global`, the store table `store` and the
     /// store settings `settings`, the analytics limits `analytics`, the remote config route
-    /// ([`crate::remote_config::remote_config_router`]) and the news routes.
+    /// ([`crate::remote_config::remote_config_router`]), the news routes and the voice prelogin
+    /// of `voice`.
     pub fn on_postgres(
         global: &PgPool,
         store: Arc<StoreTable>,
@@ -83,6 +88,7 @@ impl ServiceRouters {
         analytics: AnalyticsConfig,
         remote_config: Router,
         cms: CmsRouters,
+        voice: Option<VoiceConfig>,
     ) -> Self {
         let stats = PgStats::new(global.clone());
         Self {
@@ -101,6 +107,7 @@ impl ServiceRouters {
             privacy: privacy_router(PrivacyState {
                 store: PgPrivacy::new(global.clone()),
             }),
+            voice: voice.map(voice_router).unwrap_or_default(),
         }
     }
 }
@@ -165,7 +172,8 @@ where
         game: game_router(game)
             .merge(services.stats)
             .merge(services.shop)
-            .merge(services.privacy),
+            .merge(services.privacy)
+            .merge(services.voice),
         kinesis: services.kinesis,
         sts: services.sts,
         remote_config: services.remote_config,
@@ -219,6 +227,7 @@ mod tests {
             privacy: privacy_router(PrivacyState {
                 store: MemoryPrivacy::default(),
             }),
+            voice: Router::new(),
         };
         // `edge-http` serves with the client address (`into_make_service_with_connect_info`).
         let app = edge_router(launcher, game.state, services)

@@ -102,6 +102,7 @@ pub fn edge_app(
                 news: Router::new(),
                 images: Router::new(),
             },
+            None,
         ),
     )
     .layer(MockConnectInfo(random_peer()))

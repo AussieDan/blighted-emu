@@ -21,6 +21,7 @@ use crate::experience::ExperienceConfig;
 use crate::fast_travel::FastTravelConfig;
 use crate::game::API_REGION;
 use crate::secrets::SECRET_ENV_PREFIX;
+use crate::voice::VoiceConfig;
 
 /// Environment variable prefix for overrides of `config/edge.toml`.
 pub const EDGE_ENV_PREFIX: &str = "NW_EDGE_";
@@ -116,6 +117,10 @@ pub struct EdgeConfig {
     /// The limits and retention of the analytics stream; the defaults when left out.
     #[serde(default)]
     pub analytics: AnalyticsConfig,
+    /// The hosts of the community's voice service that the voice prelogin names
+    /// ([`crate::voice`]); left out, the prelogin is not served.
+    #[serde(default)]
+    pub voice: Option<VoiceConfig>,
     /// Worlds, one `[[world]]` block each.
     #[serde(rename = "world")]
     pub worlds: Vec<WorldConfig>,
@@ -814,6 +819,23 @@ max_connections = 5
                 "max_characters_per_account = 0",
             ),
             "world.max_characters_per_account",
+        );
+    }
+
+    #[test]
+    fn the_voice_section_is_read_when_set() {
+        assert_eq!(valid().voice, None);
+        let voice = load(&VALID.replace(
+            "[cms]",
+            "[voice]\nrealm = \"voice.example.org\"\nxmpp_host = \"game.example.org\"\n\
+             xmpp_port = 5223\nxmpp_tls = true\n\
+             ws_xmpp_url = \"wss://game.example.org:443/ws-xmpp\"\n\
+             telemetry_url = \"https://game.example.org\"\n\n[cms]",
+        ))
+        .expect("voice");
+        assert_eq!(
+            voice.voice.map(|voice| (voice.realm, voice.xmpp_port)),
+            Some(("voice.example.org".to_owned(), 5223))
         );
     }
 
