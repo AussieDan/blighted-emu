@@ -20,7 +20,7 @@ use nw_db::{
 };
 use nw_login::cms::{CmsError, CmsObjects};
 use nw_login::config::{EdgeConfig, EdgeConfigError, load_edge_config};
-use nw_login::discord::{DiscordError, DiscordHttp, is_discord_user_id};
+use nw_login::discord::{DiscordError, DiscordHttp, is_discord_id};
 use nw_login::game::GameState;
 use nw_login::host::{ServiceRouters, edge_router};
 use nw_login::install_crypto_provider;
@@ -202,7 +202,7 @@ pub fn link_discord(
 }
 
 fn check_discord_user_id(discord_user_id: &str) -> Result<(), RunError> {
-    if is_discord_user_id(discord_user_id) {
+    if is_discord_id(discord_user_id) {
         Ok(())
     } else {
         Err(RunError::DiscordUserId(discord_user_id.to_owned()))

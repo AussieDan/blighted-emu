@@ -277,7 +277,8 @@ where
 }
 
 /// The account of the request's launcher session. Like a ban, a Discord user off the allow list
-/// (`discord.allow_list`) is refused here, though its session was made before.
+/// (`discord.allow_list`) is refused here, though its session was made before; its server roles
+/// are those of its last login.
 async fn session_account<A: AccountStore>(
     accounts: &A,
     config: &EdgeConfig,
@@ -292,8 +293,9 @@ async fn session_account<A: AccountStore>(
         return Err(ApiError::Banned);
     }
     if config.auth.mode == AuthMode::Discord && config.discord.allow_list {
-        let user_id = accounts.discord_user_id(account.id).await?;
-        if !user_id.is_some_and(|user_id| config.discord.allows(&user_id)) {
+        let login = accounts.discord_login(account.id).await?;
+        if !login.is_some_and(|login| config.discord.allows(&login.user_id, &login.guild_role_ids))
+        {
             return Err(ApiError::NotAllowed);
         }
     }
@@ -441,7 +443,11 @@ where
     if user.guild_member == Some(false) {
         return Err(ApiError::NotGuildMember);
     }
-    if !state.config.discord.allows(&user.profile.user_id) {
+    if !state
+        .config
+        .discord
+        .allows(&user.profile.user_id, &user.profile.guild_role_ids)
+    {
         return Err(ApiError::NotAllowed);
     }
     let account = state.accounts.discord_account(&user.profile).await?;
@@ -478,7 +484,8 @@ pub(crate) mod tests {
     use crate::config::DiscordConfig;
     use crate::config::tests::valid;
     use crate::discord::tests::{
-        FAKE_EMAIL, FAKE_GUILD_ID, FAKE_USER_ID, FAKE_USERNAME, FakeDiscord, GOOD_CODE,
+        FAKE_EMAIL, FAKE_GUILD_ID, FAKE_ROLE_ID, FAKE_USER_ID, FAKE_USERNAME, FakeDiscord,
+        GOOD_CODE,
     };
     use crate::memory::{
         MemoryAccounts, MemoryDiscordStates, MemoryGameSessions, MemoryRateLimiter,
@@ -912,6 +919,7 @@ pub(crate) mod tests {
                 display_name: "Nelly".to_owned(),
                 email: None,
                 email_verified: false,
+                guild_role_ids: Vec::new(),
             })
             .await
             .expect("account");
@@ -1024,6 +1032,61 @@ pub(crate) mod tests {
             (status, error_code(&body).as_str()),
             (StatusCode::FORBIDDEN, "not_allowed"),
             "a user taken off the list cannot play on its older session"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_allowed_server_role_lets_its_holder_log_in_and_play() {
+        /// A role [`FAKE_USER_ID`] does not hold.
+        const OTHER_ROLE_ID: &str = "1000000000000000004";
+        let allow_role = |role_id: &str| {
+            let role_id = role_id.to_owned();
+            move |discord: &mut DiscordConfig| {
+                discord.guild_id = FAKE_GUILD_ID.to_owned();
+                discord.allow_list = true;
+                discord.allowed_user_ids = vec![OTHER_DISCORD_USER_ID.to_owned()];
+                discord.allowed_role_ids = vec![role_id];
+            }
+        };
+        let by_role = discord_state(allow_role(FAKE_ROLE_ID));
+        let accounts = by_role.accounts.clone();
+        let other_role = TestState {
+            config: discord_state(allow_role(OTHER_ROLE_ID)).config,
+            ..by_role.clone()
+        };
+        let other_role_app = app(other_role);
+        let (_, status, body) = callback_login(&other_role_app).await;
+        assert_eq!(
+            (status, &body[..]),
+            (StatusCode::FORBIDDEN, CALLBACK_NOT_ALLOWED.as_bytes()),
+            "neither the user nor its role is allowed"
+        );
+        let by_role_app = app(by_role);
+        let (start, status, body) = callback_login(&by_role_app).await;
+        assert_eq!(
+            (status, &body[..]),
+            (StatusCode::OK, CALLBACK_DONE.as_bytes())
+        );
+        assert_eq!(
+            accounts
+                .discord_profile(FAKE_USER_ID)
+                .map(|profile| profile.guild_role_ids),
+            Some(vec![FAKE_ROLE_ID.to_owned()]),
+            "the login stores the server roles"
+        );
+        let poll = serde_json::to_string(&DiscordPoll { state: start.state }).expect("poll");
+        let (_, body) = send(&by_role_app, "POST", DISCORD_POLL_PATH, None, &poll).await;
+        let DiscordPollReply::Ready(session) = serde_json::from_slice(&body).expect("ready") else {
+            panic!("expected a finished login");
+        };
+        let token = session.launcher_token.as_str();
+        let (status, _) = send(&by_role_app, "POST", PLAY_PATH, Some(token), "").await;
+        assert_eq!(status, StatusCode::OK, "the stored role lets it play");
+        let (status, body) = send(&other_role_app, "POST", PLAY_PATH, Some(token), "").await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (StatusCode::FORBIDDEN, "not_allowed"),
+            "a role taken off the list cannot play on the older session"
         );
     }
 }

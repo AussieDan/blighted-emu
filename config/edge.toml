@@ -60,14 +60,18 @@ client_id = ""
 # server, Copy Server ID): only members of that server can log in.
 # Off: "" (empty).
 guild_id = ""
-# Allow list. true: only the Discord user ids in allowed_user_ids can log in and make
-# accounts; a user taken off the list can no longer press Play, even with an old login.
-# false (the default): every Discord user can (still limited by guild_id).
-# Both checks can be on together. Restart edge-http after a change.
+# Allow list. true: only the Discord user ids in allowed_user_ids and the holders of a role in
+# allowed_role_ids can log in and make accounts; a user taken off the list can no longer press
+# Play, even with an old login. false (the default): every Discord user can (still limited by
+# guild_id). Both checks can be on together. Restart edge-http after a change.
 allow_list = false
 # Discord user ids (Discord: Developer Mode on, right-click a name, Copy User ID), for
 # example ["80351110224678912", "175928847299117063"].
 allowed_user_ids = []
+# Discord role ids in the guild_id server (Server Settings, Roles, right-click a role, Copy Role
+# ID). Needs guild_id. The roles are read at each Discord login; a Play uses those of the last
+# login, so a role given or taken in Discord counts from the player's next login.
+allowed_role_ids = []
 
 [global_database]
 url = "postgres://nw@127.0.0.1:5432/nw_global"

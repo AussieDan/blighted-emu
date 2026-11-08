@@ -288,6 +288,7 @@ mod infra_tests {
                     display_name: "Nelly".to_owned(),
                     email: None,
                     email_verified: false,
+                    guild_role_ids: Vec::new(),
                 },
             )
             .await

@@ -187,8 +187,11 @@ impl AccountStore for PgAccounts {
             .map_err(store_error)
     }
 
-    async fn discord_user_id(&self, account_id: Uuid) -> Result<Option<String>, StoreError> {
-        nw_db::discord_user_id(&self.pool, account_id)
+    async fn discord_login(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<nw_db::DiscordLogin>, StoreError> {
+        nw_db::discord_login(&self.pool, account_id)
             .await
             .map_err(store_error)
     }

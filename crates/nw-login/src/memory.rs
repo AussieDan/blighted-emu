@@ -117,12 +117,18 @@ impl AccountStore for MemoryAccounts {
         Ok(account)
     }
 
-    async fn discord_user_id(&self, account_id: Uuid) -> Result<Option<String>, StoreError> {
+    async fn discord_login(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<nw_db::DiscordLogin>, StoreError> {
         Ok(lock(&self.0)
             .discord
             .iter()
             .find(|(_, (id, _))| *id == account_id)
-            .map(|(user_id, _)| user_id.clone()))
+            .map(|(user_id, (_, profile))| nw_db::DiscordLogin {
+                user_id: user_id.clone(),
+                guild_role_ids: profile.guild_role_ids.clone(),
+            }))
     }
 
     async fn create_launcher_session(
@@ -844,6 +850,7 @@ pub(crate) mod contract {
             display_name: "Nelly".to_owned(),
             email: Some("nelly@example.org".to_owned()),
             email_verified: true,
+            guild_role_ids: Vec::new(),
         };
         let first = store.discord_account(&profile).await.expect("discord");
         let renamed = DiscordProfile {

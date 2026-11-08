@@ -41,8 +41,9 @@ mod travel;
 pub mod test_db;
 
 pub use account::{
-    account_by_discord, account_by_id, account_by_login_name, create_password_account,
-    discord_account, discord_user_id, link_discord_login, password_login, set_banned,
+    DiscordLogin, account_by_discord, account_by_id, account_by_login_name,
+    create_password_account, discord_account, discord_login, link_discord_login, password_login,
+    set_banned,
 };
 pub use admin::{
     AdminRank, AuditEntry, AuditRow, RankRow, admin_rank, admin_ranks, audit_rows, insert_audit,
@@ -128,6 +129,8 @@ pub struct DiscordProfile {
     pub email: Option<String>,
     /// Discord has verified the email.
     pub email_verified: bool,
+    /// The user's role ids in the Discord server that logins need; empty without a server check.
+    pub guild_role_ids: Vec<String>,
 }
 
 /// An account row.

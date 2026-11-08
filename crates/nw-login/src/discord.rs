@@ -24,18 +24,20 @@ pub const DISCORD_SCOPE: &str = "identify email";
 pub const DISCORD_GUILD_SCOPE: &str = "identify email guilds.members.read";
 /// Callback path on `login.<domain>`.
 pub const DISCORD_CALLBACK_PATH: &str = "/launcher/discord/callback";
-/// Digits of a Discord user id (a snowflake: 17 digits in 2015, at most 20 for a u64).
-pub const DISCORD_USER_ID_DIGITS: std::ops::RangeInclusive<usize> = 17..=20;
+/// Digits of a Discord id of a user, role or server (a snowflake: 17 digits in 2015, at most 20
+/// for a u64).
+pub const DISCORD_ID_DIGITS: std::ops::RangeInclusive<usize> = 17..=20;
 
-/// True when `id` has the form of a Discord user id ([`DISCORD_USER_ID_DIGITS`] digits).
-pub fn is_discord_user_id(id: &str) -> bool {
-    DISCORD_USER_ID_DIGITS.contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_digit())
+/// True when `id` has the form of a Discord user, role or server id ([`DISCORD_ID_DIGITS`]
+/// digits).
+pub fn is_discord_id(id: &str) -> bool {
+    DISCORD_ID_DIGITS.contains(&id.len()) && id.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 /// The Discord user behind a login.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiscordUser {
-    /// Ids, names and email.
+    /// Ids, names, email and the role ids in the required server.
     pub profile: DiscordProfile,
     /// The user is in the required Discord server; `None` when no server was asked for.
     pub guild_member: Option<bool>,
@@ -119,6 +121,12 @@ struct MeReply {
     verified: Option<bool>,
 }
 
+/// The current user's member record in one server: its role ids.
+#[derive(Deserialize)]
+struct MemberReply {
+    roles: Vec<String>,
+}
+
 impl DiscordHttp {
     /// A client for one Discord app. Needs the process crypto provider
     /// ([`crate::install_crypto_provider`]).
@@ -133,13 +141,13 @@ impl DiscordHttp {
         })
     }
 
-    /// True when the owner of `access_token` is in the server `guild_id`. Discord answers 404
-    /// for a server the user is not in.
-    async fn is_guild_member(
+    /// The role ids of the owner of `access_token` in the server `guild_id`; `None` when the
+    /// user is not in it (Discord answers 404).
+    async fn guild_member_roles(
         &self,
         access_token: &str,
         guild_id: &str,
-    ) -> Result<bool, DiscordError> {
+    ) -> Result<Option<Vec<String>>, DiscordError> {
         let reply = self
             .client
             .get(format!("{DISCORD_MY_GUILDS_URL}/{guild_id}/member"))
@@ -148,10 +156,15 @@ impl DiscordHttp {
             .await
             .map_err(failed)?;
         if reply.status() == StatusCode::NOT_FOUND {
-            return Ok(false);
+            return Ok(None);
         }
-        reply.error_for_status().map_err(failed)?;
-        Ok(true)
+        let member: MemberReply = reply
+            .error_for_status()
+            .map_err(failed)?
+            .json()
+            .await
+            .map_err(failed)?;
+        Ok(Some(member.roles))
     }
 }
 
@@ -196,10 +209,14 @@ impl DiscordApi for DiscordHttp {
             .json()
             .await
             .map_err(failed)?;
-        let guild_member = match required_guild_id {
-            Some(guild_id) => Some(self.is_guild_member(&token.access_token, guild_id).await?),
+        let member_roles = match required_guild_id {
+            Some(guild_id) => Some(
+                self.guild_member_roles(&token.access_token, guild_id)
+                    .await?,
+            ),
             None => None,
         };
+        let guild_member = member_roles.as_ref().map(Option::is_some);
         Ok(DiscordUser {
             profile: DiscordProfile {
                 user_id: me.id,
@@ -207,6 +224,7 @@ impl DiscordApi for DiscordHttp {
                 username: me.username,
                 email: me.email,
                 email_verified: me.verified.unwrap_or(false),
+                guild_role_ids: member_roles.flatten().unwrap_or_default(),
             },
             guild_member,
         })
@@ -232,6 +250,8 @@ pub(crate) mod tests {
     pub(crate) const FAKE_EMAIL: &str = "nelly@example.org";
     /// The only server [`FAKE_USER_ID`] is in.
     pub(crate) const FAKE_GUILD_ID: &str = "1234567890123456789";
+    /// The one role [`FAKE_USER_ID`] holds in [`FAKE_GUILD_ID`].
+    pub(crate) const FAKE_ROLE_ID: &str = "1000000000000000003";
 
     impl DiscordApi for FakeDiscord {
         async fn user_for_code(
@@ -249,6 +269,11 @@ pub(crate) mod tests {
                         display_name: "Nelly".to_owned(),
                         email: Some(FAKE_EMAIL.to_owned()),
                         email_verified: true,
+                        guild_role_ids: if required_guild_id == Some(FAKE_GUILD_ID) {
+                            vec![FAKE_ROLE_ID.to_owned()]
+                        } else {
+                            Vec::new()
+                        },
                     },
                     guild_member: required_guild_id.map(|guild_id| guild_id == FAKE_GUILD_ID),
                 })
@@ -305,16 +330,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_discord_user_id_is_17_to_20_digits() {
-        assert!(is_discord_user_id("80351110224678912"));
-        assert!(is_discord_user_id("18446744073709551615"));
+    fn a_discord_id_is_17_to_20_digits() {
+        assert!(is_discord_id("80351110224678912"));
+        assert!(is_discord_id("18446744073709551615"));
         for bad in [
             "8035111022467891",
             "184467440737095516150",
             "nelly",
             "8035111022467891x",
         ] {
-            assert!(!is_discord_user_id(bad), "{bad}");
+            assert!(!is_discord_id(bad), "{bad}");
         }
     }
 }

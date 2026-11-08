@@ -80,7 +80,8 @@ pub async fn password_login(
 }
 
 /// Finds the account of a Discord user, or creates it with the display name of `profile`. Each
-/// login writes the Discord username and email of `profile` again, so staff see the newest ones.
+/// login writes the Discord username, email and server role ids of `profile` again, so staff see
+/// the newest ones and a Play is checked against the newest roles.
 pub async fn discord_account(pool: &PgPool, profile: &DiscordProfile) -> Result<Account, DbError> {
     if let Some(account) = account_by_discord(pool, &profile.user_id).await? {
         update_discord_contact(pool, profile).await?;
@@ -90,14 +91,15 @@ pub async fn discord_account(pool: &PgPool, profile: &DiscordProfile) -> Result<
     let account = insert_account(&mut transaction, &profile.display_name).await?;
     let inserted = sqlx::query(
         "INSERT INTO discord_login \
-         (discord_user_id, account_id, discord_username, email, email_verified, last_login_at) \
-         VALUES ($1, $2, $3, $4, $5, now())",
+         (discord_user_id, account_id, discord_username, email, email_verified, guild_role_ids, \
+         last_login_at) VALUES ($1, $2, $3, $4, $5, $6, now())",
     )
     .bind(&profile.user_id)
     .bind(account.id)
     .bind(&profile.username)
     .bind(&profile.email)
     .bind(profile.email_verified)
+    .bind(&profile.guild_role_ids)
     .execute(&mut *transaction)
     .await;
     match inserted {
@@ -121,12 +123,13 @@ pub async fn discord_account(pool: &PgPool, profile: &DiscordProfile) -> Result<
 async fn update_discord_contact(pool: &PgPool, profile: &DiscordProfile) -> Result<(), DbError> {
     sqlx::query(
         "UPDATE discord_login SET discord_username = $2, email = $3, email_verified = $4, \
-         last_login_at = now() WHERE discord_user_id = $1",
+         guild_role_ids = $5, last_login_at = now() WHERE discord_user_id = $1",
     )
     .bind(&profile.user_id)
     .bind(&profile.username)
     .bind(&profile.email)
     .bind(profile.email_verified)
+    .bind(&profile.guild_role_ids)
     .execute(pool)
     .await?;
     Ok(())
@@ -195,13 +198,30 @@ pub async fn set_banned(pool: &PgPool, account_id: Uuid, banned: bool) -> Result
     Ok(result.rows_affected() > 0)
 }
 
-/// The Discord user id of an account's Discord login, if it has one.
-pub async fn discord_user_id(pool: &PgPool, account_id: Uuid) -> Result<Option<String>, DbError> {
-    let id = sqlx::query_scalar("SELECT discord_user_id FROM discord_login WHERE account_id = $1")
-        .bind(account_id)
-        .fetch_optional(pool)
-        .await?;
-    Ok(id)
+/// An account's Discord login: who it is and its server roles at the last login.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscordLogin {
+    /// The Discord user id.
+    pub user_id: String,
+    /// The role ids in the Discord server that logins need, as of the last login.
+    pub guild_role_ids: Vec<String>,
+}
+
+/// The Discord login of an account, if it has one.
+pub async fn discord_login(
+    pool: &PgPool,
+    account_id: Uuid,
+) -> Result<Option<DiscordLogin>, DbError> {
+    let row: Option<(String, Vec<String>)> = sqlx::query_as(
+        "SELECT discord_user_id, guild_role_ids FROM discord_login WHERE account_id = $1",
+    )
+    .bind(account_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(user_id, guild_role_ids)| DiscordLogin {
+        user_id,
+        guild_role_ids,
+    }))
 }
 
 /// The account of a Discord user.
@@ -247,6 +267,8 @@ mod tests {
     const DISCORD_NAME: &str = "Nelly";
     const DISCORD_USERNAME: &str = "nelly";
     const DISCORD_EMAIL: &str = "nelly@example.org";
+    /// A Discord role id of the user in the login server (a made-up snowflake).
+    const DISCORD_ROLE: &str = "1000000000000000001";
 
     #[tokio::test]
     async fn password_accounts_are_unique_and_found_by_username() {
@@ -277,6 +299,7 @@ mod tests {
             display_name: DISCORD_NAME.to_owned(),
             email: None,
             email_verified: false,
+            guild_role_ids: Vec::new(),
         };
         let (password, discord, by_id, by_name, missing) = with_test_schema(async |pool| {
             GLOBAL_MIGRATOR.run(pool).await.expect("migrate");
@@ -313,20 +336,22 @@ mod tests {
             display_name: DISCORD_NAME.to_owned(),
             email: None,
             email_verified: false,
+            guild_role_ids: Vec::new(),
         };
         let second_login = DiscordProfile {
             username: "nelly_new".to_owned(),
             display_name: "renamed".to_owned(),
             email: Some(DISCORD_EMAIL.to_owned()),
             email_verified: true,
+            guild_role_ids: vec![DISCORD_ROLE.to_owned()],
             ..first_login.clone()
         };
-        let (first, second, contact, rank, user_id) = with_test_schema(async |pool| {
+        let (first, second, contact, rank, login) = with_test_schema(async |pool| {
             GLOBAL_MIGRATOR.run(pool).await.expect("migrate");
             let first = discord_account(pool, &first_login).await.expect("first");
             let second = discord_account(pool, &second_login).await.expect("second");
             let rank = crate::admin_rank(pool, first.id).await.expect("rank");
-            let user_id = discord_user_id(pool, first.id).await.expect("user id");
+            let login = discord_login(pool, first.id).await.expect("login");
             let contact: (String, Option<String>, bool, bool) = sqlx::query_as(
                 "SELECT discord_username, email, email_verified, last_login_at IS NOT NULL \
                  FROM discord_login WHERE discord_user_id = $1",
@@ -335,12 +360,19 @@ mod tests {
             .fetch_one(pool)
             .await
             .expect("contact");
-            (first, second, contact, rank, user_id)
+            (first, second, contact, rank, login)
         })
         .await;
         assert_eq!(first, second);
         assert_eq!(rank, None, "a new Discord account is a normal player");
-        assert_eq!(user_id.as_deref(), Some(DISCORD_ID));
+        assert_eq!(
+            login,
+            Some(DiscordLogin {
+                user_id: DISCORD_ID.to_owned(),
+                guild_role_ids: vec![DISCORD_ROLE.to_owned()],
+            }),
+            "the newest login's server roles"
+        );
         assert_eq!(first.display_name, DISCORD_NAME);
         assert_eq!(
             contact,
@@ -361,6 +393,7 @@ mod tests {
             display_name: DISCORD_NAME.to_owned(),
             email: Some(DISCORD_EMAIL.to_owned()),
             email_verified: true,
+            guild_role_ids: Vec::new(),
         };
         let (local, first_discord, linked, login, other_user) = with_test_schema(async |pool| {
             GLOBAL_MIGRATOR.run(pool).await.expect("migrate");

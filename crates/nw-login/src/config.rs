@@ -16,7 +16,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::analytics::AnalyticsConfig;
-use crate::discord::is_discord_user_id;
+use crate::discord::is_discord_id;
 use crate::experience::ExperienceConfig;
 use crate::fast_travel::FastTravelConfig;
 use crate::game::API_REGION;
@@ -171,13 +171,18 @@ pub struct DiscordConfig {
     /// Id of the Discord server a player must be in to log in; empty: no server check.
     #[serde(default)]
     pub guild_id: String,
-    /// When true, only the Discord users of [`Self::allowed_user_ids`] may log in and make
-    /// accounts. Off by default: every Discord user may.
+    /// When true, only the Discord users of [`Self::allowed_user_ids`] and the holders of a role
+    /// of [`Self::allowed_role_ids`] may log in and make accounts. Off by default: every Discord
+    /// user may.
     #[serde(default)]
     pub allow_list: bool,
     /// The Discord user ids that may log in while [`Self::allow_list`] is on.
     #[serde(default)]
     pub allowed_user_ids: Vec<String>,
+    /// The role ids in the server [`Self::guild_id`] whose holders may log in while
+    /// [`Self::allow_list`] is on. A Play checks the roles of the last login.
+    #[serde(default)]
+    pub allowed_role_ids: Vec<String>,
 }
 
 impl DiscordConfig {
@@ -186,10 +191,15 @@ impl DiscordConfig {
         (!self.guild_id.is_empty()).then_some(self.guild_id.as_str())
     }
 
-    /// True when the Discord user `user_id` may log in: [`Self::allow_list`] is off or
-    /// [`Self::allowed_user_ids`] names it.
-    pub fn allows(&self, user_id: &str) -> bool {
-        !self.allow_list || self.allowed_user_ids.iter().any(|id| id == user_id)
+    /// True when the Discord user `user_id` with the server roles `role_ids` may log in:
+    /// [`Self::allow_list`] is off, [`Self::allowed_user_ids`] names it, or it holds a role of
+    /// [`Self::allowed_role_ids`].
+    pub fn allows(&self, user_id: &str, role_ids: &[String]) -> bool {
+        !self.allow_list
+            || self.allowed_user_ids.iter().any(|id| id == user_id)
+            || role_ids
+                .iter()
+                .any(|role| self.allowed_role_ids.contains(role))
     }
 }
 
@@ -510,17 +520,37 @@ impl EdgeConfig {
             .discord
             .allowed_user_ids
             .iter()
-            .all(|id| is_discord_user_id(id))
+            .all(|id| is_discord_id(id))
         {
             return invalid(
                 "discord.allowed_user_ids",
                 "must be Discord user ids (17 to 20 digits)",
             );
         }
-        if self.discord.allow_list && self.discord.allowed_user_ids.is_empty() {
+        if !self
+            .discord
+            .allowed_role_ids
+            .iter()
+            .all(|id| is_discord_id(id))
+        {
+            return invalid(
+                "discord.allowed_role_ids",
+                "must be Discord role ids (17 to 20 digits)",
+            );
+        }
+        if !self.discord.allowed_role_ids.is_empty() && self.discord.guild_id.is_empty() {
+            return invalid(
+                "discord.allowed_role_ids",
+                "needs discord.guild_id: the roles are read in that server",
+            );
+        }
+        if self.discord.allow_list
+            && self.discord.allowed_user_ids.is_empty()
+            && self.discord.allowed_role_ids.is_empty()
+        {
             return invalid(
                 "discord.allowed_user_ids",
-                "needs at least one Discord user id while discord.allow_list is on",
+                "needs at least one Discord user id or role id while discord.allow_list is on",
             );
         }
         if !REMOTE_CONFIG_BUCKETS.contains(&self.remote_config.bucket.as_str()) {
@@ -581,6 +611,11 @@ impl EdgeConfig {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A Discord server id and two role ids in it (made-up snowflakes).
+    const GUILD: &str = "1234567890123456789";
+    const ROLE: &str = "1000000000000000001";
+    const OTHER_ROLE: &str = "1000000000000000002";
 
     /// A valid configuration in TOML.
     pub(crate) const VALID: &str = r#"
@@ -810,6 +845,17 @@ max_connections = 5
             "discord.allowed_user_ids",
         );
         refused(
+            &format!(
+                "{VALID}\n[discord]\nclient_id = \"123\"\nguild_id = \"{GUILD}\"\n\
+                 allowed_role_ids = [\"mods\"]\n"
+            ),
+            "discord.allowed_role_ids",
+        );
+        refused(
+            &format!("{VALID}\n[discord]\nclient_id = \"123\"\nallowed_role_ids = [\"{ROLE}\"]\n"),
+            "discord.allowed_role_ids",
+        );
+        refused(
             &VALID.replace("capacity = 100", "capacity = 0"),
             "world.capacity",
         );
@@ -971,12 +1017,21 @@ max_connections = 5
         let mut discord = DiscordConfig::default();
         assert!(!discord.allow_list);
         assert!(
-            discord.allows("80351110224678912"),
+            discord.allows("80351110224678912", &[]),
             "off: every Discord user"
         );
         discord.allow_list = true;
         discord.allowed_user_ids = vec!["80351110224678912".to_owned()];
-        assert!(discord.allows("80351110224678912"));
-        assert!(!discord.allows("175928847299117063"));
+        assert!(discord.allows("80351110224678912", &[]));
+        assert!(!discord.allows("175928847299117063", &[]));
+        discord.allowed_role_ids = vec![ROLE.to_owned()];
+        assert!(
+            discord.allows(
+                "175928847299117063",
+                &[OTHER_ROLE.to_owned(), ROLE.to_owned()]
+            ),
+            "a holder of an allowed role"
+        );
+        assert!(!discord.allows("175928847299117063", &[OTHER_ROLE.to_owned()]));
     }
 }
