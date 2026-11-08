@@ -194,6 +194,7 @@ desktop.ini
 *.bak
 *.tmp
 *.log
+*.before-*
 
 # =============================================================================
 # Saved web pages: keep the .html, drop the browser "_files" support folders
