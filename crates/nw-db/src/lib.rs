@@ -94,7 +94,7 @@ pub use social_graph::{
     ICON_LEN, LinkKind, PlayerReport, STREAMER_MODE_LEN, SocialCharacter, SocialGroup,
     SocialRecords, SocialSettings, TreasuryReason, WITHDRAWAL_WINDOW_MS, add_coin_return,
     add_company_invite, add_social_link, change_treasury, company_by_id, company_listings,
-    create_company, delete_company, delete_group, insert_player_report, load_social,
+    create_company, delete_company, delete_group, display_names, insert_player_report, load_social,
     remove_coin_return, remove_company_invite, remove_company_member, remove_social_link,
     save_group, save_social_settings, set_company_member, update_company,
 };

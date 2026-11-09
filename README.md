@@ -531,6 +531,35 @@ Chat commands skip the admin site's audit log. The sim logs each line and its an
 
 `LIVE_STACK_INSTANCE=2 just live` starts a second test world next to the first. Every port moves up by 100 (the admin site is on 9280). The second world has its own world id, bot names and log folder (`local-data/logs/live-2/`).
 
+## Website status reporter
+
+The public website is not in this repository. The game servers send it a small, signed summary;
+the website opens no connection to the game machine and never reads a database or a metrics page.
+`status-reporter` (`config/status-reporter.toml`) sends that summary, one per world, on the game
+machine:
+
+- Every 15 s, the status to `<site_url>/api/ingest/status`: each part (login, gateway, director,
+  sims, social) up or down, the players online and the slowest gateway worker's p99 round trip.
+  A part is up when each of its metrics pages in `[parts]` answers. List every sim of the world.
+- Every 5 minutes, the leaderboards to `<site_url>/api/ingest/leaderboards`: every board of the
+  game data and the top 100 rows of its current rotation, with character and company names.
+
+Each report carries the headers `X-Blighted-World`, `X-Blighted-Timestamp` and
+`X-Blighted-Signature` (lowercase hex HMAC-SHA256 of `<timestamp>.<body>` with the world's
+secret). The secret is the same text as in the website's `WORLDS` entry for the world, at least
+32 characters (`openssl rand -hex 32`). The game machine's clock must be within 60 s of the
+website's.
+
+Set up:
+
+1. `content-tool leaderboards` writes the board table `local-data/content/leaderboards-<build>.json`
+   from the content bundle (run it again after a new bundle).
+2. Set `site_url` and the `[parts]` pages in a copy of `config/status-reporter.toml`, and the
+   secrets `NW_SECRET_STATUS_REPORT_SECRET`, `NW_SECRET_GLOBAL_DATABASE_PASSWORD` and the world
+   database password.
+3. `status-reporter --config <file>`. The log says `report accepted` for each kind when the
+   website takes the reports.
+
 ## Rules for contributors
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the branch and commit rules.

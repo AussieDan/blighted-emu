@@ -11,10 +11,9 @@ use nw_common::config::{ConfigError, SECRET_ENV_PREFIX, load_config};
 use nw_db::DatabaseConfig;
 use std::sync::Arc;
 
-use nw_common::time::CivilDate;
 use nw_content::combat::{CombatData, CombatRows};
 use nw_content::instances::InstanceCatalog;
-use nw_content::leaderboards::RotationCalendar;
+use nw_content::leaderboards::{RotationCalendar, RotationSettings};
 use nw_content::loot_limits::{HOURS_PER_DAY, ResetClock};
 use nw_messages::LevelSpec;
 use nw_sim_core::{CellBounds, MoveLimits, MoveLimitsError, TICKS_PER_SECOND};
@@ -185,7 +184,7 @@ pub struct SimConfig {
     /// The environment variable with the global database password; it starts with `NW_SECRET_`.
     pub global_database_password_env: String,
     /// The leaderboard rotations.
-    pub leaderboards: LeaderboardSection,
+    pub leaderboards: RotationSettings,
     /// The pinned client build file.
     pub client_build_config: PathBuf,
     /// The `edge-http` config whose `[remote_config]` sets the sim reads its gameplay values
@@ -325,19 +324,6 @@ const fn default_max_gm_spawn() -> u32 {
     DEFAULT_MAX_GM_SPAWN
 }
 
-/// `[leaderboards]`: the rotation keys the config layers give the client, so the sim names the
-/// same boards (study note `docs/re/2026-09-18-leaderboards-and-analytics.md`).
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct LeaderboardSection {
-    /// `javelin.leaderboard-rotation-startDate`, `year-month-day`.
-    pub rotation_start_date: String,
-    /// `javelin.weekly-leaderboard-reset-hour`, UTC.
-    pub weekly_reset_hour: u32,
-    /// `javelin.leaderboard-season-rotation`.
-    pub season: u32,
-}
-
 /// Shortest snapshot interval that is not off.
 pub const MIN_SNAPSHOT_INTERVAL_MS: u64 = 100;
 
@@ -461,30 +447,21 @@ impl SimConfig {
         Ok(())
     }
 
-    /// The leaderboard rotation calendar of `[leaderboards]`.
+    /// The leaderboard rotation calendar of `[leaderboards]`: the rotation keys the config
+    /// layers give the client, so the sim names the same boards (study note
+    /// `docs/re/2026-09-18-leaderboards-and-analytics.md`).
     ///
     /// # Errors
     ///
     /// Returns [`SimConfigError::Invalid`] for a start date the calendar does not have or a
     /// reset hour past the day.
     pub fn leaderboard_calendar(&self) -> Result<RotationCalendar, SimConfigError> {
-        let section = &self.leaderboards;
-        let start =
-            CivilDate::parse(&section.rotation_start_date).ok_or(SimConfigError::Invalid {
-                key: "leaderboards.rotation_start_date",
-                reason: "must be a year-month-day date",
-            })?;
-        if section.weekly_reset_hour >= HOURS_PER_DAY {
-            return Err(SimConfigError::Invalid {
-                key: "leaderboards.weekly_reset_hour",
-                reason: "must be below 24",
-            });
-        }
-        Ok(RotationCalendar {
-            start,
-            reset_hour: section.weekly_reset_hour,
-            season: section.season,
-        })
+        self.leaderboards
+            .calendar()
+            .map_err(|error| SimConfigError::Invalid {
+                key: error.key,
+                reason: error.reason,
+            })
     }
 
     /// The settings of the world state on a level with the edges `bounds` and its sea at
@@ -635,6 +612,8 @@ fn random_seed() -> u64 {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use nw_common::time::CivilDate;
+
     use super::*;
 
     const COMMITTED_CONFIG: &str = "../../config/sim.toml";

@@ -64,6 +64,9 @@ pub enum ToolError {
     /// The store table cannot be written.
     #[error(transparent)]
     StoreTable(#[from] StoreTableError),
+    /// The leaderboard table cannot be written.
+    #[error(transparent)]
+    LeaderboardTable(#[from] nw_content::leaderboard_table::LeaderboardTableError),
     /// A water file cannot be built, written or read back.
     #[error(transparent)]
     Water(#[from] WaterError),

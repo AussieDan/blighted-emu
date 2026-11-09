@@ -36,6 +36,7 @@ pub mod item_repair;
 pub mod item_rolls;
 pub mod item_rules;
 pub mod kill_rewards;
+pub mod leaderboard_table;
 pub mod leaderboards;
 pub mod loot;
 pub mod loot_limits;

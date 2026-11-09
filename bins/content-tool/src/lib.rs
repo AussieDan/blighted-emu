@@ -19,6 +19,7 @@ pub mod dungeon_scripts;
 pub mod error;
 pub mod extra_members;
 pub mod ftue_entities;
+pub mod leaderboards;
 pub mod map_tiles;
 pub mod melee_shapes;
 pub mod mob_prefabs;

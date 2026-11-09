@@ -679,6 +679,23 @@ pub async fn insert_player_report(world: &PgPool, report: &PlayerReport) -> Resu
     Ok(())
 }
 
+/// The names of the characters and companies among `ids`, by id: what a leaderboard row shows
+/// for its entity. An id of neither has no name.
+///
+/// # Errors
+///
+/// Returns [`DbError::Database`] when PostgreSQL fails.
+pub async fn display_names(world: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, String)>, DbError> {
+    let names: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT character_id, name FROM player_character WHERE character_id = ANY($1) \
+         UNION ALL SELECT company_id, name FROM company WHERE company_id = ANY($1)",
+    )
+    .bind(ids)
+    .fetch_all(world)
+    .await?;
+    Ok(names)
+}
+
 /// Creates `company` with `founder` as its governor (rank 0). `Ok(false)` when another company
 /// has the name (in any letter case).
 ///
@@ -1049,6 +1066,25 @@ mod infra_tests {
             renames: 0,
             crest_changes: 0,
         }
+    }
+
+    #[tokio::test]
+    async fn display_names_cover_characters_and_companies() {
+        let (names, ann, alpha) = with_test_schema(async |pool| {
+            WORLD_MIGRATOR.run(pool).await.expect("migrate");
+            let ann = character(pool, "Ann").await;
+            let alpha = company("Alpha");
+            assert!(create_company(pool, &alpha, ann).await.expect("create"));
+            let mut names = display_names(pool, &[ann, alpha.id, Uuid::new_v4()])
+                .await
+                .expect("names");
+            names.sort();
+            (names, ann, alpha.id)
+        })
+        .await;
+        let mut expected = vec![(ann, "Ann".to_owned()), (alpha, "Alpha".to_owned())];
+        expected.sort();
+        assert_eq!(names, expected);
     }
 
     #[tokio::test]

@@ -97,7 +97,7 @@ fn check_ids(ids: &[String]) -> Result<(), ApiError> {
 }
 
 /// The order of a board: `min-` boards rank their lowest value first.
-fn board_order(board_id: &str) -> BoardOrder {
+pub fn board_order(board_id: &str) -> BoardOrder {
     if board_id.starts_with(LOWEST_FIRST_PREFIX) {
         BoardOrder::LowestFirst
     } else {

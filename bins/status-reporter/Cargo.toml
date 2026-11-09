@@ -1,0 +1,40 @@
+[package]
+name = "status-reporter"
+version = "0.1.0"
+description = "Sends one world's status and leaderboards to the public website, signed."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+clap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+hmac.workspace = true
+nw-common.workspace = true
+nw-content.workspace = true
+nw-db.workspace = true
+nw-login.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+nw-content = { workspace = true, features = ["test-util"] }
+# The metric names the reporter reads, checked against the servers that write them.
+rep-gateway.workspace = true
+sim.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["net"] }
+toml.workspace = true
+
+[lints]
+workspace = true

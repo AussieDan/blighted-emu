@@ -37,6 +37,7 @@ zip = { workspace = true, features = ["deflate-flate2"] }
 
 [dev-dependencies]
 nw-capture = { workspace = true, features = ["test-util"] }
+nw-content = { workspace = true, features = ["test-util"] }
 # The in-sim replay of the retail mob fights (`ai_replay`).
 sim = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true

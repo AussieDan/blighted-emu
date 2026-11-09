@@ -10,9 +10,11 @@
 use std::collections::HashMap;
 
 use nw_common::time::{CivilDate, SECONDS_PER_DAY};
+use serde::{Deserialize, Serialize};
 
 use crate::Tables;
 use crate::generated::{LeaderboardData, LeaderboardStatData};
+use crate::loot_limits::HOURS_PER_DAY;
 
 /// The placeholder of the world id in a board template.
 pub const WORLD_PLACEHOLDER: &str = "{world}";
@@ -50,8 +52,9 @@ impl Aggregation {
     }
 }
 
-/// How often a board starts again (`Rotation`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How often a board starts again (`Rotation`). In JSON: `week`, `month` or `season`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Rotation {
     /// `Week`.
     Week,
@@ -62,7 +65,8 @@ pub enum Rotation {
 }
 
 impl Rotation {
-    fn parse(text: &str) -> Option<Self> {
+    /// The rotation of a datasheet cell (`Week`, `Month`, `Season`).
+    pub fn parse(text: &str) -> Option<Self> {
         match text {
             "Week" => Some(Self::Week),
             "Month" => Some(Self::Month),
@@ -204,6 +208,56 @@ impl RotationCalendar {
                 format!("{MONTH_PREFIX}{}", month + FIRST_ROTATION)
             }
             Rotation::Season => format!("{SEASON_PREFIX}{}", self.season),
+        })
+    }
+}
+
+/// The rotation keys of a server config (`[leaderboards]` of `config/sim.toml`): the values the
+/// config layers give the client (`javelin.leaderboard-rotation-startDate`,
+/// `javelin.weekly-leaderboard-reset-hour`, `javelin.leaderboard-season-rotation`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RotationSettings {
+    /// `javelin.leaderboard-rotation-startDate`, `year-month-day`.
+    pub rotation_start_date: String,
+    /// `javelin.weekly-leaderboard-reset-hour`, UTC.
+    pub weekly_reset_hour: u32,
+    /// `javelin.leaderboard-season-rotation`.
+    pub season: u32,
+}
+
+/// A value of [`RotationSettings`] that is not allowed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("config value `{key}` is not valid: {reason}")]
+pub struct RotationSettingsError {
+    /// The key path, such as `leaderboards.season`.
+    pub key: &'static str,
+    /// Why the value is refused.
+    pub reason: &'static str,
+}
+
+impl RotationSettings {
+    /// The calendar of these keys.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RotationSettingsError`] for a start date the calendar does not have or a reset
+    /// hour past the day.
+    pub fn calendar(&self) -> Result<RotationCalendar, RotationSettingsError> {
+        let start = CivilDate::parse(&self.rotation_start_date).ok_or(RotationSettingsError {
+            key: "leaderboards.rotation_start_date",
+            reason: "must be a year-month-day date",
+        })?;
+        if self.weekly_reset_hour >= HOURS_PER_DAY {
+            return Err(RotationSettingsError {
+                key: "leaderboards.weekly_reset_hour",
+                reason: "must be below 24",
+            });
+        }
+        Ok(RotationCalendar {
+            start,
+            reset_hour: self.weekly_reset_hour,
+            season: self.season,
         })
     }
 }

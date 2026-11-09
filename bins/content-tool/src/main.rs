@@ -31,14 +31,15 @@ use content_tool::creature_animations::{CreatureAnimationsReport, build_rows};
 use content_tool::dungeon_scripts::{DungeonScriptsReport, build_dungeon_scripts};
 use content_tool::error::ToolError;
 use content_tool::ftue_entities::{FtueScan, Timeline, read_ledger, write_table};
+use content_tool::leaderboards::write_leaderboard_table;
 use content_tool::map_tiles::{DEFAULT_MAP_DIR, MapTilesReport, YIndex, run_map_tiles};
 use content_tool::mob_prefabs::{
     DEFAULT_CAPTURE_ROOTS, LedgerSource, MobPrefabsError, PrefabTable, SourceList,
     find_ledger_sources, run_workers, scan_ledger, vitals_names, worker_process, write_entries,
 };
+use content_tool::music_charts::build_music_charts;
 use content_tool::player_abilities::{PlayerAbilitiesReport, build_abilities};
 use content_tool::player_attacks::{BundleRows, PlayerAttacksReport, build_stances, read_sources};
-use content_tool::music_charts::build_music_charts;
 use content_tool::quick_courses::build_quick_courses;
 use content_tool::roads::{RoadsError, RoadsReport, build_level_roads};
 use content_tool::source::GameSource;
@@ -330,6 +331,14 @@ enum Command {
     /// Writes the store table (`store-<build>.json`): the store mounts and the entitlements every
     /// account holds, from the content bundle, for `edge-http`'s store. Needs no game install.
     Store {
+        /// Folder of the content bundle and of the table.
+        #[arg(long, default_value = DEFAULT_CONTENT_DIR)]
+        content_dir: PathBuf,
+    },
+    /// Writes the leaderboard table (`leaderboards-<build>.json`): every board of a world with its
+    /// English name and group, from the content bundle, for `status-reporter`. Needs no game
+    /// install.
+    Leaderboards {
         /// Folder of the content bundle and of the table.
         #[arg(long, default_value = DEFAULT_CONTENT_DIR)]
         content_dir: PathBuf,
@@ -721,6 +730,10 @@ fn run(cli: Cli) -> Result<(), ToolError> {
                 report.mounts,
                 report.held_by_all
             );
+        }
+        Command::Leaderboards { content_dir } => {
+            let report = write_leaderboard_table(&content_dir, &client_build)?;
+            println!("{}: {} leaderboards", report.path.display(), report.boards);
         }
         Command::MobPrefabsLedger { ledger, entry } => {
             let tally = scan_ledger(

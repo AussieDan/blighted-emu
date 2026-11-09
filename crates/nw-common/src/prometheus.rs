@@ -60,6 +60,15 @@ impl Scrape {
             .sum()
     }
 
+    /// The largest value of the series `name` over every label set; `None` when there is none.
+    pub fn max(&self, name: &str) -> Option<f64> {
+        self.samples
+            .iter()
+            .filter(|sample| sample.name == name)
+            .map(|sample| sample.value)
+            .max_by(f64::total_cmp)
+    }
+
     /// The sum of the bucket of `histogram` with the bound `bound`.
     pub fn bucket(&self, histogram: &str, bound: f64) -> f64 {
         let name = format!("{histogram}{BUCKET_SUFFIX}");
@@ -205,6 +214,13 @@ sim_players 4
         assert_eq!(scrape.total("missing", None), 0.0);
         assert_eq!(scrape.bucket("sim_handoff_seconds", 0.033), 12.0);
         assert_eq!(scrape.total("sim_handoff_seconds_count", None), 13.0);
+    }
+
+    #[test]
+    fn max_takes_the_largest_series() {
+        let scrape = Scrape::parse(TEXT);
+        assert_eq!(scrape.max("sim_handoffs_total"), Some(12.0));
+        assert_eq!(scrape.max("missing"), None);
     }
 
     #[test]

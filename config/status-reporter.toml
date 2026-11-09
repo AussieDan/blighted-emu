@@ -1,0 +1,64 @@
+# status-reporter configuration: sends one world's status and leaderboards to the public website.
+# One status-reporter runs per world, on the game machine. Data only goes out: the website opens no
+# connection to this machine and never reads its databases. This file holds no secret.
+# Secrets (environment variables):
+#   the variable named by secret_env                    the world's report secret: the same text
+#                                                       as the third part of the website's WORLDS
+#                                                       entry for this world, 32+ characters
+#                                                       (openssl rand -hex 32)
+#   the variable named by global_database.password_env  password of [global_database]
+#   the variable named by world_database_password_env   password of [world_database]
+# Any key below can be overridden with NW_REPORTER_<KEY>, nested keys joined by "__",
+# for example NW_REPORTER_SITE_URL=http://localhost:3000.
+
+# The [[world]] id in config/edge.toml: the first part of the website's WORLDS entry.
+world_id = "8d0f4c2e-0000-4000-8000-000000000001"
+# The website, with no trailing /.
+site_url = "https://example.org"
+secret_env = "NW_SECRET_STATUS_REPORT_SECRET"
+world_database_password_env = "NW_SECRET_WORLD_1_DATABASE_PASSWORD"
+# Seconds between two status reports: 1 to 15. The website shows "No signal" after 45 s
+# without a report.
+status_interval_s = 15
+# Seconds between two leaderboard reports: at least 15 (the website takes 4 a minute).
+leaderboards_interval_s = 300
+# Longest wait for one metrics page or one website answer, in milliseconds; below the status
+# interval.
+request_timeout_ms = 5000
+log_filter = "info"
+
+# The pinned client build: it names the leaderboard table.
+client_build_config = "config/client-build.toml"
+# Folder of the leaderboard table leaderboards-<build>.json. Make it with
+# `content-tool leaderboards` (from the content bundle in the same folder).
+content_dir = "local-data/content"
+
+# The metrics pages (metrics_listen) of each part of the world. A part is up when every page of
+# it answers; the website shows the world Offline when the gateway or the sims are down, and
+# Having problems when another part is down. List every sim of the world (one sim per open
+# world, more with instances): a sim that is not listed is not checked.
+[parts]
+login = ["http://127.0.0.1:9100/metrics"]
+gateway = ["http://127.0.0.1:9101/metrics"]
+director = ["http://127.0.0.1:9103/metrics"]
+sims = ["http://127.0.0.1:9102/metrics"]
+social = ["http://127.0.0.1:9111/metrics"]
+
+# The leaderboard rotations: the same values as [leaderboards] in config/sim.toml.
+[leaderboards]
+rotation_start_date = "2023-02-07"
+weekly_reset_hour = 2
+season = 11
+
+# The global database with the leaderboard values (the sims write them).
+[global_database]
+password_env = "NW_SECRET_GLOBAL_DATABASE_PASSWORD"
+
+[global_database.database]
+url = "postgres://nw@127.0.0.1:5432/nw_global"
+max_connections = 2
+
+# The world database with the character and company names.
+[world_database]
+url = "postgres://nw@127.0.0.1:5432/nw_world_1"
+max_connections = 2
