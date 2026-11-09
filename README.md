@@ -535,14 +535,19 @@ Chat commands skip the admin site's audit log. The sim logs each line and its an
 
 The public website is not in this repository. The game servers send it a small, signed summary;
 the website opens no connection to the game machine and never reads a database or a metrics page.
+[docs/website-integration.md](docs/website-integration.md) describes every request and format
+between a website and this server.
 `status-reporter` (`config/status-reporter.toml`) sends that summary, one per world, on the game
 machine:
 
 - Every 15 s, the status to `<site_url>/api/ingest/status`: each part (login, gateway, director,
   sims, social) up or down, the players online and the slowest gateway worker's p99 round trip.
-  A part is up when each of its metrics pages in `[parts]` answers. List every sim of the world.
+  A part is up when each of its metrics pages in `[parts]` answers with a Prometheus text page (an
+  empty one too: a server that just started has counted nothing yet). List every sim of the world.
 - Every 5 minutes, the leaderboards to `<site_url>/api/ingest/leaderboards`: every board of the
-  game data and the top 100 rows of its current rotation, with character and company names.
+  game data (with its sub-group, value kind, order, reset time and what it ranks) and the top 100
+  rows of its current rotation, with the character, company or group member names. Equal values
+  share a rank, as in the game.
 
 Each report carries the headers `X-Blighted-World`, `X-Blighted-Timestamp` and
 `X-Blighted-Signature` (lowercase hex HMAC-SHA256 of `<timestamp>.<body>` with the world's
@@ -554,11 +559,16 @@ Set up:
 
 1. `content-tool leaderboards` writes the board table `local-data/content/leaderboards-<build>.json`
    from the content bundle (run it again after a new bundle).
-2. Set `site_url` and the `[parts]` pages in a copy of `config/status-reporter.toml`, and the
+2. Set `site_url`, `edge_config` (it gives the season end) and the `[parts]` pages in a copy of
+   `config/status-reporter.toml`, and the
    secrets `NW_SECRET_STATUS_REPORT_SECRET`, `NW_SECRET_GLOBAL_DATABASE_PASSWORD` and the world
    database password.
 3. `status-reporter --config <file>`. The log says `report accepted` for each kind when the
    website takes the reports.
+
+With `[website] site_url` in the `edge-http` config, the launcher shows the website's news
+(`GET /launcher/news-source` names the feed) and `edge-http` gets the message of the day for the
+character select screen from the website once a minute.
 
 ## Rules for contributors
 
