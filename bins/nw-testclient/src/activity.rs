@@ -760,14 +760,17 @@ mod tests {
             .steps
             .expect("a node");
         let (target, entity) = node_id(1);
-        assert!(matches!(
-            steps[0].acts.as_slice(),
-            [
-                Act::Teleport([5.0, 6.0, 7.0]),
-                Act::Interact { request, .. }
-            ] if request.target == target
-                && request.target_entity == entity
-                && request.gatherable == Some(lowercase_crc32(HARVESTED_GATHERABLE))
-        ), "an empty node id names the first node anyone gathered with it");
+        assert!(
+            matches!(
+                steps[0].acts.as_slice(),
+                [
+                    Act::Teleport([5.0, 6.0, 7.0]),
+                    Act::Interact { request, .. }
+                ] if request.target == target
+                    && request.target_entity == entity
+                    && request.gatherable == Some(lowercase_crc32(HARVESTED_GATHERABLE))
+            ),
+            "an empty node id names the first node anyone gathered with it"
+        );
     }
 }

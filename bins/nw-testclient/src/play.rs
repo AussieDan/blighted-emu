@@ -413,9 +413,7 @@ fn plan_step(line: &str, header: FacetHeader) -> Option<(String, PlanStep)> {
             placed: words.contains(&PLACED),
         },
         "item" => {
-            let (said, source) = what
-                .split_once(&format!(" {FROM} "))
-                .unwrap_or((what, ""));
+            let (said, source) = what.split_once(&format!(" {FROM} ")).unwrap_or((what, ""));
             let said: Vec<&str> = said.split_whitespace().collect();
             PlanStep::Item {
                 item: (*words.get(1)?).to_owned(),
@@ -944,8 +942,8 @@ impl Player {
             .find(|line| line.starts_with(&format!("{PLAN_LINE}{task} ")))
             .cloned()
             .unwrap_or_default();
-        let fights_on = matches!(step, PlanStep::Kill { .. })
-            && Fought::fights_on(self.fought.as_ref(), &task);
+        let fights_on =
+            matches!(step, PlanStep::Kill { .. }) && Fought::fights_on(self.fought.as_ref(), &task);
         if self.last_plan.as_deref() == Some(line.as_str()) && step != PlanStep::Wait && !fights_on
         {
             self.same_plan += 1;
@@ -1041,8 +1039,9 @@ impl Player {
                     Self::call(client, &entered(header, territory))?;
                 }
                 if placed {
-                    self.actions
-                        .push(format!("{task}: fought the placed {vitals} for {count} kills"));
+                    self.actions.push(format!(
+                        "{task}: fought the placed {vitals} for {count} kills"
+                    ));
                 } else {
                     self.say(
                         client,
@@ -1064,8 +1063,7 @@ impl Player {
                 };
             }
             PlanStep::Item {
-                node: Some(node),
-                ..
+                node: Some(node), ..
             } => {
                 let Some(index) = self.untried_node(lowercase_crc32(&node)) else {
                     self.end_quest(Verdict::Broken(format!(
@@ -1198,7 +1196,12 @@ impl Player {
     /// The nearest node of gatherable `gatherable` to the bot that it has not tried yet.
     fn untried_node(&self, gatherable: u32) -> Option<usize> {
         let own = self.own_place()?;
-        nearest_untried(&self.nodes, &self.tried_nodes, gatherable, [own.x, own.y, own.z])
+        nearest_untried(
+            &self.nodes,
+            &self.tried_nodes,
+            gatherable,
+            [own.x, own.y, own.z],
+        )
     }
 
     /// Plays one tick of `running`; its verdict once it ended.
@@ -1777,8 +1780,7 @@ mod tests {
     }
 
     #[test]
-    fn a_kill_step_that_killed_nothing_is_not_played_and_one_whose_kills_did_not_count_is_broken()
-    {
+    fn a_kill_step_that_killed_nothing_is_not_played_and_one_whose_kills_did_not_count_is_broken() {
         let fought = |mob_deaths| Fought {
             task: "w_kill".to_owned(),
             hits: 170,
@@ -1811,7 +1813,10 @@ mod tests {
             last_hits,
         };
         assert!(Fought::fights_on(Some(&fought(1, 56)), "w_kill"));
-        assert!(!Fought::fights_on(Some(&fought(1, 0)), "w_kill"), "no hit landed");
+        assert!(
+            !Fought::fights_on(Some(&fought(1, 0)), "w_kill"),
+            "no hit landed"
+        );
         assert!(
             !Fought::fights_on(Some(&fought(MAX_KILL_FIGHTS, 56)), "w_kill"),
             "the most fights"
@@ -1863,7 +1868,11 @@ mod tests {
         tried.insert(2);
         assert_eq!(nearest_untried(&nodes, &tried, ORB, from), Some(0));
         tried.insert(0);
-        assert_eq!(nearest_untried(&nodes, &tried, ORB, from), None, "each tried");
+        assert_eq!(
+            nearest_untried(&nodes, &tried, ORB, from),
+            None,
+            "each tried"
+        );
     }
 
     #[test]
