@@ -19,6 +19,7 @@ pub mod launcher;
 pub mod look;
 #[cfg(test)]
 mod memory;
+pub mod motd_pull;
 pub mod names;
 pub mod password;
 pub mod pg;

@@ -5,7 +5,7 @@
 //! ([`crate::cms`]) are served this way. This server checks no request signature.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use axum::Router;
 use axum::body::Body;
@@ -83,6 +83,46 @@ impl S3Objects {
         keys.sort_unstable();
         keys
     }
+
+    /// These objects with the object `key` set to `body` (a new ETag).
+    fn with(&self, key: &str, body: Vec<u8>) -> Self {
+        let mut objects = (*self.objects).clone();
+        objects.insert(key.to_owned(), S3Object::new(body));
+        Self {
+            objects: Arc::new(objects),
+        }
+    }
+}
+
+/// Objects that may change while they are served (the message of the day that `edge-http`
+/// gets from the website, [`crate::cms`]). Each request is answered from the objects of that
+/// moment.
+#[derive(Debug, Clone, Default)]
+pub struct LiveS3Objects {
+    current: Arc<RwLock<S3Objects>>,
+}
+
+impl LiveS3Objects {
+    /// Live objects that start as `objects`.
+    pub fn new(objects: S3Objects) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(objects)),
+        }
+    }
+
+    /// The objects now.
+    pub fn current(&self) -> S3Objects {
+        self.current
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Sets the object `key` to `body`.
+    pub fn replace(&self, key: &str, body: Vec<u8>) {
+        let mut current = self.current.write().unwrap_or_else(PoisonError::into_inner);
+        *current = current.with(key, body);
+    }
 }
 
 /// The bucket route: `GET /<key>` (and `HEAD`).
@@ -90,6 +130,21 @@ pub fn s3_router(objects: S3Objects) -> Router {
     Router::new()
         .route("/{*key}", get(get_object))
         .with_state(objects)
+}
+
+/// The bucket route of live objects: each request reads the objects of that moment.
+pub fn live_s3_router(objects: LiveS3Objects) -> Router {
+    Router::new()
+        .route("/{*key}", get(get_live_object))
+        .with_state(objects)
+}
+
+async fn get_live_object(
+    State(objects): State<LiveS3Objects>,
+    uri: Uri,
+    headers: HeaderMap,
+) -> Response {
+    get_object(State(objects.current()), uri, headers).await
 }
 
 async fn get_object(State(objects): State<S3Objects>, uri: Uri, headers: HeaderMap) -> Response {
@@ -223,5 +278,25 @@ mod tests {
         assert_eq!(objects.keys(), ["a", "b/c"]);
         assert_eq!(objects.body("b/c"), Some(b"two".as_slice()));
         assert_eq!(objects.body("c"), None);
+    }
+
+    #[test]
+    fn a_replaced_live_object_gets_a_new_body_and_etag() {
+        let etag = |objects: &S3Objects| objects.objects.get("motd").map(|o| o.etag.clone());
+        let live = LiveS3Objects::new(S3Objects::new(HashMap::from([
+            ("motd".to_owned(), b"old".to_vec()),
+            ("other".to_owned(), b"kept".to_vec()),
+        ])));
+        let before = live.current();
+        live.replace("motd", b"new".to_vec());
+        let after = live.current();
+        assert_eq!(after.body("motd"), Some(b"new".as_slice()));
+        assert_eq!(after.body("other"), Some(b"kept".as_slice()));
+        assert_ne!(etag(&after), etag(&before));
+        assert_eq!(
+            before.body("motd"),
+            Some(b"old".as_slice()),
+            "a copy stays as it was"
+        );
     }
 }

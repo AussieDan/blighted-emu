@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use crate::config::EdgeConfig;
 use crate::remote_config::PRODUCT_ID;
-use crate::s3::{S3Objects, s3_router};
+use crate::s3::{LiveS3Objects, S3Objects, live_s3_router, s3_router};
 
 /// Between the parts of an object key.
 const KEY_SEPARATOR: &str = "/";
@@ -56,7 +56,7 @@ impl CmsDocument {
     }
 
     /// Whether `document` has the top-level members of the retail document.
-    fn has_retail_shape(self, document: &Value) -> bool {
+    pub(crate) fn has_retail_shape(self, document: &Value) -> bool {
         match self {
             Self::MessageOfTheDay => ["worlds", "worldSets", "globalAnnouncement"]
                 .iter()
@@ -106,10 +106,11 @@ pub enum CmsError {
     },
 }
 
-/// The loaded news documents and images, one bucket per host.
+/// The loaded news documents and images, one bucket per host. The documents are live: the
+/// message of the day may come from the website while the server runs ([`crate::motd_pull`]).
 #[derive(Debug, Clone)]
 pub struct CmsObjects {
-    news: S3Objects,
+    news: LiveS3Objects,
     images: S3Objects,
 }
 
@@ -163,22 +164,27 @@ impl CmsObjects {
             return Err(CmsError::Unexpected(news_root.join(extra)));
         }
         Ok(Self {
-            news: S3Objects::new(documents),
+            news: LiveS3Objects::new(S3Objects::new(documents)),
             images: S3Objects::new(images),
         })
+    }
+
+    /// The documents, for a task that replaces the message of the day.
+    pub fn documents(&self) -> LiveS3Objects {
+        self.news.clone()
     }
 
     /// The routes of both hosts.
     pub fn routers(self) -> CmsRouters {
         CmsRouters {
-            news: s3_router(self.news),
+            news: live_s3_router(self.news),
             images: s3_router(self.images),
         }
     }
 }
 
 /// The first string in `value` that is an image-host URL with no key in `images`.
-fn missing_image(value: &Value, images: &HashSet<&str>) -> Option<String> {
+pub(crate) fn missing_image(value: &Value, images: &HashSet<&str>) -> Option<String> {
     let prefix = format!("{HTTPS_SCHEME}{CMS_IMAGE_HOST}{KEY_SEPARATOR}");
     match value {
         Value::String(text) => text
@@ -281,13 +287,14 @@ pub(crate) mod tests {
     #[test]
     fn tracked_files_hold_the_three_documents_and_no_amazon_text() {
         let objects = committed_objects(&valid());
+        let news = objects.news.current();
         let keys: Vec<String> = CmsDocument::ALL.iter().map(|doc| doc.key()).collect();
         let mut sorted = keys.clone();
         sorted.sort_unstable();
-        assert_eq!(objects.news.keys(), sorted);
+        assert_eq!(news.keys(), sorted);
         assert!(objects.images.keys().is_empty());
         for key in &keys {
-            let text = std::str::from_utf8(objects.news.body(key).expect("body")).expect("utf-8");
+            let text = std::str::from_utf8(news.body(key).expect("body")).expect("utf-8");
             for domain in FORBIDDEN_DOMAINS {
                 assert!(!text.contains(domain), "{key} names {domain}");
             }

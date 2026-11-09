@@ -14,8 +14,8 @@ use nw_db::Account;
 use nw_protocol::aws_mirror::AwsMirror;
 use nw_protocol::launcher_api::{
     AuthMode, DISCORD_POLL_PATH, DISCORD_START_PATH, DiscordPoll, DiscordPollReply, DiscordStart,
-    INFO_PATH, LOGIN_PATH, LOGOUT_PATH, LauncherInfo, LauncherSession, PLAY_PATH,
-    PasswordCredentials, PlayReply, REGISTER_PATH,
+    INFO_PATH, LOGIN_PATH, LOGOUT_PATH, LauncherInfo, LauncherSession, NEWS_SOURCE_PATH,
+    NewsSource, PLAY_PATH, PasswordCredentials, PlayReply, REGISTER_PATH,
 };
 use serde::Deserialize;
 
@@ -83,6 +83,7 @@ where
 {
     Router::new()
         .route(INFO_PATH, get(info::<A, G, R, D, X>))
+        .route(NEWS_SOURCE_PATH, get(news_source::<A, G, R, D, X>))
         .route(REGISTER_PATH, post(register::<A, G, R, D, X>))
         .route(LOGIN_PATH, post(login::<A, G, R, D, X>))
         .route(PLAY_PATH, post(play::<A, G, R, D, X>))
@@ -189,6 +190,19 @@ async fn info<A, G, R, D, X>(
             certificate_pem: state.aws_mirror_certificate_pem.to_string(),
             ping_port: config.public_ping_port,
         },
+    })
+}
+
+/// `GET /launcher/news-source`: the website's launcher feed, or none without `[website]`.
+async fn news_source<A, G, R, D, X>(
+    State(state): State<LauncherState<A, G, R, D, X>>,
+) -> Json<NewsSource> {
+    Json(NewsSource {
+        news_url: state
+            .config
+            .website
+            .as_ref()
+            .map(crate::config::WebsiteConfig::launcher_news_url),
     })
 }
 
@@ -578,6 +592,33 @@ pub(crate) mod tests {
         assert_ne!(
             limit_address(address("2001:db8:1:2::1")),
             limit_address(address("2001:db8:1:3::1"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_news_source_names_the_website_feed_or_none() {
+        let (status, body) = send(
+            &app(state(AuthMode::Password)),
+            "GET",
+            NEWS_SOURCE_PATH,
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let none: NewsSource = serde_json::from_slice(&body).expect("source");
+        assert_eq!(none.news_url, None);
+        let mut with_site = state(AuthMode::Password);
+        let mut config = (*with_site.config).clone();
+        config.website = Some(crate::config::WebsiteConfig {
+            site_url: "https://example.org".to_owned(),
+        });
+        with_site.config = Arc::new(config);
+        let (_, body) = send(&app(with_site), "GET", NEWS_SOURCE_PATH, None, "").await;
+        let source: NewsSource = serde_json::from_slice(&body).expect("source");
+        assert_eq!(
+            source.news_url.as_deref(),
+            Some("https://example.org/api/news?target=launcher")
         );
     }
 

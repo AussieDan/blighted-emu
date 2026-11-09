@@ -101,6 +101,14 @@ cognito_pool_id = "b04fbfcd-942c-472d-88c0-c762c4076b2f"
 [cms]
 directory = "config/cms"
 
+# The community's public website (docs/website-integration.md) is a [website] section with one
+# key, site_url (such as https://example.org, no trailing /). This file has none: a server
+# without a site shows no launcher news and serves the message of the day from [cms]. Put the
+# section in the git-ignored local config. With it, the launcher reads its news from
+# <site_url>/api/news?target=launcher (GET /launcher/news-source names it), and edge-http gets
+# the message of the day from <site_url>/api/game/cms/motd once a minute; the [cms] file is only
+# the first copy.
+
 # The Amazon names our launcher maps to this server, for the game process only (private hosts
 # file and trust file under bwrap, or the loopback proxy on Windows). Only the remote-config
 # bucket host, Kinesis, STS and DynamoDB (region ping) hosts and the two news hosts are allowed,

@@ -25,6 +25,7 @@ use nw_login::game::GameState;
 use nw_login::host::{ServiceRouters, edge_router};
 use nw_login::install_crypto_provider;
 use nw_login::launcher::LauncherState;
+use nw_login::motd_pull::{MotdPull, motd_client};
 use nw_login::names::{NameError, normalize_username};
 use nw_login::password::{PasswordError, PasswordHasher};
 use nw_login::pg::{PgAccounts, PgCharacters};
@@ -43,6 +44,8 @@ use crate::tls::{TlsError, mirror_certificate_pem, server_config, write_mirror_c
 const SHUTDOWN_GRACE_SECONDS: u64 = 10;
 /// Path of the Prometheus scrape route on the metrics listener.
 const METRICS_PATH: &str = "/metrics";
+/// The user agent of this server's requests to the website.
+const USER_AGENT: &str = concat!("blighted-edge-http/", env!("CARGO_PKG_VERSION"));
 
 /// Failure while starting or running `edge-http`.
 #[derive(Debug, thiserror::Error)]
@@ -83,6 +86,9 @@ pub enum RunError {
     /// The news files cannot be loaded.
     #[error(transparent)]
     Cms(#[from] CmsError),
+    /// The HTTP client of the message of the day pull could not start.
+    #[error("website client")]
+    WebsiteClient(#[source] reqwest::Error),
     /// The store table cannot be loaded.
     #[error(transparent)]
     StoreTable(#[from] StoreTableError),
@@ -228,6 +234,11 @@ pub fn serve(config_path: &Path) -> Result<(), RunError> {
 async fn serve_async(config: EdgeConfig, secrets: Secrets) -> Result<(), RunError> {
     let remote_config = RemoteConfigSets::load(&config)?;
     let cms = CmsObjects::load(&config)?;
+    if let Some(website) = &config.website {
+        let http = motd_client(USER_AGENT).map_err(RunError::WebsiteClient)?;
+        tokio::spawn(MotdPull::new(http, website, cms.documents()).run());
+        tracing::info!(url = %website.motd_url(), "pulling the message of the day");
+    }
     let store = Arc::new(match &config.shop.store_table {
         Some(path) => StoreTable::load(path)?,
         None => StoreTable::default(),

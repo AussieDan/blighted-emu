@@ -17,6 +17,8 @@ nw-common.workspace = true
 nw-db.workspace = true
 nw-login.workspace = true
 nw-protocol.workspace = true
+# The message of the day pull from the website (nw_login::motd_pull).
+reqwest.workspace = true
 rustls.workspace = true
 sqlx.workspace = true
 thiserror.workspace = true
@@ -28,7 +30,6 @@ uuid.workspace = true
 [dev-dependencies]
 http-body-util.workspace = true
 openssl.workspace = true
-reqwest.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 

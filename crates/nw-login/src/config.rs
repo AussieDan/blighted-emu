@@ -121,6 +121,10 @@ pub struct EdgeConfig {
     /// ([`crate::voice`]); left out, the prelogin is not served.
     #[serde(default)]
     pub voice: Option<VoiceConfig>,
+    /// The community's public website; left out, the launcher gets no news and the message of
+    /// the day stays the `[cms]` file.
+    #[serde(default)]
+    pub website: Option<WebsiteConfig>,
     /// Worlds, one `[[world]]` block each.
     #[serde(rename = "world")]
     pub worlds: Vec<WorldConfig>,
@@ -302,6 +306,49 @@ pub struct CmsConfig {
     /// Folder with one subfolder per news host, named after it; each file in it is served at its
     /// path ([`crate::cms::CmsObjects::load`]).
     pub directory: PathBuf,
+}
+
+/// The website's launcher news feed, after [`WebsiteConfig::site_url`].
+pub const LAUNCHER_NEWS_PATH: &str = "/api/news?target=launcher";
+/// The website's message of the day in the client's retail shape, after
+/// [`WebsiteConfig::site_url`].
+pub const SITE_MOTD_PATH: &str = "/api/game/cms/motd";
+const HTTP_SCHEME: &str = "http://";
+const HTTPS_SCHEME: &str = "https://";
+const URL_PATH_SEPARATOR: char = '/';
+const URL_PORT_SEPARATOR: char = ':';
+
+/// `[website]`: the community's public website. The launcher reads its news feed there
+/// (`GET /launcher/news-source` names it), and `edge-http` gets the message of the day from it
+/// once a minute. The website opens no connection to this server.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebsiteConfig {
+    /// The website, such as `https://example.org`, with no trailing `/`.
+    pub site_url: String,
+}
+
+impl WebsiteConfig {
+    /// The launcher news feed.
+    pub fn launcher_news_url(&self) -> String {
+        format!("{}{LAUNCHER_NEWS_PATH}", self.site_url)
+    }
+
+    /// The message of the day.
+    pub fn motd_url(&self) -> String {
+        format!("{}{SITE_MOTD_PATH}", self.site_url)
+    }
+
+    /// The host of [`Self::site_url`]; `None` when it does not start with `http://` or
+    /// `https://`.
+    fn host(&self) -> Option<&str> {
+        let rest = self
+            .site_url
+            .strip_prefix(HTTPS_SCHEME)
+            .or_else(|| self.site_url.strip_prefix(HTTP_SCHEME))?;
+        let authority = rest.split(URL_PATH_SEPARATOR).next()?;
+        authority.split(URL_PORT_SEPARATOR).next()
+    }
 }
 
 /// `[aws_mirror]`: the Amazon names our launcher maps to this server for the game process, and
@@ -563,6 +610,22 @@ impl EdgeConfig {
             return invalid("experience", &error.to_string());
         }
         self.validate_aws_mirror()?;
+        if let Some(website) = &self.website {
+            let url = website.site_url.as_str();
+            match website.host() {
+                Some(host)
+                    if !host.is_empty()
+                        && !url.ends_with(URL_PATH_SEPARATOR)
+                        && !is_forbidden_host(host) => {}
+                _ => {
+                    return invalid(
+                        "website.site_url",
+                        "must start with http:// or https://, have no trailing / and no Amazon \
+                         or CloudFront host",
+                    );
+                }
+            }
+        }
         if self.worlds.is_empty() {
             return invalid("world", "at least one [[world]] is required");
         }
@@ -866,6 +929,40 @@ max_connections = 5
             ),
             "world.max_characters_per_account",
         );
+    }
+
+    #[test]
+    fn the_website_section_names_the_feed_and_the_motd() {
+        assert_eq!(valid().website, None);
+        let with = |url: &str| {
+            load(&VALID.replace(
+                "[cms]",
+                &format!("[website]\nsite_url = \"{url}\"\n\n[cms]"),
+            ))
+        };
+        let website = with("https://example.org")
+            .expect("website")
+            .website
+            .expect("set");
+        assert_eq!(
+            website.launcher_news_url(),
+            "https://example.org/api/news?target=launcher"
+        );
+        assert_eq!(website.motd_url(), "https://example.org/api/game/cms/motd");
+        assert!(with("http://127.0.0.1:3100").is_ok());
+        for bad in [
+            "example.org",
+            "https://example.org/",
+            "https://",
+            "https://d1hkbwzm1bktgo.cloudfront.net",
+        ] {
+            match with(bad) {
+                Err(EdgeConfigError::Invalid { key, .. }) => {
+                    assert_eq!(key, "website.site_url", "{bad}");
+                }
+                other => panic!("expected {bad} to be refused, got {other:?}"),
+            }
+        }
     }
 
     #[test]
