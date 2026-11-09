@@ -7,7 +7,7 @@
 //! the rotation (study note `docs/re/2026-09-18-leaderboards-and-analytics.md`). Boards without
 //! the world (the cross-world Outpost Rush boards) are in the table too: the players of this
 //! world see them. The two influence race boards also need a territory and a race id, so they are
-//! not in the table.
+//! not in the table, and so is a board that ranks no character, company or group.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,50 @@ const PROBE_ROTATION: &str = "w1";
 const TAG_START: char = '<';
 const TAG_END: char = '>';
 
+/// What a board ranks (`GroupLeaderboard`, `CompanyLeaderboard`, `CharacterLeaderboard`). In JSON:
+/// `character`, `company` or `group`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EntityKind {
+    /// One character.
+    Character,
+    /// One company.
+    Company,
+    /// A group of characters: the entity id is the member ids joined by
+    /// [`GROUP_MEMBER_SEPARATOR`].
+    Group,
+}
+
+/// Between the member ids of a group entity (`<id>_<id>_..._<id>` in the retail stats replies).
+pub const GROUP_MEMBER_SEPARATOR: char = '_';
+/// The part of a template that names a company board (`top-company-influence-races-won...`).
+const COMPANY_TEMPLATE_MARK: &str = "-company-";
+/// The part of a template that names a group board (`top-group-expedition-score...`).
+const GROUP_TEMPLATE_MARK: &str = "-group-";
+
+impl EntityKind {
+    /// The kind of `row`; a group board wins over a company board, a company board over a
+    /// character board. A row with none of the three flags (the three company influence race
+    /// win boards of build 25810808) takes the kind its template names (Inferred). `None` for a
+    /// row that names none of them.
+    fn of(row: &LeaderboardData) -> Option<Self> {
+        let template = row.leaderboard_definition_id.as_str();
+        if row.group_leaderboard {
+            Some(Self::Group)
+        } else if row.company_leaderboard {
+            Some(Self::Company)
+        } else if row.character_leaderboard {
+            Some(Self::Character)
+        } else if template.contains(GROUP_TEMPLATE_MARK) {
+            Some(Self::Group)
+        } else if template.contains(COMPANY_TEMPLATE_MARK) {
+            Some(Self::Company)
+        } else {
+            None
+        }
+    }
+}
+
 /// One board.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TableBoard {
@@ -40,6 +84,14 @@ pub struct TableBoard {
     /// Its English group (`Category`, such as `War`), or `FirstLevelCategory` when the game data
     /// has no text for it.
     pub group: String,
+    /// Its English sub-group (`SecondLevelCategory`, such as `Expedition Clear Time`); `None`
+    /// when the game data has no text for it.
+    pub subgroup: Option<String>,
+    /// The English label of its value (`ValueString`, such as `Time`); `None` when the game data
+    /// has no text for it.
+    pub value_kind: Option<String>,
+    /// What it ranks.
+    pub entity_kind: EntityKind,
     /// How often it starts again.
     pub rotation: Rotation,
     /// The stats service namespace (`Namespace`), such as `pc`.
@@ -106,25 +158,32 @@ fn one_board_per_rotation(template: &str) -> bool {
     board_name(template, PROBE_WORLD, PROBE_ROTATION).is_some()
 }
 
+/// The English text of the cell `key` without markup; `None` when it has none.
+fn english_text(text: &BTreeMap<String, String>, key: &str) -> Option<String> {
+    english(text, key)
+        .map(plain_text)
+        .filter(|plain| !plain.is_empty())
+}
+
 /// The board of `row`, with the English text of `text`; `None` for a disabled row, an unknown
-/// rotation or a template that needs more than the world and the rotation.
+/// rotation, a template that needs more than the world and the rotation, or a row that ranks
+/// no character, company or group.
 fn table_board(row: &LeaderboardData, text: &BTreeMap<String, String>) -> Option<TableBoard> {
     if !row.is_enabled || !one_board_per_rotation(&row.leaderboard_definition_id) {
         return None;
     }
     let rotation = Rotation::parse(&row.rotation)?;
-    let name = english(text, &row.display_name)
-        .map(plain_text)
-        .filter(|name| !name.is_empty())
-        .unwrap_or_else(|| row.leaderboard_id.clone());
-    let group = english(text, &row.category)
-        .map(plain_text)
-        .filter(|group| !group.is_empty())
-        .unwrap_or_else(|| plain_text(&row.first_level_category));
+    let entity_kind = EntityKind::of(row)?;
+    let name = english_text(text, &row.display_name).unwrap_or_else(|| row.leaderboard_id.clone());
+    let group =
+        english_text(text, &row.category).unwrap_or_else(|| plain_text(&row.first_level_category));
     Some(TableBoard {
         board_id: row.leaderboard_id.clone(),
         name,
         group,
+        subgroup: english_text(text, &row.second_level_category),
+        value_kind: english_text(text, &row.value_string),
+        entity_kind,
         rotation,
         namespace: row.namespace.clone(),
         template: row.leaderboard_definition_id.clone(),
@@ -204,6 +263,8 @@ mod tests {
             display_name: "@ui_leaderboard_display_war_score".to_owned(),
             category: "@ui_leaderboard_category_or".to_owned(),
             first_level_category: "Faction War".to_owned(),
+            second_level_category: "@ui_leaderboard_display_war".to_owned(),
+            value_string: "@ui_leaderboard_column_score".to_owned(),
             rotation: rotation.to_owned(),
             ..board_row(id, template)
         }
@@ -215,6 +276,8 @@ mod tests {
                 "ui_leaderboard_display_war_score".to_owned(),
                 "Score".to_owned(),
             ),
+            ("ui_leaderboard_display_war".to_owned(), "War".to_owned()),
+            ("ui_leaderboard_column_score".to_owned(), "Score".to_owned()),
             (
                 "ui_leaderboard_category_or".to_owned(),
                 "Outpost Rush <img src=\"lyshineui/images/icon\" scale=\"1.0\"></img>".to_owned(),
@@ -231,6 +294,9 @@ mod tests {
                 board_id: "MonthWarScore".to_owned(),
                 name: "Score".to_owned(),
                 group: "Outpost Rush".to_owned(),
+                subgroup: Some("War".to_owned()),
+                value_kind: Some("Score".to_owned()),
+                entity_kind: EntityKind::Character,
                 rotation: Rotation::Month,
                 namespace: "pc".to_owned(),
                 template: MONTH_TEMPLATE.to_owned(),
@@ -245,6 +311,49 @@ mod tests {
         assert_eq!(
             (board.name.as_str(), board.group.as_str()),
             ("MonthWarScore", "Faction War")
+        );
+        assert_eq!((&board.subgroup, &board.value_kind), (&None, &None));
+    }
+
+    #[test]
+    fn a_group_board_wins_over_company_and_character() {
+        let kind = |group, company, character| {
+            let row = LeaderboardData {
+                group_leaderboard: group,
+                company_leaderboard: company,
+                character_leaderboard: character,
+                ..row("MonthWarScore", MONTH_TEMPLATE, "Month")
+            };
+            leaderboard_table_of(&[row], &text())
+                .boards
+                .first()
+                .map(|board| board.entity_kind)
+        };
+        assert_eq!(kind(true, true, true), Some(EntityKind::Group));
+        assert_eq!(kind(false, true, true), Some(EntityKind::Company));
+        assert_eq!(kind(false, false, true), Some(EntityKind::Character));
+        assert_eq!(kind(false, false, false), None);
+    }
+
+    #[test]
+    fn a_row_without_flags_takes_the_kind_its_template_names() {
+        let kind = |template| {
+            let row = LeaderboardData {
+                character_leaderboard: false,
+                ..row("SeasonInfluenceRaceWins", template, "Season")
+            };
+            leaderboard_table_of(&[row], &text())
+                .boards
+                .first()
+                .map(|board| board.entity_kind)
+        };
+        assert_eq!(
+            kind("top-company-influence-races-won.{world}.{season}"),
+            Some(EntityKind::Company)
+        );
+        assert_eq!(
+            kind("top-group-expedition-score.Dungeon.1.{world}.{week}"),
+            Some(EntityKind::Group)
         );
     }
 

@@ -35,6 +35,11 @@ const MONTHS_MARCH_TO_DECEMBER: i64 = 10;
 const MARCH_SHIFT: u32 = 3;
 const JANUARY_SHIFT: u32 = 9;
 const SEPARATOR: char = '-';
+/// Between the date and the time of day in a date-time text (`2027-01-31T00:00:00`).
+const DATE_TIME_SEPARATOR: char = 'T';
+/// Between the hours, minutes and seconds of a time of day.
+const TIME_SEPARATOR: char = ':';
+const HOURS_PER_DAY: u64 = 24;
 
 /// Milliseconds since 1970-01-01 UTC; 0 for a clock before that.
 pub fn unix_ms() -> u64 {
@@ -141,6 +146,23 @@ impl CivilDate {
     pub fn month_number(self) -> i64 {
         self.year * i64::from(MONTHS_PER_YEAR) + i64::from(self.month)
     }
+}
+
+/// The Unix seconds of the UTC date-time text `year-month-dayThh:mm:ss`, as the client's season
+/// keys write it (`javelin.leaderboard-season-end-datetime` `2027-01-31T00:00:00`); `None` for
+/// other text or a time that the day does not have.
+pub fn unix_seconds_of_date_time(text: &str) -> Option<i64> {
+    let (date, time) = text.trim().split_once(DATE_TIME_SEPARATOR)?;
+    let date = CivilDate::parse(date)?;
+    let mut parts = time.splitn(3, TIME_SEPARATOR);
+    let hours: u64 = parts.next()?.parse().ok()?;
+    let minutes: u64 = parts.next()?.parse().ok()?;
+    let seconds: u64 = parts.next()?.parse().ok()?;
+    if hours >= HOURS_PER_DAY || minutes >= SECONDS_PER_MINUTE || seconds >= SECONDS_PER_MINUTE {
+        return None;
+    }
+    let seconds_of_day = hours * SECONDS_PER_HOUR + minutes * SECONDS_PER_MINUTE + seconds;
+    Some(date.to_days() * SECONDS_PER_DAY + i64::try_from(seconds_of_day).ok()?)
 }
 
 /// ISO 8601 UTC text with milliseconds, for example `2026-06-30T09:53:59.123Z`.
@@ -265,6 +287,30 @@ mod tests {
             day: 30,
         };
         assert_eq!(june_2026.month_number() - ROTATION_START.month_number(), 40);
+    }
+
+    /// 2027-01-31 00:00:00 UTC, the retail season end.
+    const SEASON_END_SECONDS: i64 = 1_801_353_600;
+
+    #[test]
+    fn date_times_parse_as_utc() {
+        assert_eq!(
+            unix_seconds_of_date_time("2027-01-31T00:00:00"),
+            Some(SEASON_END_SECONDS)
+        );
+        assert_eq!(
+            unix_seconds_of_date_time("2026-06-30T09:53:59"),
+            Some(i64::try_from(SAMPLE_MS / SECOND_MS).expect("seconds"))
+        );
+        for bad in [
+            "2026-06-30-T17:00:0",
+            "2027-01-31",
+            "2027-01-31T24:00:00",
+            "2027-01-31T00:60:00",
+            "2027-02-30T00:00:00",
+        ] {
+            assert_eq!(unix_seconds_of_date_time(bad), None, "{bad}");
+        }
     }
 
     #[test]

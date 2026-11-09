@@ -29,6 +29,10 @@ const DAYS_PER_WEEK: i64 = 7;
 const SECONDS_PER_HOUR: i64 = 3600;
 /// The first rotation's number: the client counts rotations from 1.
 const FIRST_ROTATION: i64 = 1;
+const SECONDS_PER_WEEK: i64 = DAYS_PER_WEEK * SECONDS_PER_DAY;
+const DECEMBER: u32 = 12;
+const JANUARY: u32 = 1;
+const FIRST_DAY: u32 = 1;
 
 /// How a stat's values join on its board (`Aggregation`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -192,14 +196,13 @@ impl RotationCalendar {
     /// The name of the rotation that holds `unix_seconds`: `w<week>`, `m<month>` or
     /// `s<season>`, counted from 1. `None` before the first rotation starts.
     pub fn name(&self, rotation: Rotation, unix_seconds: i64) -> Option<String> {
-        let start_seconds =
-            self.start.to_days() * SECONDS_PER_DAY + i64::from(self.reset_hour) * SECONDS_PER_HOUR;
+        let start_seconds = self.start_seconds();
         if unix_seconds < start_seconds {
             return None;
         }
         Some(match rotation {
             Rotation::Week => {
-                let week = (unix_seconds - start_seconds) / (DAYS_PER_WEEK * SECONDS_PER_DAY);
+                let week = (unix_seconds - start_seconds) / SECONDS_PER_WEEK;
                 format!("{WEEK_PREFIX}{}", week + FIRST_ROTATION)
             }
             Rotation::Month => {
@@ -209,6 +212,51 @@ impl RotationCalendar {
             }
             Rotation::Season => format!("{SEASON_PREFIX}{}", self.season),
         })
+    }
+
+    /// The Unix seconds when the rotation that holds `unix_seconds` ends: the next week start,
+    /// the first day of the next month (months change at 00:00 UTC, as [`Self::name`] counts
+    /// them), or `season_end` for a season. `None` before the first rotation starts, and for a
+    /// season without an end or past its end.
+    pub fn ends_at(
+        &self,
+        rotation: Rotation,
+        unix_seconds: i64,
+        season_end: Option<i64>,
+    ) -> Option<i64> {
+        let start_seconds = self.start_seconds();
+        if unix_seconds < start_seconds {
+            return None;
+        }
+        match rotation {
+            Rotation::Week => {
+                let week = (unix_seconds - start_seconds) / SECONDS_PER_WEEK;
+                Some(start_seconds + (week + 1) * SECONDS_PER_WEEK)
+            }
+            Rotation::Month => {
+                let now = CivilDate::of_unix_seconds(unix_seconds);
+                let next = if now.month == DECEMBER {
+                    CivilDate {
+                        year: now.year + 1,
+                        month: JANUARY,
+                        day: FIRST_DAY,
+                    }
+                } else {
+                    CivilDate {
+                        year: now.year,
+                        month: now.month + 1,
+                        day: FIRST_DAY,
+                    }
+                };
+                Some(next.to_days() * SECONDS_PER_DAY)
+            }
+            Rotation::Season => season_end.filter(|end| *end > unix_seconds),
+        }
+    }
+
+    /// The Unix seconds when the first week and month start.
+    fn start_seconds(&self) -> i64 {
+        self.start.to_days() * SECONDS_PER_DAY + i64::from(self.reset_hour) * SECONDS_PER_HOUR
     }
 }
 
@@ -422,6 +470,52 @@ mod tests {
             CALENDAR.name(Rotation::Season, CAPTURE_SECONDS).as_deref(),
             Some("s11")
         );
+    }
+
+    #[test]
+    fn rotations_end_at_the_next_start() {
+        /// 2026-07-07 02:00 UTC: w179 starts.
+        const NEXT_WEEK: i64 = 1_783_389_600;
+        /// 2026-07-01 00:00 UTC: m42 starts.
+        const NEXT_MONTH: i64 = 1_782_864_000;
+        /// 2027-01-01 00:00 UTC.
+        const NEW_YEAR: i64 = 1_798_761_600;
+        /// 2026-12-15 12:00 UTC.
+        const MID_DECEMBER: i64 = 1_797_336_000;
+        const SEASON_END: i64 = 1_801_353_600;
+        assert_eq!(
+            CALENDAR.ends_at(Rotation::Week, CAPTURE_SECONDS, None),
+            Some(NEXT_WEEK)
+        );
+        assert_eq!(
+            CALENDAR.name(Rotation::Week, NEXT_WEEK).as_deref(),
+            Some("w179")
+        );
+        assert_eq!(
+            CALENDAR.ends_at(Rotation::Month, CAPTURE_SECONDS, None),
+            Some(NEXT_MONTH)
+        );
+        assert_eq!(
+            CALENDAR.name(Rotation::Month, NEXT_MONTH).as_deref(),
+            Some("m42")
+        );
+        assert_eq!(
+            CALENDAR.ends_at(Rotation::Month, MID_DECEMBER, None),
+            Some(NEW_YEAR)
+        );
+        assert_eq!(
+            CALENDAR.ends_at(Rotation::Season, CAPTURE_SECONDS, Some(SEASON_END)),
+            Some(SEASON_END)
+        );
+        assert_eq!(
+            CALENDAR.ends_at(Rotation::Season, CAPTURE_SECONDS, None),
+            None
+        );
+        assert_eq!(
+            CALENDAR.ends_at(Rotation::Season, SEASON_END, Some(SEASON_END)),
+            None
+        );
+        assert_eq!(CALENDAR.ends_at(Rotation::Week, BEFORE_START, None), None);
     }
 
     #[test]

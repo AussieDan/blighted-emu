@@ -10,18 +10,17 @@ use std::time::Duration;
 
 use nw_common::logging::{LoggingError, init_logging};
 use nw_common::shutdown::stop_signal;
-use nw_common::time::unix_seconds;
+use nw_common::time::{unix_seconds, unix_seconds_of_date_time};
 use nw_content::leaderboard_table::{
     LeaderboardTable, LeaderboardTableError, leaderboard_table_path,
 };
-use nw_content::leaderboards::RotationCalendar;
 use nw_db::connect_lazy;
 use nw_login::install_crypto_provider;
 use reqwest::{Client, StatusCode};
 use tokio::time::MissedTickBehavior;
 use uuid::Uuid;
 
-use crate::boards::{BoardDatabases, read_snapshot};
+use crate::boards::{BoardClock, BoardDatabases, read_snapshot};
 use crate::config::{PartPages, ReporterConfig, ReporterConfigError, load_reporter_config};
 use crate::signing::{
     ReportSecret, SIGNATURE_HEADER, SecretTooShort, TIMESTAMP_HEADER, WORLD_HEADER,
@@ -56,6 +55,9 @@ pub enum RunError {
     /// The leaderboard table cannot be read (`content-tool leaderboards` writes it).
     #[error(transparent)]
     LeaderboardTable(#[from] LeaderboardTableError),
+    /// The client's gameplay values (the season end) cannot be read.
+    #[error(transparent)]
+    Gameplay(#[from] sim::gameplay::GameplayError),
     /// A database URL does not parse.
     #[error("database config")]
     Database(#[source] sqlx::Error),
@@ -192,8 +194,8 @@ pub struct BoardSource {
     pub databases: BoardDatabases,
     /// The boards.
     pub table: LeaderboardTable,
-    /// The rotations.
-    pub calendar: RotationCalendar,
+    /// The rotations and the season end.
+    pub clock: BoardClock,
     /// The world.
     pub world_id: Uuid,
 }
@@ -208,7 +210,7 @@ pub async fn leaderboards_loop(sender: Sender, source: BoardSource, period: Dura
         let snapshot = match read_snapshot(
             &source.databases,
             &source.table,
-            &source.calendar,
+            &source.clock,
             source.world_id,
             unix_seconds(),
         )
@@ -261,6 +263,18 @@ fn prepare(config: ReporterConfig) -> Result<Ready, RunError> {
         .leaderboards
         .calendar()
         .map_err(ReporterConfigError::from)?;
+    let gameplay = sim::gameplay::load_gameplay(&config.edge_config, config.world_id)?;
+    let season_end = gameplay
+        .seasons
+        .leaderboard_season_end
+        .as_deref()
+        .and_then(|text| {
+            let end = unix_seconds_of_date_time(text);
+            if end.is_none() {
+                tracing::warn!(%text, "the season end is no date-time; boards get no season reset");
+            }
+            end
+        });
     let http = http_client(config.request_timeout()).map_err(RunError::Http)?;
     let databases = BoardDatabases {
         global: connect_lazy(
@@ -288,7 +302,10 @@ fn prepare(config: ReporterConfig) -> Result<Ready, RunError> {
         source: BoardSource {
             databases,
             table,
-            calendar,
+            clock: BoardClock {
+                calendar,
+                season_end,
+            },
             world_id: config.world_id,
         },
         status_period: Duration::from_secs(config.status_interval_s),

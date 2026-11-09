@@ -17,8 +17,8 @@ world_id = "8d0f4c2e-0000-4000-8000-000000000001"
 site_url = "https://example.org"
 secret_env = "NW_SECRET_STATUS_REPORT_SECRET"
 world_database_password_env = "NW_SECRET_WORLD_1_DATABASE_PASSWORD"
-# Seconds between two status reports: 1 to 15. The website shows "No signal" after 45 s
-# without a report.
+# Seconds between two status reports: 3 to 15. The website takes at most 20 a minute and shows
+# "No signal" after 45 s without a report.
 status_interval_s = 15
 # Seconds between two leaderboard reports: at least 15 (the website takes 4 a minute).
 leaderboards_interval_s = 300
@@ -29,6 +29,9 @@ log_filter = "info"
 
 # The pinned client build: it names the leaderboard table.
 client_build_config = "config/client-build.toml"
+# The edge-http config of this world: its remote config sets give the season end
+# (javelin.leaderboard-season-end-datetime), the time the season boards reset.
+edge_config = "config/edge.toml"
 # Folder of the leaderboard table leaderboards-<build>.json. Make it with
 # `content-tool leaderboards` (from the content bundle in the same folder).
 content_dir = "local-data/content"

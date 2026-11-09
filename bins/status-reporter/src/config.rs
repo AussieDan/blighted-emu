@@ -14,6 +14,8 @@ use uuid::Uuid;
 pub const REPORTER_ENV_PREFIX: &str = "NW_REPORTER_";
 /// The website reads a report every 15 s and shows "No signal" after 45 s without one.
 pub const MAX_STATUS_INTERVAL_S: u64 = 15;
+/// The website takes at most 20 status reports a minute.
+pub const MIN_STATUS_INTERVAL_S: u64 = 3;
 /// The website takes at most 4 leaderboard reports a minute.
 pub const MIN_LEADERBOARDS_INTERVAL_S: u64 = 15;
 const HTTP_SCHEME: &str = "http://";
@@ -43,6 +45,9 @@ pub struct ReporterConfig {
     pub parts: PartPages,
     /// The pinned client build file: it names the leaderboard table.
     pub client_build_config: PathBuf,
+    /// The `edge-http` config of the world: its remote config sets give the season end
+    /// (`javelin.leaderboard-season-end-datetime`), as the client gets it.
+    pub edge_config: PathBuf,
     /// Folder of the leaderboard table (`leaderboards-<build>.json` of
     /// `content-tool leaderboards`).
     pub content_dir: PathBuf,
@@ -131,8 +136,8 @@ impl ReporterConfig {
                 return invalid(key, "must start with NW_SECRET_");
             }
         }
-        if !(1..=MAX_STATUS_INTERVAL_S).contains(&self.status_interval_s) {
-            return invalid("status_interval_s", "must be 1 to 15");
+        if !(MIN_STATUS_INTERVAL_S..=MAX_STATUS_INTERVAL_S).contains(&self.status_interval_s) {
+            return invalid("status_interval_s", "must be 3 to 15");
         }
         if self.leaderboards_interval_s < MIN_LEADERBOARDS_INTERVAL_S {
             return invalid("leaderboards_interval_s", "must be at least 15");
@@ -229,6 +234,11 @@ mod tests {
             config.global_database.password_env = "PASSWORD".to_owned();
         }));
         assert!(refused(|config| config.status_interval_s = 0));
+        assert!(refused(|config| config.status_interval_s = 2));
+        assert!(!refused(|config| {
+            config.status_interval_s = MIN_STATUS_INTERVAL_S;
+            config.request_timeout_ms = 2_000;
+        }));
         assert!(refused(|config| config.status_interval_s = 16));
         assert!(refused(|config| config.leaderboards_interval_s = 14));
         assert!(refused(|config| config.request_timeout_ms = 0));

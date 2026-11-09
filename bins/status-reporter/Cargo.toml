@@ -17,6 +17,8 @@ nw-content.workspace = true
 nw-db.workspace = true
 nw-login.workspace = true
 reqwest.workspace = true
+# The client's gameplay values (the season end), read as the sim reads them.
+sim.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -31,7 +33,6 @@ axum.workspace = true
 nw-content = { workspace = true, features = ["test-util"] }
 # The metric names the reporter reads, checked against the servers that write them.
 rep-gateway.workspace = true
-sim.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["net"] }
 toml.workspace = true
