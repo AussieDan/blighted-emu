@@ -7,10 +7,10 @@ use std::time::Duration;
 use nw_protocol::launcher_api::{
     DISCORD_AUTHORIZE_URL, DISCORD_POLL_PATH, DISCORD_START_PATH, DiscordPoll, DiscordPollReply,
     DiscordStart, ErrorBody, INFO_PATH, LOGIN_PATH, LOGOUT_PATH, LauncherInfo, LauncherSession,
-    PLAY_PATH, PasswordCredentials, PlayReply, REGISTER_PATH,
+    NEWS_SOURCE_PATH, NewsSource, PLAY_PATH, PasswordCredentials, PlayReply, REGISTER_PATH,
 };
-use reqwest::Url;
 use reqwest::blocking::{Client, RequestBuilder};
+use reqwest::{StatusCode, Url};
 use serde::de::DeserializeOwned;
 
 use crate::server::{api_host, api_host_name, api_port};
@@ -98,6 +98,22 @@ impl LauncherApi {
         self.call(self.client.get(self.url(INFO_PATH)))
     }
 
+    /// The server's news feed address, asked within `time_limit`. `None` when the server has no
+    /// news: it names no feed, or it is an older server without the news path (`404`).
+    pub fn news_source(&self, time_limit: Duration) -> Result<Option<String>, ApiError> {
+        let response = self
+            .client
+            .get(self.url(NEWS_SOURCE_PATH))
+            .timeout(time_limit)
+            .send()
+            .map_err(ApiError::Unreachable)?;
+        if response.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        let source: NewsSource = check_status(response)?.json().map_err(ApiError::BadReply)?;
+        Ok(source.news_url)
+    }
+
     /// Makes a password account and logs in.
     pub fn register(&self, credentials: &PasswordCredentials) -> Result<LauncherSession, ApiError> {
         self.call(self.client.post(self.url(REGISTER_PATH)).json(credentials))
@@ -168,8 +184,6 @@ fn check_status(
 
 #[cfg(test)]
 mod tests {
-    use std::net::SocketAddr;
-
     use axum::http::{HeaderMap, StatusCode};
     use axum::response::Redirect;
     use axum::routing::{get, post};
@@ -178,6 +192,7 @@ mod tests {
     use nw_protocol::launcher_api::{AuthMode, DISCORD_AUTHORIZE_URL};
 
     use super::*;
+    use crate::test_server::serve;
 
     const TOKEN: &str = "launcher-token";
     const KEY: &str = "game-session-key";
@@ -204,25 +219,6 @@ mod tests {
                 ping_port: CLIENT_PING_PORT,
             },
         })
-    }
-
-    /// Serves `app` on a free port in its own thread and returns its base URL.
-    fn serve(app: Router) -> String {
-        let (sender, receiver) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let runtime = tokio::runtime::Runtime::new().expect("runtime");
-            runtime.block_on(async move {
-                let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
-                    .await
-                    .expect("bind");
-                sender
-                    .send(listener.local_addr().expect("address"))
-                    .expect("send");
-                axum::serve(listener, app).await.expect("serve");
-            });
-        });
-        let address = receiver.recv().expect("address");
-        format!("http://{address}")
     }
 
     /// A fake launcher API; returns its base URL.
@@ -274,6 +270,33 @@ mod tests {
             }
             other => panic!("expected a server error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_news_source_is_read_and_an_older_server_has_none() {
+        crate::install_crypto_provider();
+        const FEED: &str = "https://example.org/api/news?target=launcher";
+        let with_feed = serve(Router::new().route(
+            NEWS_SOURCE_PATH,
+            get(|| async {
+                Json(NewsSource {
+                    news_url: Some(FEED.to_owned()),
+                })
+            }),
+        ));
+        let api = LauncherApi::new(with_feed).expect("client");
+        assert_eq!(
+            api.news_source(CALL_TIMEOUT).expect("source").as_deref(),
+            Some(FEED)
+        );
+        let without_feed = serve(Router::new().route(
+            NEWS_SOURCE_PATH,
+            get(|| async { Json(NewsSource { news_url: None }) }),
+        ));
+        let api = LauncherApi::new(without_feed).expect("client");
+        assert_eq!(api.news_source(CALL_TIMEOUT).expect("source"), None);
+        let older = LauncherApi::new(fake_server()).expect("client");
+        assert_eq!(older.news_source(CALL_TIMEOUT).expect("source"), None);
     }
 
     #[test]

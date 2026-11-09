@@ -8,7 +8,9 @@ license = "GPL-3.0-or-later"
 publish.workspace = true
 
 [dependencies]
+chrono.workspace = true
 eframe.workspace = true
+image.workspace = true
 nw-protocol.workspace = true
 open.workspace = true
 reqwest = { workspace = true, features = ["blocking"] }

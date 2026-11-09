@@ -12,9 +12,10 @@ use launcher::theme;
 
 /// Window title.
 const APP_NAME: &str = "Blighted New World launcher";
-/// Window size at start, and the smallest size.
-const WINDOW_SIZE: [f32; 2] = [560.0, 760.0];
-const MIN_WINDOW_SIZE: [f32; 2] = [400.0, 480.0];
+/// Window size at start (wide enough for the play column beside the news), and the smallest
+/// size (one column).
+const WINDOW_SIZE: [f32; 2] = [1080.0, 720.0];
+const MIN_WINDOW_SIZE: [f32; 2] = [420.0, 520.0];
 
 fn main() -> ExitCode {
     install_crypto_provider();

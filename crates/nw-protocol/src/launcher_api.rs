@@ -16,6 +16,9 @@ pub const LOGIN_PATH: &str = "/launcher/login";
 pub const PLAY_PATH: &str = "/launcher/play";
 /// `POST` end the launcher session.
 pub const LOGOUT_PATH: &str = "/launcher/logout";
+/// `GET` where the launcher reads the server's news ([`NewsSource`]). Old servers answer `404`:
+/// then there is no news.
+pub const NEWS_SOURCE_PATH: &str = "/launcher/news-source";
 /// `POST` start a Discord login.
 pub const DISCORD_START_PATH: &str = "/launcher/discord/start";
 /// `POST` ask whether a Discord login finished.
@@ -129,6 +132,15 @@ pub enum DiscordPollReply {
     Ready(LauncherSession),
 }
 
+/// Reply of `GET /launcher/news-source`: the site feed the launcher reads its news from. It is a
+/// path of its own, so [`LauncherInfo`] stays the same for older launchers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NewsSource {
+    /// The feed (`https://<site>/api/news?target=launcher`); `None` when the server has no site.
+    pub news_url: Option<String>,
+}
+
 /// Error body of every `edge-http` route that has no client-defined error shape.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -170,6 +182,16 @@ mod tests {
         assert!(is_forbidden_host("client.amazongames.com"));
         assert!(!is_forbidden_host("notcloudfront.net"));
         assert!(!is_forbidden_host("example.org"));
+    }
+
+    #[test]
+    fn news_source_has_the_documented_keys() {
+        let source = NewsSource {
+            news_url: Some("https://example.org/api/news?target=launcher".to_owned()),
+        };
+        assert_eq!(keys(&json(&source)), ["news_url"]);
+        let none: NewsSource = serde_json::from_str(r#"{"news_url":null}"#).expect("none");
+        assert_eq!(none.news_url, None);
     }
 
     #[test]

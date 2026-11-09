@@ -1,16 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The launcher window (M2 spec section 6), the same on Windows and Linux. Network calls run on a
-//! worker thread; the window reads their results each frame. The window shows one status line (a
-//! state bar, a state word and a detail line), then the server (the saved servers, the address
-//! field and the connected server), account, options and settings sections divided by rules.
+//! The launcher window (M2 spec section 6), the same on Windows and Linux, in the look and flow
+//! of the project website. Network calls run on worker threads; the window reads their results
+//! each frame. A top bar holds the wordmark and the page links (Home, Options, Settings). Home
+//! shows the server and the way to play first: the server name, its state line (a state dot, a
+//! word and a detail), its facts, Play or the login, then the saved servers; the server news
+//! ([`crate::news_view`]) sits beside it in a wide window and below it in a narrow one.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
 use eframe::egui::{
-    self, Align, Color32, CornerRadius, Layout, RichText, Sense, StrokeKind, TextStyle, UiBuilder,
-    vec2,
+    self, Align, Color32, CornerRadius, Layout, Margin, Rect, RichText, Sense, Stroke, StrokeKind,
+    TextStyle, UiBuilder, pos2, vec2,
 };
 use nw_protocol::launcher_api::{AuthMode, DiscordPollReply, LauncherInfo, PasswordCredentials};
 
@@ -26,13 +28,16 @@ use crate::game::{checked_direct_launch, start_game};
 use crate::game::{checked_windows_launch, start_game_windows};
 #[cfg(not(windows))]
 use crate::mirror::{NETWORK_DIR, write_network_files};
+use crate::news_view::NewsPanel;
 #[cfg(any(windows, test))]
 use crate::options::LaunchOptions;
 use crate::options::{DEFAULT_PREFIX_DIR, ProtonSwitch};
 use crate::server::api_base_url;
 use crate::settings::{ServerProfile, Settings, same_server};
 use crate::steam::{self, Found};
-use crate::theme::{self, LABEL_STYLE, LINE_WIDTH, Palette, TITLE_STYLE, ThemeChoice, mix};
+use crate::theme::{
+    self, CORNER, LABEL_STYLE, LINE_WIDTH, Palette, TITLE_STYLE, ThemeChoice, WORDMARK_STYLE,
+};
 
 /// Time between Discord login polls.
 pub const DISCORD_POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -43,30 +48,70 @@ const BUSY_REPAINT: Duration = Duration::from_millis(100);
 /// Error code of an expired launcher session.
 const NO_SESSION_CODE: &str = "no_session";
 
-/// Time the state bar takes to grow after a change.
-pub const BAR_GROWTH: Duration = Duration::from_millis(480);
-/// Height of the state bar, of a section rule, and of the play button.
-const BAR_HEIGHT: f32 = 3.0;
-const RULE_HEIGHT: f32 = 2.0;
-const PLAY_HEIGHT: f32 = 40.0;
-/// Outer margin of the window content, and space around a section.
+/// The wordmark in the top bar.
+const WORDMARK: &str = "Blighted New World";
+/// Space left and right of the top bar and the page, and above and below the top bar text.
 const WINDOW_MARGIN: i8 = 24;
-const SECTION_GAP: f32 = 16.0;
-/// Extra letter spacing of label type and of the state word.
-const LABEL_TRACKING: f32 = 0.9;
-/// Width of the fact label column, and of the server field.
-const FACT_LABEL_WIDTH: f32 = 96.0;
-const CONNECT_BUTTON_WIDTH: f32 = 88.0;
-/// Width of the remove button of the saved server.
-const REMOVE_BUTTON_WIDTH: f32 = 88.0;
-/// Space inside a saved server row, left and right of its text.
-const ROW_PADDING: f32 = 10.0;
+const TOP_BAR_PADDING: i8 = 14;
+/// Space between the page links of the top bar.
+const NAV_GAP: f32 = 26.0;
+/// A window at least this wide shows Home in two columns: the play column at its width, the
+/// gap, then the news.
+pub const TWO_COLUMN_MIN_WIDTH: f32 = 760.0;
+const PLAY_COLUMN_WIDTH: f32 = 360.0;
+const COLUMN_GAP: f32 = 40.0;
+/// Widest text column of the Options and Settings pages.
+const PAGE_MAX_WIDTH: f32 = 640.0;
+/// Scroll ids of the Home columns.
+const PLAY_SCROLL: &str = "play column";
+const NEWS_SCROLL: &str = "news column";
+/// Height of the play button.
+const PLAY_HEIGHT: f32 = 44.0;
+/// Space between sections, and between a fact label and its value.
+const SECTION_GAP: f32 = 22.0;
+const FACT_GAP: f32 = 18.0;
+/// Width of the fact label column.
+const FACT_LABEL_WIDTH: f32 = 72.0;
+/// Width of the connect and remove buttons, and of the theme choices.
+const CONNECT_BUTTON_WIDTH: f32 = 96.0;
+/// Space inside a picker row, left and right of its text.
+const ROW_PADDING: f32 = 12.0;
 /// Width of the state word after a path field.
 const PATH_STATE_WIDTH: f32 = 64.0;
+/// Radius of the state dot, and the ring width of the idle dot (the website's "no signal").
+const DOT_RADIUS: f32 = 5.0;
+const IDLE_RING_WIDTH: f32 = 2.0;
 /// Rows of the extra environment field.
 const ENVIRONMENT_ROWS: usize = 3;
+/// The Home heading when no server is connected.
+const NO_SERVER_HEADING: &str = "No server";
 /// Whether the Proton options apply: the game runs under Proton on every system but Windows.
 const USES_PROTON: bool = cfg!(not(windows));
+
+/// A page of the window, picked in the top bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Page {
+    /// Server, login, play and news.
+    Home,
+    /// How the game starts.
+    Options,
+    /// Theme and the settings file.
+    Settings,
+}
+
+impl Page {
+    /// The pages in top bar order.
+    pub const ALL: [Self; 3] = [Self::Home, Self::Options, Self::Settings];
+
+    /// The link text, and the heading of the page.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Home => "Home",
+            Self::Options => "Options",
+            Self::Settings => "Settings",
+        }
+    }
+}
 
 /// Kind of a state, which picks its colour.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,18 +129,10 @@ pub enum Tone {
 impl Tone {
     fn color(self, palette: &Palette) -> Color32 {
         match self {
-            Self::Idle => palette.mute,
+            Self::Idle => palette.ink_2,
             Self::Busy => palette.warn,
-            Self::Ready => palette.ready,
-            Self::Fault => palette.alert,
-        }
-    }
-
-    fn bar_color(self, palette: &Palette) -> Color32 {
-        match self {
-            Self::Idle => palette.line,
-            Self::Busy => theme::SIGNAL_YELLOW,
-            other => other.color(palette),
+            Self::Ready => palette.good,
+            Self::Fault => palette.bad,
         }
     }
 }
@@ -103,9 +140,9 @@ impl Tone {
 /// The status line: a state word and a detail line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Status {
-    /// Colour of the bar and the word.
+    /// Colour of the dot.
     pub tone: Tone,
-    /// The state word, lower case; the window shows it in capitals.
+    /// The state word, lower case; the window starts it with a capital.
     pub word: &'static str,
     /// What happened, in one sentence.
     pub detail: String,
@@ -186,8 +223,9 @@ pub struct LauncherApp {
     password: String,
     connection: Option<(LauncherApi, LauncherInfo)>,
     status: Status,
-    status_since: Instant,
     job: Option<Receiver<Event>>,
+    page: Page,
+    news: NewsPanel,
     /// What the last scan of this PC found, for the Proton pick list.
     found: Found,
     /// The loopback proxy that carries the game's AWS calls to the server. It must outlive the
@@ -259,13 +297,6 @@ fn wait_for_discord(api: &LauncherApi, state: &str) -> Event {
     Event::Failed("Discord login timed out".to_owned())
 }
 
-/// The share of the state bar drawn `elapsed` after a change: a cubic ease-out over
-/// [`BAR_GROWTH`], then the full bar.
-pub fn bar_progress(elapsed: Duration) -> f32 {
-    let linear = (elapsed.as_secs_f32() / BAR_GROWTH.as_secs_f32()).min(1.0);
-    1.0 - (1.0 - linear).powi(3)
-}
-
 /// The name of a login mode.
 pub fn auth_mode_name(mode: AuthMode) -> &'static str {
     match mode {
@@ -274,55 +305,107 @@ pub fn auth_mode_name(mode: AuthMode) -> &'static str {
     }
 }
 
-/// Label type: condensed capitals in the mute colour.
-fn label_text(text: &str, color: Color32) -> RichText {
-    RichText::new(text.to_uppercase())
-        .text_style(TextStyle::Name(LABEL_STYLE.into()))
-        .extra_letter_spacing(LABEL_TRACKING)
-        .color(color)
+/// The state word with a capital first letter.
+fn capitalized(word: &str) -> String {
+    let mut characters = word.chars();
+    characters
+        .next()
+        .map(|first| first.to_uppercase().chain(characters).collect())
+        .unwrap_or_default()
 }
 
-/// A full-width filled rule of `height`.
+/// A field label: the label style in ink, above its field.
+fn field_label(ui: &mut egui::Ui, palette: &Palette, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .text_style(TextStyle::Name(LABEL_STYLE.into()))
+            .color(palette.ink),
+    );
+}
+
+/// A one-line text field with its text in the middle of the control height.
+fn text_field(value: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(value).vertical_align(Align::Center)
+}
+
+/// A section heading in the title style.
+fn title(ui: &mut egui::Ui, palette: &Palette, text: &str) {
+    ui.label(
+        RichText::new(text)
+            .text_style(TextStyle::Name(TITLE_STYLE.into()))
+            .color(palette.ink),
+    );
+}
+
+/// A full-width filled line of `height`.
 fn rule(ui: &mut egui::Ui, height: f32, color: Color32) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     ui.painter().rect_filled(rect, 0.0, color);
 }
 
-/// A section: space, its head in label type, the content, then a 1px line.
-fn section(ui: &mut egui::Ui, palette: &Palette, head: &str, content: impl FnOnce(&mut egui::Ui)) {
+/// A rule with space above and below, between the parts of a page.
+fn divider(ui: &mut egui::Ui, palette: &Palette) {
     ui.add_space(SECTION_GAP);
-    ui.label(label_text(head, palette.mute));
-    content(ui);
+    rule(ui, LINE_WIDTH, palette.rule);
     ui.add_space(SECTION_GAP);
-    rule(ui, LINE_WIDTH, palette.line);
 }
 
-/// One fact row: a label column, then the value.
+/// One fact row: the label column in the secondary ink, then the value.
 fn fact(ui: &mut egui::Ui, palette: &Palette, label: &str, value: RichText) {
     ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = FACT_GAP;
         ui.add_sized(
-            vec2(FACT_LABEL_WIDTH, ui.spacing().interact_size.y),
-            egui::Label::new(label_text(label, palette.mute)),
+            vec2(FACT_LABEL_WIDTH, ui.text_style_height(&TextStyle::Body)),
+            egui::Label::new(RichText::new(label).color(palette.ink_2)),
         );
         ui.label(value);
     });
 }
 
-/// A button filled with the accent colour, for the main action of a section.
+/// The state dot of `tone`: filled, or a ring when idle.
+fn state_dot(ui: &mut egui::Ui, palette: &Palette, tone: Tone) {
+    let side = DOT_RADIUS * 2.0;
+    let (rect, _) = ui.allocate_exact_size(vec2(side, side), Sense::hover());
+    let color = tone.color(palette);
+    if tone == Tone::Idle {
+        ui.painter().circle_stroke(
+            rect.center(),
+            DOT_RADIUS - IDLE_RING_WIDTH / 2.0,
+            Stroke::new(IDLE_RING_WIDTH, color),
+        );
+    } else {
+        ui.painter().circle_filled(rect.center(), DOT_RADIUS, color);
+    }
+}
+
+/// The state line: the dot and the word, then the detail in the secondary ink.
+fn status_line(ui: &mut egui::Ui, palette: &Palette, status: &Status) {
+    ui.horizontal(|ui| {
+        state_dot(ui, palette, status.tone);
+        ui.label(RichText::new(capitalized(status.word)).color(palette.ink));
+    });
+    ui.label(RichText::new(&status.detail).color(palette.ink_2));
+}
+
+/// A button filled with violet, for the one main action of a page.
 fn primary_button(ui: &mut egui::Ui, palette: &Palette, text: &str, size: egui::Vec2) -> bool {
     ui.scope(|ui| {
         let widgets = &mut ui.visuals_mut().widgets;
-        widgets.inactive.weak_bg_fill = palette.accent;
-        widgets.hovered.weak_bg_fill = mix(palette.accent, palette.ground, theme::HOVER_MIX);
-        for state in [&mut widgets.inactive, &mut widgets.hovered] {
-            state.fg_stroke.color = palette.ground;
+        for (state, fill) in [
+            (&mut widgets.inactive, palette.violet),
+            (&mut widgets.hovered, palette.violet_hover),
+            (&mut widgets.active, palette.violet_hover),
+        ] {
+            state.weak_bg_fill = fill;
+            state.bg_stroke = Stroke::new(LINE_WIDTH, fill);
+            state.fg_stroke.color = palette.on_violet;
         }
         ui.add_sized(size, egui::Button::new(text)).clicked()
     })
     .inner
 }
 
-/// A path option row: the label column, the field, then its state word. True when the field lost
+/// A path option: its label above, then the field and its state word. True when the field lost
 /// focus, so the options are saved.
 fn path_row(
     ui: &mut egui::Ui,
@@ -332,26 +415,79 @@ fn path_row(
     hint: &str,
     check: PathCheck,
 ) -> bool {
+    field_label(ui, palette, label);
     ui.horizontal(|ui| {
-        ui.add_sized(
-            vec2(FACT_LABEL_WIDTH, ui.spacing().interact_size.y),
-            egui::Label::new(label_text(label, palette.mute)),
-        );
         let field_width = ui.available_width() - PATH_STATE_WIDTH - ui.spacing().item_spacing.x;
         let field = ui.add_sized(
             vec2(field_width, ui.spacing().interact_size.y),
-            egui::TextEdit::singleline(value).hint_text(hint),
+            text_field(value).hint_text(hint),
         );
         let (tone, word) = path_state(value, check);
-        ui.label(label_text(word, tone.color(palette)));
+        ui.label(
+            RichText::new(word)
+                .text_style(TextStyle::Name(LABEL_STYLE.into()))
+                .color(tone.color(palette)),
+        );
         field.lost_focus()
     })
     .inner
 }
 
-/// One saved server row, as wide as the section: its name, then its address at the right end;
-/// the selected row is raised and outlined, a hovered row is quiet-filled. True when the player
-/// picked it (a click, or Enter or Space with the focus on it).
+/// The fill and outline of a picker choice (the website's picker links): the selected one is
+/// raised and outlined in violet, a hovered one is outlined in violet, the others in vein; the
+/// focused one gets the focus outline. Returns the text colour.
+fn paint_picker(
+    ui: &egui::Ui,
+    palette: &Palette,
+    rect: Rect,
+    response: &egui::Response,
+    selected: bool,
+) -> Color32 {
+    let corner = CornerRadius::same(CORNER);
+    if selected {
+        ui.painter().rect_filled(rect, corner, palette.stone_hi);
+    }
+    let outline = if response.has_focus() {
+        ui.visuals().selection.stroke
+    } else if selected || response.hovered() {
+        Stroke::new(LINE_WIDTH, palette.violet)
+    } else {
+        Stroke::new(LINE_WIDTH, palette.vein)
+    };
+    ui.painter()
+        .rect_stroke(rect, corner, outline, StrokeKind::Inside);
+    if selected || response.hovered() {
+        palette.ink
+    } else {
+        palette.ink_2
+    }
+}
+
+/// A picker choice of `size` with one text; true when picked.
+fn picker_button(
+    ui: &mut egui::Ui,
+    palette: &Palette,
+    text: &str,
+    size: egui::Vec2,
+    selected: bool,
+) -> bool {
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let enabled = ui.is_enabled();
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::SelectableLabel, enabled, selected, text)
+    });
+    let color = paint_picker(ui, palette, rect, &response, selected);
+    let galley =
+        ui.painter()
+            .layout_no_wrap(text.to_owned(), TextStyle::Body.resolve(ui.style()), color);
+    ui.painter()
+        .galley(rect.center() - galley.size() / 2.0, galley, color);
+    response.clicked()
+}
+
+/// One saved server row, as wide as the column: its name, then its address at the right end, in
+/// the picker look. True when the player picked it (a click, or Enter or Space with the focus on
+/// it).
 fn profile_row(
     ui: &mut egui::Ui,
     palette: &Palette,
@@ -369,24 +505,7 @@ fn profile_row(
             &profile.name,
         )
     });
-    let fill = if selected {
-        palette.raised
-    } else if response.hovered() {
-        palette.surface
-    } else {
-        Color32::TRANSPARENT
-    };
-    let outline = if response.has_focus() {
-        ui.visuals().selection.stroke
-    } else if selected {
-        egui::Stroke::new(LINE_WIDTH, palette.accent)
-    } else {
-        egui::Stroke::NONE
-    };
-    let corner = CornerRadius::same(theme::CONTROL_CORNER);
-    ui.painter().rect_filled(rect, corner, fill);
-    ui.painter()
-        .rect_stroke(rect, corner, outline, StrokeKind::Inside);
+    let color = paint_picker(ui, palette, rect, &response, selected);
     let mut row = ui.new_child(
         UiBuilder::new()
             .max_rect(rect.shrink2(vec2(ROW_PADDING, 0.0)))
@@ -396,18 +515,55 @@ fn profile_row(
         egui::Label::new(
             RichText::new(&profile.server)
                 .monospace()
-                .color(palette.mute),
+                .color(palette.ink_2),
         )
         .selectable(false),
     );
     row.with_layout(Layout::left_to_right(Align::Center), |row| {
         row.add(
-            egui::Label::new(RichText::new(&profile.name).color(palette.ink))
+            egui::Label::new(RichText::new(&profile.name).color(color))
                 .selectable(false)
                 .truncate(),
         );
     });
     response.clicked()
+}
+
+/// A page link of the top bar: ink when current, hovered or focused, else the secondary ink.
+fn nav_link(ui: &mut egui::Ui, palette: &Palette, page: Page, current: bool) -> bool {
+    let font = TextStyle::Body.resolve(ui.style());
+    let size = ui
+        .painter()
+        .layout_no_wrap(page.label().to_owned(), font.clone(), palette.ink)
+        .size();
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    let enabled = ui.is_enabled();
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::WidgetType::Link, enabled, current, page.label())
+    });
+    let color = if current || response.hovered() || response.has_focus() {
+        palette.ink
+    } else {
+        palette.ink_2
+    };
+    let galley = ui
+        .painter()
+        .layout_no_wrap(page.label().to_owned(), font, color);
+    ui.painter().galley(rect.min, galley, color);
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            rect.expand(DOT_RADIUS),
+            CornerRadius::same(CORNER),
+            ui.visuals().selection.stroke,
+            StrokeKind::Outside,
+        );
+    }
+    response.clicked()
+}
+
+/// The folder of a file path.
+fn folder_of(path: &Path) -> PathBuf {
+    path.parent().map(Path::to_path_buf).unwrap_or_default()
 }
 
 /// Whether Enter was pressed in the field of `response`.
@@ -419,6 +575,7 @@ impl LauncherApp {
     /// The window state from saved settings; connects at once when a server is saved.
     pub fn new(settings_path: PathBuf, settings: Settings, found: Found) -> Self {
         let selected = settings.selected_profile();
+        let settings_dir = folder_of(&settings_path);
         let mut app = Self {
             server_input: selected
                 .map(|profile| profile.server.clone())
@@ -432,8 +589,9 @@ impl LauncherApp {
             password: String::new(),
             connection: None,
             status: Status::not_connected(),
-            status_since: Instant::now(),
             job: None,
+            page: Page::Home,
+            news: NewsPanel::open(settings_dir),
             found,
             proxy: None,
         };
@@ -449,10 +607,7 @@ impl LauncherApp {
     }
 
     fn set_status(&mut self, status: Status) {
-        if status != self.status {
-            self.status = status;
-            self.status_since = Instant::now();
-        }
+        self.status = status;
     }
 
     fn save(&mut self) {
@@ -461,12 +616,9 @@ impl LauncherApp {
         }
     }
 
-    /// The folder of the settings file, which also holds the default prefix.
+    /// The folder of the settings file, which also holds the default prefix and the news cache.
     fn settings_dir(&self) -> PathBuf {
-        self.settings_path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default()
+        folder_of(&self.settings_path)
     }
 
     fn connect(&mut self) {
@@ -666,6 +818,7 @@ impl LauncherApp {
                     .selected_profile()
                     .map(|profile| profile.name.clone())
                     .unwrap_or_default();
+                self.news.connected(&api);
                 self.connection = Some((api, info));
                 self.save();
             }
@@ -718,144 +871,134 @@ impl LauncherApp {
         }
     }
 
-    /// The masthead and the status line: the state bar, the state word and the detail.
-    fn draw_status(&self, ui: &mut egui::Ui, palette: &Palette) {
-        ui.label(
-            RichText::new("Blighted New World")
-                .heading()
-                .color(palette.ink),
-        );
+    /// The page heading and the state line.
+    fn draw_heading(&self, ui: &mut egui::Ui, palette: &Palette, heading: &str) {
+        ui.label(RichText::new(heading).heading().color(palette.ink));
+        status_line(ui, palette, &self.status);
         ui.add_space(SECTION_GAP);
-        let progress = bar_progress(self.status_since.elapsed());
-        if progress < 1.0 {
-            ui.ctx().request_repaint();
-        }
-        let (track, _) =
-            ui.allocate_exact_size(vec2(ui.available_width(), BAR_HEIGHT), Sense::hover());
-        let mut bar = track;
-        bar.set_width(track.width() * progress);
-        ui.painter()
-            .rect_filled(bar, 0.0, self.status.tone.bar_color(palette));
-        ui.label(
-            RichText::new(self.status.word.to_uppercase())
-                .text_style(TextStyle::Name(TITLE_STYLE.into()))
-                .extra_letter_spacing(LABEL_TRACKING)
-                .color(self.status.tone.color(palette)),
-        );
-        ui.label(RichText::new(&self.status.detail).color(palette.mute));
-        ui.add_space(SECTION_GAP);
-        rule(ui, RULE_HEIGHT, palette.ink);
     }
 
-    fn draw_server(&mut self, ui: &mut egui::Ui, palette: &Palette) {
-        section(ui, palette, "Server", |ui| {
-            let mut picked = None;
-            for profile in &self.settings.profiles {
-                let selected = self
-                    .settings
-                    .selected
-                    .as_deref()
-                    .is_some_and(|server| same_server(server, &profile.server));
-                if profile_row(ui, palette, profile, selected) {
-                    picked = Some(profile.server.clone());
-                }
+    /// The connected server's facts.
+    fn draw_facts(ui: &mut egui::Ui, palette: &Palette, api: &LauncherApi, info: &LauncherInfo) {
+        fact(
+            ui,
+            palette,
+            "Address",
+            RichText::new(api.host()).monospace().color(palette.ink),
+        );
+        fact(
+            ui,
+            palette,
+            "Login",
+            RichText::new(auth_mode_name(info.auth_mode)).color(palette.ink),
+        );
+        if info.auth_mode == AuthMode::Password {
+            let sign_up = if info.allow_registration {
+                "Open"
+            } else {
+                "Closed"
+            };
+            fact(
+                ui,
+                palette,
+                "Sign-up",
+                RichText::new(sign_up).color(palette.ink),
+            );
+        }
+        ui.add_space(SECTION_GAP);
+    }
+
+    /// The play column of Home: the server name and state, its facts, play or login, then the
+    /// saved servers. Disabled while a call runs.
+    fn draw_play_column(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        let heading = self
+            .connection
+            .as_ref()
+            .map_or(NO_SERVER_HEADING, |(_, info)| info.server_name.as_str())
+            .to_owned();
+        self.draw_heading(ui, palette, &heading);
+        let busy = self.job.is_some();
+        ui.add_enabled_ui(!busy, |ui| {
+            if let Some((api, info)) = &self.connection {
+                Self::draw_facts(ui, palette, api, info);
             }
-            if let Some(server) = picked {
-                self.pick(&server);
+            self.draw_account(ui, palette);
+            divider(ui, palette);
+            self.draw_servers(ui, palette);
+        });
+    }
+
+    fn draw_servers(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        title(ui, palette, "Servers");
+        let mut picked = None;
+        for profile in &self.settings.profiles {
+            let selected = self
+                .settings
+                .selected
+                .as_deref()
+                .is_some_and(|server| same_server(server, &profile.server));
+            if profile_row(ui, palette, profile, selected) {
+                picked = Some(profile.server.clone());
             }
-            if !self.settings.profiles.is_empty() {
-                ui.add_space(SECTION_GAP / 2.0);
+        }
+        if let Some(server) = picked {
+            self.pick(&server);
+        }
+        if !self.settings.profiles.is_empty() {
+            ui.add_space(SECTION_GAP / 2.0);
+        }
+        field_label(ui, palette, "Server address");
+        ui.horizontal(|ui| {
+            let field_width =
+                ui.available_width() - CONNECT_BUTTON_WIDTH - ui.spacing().item_spacing.x;
+            let field = ui.add_sized(
+                vec2(field_width, ui.spacing().interact_size.y),
+                text_field(&mut self.server_input).hint_text("example.org"),
+            );
+            let pressed = ui
+                .add_sized(
+                    vec2(CONNECT_BUTTON_WIDTH, ui.spacing().interact_size.y),
+                    egui::Button::new("Connect"),
+                )
+                .clicked();
+            if pressed || submitted(ui, &field) {
+                self.connect();
             }
-            ui.horizontal(|ui| {
+        });
+        let typed = self.server_input.trim();
+        let is_new = !typed.is_empty()
+            && !self
+                .settings
+                .profiles
+                .iter()
+                .any(|profile| same_server(&profile.server, typed));
+        if is_new {
+            ui.label(
+                RichText::new("A new address is saved here once it connects.")
+                    .small()
+                    .color(palette.ink_2),
+            );
+        }
+        if self.connection.is_some() && self.settings.selected_profile().is_some() {
+            self.draw_saved_as(ui, palette);
+        }
+    }
+
+    /// The selected server's name field, then the remove button.
+    fn draw_saved_as(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        ui.add_space(SECTION_GAP / 2.0);
+        field_label(ui, palette, "Saved as");
+        let (renamed, remove) = ui
+            .horizontal(|ui| {
                 let field_width =
                     ui.available_width() - CONNECT_BUTTON_WIDTH - ui.spacing().item_spacing.x;
                 let field = ui.add_sized(
                     vec2(field_width, ui.spacing().interact_size.y),
-                    egui::TextEdit::singleline(&mut self.server_input).hint_text("example.org"),
-                );
-                let pressed = ui
-                    .add_sized(
-                        vec2(CONNECT_BUTTON_WIDTH, ui.spacing().interact_size.y),
-                        egui::Button::new("Connect"),
-                    )
-                    .clicked();
-                if pressed || submitted(ui, &field) {
-                    self.connect();
-                }
-            });
-            let typed = self.server_input.trim();
-            let is_new = !typed.is_empty()
-                && !self
-                    .settings
-                    .profiles
-                    .iter()
-                    .any(|profile| same_server(&profile.server, typed));
-            if is_new {
-                ui.label(
-                    RichText::new("A new address is saved here once it connects.")
-                        .color(palette.mute),
-                );
-            }
-            let Some((api, info)) = &self.connection else {
-                return;
-            };
-            ui.add_space(SECTION_GAP / 2.0);
-            fact(
-                ui,
-                palette,
-                "Name",
-                RichText::new(&info.server_name)
-                    .text_style(TextStyle::Name(TITLE_STYLE.into()))
-                    .color(palette.ink),
-            );
-            fact(
-                ui,
-                palette,
-                "Address",
-                RichText::new(api.host()).monospace().color(palette.ink),
-            );
-            fact(
-                ui,
-                palette,
-                "Login",
-                RichText::new(auth_mode_name(info.auth_mode)).color(palette.ink),
-            );
-            if info.auth_mode == AuthMode::Password {
-                let sign_up = if info.allow_registration {
-                    "Open"
-                } else {
-                    "Closed"
-                };
-                fact(
-                    ui,
-                    palette,
-                    "Sign-up",
-                    RichText::new(sign_up).color(palette.ink),
-                );
-            }
-            if self.settings.selected_profile().is_some() {
-                self.draw_saved_as(ui, palette);
-            }
-        });
-    }
-
-    /// The selected server's row: the label column, its name field, then the remove button.
-    fn draw_saved_as(&mut self, ui: &mut egui::Ui, palette: &Palette) {
-        let (renamed, remove) = ui
-            .horizontal(|ui| {
-                ui.add_sized(
-                    vec2(FACT_LABEL_WIDTH, ui.spacing().interact_size.y),
-                    egui::Label::new(label_text("Saved as", palette.mute)),
-                );
-                let field_width =
-                    ui.available_width() - REMOVE_BUTTON_WIDTH - ui.spacing().item_spacing.x;
-                let field = ui.add_sized(
-                    vec2(field_width, ui.spacing().interact_size.y),
-                    egui::TextEdit::singleline(&mut self.name_input).hint_text("Server name"),
+                    text_field(&mut self.name_input).hint_text("Server name"),
                 );
                 let remove = ui
                     .add_sized(
-                        vec2(REMOVE_BUTTON_WIDTH, ui.spacing().interact_size.y),
+                        vec2(CONNECT_BUTTON_WIDTH, ui.spacing().interact_size.y),
                         egui::Button::new("Remove"),
                     )
                     .on_hover_text("Forget this server and its login.")
@@ -871,35 +1014,32 @@ impl LauncherApp {
     }
 
     fn draw_account(&mut self, ui: &mut egui::Ui, palette: &Palette) {
-        section(ui, palette, "Account", |ui| {
-            let Some((api, info)) = self.connection.clone() else {
-                ui.label(RichText::new("Connect to a server first.").color(palette.mute));
-                return;
-            };
-            if let Some(token) = self.settings.token().map(str::to_owned) {
-                let play_size = vec2(ui.available_width(), PLAY_HEIGHT);
-                if primary_button(ui, palette, "Play", play_size) {
-                    self.play(api.clone(), info, token.clone());
-                }
-                if ui.button("Log out").clicked() {
-                    self.logout(api, token);
-                }
-                return;
+        let Some((api, info)) = self.connection.clone() else {
+            ui.label(RichText::new("Connect to a server first.").color(palette.ink_2));
+            return;
+        };
+        if let Some(token) = self.settings.token().map(str::to_owned) {
+            let play_size = vec2(ui.available_width(), PLAY_HEIGHT);
+            if primary_button(ui, palette, "Play", play_size) {
+                self.play(api.clone(), info, token.clone());
             }
-            match info.auth_mode {
-                AuthMode::Password => self.draw_password_login(ui, palette, api, &info),
-                AuthMode::Discord => {
-                    ui.label(
-                        RichText::new("Your browser opens Discord's login page.")
-                            .color(palette.mute),
-                    );
-                    let size = vec2(ui.available_width(), ui.spacing().interact_size.y);
-                    if primary_button(ui, palette, "Log in with Discord", size) {
-                        self.discord_login(api);
-                    }
+            if ui.button("Log out").clicked() {
+                self.logout(api, token);
+            }
+            return;
+        }
+        match info.auth_mode {
+            AuthMode::Password => self.draw_password_login(ui, palette, api, &info),
+            AuthMode::Discord => {
+                ui.label(
+                    RichText::new("Your browser opens Discord's login page.").color(palette.ink_2),
+                );
+                let size = vec2(ui.available_width(), PLAY_HEIGHT);
+                if primary_button(ui, palette, "Log In with Discord", size) {
+                    self.discord_login(api);
                 }
             }
-        });
+        }
     }
 
     fn draw_password_login(
@@ -909,31 +1049,25 @@ impl LauncherApp {
         api: LauncherApi,
         info: &LauncherInfo,
     ) {
-        let field_size = |ui: &egui::Ui| vec2(ui.available_width(), ui.spacing().interact_size.y);
         let mut submit = false;
         for (label, secret) in [("Username", false), ("Password", true)] {
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    vec2(FACT_LABEL_WIDTH, ui.spacing().interact_size.y),
-                    egui::Label::new(label_text(label, palette.mute)),
-                );
-                let value = if secret {
-                    &mut self.password
-                } else {
-                    &mut self.username
-                };
-                let field = ui.add_sized(
-                    field_size(ui),
-                    egui::TextEdit::singleline(value).password(secret),
-                );
-                submit |= secret && submitted(ui, &field);
-            });
+            field_label(ui, palette, label);
+            let value = if secret {
+                &mut self.password
+            } else {
+                &mut self.username
+            };
+            let field = ui.add_sized(
+                vec2(ui.available_width(), ui.spacing().interact_size.y),
+                text_field(value).password(secret),
+            );
+            submit |= secret && submitted(ui, &field);
         }
+        ui.add_space(SECTION_GAP / 2.0);
         ui.horizontal(|ui| {
-            ui.add_space(FACT_LABEL_WIDTH + ui.spacing().item_spacing.x);
             let size = vec2(CONNECT_BUTTON_WIDTH, ui.spacing().interact_size.y);
-            let log_in = primary_button(ui, palette, "Log in", size) || submit;
-            let register = info.allow_registration && ui.button("Make account").clicked();
+            let log_in = primary_button(ui, palette, "Log In", size) || submit;
+            let register = info.allow_registration && ui.button("Make Account").clicked();
             if log_in {
                 self.password_login(api, false);
             } else if register {
@@ -961,164 +1095,249 @@ impl LauncherApp {
             .find(|build| build.program == Path::new(proton.as_str()))
             .map_or("Pick a Proton build", |build| build.name.as_str());
         let mut picked = false;
-        ui.horizontal(|ui| {
-            ui.add_space(FACT_LABEL_WIDTH + ui.spacing().item_spacing.x);
-            egui::ComboBox::from_id_salt("proton build")
-                .selected_text(RichText::new(picked_name).color(palette.ink))
-                .show_ui(ui, |ui| {
-                    for build in &self.found.protons {
-                        let current = build.program == Path::new(proton.as_str());
-                        if ui.selectable_label(current, &build.name).clicked() {
-                            *proton = build.program.display().to_string();
-                            picked = true;
-                        }
+        egui::ComboBox::from_id_salt("proton build")
+            .selected_text(RichText::new(picked_name).color(palette.ink))
+            .show_ui(ui, |ui| {
+                for build in &self.found.protons {
+                    let current = build.program == Path::new(proton.as_str());
+                    if ui.selectable_label(current, &build.name).clicked() {
+                        *proton = build.program.display().to_string();
+                        picked = true;
                     }
-                });
-        });
+                }
+            });
         picked
     }
 
     fn draw_options(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        self.draw_heading(ui, palette, Page::Options.label());
         let default_prefix = self
             .settings_dir()
             .join(DEFAULT_PREFIX_DIR)
             .display()
             .to_string();
-        section(ui, palette, "Options", |ui| {
-            let mut save = path_row(
+        let mut save = path_row(
+            ui,
+            palette,
+            "Game",
+            &mut self.settings.options.game_exe,
+            PATCHED_EXE_NAME,
+            PathCheck::RequiredFile,
+        );
+        if USES_PROTON {
+            save |= path_row(
                 ui,
                 palette,
-                "Game",
-                &mut self.settings.options.game_exe,
-                PATCHED_EXE_NAME,
+                "Proton",
+                &mut self.settings.options.proton,
+                "proton",
                 PathCheck::RequiredFile,
             );
-            if USES_PROTON {
-                save |= path_row(
-                    ui,
-                    palette,
-                    "Proton",
-                    &mut self.settings.options.proton,
-                    "proton",
-                    PathCheck::RequiredFile,
-                );
-                save |= self.draw_proton_list(ui, palette);
-                let options = &mut self.settings.options;
-                save |= path_row(
-                    ui,
-                    palette,
-                    "Prefix",
-                    &mut options.prefix,
-                    &default_prefix,
-                    PathCheck::Prefix,
-                );
-                save |= path_row(
-                    ui,
-                    palette,
-                    "Steam",
-                    &mut options.steam_install,
-                    "Steam folder",
-                    PathCheck::RequiredFolder,
-                );
-            }
+            save |= self.draw_proton_list(ui, palette);
             let options = &mut self.settings.options;
             save |= path_row(
                 ui,
                 palette,
-                "Override",
-                &mut options.override_config,
-                "ClientOverride.json (optional)",
-                PathCheck::OptionalFile,
+                "Prefix",
+                &mut options.prefix,
+                &default_prefix,
+                PathCheck::Prefix,
             );
-            if USES_PROTON {
-                ui.add_space(SECTION_GAP / 2.0);
-                for switch in ProtonSwitch::ALL {
-                    let mut on = options.proton_switches.contains(&switch);
-                    if ui.checkbox(&mut on, switch.label()).changed() {
-                        if on {
-                            options.proton_switches.insert(switch);
-                        } else {
-                            options.proton_switches.remove(&switch);
-                        }
-                        save = true;
+            save |= path_row(
+                ui,
+                palette,
+                "Steam",
+                &mut options.steam_install,
+                "Steam folder",
+                PathCheck::RequiredFolder,
+            );
+        }
+        let options = &mut self.settings.options;
+        save |= path_row(
+            ui,
+            palette,
+            "Override",
+            &mut options.override_config,
+            "ClientOverride.json (optional)",
+            PathCheck::OptionalFile,
+        );
+        if USES_PROTON {
+            ui.add_space(SECTION_GAP / 2.0);
+            for switch in ProtonSwitch::ALL {
+                let mut on = options.proton_switches.contains(&switch);
+                if ui.checkbox(&mut on, switch.label()).changed() {
+                    if on {
+                        options.proton_switches.insert(switch);
+                    } else {
+                        options.proton_switches.remove(&switch);
                     }
+                    save = true;
                 }
             }
-            ui.add_space(SECTION_GAP / 2.0);
-            ui.label(label_text("Extra environment", palette.mute));
-            ui.label(RichText::new("One NAME=value per line.").color(palette.mute));
-            save |= ui
-                .add(
-                    egui::TextEdit::multiline(&mut options.environment)
-                        .desired_rows(ENVIRONMENT_ROWS)
-                        .desired_width(f32::INFINITY)
-                        .code_editor(),
-                )
-                .lost_focus();
-            ui.add_space(SECTION_GAP / 2.0);
-            if ui.button("Find paths").clicked() {
-                self.find_paths();
-                save = true;
-            }
-            if save {
-                self.save();
-            }
-        });
+        }
+        ui.add_space(SECTION_GAP / 2.0);
+        field_label(ui, palette, "Extra environment");
+        ui.label(
+            RichText::new("One NAME=value per line.")
+                .small()
+                .color(palette.ink_2),
+        );
+        save |= ui
+            .add(
+                egui::TextEdit::multiline(&mut options.environment)
+                    .desired_rows(ENVIRONMENT_ROWS)
+                    .desired_width(f32::INFINITY)
+                    .code_editor(),
+            )
+            .lost_focus();
+        ui.add_space(SECTION_GAP / 2.0);
+        if ui.button("Find Paths").clicked() {
+            self.find_paths();
+            save = true;
+        }
+        if save {
+            self.save();
+        }
     }
 
     fn draw_settings(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        self.draw_heading(ui, palette, Page::Settings.label());
         let ctx = ui.ctx().clone();
-        section(ui, palette, "Settings", |ui| {
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    vec2(FACT_LABEL_WIDTH, ui.spacing().interact_size.y),
-                    egui::Label::new(label_text("Theme", palette.mute)),
-                );
-                for choice in ThemeChoice::ALL {
-                    let size = vec2(CONNECT_BUTTON_WIDTH, ui.spacing().interact_size.y);
-                    let pressed = if self.settings.theme == choice {
-                        primary_button(ui, palette, choice.label(), size)
-                    } else {
-                        ui.add_sized(size, egui::Button::new(choice.label()))
-                            .clicked()
-                    };
-                    if pressed {
-                        self.set_theme(&ctx, choice);
-                    }
+        field_label(ui, palette, "Theme");
+        ui.horizontal(|ui| {
+            for choice in ThemeChoice::ALL {
+                let size = vec2(CONNECT_BUTTON_WIDTH, ui.spacing().interact_size.y);
+                let selected = self.settings.theme == choice;
+                if picker_button(ui, palette, choice.label(), size, selected) {
+                    self.set_theme(&ctx, choice);
                 }
-            });
-            fact(
-                ui,
-                palette,
-                "Saved in",
-                RichText::new(self.settings_path.display().to_string())
-                    .monospace()
-                    .color(palette.mute),
-            );
+            }
         });
+        ui.add_space(SECTION_GAP / 2.0);
+        field_label(ui, palette, "Saved in");
+        ui.label(
+            RichText::new(self.settings_path.display().to_string())
+                .monospace()
+                .color(palette.ink_2),
+        );
+    }
+
+    /// The top bar: the wordmark, then the page links at the right end, above a rule.
+    fn draw_top_bar(&mut self, ui: &mut egui::Ui, palette: &Palette) {
+        egui::Frame::new()
+            .fill(palette.abyss)
+            .inner_margin(Margin::symmetric(WINDOW_MARGIN, TOP_BAR_PADDING))
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new(WORDMARK)
+                            .text_style(TextStyle::Name(WORDMARK_STYLE.into()))
+                            .color(palette.ink),
+                    );
+                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = NAV_GAP;
+                        for page in Page::ALL.into_iter().rev() {
+                            if nav_link(ui, palette, page, self.page == page) {
+                                self.page = page;
+                            }
+                        }
+                    });
+                });
+            });
+        rule(ui, LINE_WIDTH, palette.rule);
+    }
+
+    /// Home: the play column and the news side by side in a wide window, else one below the
+    /// other. Returns the error of a news link that could not be opened.
+    fn draw_home(&mut self, ui: &mut egui::Ui, palette: &Palette) -> Option<String> {
+        if ui.available_width() < TWO_COLUMN_MIN_WIDTH {
+            return egui::ScrollArea::vertical()
+                .id_salt(PLAY_SCROLL)
+                .auto_shrink(false)
+                .show(ui, |ui| {
+                    self.draw_play_column(ui, palette);
+                    divider(ui, palette);
+                    self.news.draw(ui, palette)
+                })
+                .inner;
+        }
+        let full = ui.available_rect_before_wrap();
+        let play = Rect::from_min_size(full.min, vec2(PLAY_COLUMN_WIDTH, full.height()));
+        let news = Rect::from_min_max(pos2(play.max.x + COLUMN_GAP, full.min.y), full.max);
+        let column = |ui: &mut egui::Ui, rect: Rect| {
+            ui.new_child(
+                UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(Layout::top_down(Align::Min)),
+            )
+        };
+        let mut play_ui = column(ui, play);
+        egui::ScrollArea::vertical()
+            .id_salt(PLAY_SCROLL)
+            .auto_shrink(false)
+            .show(&mut play_ui, |ui| self.draw_play_column(ui, palette));
+        let mut news_ui = column(ui, news);
+        let failure = egui::ScrollArea::vertical()
+            .id_salt(NEWS_SCROLL)
+            .auto_shrink(false)
+            .show(&mut news_ui, |ui| self.news.draw(ui, palette))
+            .inner;
+        ui.advance_cursor_after_rect(full);
+        failure
+    }
+
+    /// A text page (Options or Settings): `content` in one scrolling column.
+    fn draw_text_page(
+        &mut self,
+        ui: &mut egui::Ui,
+        palette: &Palette,
+        page: Page,
+        content: fn(&mut Self, &mut egui::Ui, &Palette),
+    ) {
+        egui::ScrollArea::vertical()
+            .id_salt(page.label())
+            .auto_shrink(false)
+            .show(ui, |ui| {
+                ui.set_max_width(PAGE_MAX_WIDTH);
+                content(self, ui, palette);
+            });
     }
 
     fn draw(&mut self, ui: &mut egui::Ui) {
         let palette = Palette::current(ui.visuals());
-        self.draw_status(ui, palette);
-        let busy = self.job.is_some();
-        ui.add_enabled_ui(!busy, |ui| {
-            self.draw_server(ui, palette);
-            self.draw_account(ui, palette);
-        });
-        self.draw_options(ui, palette);
-        self.draw_settings(ui, palette);
+        let spacing = ui.spacing().item_spacing;
+        ui.spacing_mut().item_spacing.y = 0.0;
+        self.draw_top_bar(ui, palette);
+        egui::Frame::new()
+            .inner_margin(Margin::same(WINDOW_MARGIN))
+            .show(ui, |ui| {
+                ui.spacing_mut().item_spacing = spacing;
+                match self.page {
+                    Page::Home => {
+                        if let Some(error) = self.draw_home(ui, palette) {
+                            self.set_status(Status::error(error));
+                        }
+                    }
+                    Page::Options => {
+                        self.draw_text_page(ui, palette, Page::Options, Self::draw_options);
+                    }
+                    Page::Settings => {
+                        self.draw_text_page(ui, palette, Page::Settings, Self::draw_settings);
+                    }
+                }
+            });
     }
 }
 
 impl eframe::App for LauncherApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.poll_job(ui.ctx());
+        let connection = self.connection.as_ref().map(|(api, _)| api);
+        self.news.update(ui.ctx(), connection);
         egui::Frame::central_panel(ui.style())
-            .inner_margin(WINDOW_MARGIN)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| self.draw(ui));
-            });
+            .inner_margin(0)
+            .show(ui, |ui| self.draw(ui));
     }
 }
 
@@ -1249,32 +1468,26 @@ mod tests {
     }
 
     #[test]
-    fn a_new_state_restarts_the_bar_and_the_same_state_does_not() {
-        let (_dir, mut app) = app();
-        let first = app.status_since;
-        app.set_status(Status::not_connected());
-        assert_eq!(app.status_since, first);
-        app.set_status(Status::error("x"));
-        assert!(app.status_since >= first);
-        assert_eq!(app.status().word, "error");
-    }
-
-    #[test]
-    fn the_bar_grows_with_an_ease_out_and_then_stays_full() {
-        assert_eq!(bar_progress(Duration::ZERO), 0.0);
-        let half = bar_progress(BAR_GROWTH / 2);
-        assert!(half > 0.5 && half < 1.0, "{half}");
-        assert_eq!(bar_progress(BAR_GROWTH), 1.0);
-        assert_eq!(bar_progress(BAR_GROWTH * 2), 1.0);
-    }
-
-    #[test]
-    fn tones_use_the_palette_state_colours() {
+    fn tones_use_the_website_state_colours() {
         let palette = &theme::NIGHT;
-        assert_eq!(Tone::Ready.color(palette), palette.ready);
-        assert_eq!(Tone::Fault.bar_color(palette), palette.alert);
-        assert_eq!(Tone::Busy.bar_color(palette), theme::SIGNAL_YELLOW);
-        assert_eq!(Tone::Idle.bar_color(palette), palette.line);
+        assert_eq!(Tone::Ready.color(palette), palette.good);
+        assert_eq!(Tone::Busy.color(palette), palette.warn);
+        assert_eq!(Tone::Fault.color(palette), palette.bad);
+        assert_eq!(Tone::Idle.color(palette), palette.ink_2);
+    }
+
+    #[test]
+    fn state_words_start_with_a_capital() {
+        assert_eq!(capitalized("logged in"), "Logged in");
+        assert_eq!(capitalized(""), "");
+    }
+
+    #[test]
+    fn home_opens_first_and_every_page_has_a_link() {
+        let (_dir, app) = app();
+        assert_eq!(app.page, Page::Home);
+        let labels: Vec<_> = Page::ALL.iter().map(|page| page.label()).collect();
+        assert_eq!(labels, ["Home", "Options", "Settings"]);
     }
 
     #[test]

@@ -10,10 +10,15 @@ pub mod app;
 pub mod aws_proxy;
 pub mod game;
 pub mod mirror;
+pub mod news;
+pub mod news_html;
+pub mod news_view;
 pub mod options;
 pub mod server;
 pub mod settings;
 pub mod steam;
+#[cfg(test)]
+mod test_server;
 pub mod theme;
 
 /// Installs the `ring` TLS crypto provider for this process. A second call has no effect.

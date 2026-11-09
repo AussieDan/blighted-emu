@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-//! The launcher's look: a neutral night theme with no blue tint (the default), a warm day theme,
-//! flat fills, 1px lines, 2px corners on controls, and installed system fonts only.
+//! The launcher's look, taken from the project website: the crest colours (a near-black violet
+//! ground, violet for what the player presses, crystal for focus, teal for links), flat tone
+//! layers divided by 1px rules, 3px corners, a light serif for headings and a plain sans for
+//! facts. Night is the website's own theme (the default); day is a light theme of the same
+//! colours. Only installed system fonts are used: the website's own fallbacks (Georgia and the
+//! system sans) and their Linux equivalents.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,10 +19,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ThemeChoice {
-    /// Neutral near-black.
+    /// The website's dark violet theme.
     #[default]
     Night,
-    /// Warm paper.
+    /// A light theme of the same colours.
     Day,
 }
 
@@ -42,61 +46,85 @@ impl ThemeChoice {
     }
 }
 
-/// The colours of one theme.
+/// The colours of one theme, named as on the website.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Palette {
-    /// The window and the base of every control.
+    /// The deepest layer: the top bar and the field fills.
+    pub abyss: Color32,
+    /// The window background.
     pub ground: Color32,
-    /// Quiet surfaces.
-    pub surface: Color32,
-    /// Raised fills.
-    pub raised: Color32,
-    /// Text and the 2px rules.
+    /// Tracks and quiet fills.
+    pub stone: Color32,
+    /// The selected choice.
+    pub stone_hi: Color32,
+    /// Borders of outlined controls, and the text selection.
+    pub vein: Color32,
+    /// 1px divider lines.
+    pub rule: Color32,
+    /// The one action colour: the main button fill and a hovered border.
+    pub violet: Color32,
+    /// The main button fill on hover.
+    pub violet_hover: Color32,
+    /// Text on violet.
+    pub on_violet: Color32,
+    /// Response: the focus outline, inline code and the one stressed phrase.
+    pub crystal: Color32,
+    /// Links.
+    pub link: Color32,
+    /// Borders of text fields.
+    pub edge: Color32,
+    /// Text.
     pub ink: Color32,
-    /// Labels, detail lines and hints.
-    pub mute: Color32,
-    /// 1px dividers and field borders.
-    pub line: Color32,
-    /// Control colour: button text and borders, the selected fill.
-    pub accent: Color32,
+    /// Secondary text: meta lines, labels and hints.
+    pub ink_2: Color32,
     /// Ready state.
-    pub ready: Color32,
-    /// Busy or strained state text.
+    pub good: Color32,
+    /// Busy state and downtime notes.
     pub warn: Color32,
     /// Error state.
-    pub alert: Color32,
+    pub bad: Color32,
 }
 
-/// Signal yellow: the focus outline and the text selection, the same in both themes.
-pub const SIGNAL_YELLOW: Color32 = Color32::from_rgb(0xf2, 0xb7, 0x05);
-
-/// The night theme.
+/// The night theme: the website's colours.
 pub const NIGHT: Palette = Palette {
-    ground: Color32::from_rgb(0x12, 0x12, 0x12),
-    surface: Color32::from_rgb(0x1a, 0x1a, 0x1a),
-    raised: Color32::from_rgb(0x26, 0x26, 0x26),
-    ink: Color32::from_rgb(0xe8, 0xe6, 0xe1),
-    mute: Color32::from_rgb(0xa3, 0xa0, 0x9a),
-    line: Color32::from_rgb(0x30, 0x30, 0x30),
-    accent: Color32::from_rgb(0xd9, 0xd6, 0xcf),
-    ready: Color32::from_rgb(0x4c, 0xaf, 0x6e),
-    warn: SIGNAL_YELLOW,
-    alert: Color32::from_rgb(0xf0, 0x47, 0x5c),
+    abyss: Color32::from_rgb(0x05, 0x04, 0x09),
+    ground: Color32::from_rgb(0x10, 0x0e, 0x18),
+    stone: Color32::from_rgb(0x24, 0x1b, 0x35),
+    stone_hi: Color32::from_rgb(0x33, 0x24, 0x4c),
+    vein: Color32::from_rgb(0x4c, 0x2a, 0x60),
+    rule: Color32::from_rgb(0x2c, 0x22, 0x40),
+    violet: Color32::from_rgb(0xa3, 0x47, 0xbe),
+    violet_hover: Color32::from_rgb(0x8f, 0x3a, 0xa8),
+    on_violet: Color32::WHITE,
+    crystal: Color32::from_rgb(0xed, 0x8e, 0xf2),
+    link: Color32::from_rgb(0x7c, 0xc3, 0xd8),
+    edge: Color32::from_rgb(0x7a, 0x55, 0x98),
+    ink: Color32::from_rgb(0xec, 0xe6, 0xf2),
+    ink_2: Color32::from_rgb(0xb9, 0xae, 0xcb),
+    good: Color32::from_rgb(0x6c, 0xc4, 0x89),
+    warn: Color32::from_rgb(0xe0, 0xb4, 0x5a),
+    bad: Color32::from_rgb(0xe2, 0x67, 0x5f),
 };
 
-/// The day theme.
+/// The day theme: the crest colours on light violet paper, darkened to keep AA contrast.
 pub const DAY: Palette = Palette {
-    ground: Color32::from_rgb(0xf4, 0xf1, 0xea),
-    surface: Color32::from_rgb(0xeb, 0xe6, 0xdb),
-    raised: Color32::from_rgb(0xe2, 0xdc, 0xcd),
-    ink: Color32::from_rgb(0x1f, 0x1f, 0x1f),
-    mute: Color32::from_rgb(0x63, 0x5e, 0x54),
-    line: Color32::from_rgb(0xd8, 0xd1, 0xc2),
-    accent: Color32::from_rgb(0x13, 0x29, 0x4b),
-    // `day-state-ready`: signal green (#2e7d4f) gives 4.47:1 on the day ground, under AA.
-    ready: Color32::from_rgb(0x2b, 0x76, 0x4a),
+    abyss: Color32::from_rgb(0xfc, 0xfa, 0xff),
+    ground: Color32::from_rgb(0xf4, 0xf0, 0xf8),
+    stone: Color32::from_rgb(0xe6, 0xde, 0xef),
+    stone_hi: Color32::from_rgb(0xdc, 0xcf, 0xe9),
+    vein: Color32::from_rgb(0xb3, 0x9b, 0xc9),
+    rule: Color32::from_rgb(0xdd, 0xd3, 0xe8),
+    violet: Color32::from_rgb(0x8a, 0x2f, 0xa5),
+    violet_hover: Color32::from_rgb(0x74, 0x25, 0x8b),
+    on_violet: Color32::WHITE,
+    crystal: Color32::from_rgb(0xa0, 0x1f, 0x9d),
+    link: Color32::from_rgb(0x1d, 0x6b, 0x80),
+    edge: Color32::from_rgb(0x7a, 0x55, 0x98),
+    ink: Color32::from_rgb(0x1d, 0x16, 0x26),
+    ink_2: Color32::from_rgb(0x5b, 0x4e, 0x6c),
+    good: Color32::from_rgb(0x2b, 0x76, 0x4a),
     warn: Color32::from_rgb(0x7a, 0x56, 0x00),
-    alert: Color32::from_rgb(0xc8, 0x10, 0x2e),
+    bad: Color32::from_rgb(0xb3, 0x26, 0x1e),
 };
 
 impl Palette {
@@ -106,84 +134,55 @@ impl Palette {
     }
 }
 
-/// Corner of buttons and fields.
-pub const CONTROL_CORNER: u8 = 2;
-/// Width of a button border.
-const BUTTON_BORDER: f32 = 1.5;
-/// Width of a field border and a divider.
+/// Corner of buttons, fields, badges and pictures.
+pub const CORNER: u8 = 3;
+/// Width of every border and divider.
 pub const LINE_WIDTH: f32 = 1.0;
 /// Width of the focus outline.
 const FOCUS_WIDTH: f32 = 2.0;
-/// Share of the accent mixed into the ground on hover, and when pressed.
-pub const HOVER_MIX: f32 = 0.16;
-const PRESS_MIX: f32 = 0.28;
-/// Opacity of the text selection fill.
-const SELECTION_ALPHA: u8 = 0x59;
 /// Opacity factor of a disabled control.
 const DISABLED_ALPHA: f32 = 0.45;
 /// Space between items, and inside buttons.
 const ITEM_SPACING: [f32; 2] = [8.0, 8.0];
-const BUTTON_PADDING: [f32; 2] = [12.0, 5.0];
+const BUTTON_PADDING: [f32; 2] = [16.0, 7.0];
 /// Height of a control.
-const CONTROL_HEIGHT: f32 = 28.0;
-
-/// `a` mixed with `share` of `b`, per sRGB channel (as CSS `color-mix(in srgb)`).
-pub fn mix(a: Color32, b: Color32, share: f32) -> Color32 {
-    let channel = |from: u8, to: u8| {
-        let value = f32::from(from) + (f32::from(to) - f32::from(from)) * share;
-        // The value is between two u8 values, so it fits.
-        value.round() as u8
-    };
-    Color32::from_rgb(
-        channel(a.r(), b.r()),
-        channel(a.g(), b.g()),
-        channel(a.b(), b.b()),
-    )
-}
+pub const CONTROL_HEIGHT: f32 = 32.0;
 
 /// The egui visuals of a palette.
 pub fn visuals(palette: &Palette) -> Visuals {
-    let dark = palette == &NIGHT;
-    let mut visuals = if dark {
+    let mut visuals = if palette == &NIGHT {
         Visuals::dark()
     } else {
         Visuals::light()
     };
-    let corner = CornerRadius::same(CONTROL_CORNER);
-    let control = |fill: Color32, border: Stroke| egui::style::WidgetVisuals {
-        bg_fill: fill,
-        weak_bg_fill: fill,
-        bg_stroke: border,
+    let corner = CornerRadius::same(CORNER);
+    let control = |weak_fill: Color32, border: Color32| egui::style::WidgetVisuals {
+        bg_fill: palette.abyss,
+        weak_bg_fill: weak_fill,
+        bg_stroke: Stroke::new(LINE_WIDTH, border),
         corner_radius: corner,
-        fg_stroke: Stroke::new(LINE_WIDTH, palette.accent),
+        fg_stroke: Stroke::new(LINE_WIDTH, palette.ink),
         expansion: 0.0,
     };
-    let border = Stroke::new(BUTTON_BORDER, palette.accent);
     let widgets = &mut visuals.widgets;
-    widgets.noninteractive = egui::style::WidgetVisuals {
-        fg_stroke: Stroke::new(LINE_WIDTH, palette.ink),
-        ..control(palette.ground, Stroke::new(LINE_WIDTH, palette.line))
-    };
-    widgets.inactive = control(palette.ground, border);
-    widgets.hovered = control(mix(palette.ground, palette.accent, HOVER_MIX), border);
-    widgets.active = control(
-        mix(palette.ground, palette.accent, PRESS_MIX),
-        Stroke::new(FOCUS_WIDTH, SIGNAL_YELLOW),
-    );
+    widgets.noninteractive = control(palette.ground, palette.rule);
+    widgets.inactive = control(Color32::TRANSPARENT, palette.vein);
+    widgets.hovered = control(Color32::TRANSPARENT, palette.violet);
+    widgets.active = control(palette.stone, palette.violet);
     widgets.open = widgets.active;
-    visuals.selection.bg_fill = SIGNAL_YELLOW.gamma_multiply_u8(SELECTION_ALPHA);
-    visuals.selection.stroke = Stroke::new(FOCUS_WIDTH, SIGNAL_YELLOW);
-    visuals.text_cursor.stroke = Stroke::new(FOCUS_WIDTH, palette.accent);
-    visuals.hyperlink_color = palette.accent;
-    visuals.faint_bg_color = palette.surface;
-    visuals.extreme_bg_color = palette.ground;
-    visuals.text_edit_bg_color = Some(palette.ground);
-    visuals.code_bg_color = palette.raised;
+    visuals.selection.bg_fill = palette.vein;
+    visuals.selection.stroke = Stroke::new(FOCUS_WIDTH, palette.crystal);
+    visuals.text_cursor.stroke = Stroke::new(FOCUS_WIDTH, palette.ink);
+    visuals.hyperlink_color = palette.link;
+    visuals.faint_bg_color = palette.stone;
+    visuals.extreme_bg_color = palette.abyss;
+    visuals.text_edit_bg_color = Some(palette.abyss);
+    visuals.code_bg_color = palette.stone;
     visuals.warn_fg_color = palette.warn;
-    visuals.error_fg_color = palette.alert;
-    visuals.window_fill = palette.surface;
-    visuals.window_stroke = Stroke::new(LINE_WIDTH, palette.line);
-    visuals.window_corner_radius = CornerRadius::ZERO;
+    visuals.error_fg_color = palette.bad;
+    visuals.window_fill = palette.stone;
+    visuals.window_stroke = Stroke::new(LINE_WIDTH, palette.vein);
+    visuals.window_corner_radius = corner;
     visuals.menu_corner_radius = corner;
     visuals.window_shadow = Shadow::NONE;
     visuals.popup_shadow = Shadow::NONE;
@@ -193,27 +192,35 @@ pub fn visuals(palette: &Palette) -> Visuals {
     visuals
 }
 
-/// Family name of the condensed face used for labels, titles and buttons.
-pub const CONDENSED: &str = "condensed";
+/// Family of the light serif of headings (the website's display face).
+pub const SERIF: &str = "serif";
+/// Family of the semibold sans of buttons, labels and badges.
+pub const SEMIBOLD: &str = "semibold";
 /// Font name of the body face and of the data face.
 const BODY_FACE: &str = "body";
 const DATA_FACE: &str = "data";
-/// Text style of a section head and a fact label (label type).
-pub const LABEL_STYLE: &str = "label";
-/// Text style of the server name and the state word (title type).
+/// Text style of the top bar wordmark.
+pub const WORDMARK_STYLE: &str = "wordmark";
+/// Text style of a section heading ("News", "Servers").
 pub const TITLE_STYLE: &str = "title";
+/// Text style of a post title.
+pub const POST_TITLE_STYLE: &str = "post title";
+/// Text style of a field label and a badge.
+pub const LABEL_STYLE: &str = "label";
 
 /// Font size of each role.
 const BODY_SIZE: f32 = 14.0;
-const SMALL_SIZE: f32 = 12.0;
-const BUTTON_SIZE: f32 = 13.0;
-const HEADING_SIZE: f32 = 22.0;
-const TITLE_SIZE: f32 = 15.0;
-const LABEL_SIZE: f32 = 11.0;
-const DATA_SIZE: f32 = 12.0;
+const SMALL_SIZE: f32 = 12.5;
+const BUTTON_SIZE: f32 = 14.0;
+const HEADING_SIZE: f32 = 30.0;
+const WORDMARK_SIZE: f32 = 21.0;
+const TITLE_SIZE: f32 = 22.0;
+const POST_TITLE_SIZE: f32 = 18.0;
+const LABEL_SIZE: f32 = 12.5;
+const DATA_SIZE: f32 = 12.5;
 
-fn condensed() -> FontFamily {
-    FontFamily::Name(CONDENSED.into())
+fn family(name: &str) -> FontFamily {
+    FontFamily::Name(name.into())
 }
 
 /// Spacing and text sizes, the same in both themes.
@@ -224,16 +231,27 @@ pub fn apply_style(style: &mut egui::Style) {
     style.text_styles = [
         (TextStyle::Body, FontId::proportional(BODY_SIZE)),
         (TextStyle::Small, FontId::proportional(SMALL_SIZE)),
-        (TextStyle::Button, FontId::new(BUTTON_SIZE, condensed())),
-        (TextStyle::Heading, FontId::new(HEADING_SIZE, condensed())),
+        (
+            TextStyle::Button,
+            FontId::new(BUTTON_SIZE, family(SEMIBOLD)),
+        ),
+        (TextStyle::Heading, FontId::new(HEADING_SIZE, family(SERIF))),
         (TextStyle::Monospace, FontId::monospace(DATA_SIZE)),
         (
+            TextStyle::Name(WORDMARK_STYLE.into()),
+            FontId::new(WORDMARK_SIZE, family(SERIF)),
+        ),
+        (
             TextStyle::Name(TITLE_STYLE.into()),
-            FontId::new(TITLE_SIZE, condensed()),
+            FontId::new(TITLE_SIZE, family(SERIF)),
+        ),
+        (
+            TextStyle::Name(POST_TITLE_STYLE.into()),
+            FontId::new(POST_TITLE_SIZE, family(SERIF)),
         ),
         (
             TextStyle::Name(LABEL_STYLE.into()),
-            FontId::new(LABEL_SIZE, condensed()),
+            FontId::new(LABEL_SIZE, family(SEMIBOLD)),
         ),
     ]
     .into();
@@ -245,42 +263,55 @@ struct FontRole {
     files: &'static [&'static str],
 }
 
-/// Installed faces per role on Linux (Fira Sans, then common faces).
+/// Installed faces per role on Linux: Noto (light serif for headings), then DejaVu.
 #[cfg(unix)]
-const FONT_ROLES: [FontRole; 3] = [
+const FONT_ROLES: [FontRole; 4] = [
     FontRole {
         name: BODY_FACE,
         files: &[
-            "/usr/share/fonts/opentype/fira/FiraSans-Regular.otf",
             "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ],
     },
     FontRole {
-        name: CONDENSED,
+        name: SEMIBOLD,
         files: &[
-            "/usr/share/fonts/opentype/fira/FiraSansCondensed-SemiBold.otf",
-            "/usr/share/fonts/truetype/noto/NotoSans-CondensedSemiBold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansCondensed-Bold.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSans-SemiBold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        ],
+    },
+    FontRole {
+        name: SERIF,
+        files: &[
+            "/usr/share/fonts/truetype/noto/NotoSerif-Light.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSerif-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
         ],
     },
     FontRole {
         name: DATA_FACE,
-        files: &["/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"],
+        files: &[
+            "/usr/share/fonts/truetype/jetbrains-mono/JetBrainsMono-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        ],
     },
 ];
 
-/// Installed faces per role on Windows, under the Windows font folder
-/// (Segoe UI, Arial Narrow, Cascadia Mono, Consolas).
+/// Installed faces per role on Windows, under the Windows font folder: Segoe UI, Georgia (the
+/// website's serif fallback), Cascadia Mono or Consolas.
 #[cfg(windows)]
-const FONT_ROLES: [FontRole; 3] = [
+const FONT_ROLES: [FontRole; 4] = [
     FontRole {
         name: BODY_FACE,
         files: &["segoeui.ttf"],
     },
     FontRole {
-        name: CONDENSED,
-        files: &["arialnb.ttf", "segoeuisb.ttf"],
+        name: SEMIBOLD,
+        files: &["seguisb.ttf", "segoeuib.ttf"],
+    },
+    FontRole {
+        name: SERIF,
+        files: &["georgia.ttf", "times.ttf"],
     },
     FontRole {
         name: DATA_FACE,
@@ -316,8 +347,9 @@ fn first_font(dir: &Path, files: &[&str]) -> Option<Vec<u8>> {
         .find_map(|file| std::fs::read(dir.join(file)).ok())
 }
 
-/// egui's built-in faces with each found system face first in its family. A role with no
-/// installed face keeps the built-in face; the condensed family then uses the body faces.
+/// egui's built-in faces with each found system face first in its family. The serif and
+/// semibold families start as copies of the body family, so a role with no installed face uses
+/// the body faces.
 fn font_definitions(found: &[(&'static str, Vec<u8>)]) -> FontDefinitions {
     let mut fonts = FontDefinitions::default();
     let proportional = fonts
@@ -325,20 +357,22 @@ fn font_definitions(found: &[(&'static str, Vec<u8>)]) -> FontDefinitions {
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    fonts.families.insert(condensed(), proportional);
+    for name in [SERIF, SEMIBOLD] {
+        fonts.families.insert(family(name), proportional.clone());
+    }
     for (role, data) in found {
         fonts.font_data.insert(
             (*role).to_owned(),
             Arc::new(FontData::from_owned(data.clone())),
         );
-        let family = match *role {
-            CONDENSED => condensed(),
+        let target = match *role {
+            SERIF | SEMIBOLD => family(role),
             DATA_FACE => FontFamily::Monospace,
             _ => FontFamily::Proportional,
         };
         fonts
             .families
-            .entry(family)
+            .entry(target)
             .or_default()
             .insert(0, (*role).to_owned());
     }
@@ -401,46 +435,44 @@ mod tests {
     }
 
     #[test]
-    fn text_and_state_colours_pass_aa_on_both_grounds() {
+    fn text_colours_pass_aa_where_they_show_in_both_themes() {
         for palette in [&NIGHT, &DAY] {
-            for (name, color) in [
-                ("ink", palette.ink),
-                ("mute", palette.mute),
-                ("accent", palette.accent),
-                ("ready", palette.ready),
-                ("warn", palette.warn),
-                ("alert", palette.alert),
-            ] {
+            for (name, color) in [("ink", palette.ink), ("ink_2", palette.ink_2)] {
                 assert!(
-                    contrast(color, palette.ground) >= TEXT_CONTRAST,
-                    "{name} on {:?}",
-                    palette.ground
+                    contrast(color, palette.stone_hi) >= TEXT_CONTRAST,
+                    "{name} on the selected choice"
                 );
             }
-            let hovered = mix(palette.ground, palette.accent, HOVER_MIX);
-            assert!(contrast(palette.accent, hovered) >= TEXT_CONTRAST);
-            assert!(contrast(palette.ground, palette.accent) >= TEXT_CONTRAST);
-            assert!(contrast(palette.accent, palette.ground) >= LARGE_CONTRAST);
+            for layer in [palette.abyss, palette.ground] {
+                for (name, color) in [
+                    ("ink", palette.ink),
+                    ("ink_2", palette.ink_2),
+                    ("crystal", palette.crystal),
+                    ("link", palette.link),
+                    ("good", palette.good),
+                    ("warn", palette.warn),
+                    ("bad", palette.bad),
+                ] {
+                    assert!(
+                        contrast(color, layer) >= TEXT_CONTRAST,
+                        "{name} on {layer:?}"
+                    );
+                }
+            }
+            for fill in [palette.violet, palette.violet_hover] {
+                assert!(contrast(palette.on_violet, fill) >= TEXT_CONTRAST);
+            }
+            assert!(contrast(palette.edge, palette.abyss) >= LARGE_CONTRAST);
+            assert!(contrast(palette.crystal, palette.ground) >= LARGE_CONTRAST);
         }
     }
 
     #[test]
-    fn night_neutrals_have_no_blue_tint() {
-        for color in [NIGHT.ground, NIGHT.surface, NIGHT.raised, NIGHT.line] {
-            assert!(
-                color.b() <= color.r() && color.b() <= color.g(),
-                "{color:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn mix_moves_each_channel_by_the_share() {
-        let black = Color32::from_rgb(0, 0, 0);
-        let white = Color32::from_rgb(200, 100, 50);
-        assert_eq!(mix(black, white, 0.0), black);
-        assert_eq!(mix(black, white, 1.0), white);
-        assert_eq!(mix(black, white, 0.5), Color32::from_rgb(100, 50, 25));
+    fn night_uses_the_website_colours() {
+        assert_eq!(NIGHT.ground, Color32::from_hex("#100e18").expect("hex"));
+        assert_eq!(NIGHT.violet, Color32::from_hex("#a347be").expect("hex"));
+        assert_eq!(NIGHT.crystal, Color32::from_hex("#ed8ef2").expect("hex"));
+        assert_eq!(NIGHT.link, Color32::from_hex("#7cc3d8").expect("hex"));
     }
 
     #[test]
@@ -449,6 +481,8 @@ mod tests {
         assert!(!visuals(&DAY).dark_mode);
         assert_eq!(visuals(&NIGHT).panel_fill, NIGHT.ground);
         assert_eq!(visuals(&DAY).panel_fill, DAY.ground);
+        assert_eq!(visuals(&NIGHT).hyperlink_color, NIGHT.link);
+        assert_eq!(visuals(&NIGHT).selection.stroke.color, NIGHT.crystal);
         assert_eq!(Palette::current(&visuals(&DAY)), &DAY);
         assert_eq!(Palette::current(&visuals(&NIGHT)), &NIGHT);
     }
@@ -466,16 +500,19 @@ mod tests {
     }
 
     #[test]
-    fn found_faces_go_first_and_condensed_always_exists() {
+    fn found_faces_go_first_and_every_family_exists() {
         let none = font_definitions(&[]);
-        assert_eq!(
-            none.families.get(&condensed()),
-            none.families.get(&FontFamily::Proportional)
-        );
-        let fonts = font_definitions(&[(CONDENSED, b"c".to_vec()), (DATA_FACE, b"d".to_vec())]);
-        assert_eq!(fonts.families[&condensed()][0], CONDENSED);
+        for name in [SERIF, SEMIBOLD] {
+            assert_eq!(
+                none.families.get(&family(name)),
+                none.families.get(&FontFamily::Proportional)
+            );
+        }
+        let fonts = font_definitions(&[(SERIF, b"s".to_vec()), (DATA_FACE, b"d".to_vec())]);
+        assert_eq!(fonts.families[&family(SERIF)][0], SERIF);
         assert_eq!(fonts.families[&FontFamily::Monospace][0], DATA_FACE);
-        assert_ne!(fonts.families[&FontFamily::Proportional][0], CONDENSED);
+        assert_ne!(fonts.families[&FontFamily::Proportional][0], SERIF);
+        assert_ne!(fonts.families[&family(SEMIBOLD)][0], SERIF);
     }
 
     #[test]
