@@ -2,14 +2,17 @@
 //! The status report (`POST /api/ingest/status`): the state of each part of the world, the
 //! players online and the round trip of the slowest players, from the servers' metrics pages.
 //!
-//! A part is up when every metrics page of it answers with Prometheus samples; a page that does
-//! not answer in time, answers an error or answers no samples makes its part down. The website
+//! A part is up when every metrics page of it answers with a Prometheus text page, also an empty
+//! one: a server writes a counter only after its first event, so a server that just started has
+//! an empty page. A page that does not answer in time, answers an error or answers another kind
+//! of page (such as HTML from a wrong address) makes its part down. The website
 //! shows the world Offline when the gateway or the sims are down and Having problems when another
 //! part is down.
 
 use futures_util::future::join_all;
 use nw_common::prometheus::Scrape;
 use reqwest::Client;
+use reqwest::header::CONTENT_TYPE;
 use serde::Serialize;
 
 use crate::config::PartPages;
@@ -19,6 +22,8 @@ pub const SIM_PLAYERS_METRIC: &str = "sim_players";
 /// The 99th percentile round trip of the players of one gateway worker, 0 for a worker without
 /// players (`rep_gateway::server::METRIC_ROUND_TRIP_P99_MS`).
 pub const GATEWAY_ROUND_TRIP_P99_METRIC: &str = "rep_gateway_round_trip_p99_ms";
+/// The content type of a Prometheus text page (`text/plain`, maybe with a version or charset).
+const PROMETHEUS_CONTENT_TYPE: &str = "text/plain";
 
 /// One part of the world.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,15 +160,24 @@ pub fn status_report(scrapes: &[PartScrapes]) -> StatusReport {
     }
 }
 
-/// The samples of the page `url`; `None` when it does not answer with Prometheus samples.
+/// The samples of the page `url`; `None` when it does not answer with a Prometheus text page.
 async fn fetch_page(http: &Client, url: &str) -> Option<Scrape> {
     let result = async {
         let response = http.get(url).send().await?.error_for_status()?;
-        response.text().await
+        let prometheus = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.starts_with(PROMETHEUS_CONTENT_TYPE));
+        Ok::<_, reqwest::Error>((prometheus, response.text().await?))
     }
     .await;
     match result {
-        Ok(text) => Some(Scrape::parse(&text)).filter(|scrape| !scrape.is_empty()),
+        Ok((true, text)) => Some(Scrape::parse(&text)),
+        Ok((false, _)) => {
+            tracing::debug!(%url, "metrics page is no Prometheus text page");
+            None
+        }
         Err(error) => {
             tracing::debug!(%url, %error, "metrics page not read");
             None
@@ -194,6 +208,8 @@ mod tests {
          rep_gateway_round_trip_p99_ms{worker=\"1\"} 87.4\n\
          rep_gateway_round_trip_p99_ms{worker=\"2\"} 41\n";
     const OTHER_PAGE: &str = "director_players 7\n";
+    /// The page of a server that has counted nothing yet.
+    const EMPTY_PAGE: &str = "";
     const TIMEOUT: Duration = Duration::from_secs(2);
 
     fn up(part: Part, texts: &[&str]) -> PartScrapes {
@@ -279,16 +295,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pages_without_samples_or_answer_are_down() {
+    async fn text_pages_are_up_even_empty_and_others_are_down() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
         let address = listener.local_addr().expect("address");
         let app = axum::Router::new()
             .route("/metrics", axum::routing::get(|| async { SIM_PAGE }))
+            .route("/empty", axum::routing::get(|| async { EMPTY_PAGE }))
             .route(
                 "/html",
-                axum::routing::get(|| async { "<html>login</html>" }),
+                axum::routing::get(|| async { axum::response::Html("<html>login</html>") }),
             );
         tokio::spawn(async move { axum::serve(listener, app).await });
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -300,7 +317,7 @@ mod tests {
         let pages = PartPages {
             login: vec![format!("http://{address}/html")],
             gateway: vec![closed_url],
-            director: vec![good.clone()],
+            director: vec![format!("http://{address}/empty")],
             sims: vec![good.clone(), good.clone()],
             social: Vec::new(),
         };
