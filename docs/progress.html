@@ -91,6 +91,8 @@
   .legend { display: flex; flex-wrap: wrap; gap: 8px 16px; margin: 8px 0 0; font-size: 0.92rem; }
   ul.done { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px 12px 40px; margin: 0; }
   ul.done li { margin: 4px 0; }
+  ol.next p, ul.done p { margin: 0; }
+  ol.next p + p { margin-top: 4px; }
   code { font-family: ui-monospace, "Cascadia Code", Menlo, monospace; font-size: 0.88em; }
   footer { color: var(--muted); font-size: 0.9rem; margin-top: 40px; }
 </style>
@@ -98,7 +100,7 @@
 <body>
 <main>
   <h1>Blighted New World Emulator: Progress</h1>
-  <p class="sub">Status on 2026-11-09. Client build 25810808. Last commit <code>d8e79a6b</code>.</p>
+  <p class="sub" id="sub"></p>
 
   <div class="cards" id="summary"></div>
 
@@ -122,195 +124,22 @@
   </div>
 
   <h2>What to do next (in order)</h2>
-  <ol class="next">
-    <li><strong>Voice with two players.</strong>
-      <div class="why">Seen live on 2026-11-08 with one player: the rooms join and the player hears itself (<code>echo = true</code> in the local voice server). Still to see: two games in one room hear each other, and the speaking icon (whether retail shows one for the own voice is Unknown). Turn <code>echo</code> off for that test.</div></li>
-    <li><strong>Live check of the town points on the map.</strong>
-      <div class="why">Built (2026-11-06). Seen live on 2026-11-07: walking into a town gave the "town visited" line, and the visit was still saved after a new login (<code>visited_towns</code>). Still to see: which map icon changes, and a fast travel to that town (use <code>!azoth 1000</code>, or set <code>[fast_travel] free = true</code>). Then check one Brimstone shrine (its point moved by 0.4 m to the retail place). Towns from before this build count only after one new visit, because the server did not keep them before.</div></li>
-    <li><strong>Fix the quests the quest walk found broken.</strong>
-      <div class="why">The walk (2026-11-06) played all 18,441 quests and missions: 16,976 end, 1,173 do not. The biggest cause by far (698 quests) looks like one server gap: a normal quest's "have and return items" step keeps no item source, so the item never drops (a mission's step keeps it). Prove it on a retail capture first, then fix. Next come 297 kill steps with no matching open world mob, 47 step kinds the server does not run, and the beach chain for a character that skipped the tutorial (it waits for an achievement no open world step gives). The list with each quest's stop is in <code>local-data/reports/quest-walk-all.md</code>; the causes are in <code>local-data/findings/2026-11-06-quest-walk-and-play-bot.md</code>. The 6 quests the play bot reported broken (and the walk did not) were each a fault of the bot, not of the quest (2026-11-06): after the bot fixes, 5 of them were turned in over the network, and the sixth passed its old stop and waits at a step the bot does not play yet.</div></li>
-    <li><strong>Windows test of the three reroutes, and a look at the empty shop screen.</strong>
-      <div class="why">The news reroute is live-checked on Linux (2026-11-02): the client's news polls reach our server. That run showed one more call to Amazon: the region ping, <code>GET /ping</code> on <code>dynamodb.us-east-1.amazonaws.com</code>, port 80. Now our server answers it on <code>ping_listen</code> (port 80), and the launcher maps the name (tests only). For each server: add the ping host to <code>[aws_mirror] hosts</code> and <code>ping_listen</code> to <code>edge.toml</code>, make the mirror certificate again, restart edge-http. On Windows, run <code>patch-client.py --aws-proxy</code> again (five caves). The region ping is live-checked on Linux too (2026-11-02). That run showed one call after login to Amazon's shop or entitlement service; now our remote config points the three <code>omni.fcs.endpoints.*</code> keys at <code>game.&lt;domain&gt;</code>, and the server answers an empty shop. Live on Linux: after a new start the game held no connection to an Amazon address for 40 s, and its entitlement sync reached our server. Still to see: the shop screen opens empty (not opened yet), and the same on Windows. Privacy settings service (2026-11-04, tests only): a retail capture holds its call (<code>unlock_store_content</code>, call 52: the client posts 5 setting names, retail answers each at its default, <code>Everyone</code>). Now the remote config points <code>omni.privacy-settings.client-endpoint</code> at <code>game.&lt;domain&gt;</code> (read by <code>FUN_14160ad60</code>), and <code>game.&lt;domain&gt;</code> answers the retail request with the retail reply byte for byte. Still to see live: whether and when our client calls it. Notes: <code>docs/re/2026-11-02-cms-news-hosts.md</code>, <code>docs/re/2026-11-02-region-ping.md</code>, <code>docs/re/2026-11-02-shop-services.md</code>.</div></li>
-    <li><strong>Find why one mob stops walking home.</strong>
-      <div class="why">The hunt test passes all 11 checks (2026-10-31: 30 bots, 1,748 hits, 276 mob deaths). In 1 of 4 runs one mob (spawn <code>575fea06</code> near 7171, 3147) stood 18.7 m from its spawn and reset every 2.8 s for minutes without moving; a mob that walks home takes no hit. Short steps from its place are free; why its tree does not walk home is Unknown. The sim now logs <code>mob move to a point</code> and <code>mob move failed</code> at debug level. In that run, 98.9 % of ticks on busy sims fit in one tick (the test wants 99 %). Notes: <code>local-data/findings/2026-10-31-beach-sim-speed.md</code>. Janszoon with his hard attack tree (the tree with his spin) got stuck the same way in one test: idle, fidget, and his <code>Reset_Move</code> never starts, about 4 m from his spawn (7059.5, 3134.5, height 43.3). Checked 2026-11-04 (tests): the mob is <code>Corrupted_Sailor_1H_Sword_Named_00</code> (<code>575fea06</code> is the crc of its vitals id). On the real ground with its level route, drawn 18.7 m out on 8 bearings, it walked home every time, both when the player left and when the player stayed beside it and hit it each second (16 of 16, test <code>the_beach_sword_sailor_walks_home_from_every_side</code>). So the cause is still Unknown, and no fix is made. Next step: a hunt run with <code>RUST_LOG</code> debug for <code>sim::mob_ai</code> (the local stack was running for the user, so this run was not made).</div></li>
-    <li><strong>Live check of the weapon abilities and mana.</strong>
-      <div class="why">Built, not yet checked with the game client: keys 1 to 3 run the game's own ability lists (19 lists, 278 actions), cooldowns go to the client as retail (byte-checked), mana is spent per spell and comes back, spells fly or open areas that last, upgrades count from skill points, perks and Focus. Check live: map a life staff ability, press it, watch the cooldown and the mana bar. Input names are solved (the client numbers its 596 input actions by the CRC of their names; keys 1/2/3 = 402/115/139 from the game files). Still Unknown: the rest of the retail cooldown cut (0.8847 life staff, 0.8575 flail; Focus gives 0.97). Fixed 2026-11-04 (tests): Shooter's Stance and Stopping Power now start (8 aimed abilities open before, 6 now). Two engine faults: a key press test without <code>BackTicks</code> counts only the frame of the press (the client's maker of the test, <code>FUN_142bec920</code>, fills it with zeros), not 20 frames; and a tag activity now sets and unsets its tag on its start and end, inside its branch and named cases, so a tag that a branch sets only after a shot (<code>ReloadRequired</code>) is no longer on all the time. Still open: the bow's three ability shots, Meteor Shower and Ice Storm fire through actions that no parsed fragment transition leads to (the server reads one fragment option per name; Unknown: whether the client picks options by tags), and Ice Pylon needs the server to place its pylon. Notes: <code>local-data/findings/2026-10-31-abilities-design.md</code>.</div></li>
-    <li><strong>Live check of the mount fixes.</strong>
-      <div class="why">Seen live (2026-11-03): My Kingdom for a Horse to its end, the reward box, the summon and the ride; after the cooldown fix the summons after a new login work (01:34 and 01:42 UTC), and Hermit's Rally (<code>EF_Tour_0</code>) ran to its finish. Then the vittles of Hungry as a Horse did nothing: the press of a quick slot key while riding sent no call (retail too), and the server read only quick slot 1 and only weapon-stance uses, which have no <code>MountItem</code>. Fixed, not yet seen live: quick slot keys 1 to 4 (<code>Use_Quickslot_1</code> to <code>4</code>, slots 14 to 17) use their item; a mount food takes effect 690 ms after the press while riding (retail <code>9401_tutorialfood</code> capture), gives its <code>Riding</code> experience (2,500 for T1), counts on the daily limit of 3 and sends its visual script (608). Live on 2026-11-05 the change mount screen still spins: the catalog reaches the client every time (its own report says 47 offers and 4 stores, valid), but the list never builds. The copy of the store script in the screen's context does not get the catalog, and why is Unknown (notes: <code>local-data/findings/2026-11-04-mount-store-capture.md</code>). Live again on 2026-11-06: still spins. Each open sends the 6066 change call, five store asks (all answered <code>304</code>) and gets two to four catalog-ready reports (47 items, 4 stores, valid). The screen's script (<code>selectionpanel.luac</code>) clears its spinner only in the catalog callback, and the static read of the store scripts finds no step that stops it. The next proof needs a trace inside the running client. Since 2026-11-04 (tests only) each store has one empty static slot (every one of the 1,029 retail store replies in the captures had one to six), an offer's alias is its mount's store product (retail <code>Mount_Wolf_1</code>; the client leaves out an offer without a product, so 47 of the 52 store mounts are sold), a free offer shows 99 % off as retail, and the client's <code>x-amzn-if-none-match</code> header gets the <code>304</code>. To check: feed the horse from a quick slot while riding, open the change mount screen.</div></li>
-    <li><strong>Live check of a server on other ports.</strong>
-      <div class="why">Built, tests only: <code>public_https_port</code> and <code>public_ping_port</code> in <code>config/edge.toml</code> (default 443 and 80). Check live: set <code>https_listen</code> and <code>public_https_port</code> to 8443, <code>ping_listen</code> and <code>public_ping_port</code> to 8080, patch the client with <code>--aws-proxy</code>, type <code>example.org:8443</code> in the launcher, play to character select. Expected: the remote config, news, region ping and game routes reach the server. Unknown: the game client reads a link with a port (<code>game.&lt;domain&gt;:8443/s/&lt;session&gt;</code>). Steps: "Servers on other ports" in <code>docs/client-patch.md</code>.</div></li>
-    <li><strong>Live check of the GM chat commands.</strong>
-      <div class="why">Give your account the <code>game_master</code> rank, log in, and type <code>!help</code>, <code>!level 60</code>, <code>!coins 1000</code> and <code>!where</code> in chat. The answer comes as a System chat line that only you see. If the client does not show it, move the answer to the whisper channel. The command list is in the README under "GM chat commands".</div></li>
-    <li><strong>Check the target lock pick on retail.</strong>
-      <div class="why">On our server the first lock takes the nearest mob inside a small circle around the crosshair, not the mob under the crosshair. The client code works that way (<code>FUN_142c8b350</code>), so it is likely normal. To check on retail: stand near 2 mobs close together, aim at the farther one, lock. Also check: after a reconnect, does lock still work (flag 4, weapon swap range 0 were seen after gdb reconnects)? Notes: <code>local-data/findings/2026-10-01-client-lock-and-actor-state-map.md</code>.</div></li>
-    <li><strong>Work through the open world capture survey.</strong>
-      <div class="why">The open world captures already hold wars and sieges (about 26 captures), invasions (5), expeditions (35), Outpost Rush (12), trading post (10), housing (17) and companies (11). The survey of all 1,071 captures lists what the server still lacks, area by area, with a fix order: <code>local-data/findings/2026-11-05-open-world-capture-coverage.md</code>. Systems with no capture must still be recorded before 2027-01-31.</div></li>
-    <li><strong>Live check of many quests at once.</strong>
-      <div class="why">A player can run many quests. Each quest type has the client's own journal limit (side quests 30, town board and faction missions 30, main story 20, community goals 50, and more; read from the client code). A quest the game starts by itself, such as the next step of a chain, has no limit. None of this is checked live. To check: accept Truffle Fever (Hapless Howe) while the main story quest runs, gather its 5 truffles, then its herbs and berries (they count only when gathered). Truffle Fever failed live before the loot-container fix of 2026-10-03, which touched 346 of the 381 item steps that drop from an object. Kill and drop steps that name a spawner's category (<code>Barbary_Lion_16BS12</code>) or its group (<code>Periville</code>) also count now; 11 steps still have an unknown source (faction, season and event steps). Also check the stones of Bridge into the Past (Weaver's Fen) and the staff ritual of Arcana Aligned (Elysian Wilds). Notes: <code>local-data/findings/2026-10-02-quest-journal-limits.md</code>.</div></li>
-    <li><strong>Bring in the quests of the captures: quest step types.</strong>
-      <div class="why">The server runs most step types of the task sheets now (the full list is in the Quest engine row below). Quests whose steps are all supported: side quests 526 of 528, main story 354 of 358 (2026-10-31); housing quests 14 of 22 and town projects 12 of 12 (2026-10-03). Skipped task rows: 29, down from 146. That count is from tests on the game data; only a few of these quests were played live. Still open: the puzzle slayer scripts (5; where the scripts are is Unknown), <code>TaskPerformEmote</code> (1, the summer event's <code>13_Summer_08_Poet_DanceForPoet</code>; blocked: no capture holds an emote, and the client type list has no emote request; a retail capture of <code>/dance</code> is needed before 2027-01-31), the PvP faction mission steps <code>TaskDie</code>, <code>TaskControlPoint</code> and the PvP patrol (they need the faction boards), and empty templates. List: <code>local-data/findings/2026-10-02-quest-gaps.tsv</code>; notes: <code>local-data/findings/2026-10-02-task-interact.md</code>.</div></li>
-    <li><strong>Live check of the beach play test 2 fixes (<code>ba675453</code>).</strong>
-      <div class="why">Confirmed live: the skinning knife crafts with no "Crafting attempt failed" message, and crafting no longer fails over and over. Fixed in code but not seen live yet: food from the quick slot gives its buff, the watchtower crate gives loot, growths get retail's break gather state (the explosion is still to see), and mobs no longer walk into walls or climb more than 0.6 m in a step. The level's terrain cookies (height stamps the client puts on its terrain) are now in our terrain; at La Roussette, 83 % of retail player feet samples now sit on our ground (62 % before). Not a bug: crewmate loot drops about 1 kill in 25, as on retail (<code>[combat] loot_drop_multiplier</code> scales it; 1.0 is retail). Still open: hits from behind (our reach matches retail; what the client draws is Unknown), the road float on the way to Hapless Howe, the skip potions (no retail capture). Notes: <code>local-data/findings/2026-10-03-beach-playtest-notes.md</code>.</div></li>
-    <li><strong>Close the new player bugs (tutorial and starting beach).</strong>
-      <div class="why">Every new player goes through both. The tutorial is the <code>ftue_v2</code> level (ship, quick time event, sailors, legionnaires, corruption, Damned Commander). The starting beach is open world. Found on the beach (play test 2026-10-01, 18 issues): player hits that miss (boars, Janszoon, mariners), bosses whose melee does no damage, mobs that swing from 3 to 4.5 m, mobs sunk in the ground or stuck in walls (Janszoon, the cave), a mob back to full health, debuffs shown as 10,957 days, no food buff, no fall damage, the watchtower crate gives nothing, growths with no break effect, deck boars not asleep. Fixed since, live check needed: the food buff, the watchtower crate, the growths' break state (<code>ba675453</code>), the ground at La Roussette (<code>4c1a219f</code>). The others: not checked again. Level not yet checked: temple door wall.</div></li>
-    <li><strong>Make own movement match retail (to-do <code>t1</code>).</strong>
-      <div class="why">The server body is still off from the client: median 0.156 m in the open world, 0.219 m in the tutorial. Small drifts cause missed hits and bad walls.</div></li>
-    <li><strong>Close the collision gaps: attack motion, camera, physics.</strong>
-      <div class="why">The server already has the slayer state, its own movement checks, and a collision file of the whole open world from the client's paks (<code>collision-25810808-newworld_vitaeeterna.bin</code>, floor and ray queries). Still open: (1) the client moves the body by an attack's root motion (<code>AnimationDrivenMotion</code>); our body stops it at walls (<code>SetHaltMotionOnCollision</code>), but not yet at an enemy's capsule, and the live server body does not use it yet (only the replay tool). Wired before the capsule halt and the camera boom, it made the camera-follow parts worse (2026-09-26). (2) Camera collision and the fight camera boom (0.9 to 5 m) are not built; ship fights are 0.94 m median off. (3) The server checks rules against the collision mesh; it runs no full physics engine. Whether the retail servers run one: Unknown. Notes: <code>local-data/findings/2026-11-01-movement-review.md</code>.</div></li>
-    <li><strong>Make the first open world hours work.</strong>
-      <div class="why">After the beach: main story quests, gathering, crafting, shops, fast travel. The code exists, but nobody played it live.</div></li>
-    <li><strong>Finish combat: ranged, magic, block, status effects.</strong>
-      <div class="why">All of this is in tests only; none of it is checked with the game client. Block has the guard break, no stamina regen while held, 2218 only in the tutorial and cross-sim hits (2026-10-30). A mob projectile is blocked only by a weapon with <code>CanBlockRanged</code>, with its ranged block health and stamina scales (from the data; no retail ranged block was captured). From the data (2026-11-01): unblockable attacks pass a block, empower buffs raise block stamina, and about 20 status effect columns now act (stun, root, silence, rend, weakness, heal mods, food attributes, stamina regen). Still open: the block rise delay of about 1 s (retail evidence conflicts), the facing arc (the yaw convention of the input view is Unknown), the passive ability triggers (<code>OnBlockedHitTaken</code>, <code>OnBlockBreak</code>, <code>OnHit</code>: no trigger engine yet; <code>AbilityData</code> has 288 columns and no code reads <code>AbilityTrigger</code>; not started on 2026-11-04), mobs that block (<code>VitalsData</code> block columns).</div></li>
-    <li><strong>Expeditions (dungeons) and instances.</strong>
-      <div class="why">The group content of the game. Instance code exists, but it is not tested live.</div></li>
-    <li><strong>Companies, territories, wars, invasions.</strong>
-      <div class="why">These need many players and the captures from step 5.</div></li>
-    <li><strong>Trading post and full economy.</strong>
-      <div class="why">Part buys, settlement ids and buy-order storage now match retail in tests on the database (2026-11-01). A live test with two players is next; posting fees are Unknown.</div></li>
-    <li><strong>Check the live page through the relay.</strong>
-      <div class="why">Discord login on the public admin site works (2026-11-04). Not checked yet: the live page's stream (server-sent events) through NPMplus and the relay.</div></li>
-    <li><strong>Put the status reporter beside the public website.</strong>
-      <div class="why">The website lives in its own repo (<code>blighted-emu-website</code>). <code>status-reporter</code> is built and was seen with a local copy of the site (2026-11-08). Still to do: run it on the game VM with the public site's address and a secret shared with the site's <code>WORLDS</code>, and see the real client's round trip and a leaderboard row on the site.</div></li>
-    <li><strong>Systems with no code: housing, artifacts, heartrunes, trophies.</strong>
-      <div class="why">Start these last. They are not on the path of a new player.</div></li>
-  </ol>
+  <ol class="next" id="next"></ol>
 
   <div id="areas"></div>
 
   <h2>Done list</h2>
-  <ul class="done">
-    <li>Website link, part 2 (2026-11-09, tests only). The leaderboard report now gives each board its sub-group, value kind (Time, Ratio, Days ...), order (lowest first for clear times), whether it holds every world, what it ranks (character, company or group), the current rotation and its reset time (the season end comes from the client's remote config). Rows keep the game's shared ranks (1, 1, 3), keep decimals (clear times in seconds), and group rows name every member this world knows. With <code>[website] site_url</code> in the edge config, <code>edge-http</code> gets the message of the day for character select from the site once a minute (ETag, last good copy kept), and the new <code>GET /launcher/news-source</code> tells the launcher where the site's news feed is. The client shows the message of the day as plain text (markup is off in its screen files). How a site connects: <code>docs/website-integration.md</code>.</li>
-    <li>Status reporter for the website (2026-11-08, seen with test bots and a local copy of the website). New <code>status-reporter</code> (<code>config/status-reporter.toml</code>): one per world, on the game machine, sending out only. Every 15 s it reads the metrics pages of each part (login, gateway, director, sims, social; a part is up when each of its pages answers with a Prometheus text page, also an empty one: a server that just started has counted nothing yet) and posts the status to <code>/api/ingest/status</code>: the part states, the players of the sims (<code>sim_players</code>) and the largest gateway worker p99 round trip. Every 5 minutes it posts all 422 boards of the game data to <code>/api/ingest/leaderboards</code>, with the top 100 named rows of each board's current rotation; a row whose entity is no character or company of the world is left out. Each report carries the world id, the time and a lowercase hex HMAC-SHA256 of <code>time.body</code> with the world's secret (the website's test vector passes). <code>content-tool leaderboards</code> writes the board table <code>leaderboards-&lt;build&gt;.json</code> with the English names and groups. The rotation keys of <code>[leaderboards]</code> are now one shared type for the sim and the reporter. Live check: the local site went from "No signal" to Online, and showed Players online 3 while 3 test bots were in the world.</li>
-    <li>Discord role access (2026-11-08, tests only). With the allow list on, the holders of a role in <code>[discord] allowed_role_ids</code> (in the <code>guild_id</code> server) may log in too, so a whole group of testers needs no per-person list. The roles come from the member record the login already reads; each Discord login stores them (global migration 0008, <code>discord_login.guild_role_ids</code>), and each Play checks the stored ones, since Discord cannot be asked then. A role given or taken in Discord counts from the player's next login. To check: a role holder logs in and plays on the VM.</li>
-    <li>Fast travel kneel (2026-11-08, seen live). Live, inn recall and shrine travel still did not kneel, while unstuck did. The server's own pose log showed our kneel matched retail's usual form byte for byte: the kneel sequence alone (<code>15=05</code>), from standing still, with the channel flag and interaction off before it in the same bundle. Unstuck sends a full state with its sequence, and it plays. Retail also sends the fast travel kneel as a full state (<code>13=1f 15=05</code>) in 21 of 487 starts. Live, the full form did not kneel either (log: <code>13=1f 15=05</code> sent at 20:05:53). The server now sends the unstuck kneel (<code>13=19 15=b247</code>), which plays live, for every fast travel and inn recall too (the user's call: it is the same animation). Live, still no kneel with the same pose. A client trace then showed the game does get the channel flag (its fast travel teleporting flag turned on at the start and off at the cancel), and the unstuck kneel plays from the unstuck accept message (3980) alone. So a fast travel now also sends the unstuck accept at its start (with the channel's wait) and the unstuck done message (2190) at its end or cancel. Seen live (2026-11-08 20:40 UTC): the fast travel kneels. The inn cooldown stays 15 minutes: right after 9 retail recalls, at most 884 s were left, never more than 900 s.</li>
-    <li>Inn recall timer and landing (2026-11-08, tests only). Live, after a recall the Game Menu showed a 10,956 day countdown, and the recall put the player behind the innkeeper. The timer: the inn point's cooldown end went out as a Unix time, and the client counts from 2000-01-01 (10,957 days later). It now goes out on the client's clock. Retail's cooldown is 15 minutes (900 s in all 449 retail inn points), not one hour. The landing: the inn's level point is the innkeeper; retail lands 3.00 m in front of the innkeeper, at the same height (9 of 10 innkeepers with retail recalls; one lands 1.00 m in front, why is Unknown). The server now does the same. The server also logs each own pose change at debug level, for the fast travel kneel, which still does not play.</li>
-    <li>Inn recall and the Game Menu store box (2026-11-08, tests only). Live, "Recall to Inn" stayed grey and the store box on the Game Menu spun. One cause: the home point state named the bound inn as the point the player had just used. At each such state the client starts that point's 900 s cooldown from its own clock (a client trace: the inn's cooldown end was the login time plus 900 s). The Game Menu then checks the cooldown every second and redraws, and each redraw asks for the store again. Retail names a used point in 16 of 1,573 login states and never an inn (0 of 4,347 states). The server now names no point. To check: log in bound to an inn, open the Game Menu.</li>
-    <li>Unstuck kneels and stands up as retail (2026-11-08, tests only). Live, after an unstuck the character kept a stiff pose with arms out and the weapon pose until a jump. Retail sends a kneel pose (<code>13=19 15=b247</code>) and turns interaction off when it accepts the unstuck, and a stand-still pose (<code>13=1f 15=b910</code>) with interaction on at the move. The server sent neither; it now sends both, and it also stands the player up when the move fails (Inferred). To check: use unstuck, then walk.</li>
-    <li>Our own voice service (2026-11-08, seen live with one player). New <code>voice-server</code> (<code>config/voice-server.toml</code>) and the voice prelogin in edge-http (<code>[voice]</code> of <code>config/edge.toml</code>). The game signs in, joins its map cell rooms within 0.2 s ("channel joined" in <code>Game.log</code>), sends speech while push-to-talk is held, and the player heard its own voice through the relay. Three fixes found with a trace of the voice SDK: the status answer carries the request id, the room presence names the occupant jid, and the bound jid keeps the SDK's <code>+B</code> account name (without it the game never saw itself in a room and showed "join failed" after 60 s).</li>
-    <li>Quest walk and play bot (2026-11-06). <code>sim quest-walk</code> plays every quest of the level with a test character and writes which end and where the others stop: 16,976 of 18,441 end. The GM lines <code>!queststate</code>, <code>!questplan</code> and <code>!state</code> show a quest's place, its next steps and the player's state. <code>nw-testclient play</code> runs a bot on the live servers through the client's calls: it leaves the tutorial, plays quests in the order their requirements allow, and plays activities. Seen working over the wire: level up, PvP flag, crafting, shrine fast travel, an expedition's remote entry and a town board take. Not played yet: groups (needs two bots at once), mounts (the summon key input), music (equipping an instrument) and inns (which id a check in names is Unknown). The bots log in through a second edge in password mode on port 8444, because the live edge uses Discord.</li>
-    <li>Test bots at level 65 in good gear (2026-11-06, tests only). New GM line <code>!gearup</code>: for each worn item it wears the best item of its kind (the same item classes, no fixed gear score, the highest <code>MaxGearScore</code>) at that gear score; the old item goes into the bag. A player's hit scales with its weapon's gear score, so a Soldier bot now hits with a gear score 800 tier 5 longsword in place of the gear score 60 kit sword. The bot's setup is <code>!god on</code>, <code>!heal</code>, <code>!level 65</code>, <code>!gearup</code>. Seen live on 2026-11-06: the setup lines ran, and a new Ranger bot finished 18 of 20 starting quests (the other 2: no hit landed on a Withered Grunt, and a mandolin step the bot does not play).</li>
-    <li>A town fast travel lands on the town's ground (2026-11-07, tests only). Live, a travel to area 30155 put the player at height 104, under the terrain at 111.4; the refused falling moves then put the player back at the shrine it had left, under that shrine's platform. Retail town and outpost travels arrive at the retail home point of their area (Monarch's Bluffs 19 of 19, area 30253 10 of 10, outpost 40325 12 of 12). The server now uses that point, and a teleport makes the new place the one a move back goes to.</li>
-    <li>Voice chat rooms follow retail (2026-11-07, tests only). From 7,404 retail room lists (405) of 556 captures: the list holds the 512 m squares that a 512 m box around the player overlaps (2 to 4, own square first; it held retail's list in 5,697 of 6,270 cases, the exact rule is Unknown), was the own square only before (retail's list in 496); the layer is <code>0</code> in the open world and a 16-digit id per instance (113 captures switched layers when entering an instance), was always <code>0</code>; every 405 and every group room (4200, 312 of 312) answered a request within 1 s, so the server pushes neither. The test bot has a <code>voice</code> check (service, login ticket, rooms, join ticket). Real voice still needs a Vivox-compatible voice server; none exists for this client's SDK.</li>
-    <li>The inn home point carries its retail name (2026-11-07, tests only). Live, inn recall stayed unusable with its timer at 0. Our inn entry matched retail's in place (the innkeeper on the inn's <code>InnInteract</code> landmark), cooldown, use time and id (<code>[17680737194352937251]0</code> is the Prydwen inn element's own id; correction 2026-11-08: retail never names it as the used point), but its name was empty; retail names it, for example <code>@12_InnName</code> (23 retail inn points, now a table). Whether the name is what the client needs to allow the recall is Inferred.</li>
-    <li>The shield comes out with the sword (2026-11-07, tests only). Live, the shield sometimes stayed on the back in combat. Our paperdoll maps always kept slot 27 sheathed, so the client's own draw could be undone. In 1,085 retail ledgers the shield of slot 27 is drawn and attached with a longsword or a flail from option 24 or 25, and stays sheathed with other weapons. The server now draws and attaches it with those weapons, and other players see it too.</li>
-    <li>Mobs stand on the floor at spawn (2026-11-07, tests only). Live, timber wolves near Prydwen walked 3 to 6 m in the air. Their spawn was 3.32 m over the floor, and the spawn landing only moved a mob down 3 m. Retail wolves of the same spawn stand 0.10 m over the floor. A spawn now lands on the floor at any height. 5,088 of 115,965 open world spawns were more than 3 m up. All 10 retail tutorial mobs are within 1 m of our floor, the ship deck too.</li>
-    <li>A login starts on the floor (2026-11-07, tests only). Live, a login sometimes dropped the player a few feet. The saved spot is the last client position, which can be in a jump; the server only fixed spots more than 150 m up. Retail's first login position is 0.00 to 0.08 m over the floor. The arrival now lands on the floor under it (ground or a building), or at swim height in water.</li>
-    <li>The fast travel kneel plays (2026-11-07, tests only). Live, the countdown ran but the character stood still. Retail starts the kneel itself: 40 to 80 ms after the travel call, the player's animation state gets sequence 5 (461 of the retail 3713 calls and 30 of 30 home travels). Our server sent nothing. It now sends that sequence. A rider first gets off the mount with 5937 reason 0, as in all 23 retail rider travels, and then kneels standing still. Live test 1 (2026-11-07): still no kneel, and after the arrival the sword and shield showed in the hands while the server held them sheathed. Retail stands the player still after the arrival (<code>13=1f 15=b910 16=2d 18=00</code>, 65 of about 100 arrivals) and turns the player's interactor off for the channel (all retail travels checked); the server now does both. Why the client did not kneel is still Unknown.</li>
-    <li>Fast travel to a shrine works again (2026-11-07, seen live: two shrines reached). Live, every shrine travel failed with "fast travel failed". The server found the place by the position the client sends, inside the place's radius. A shrine's radius in the level is 0 m, and the client sends a position up to 3.4 m away, so no shrine matched. In 751 retail fast travels (406 shrines, 122 settlements, 60 of type 22, 163 inn recalls), the type and the area id the client sends name exactly one level place every time. The server now finds the place by its type and area id. The test bot sent the place's exact position, so it hid this fault.</li>
-    <li>Free fast travel switch and a GM line for azoth (2026-11-07, tests only). New <code>[fast_travel] free</code> setting in <code>config/edge.toml</code>, next to <code>[experience]</code>: <code>true</code> makes every fast travel to a settlement or a shrine cost no azoth. The server writes it into the remote config as <code>javelin.playtest-disable-fast-travel-costs</code> (the client's own switch), and the sims read the same value, so the map and the server agree. Left out, it is <code>false</code>: the retail cost. No config file may set that key by hand. New GM line <code>!azoth &lt;amount&gt; [player]</code> sets the azoth, at most the azoth cap.</li>
-    <li>Town and outpost points on the map, and exact shrine points (2026-11-06, tests only). A scan of every home point list in 816 retail captures found 22 town and outpost points, 131 shrine points and 3 crow's nests. Each one has the same position for every character, so it is fixed game data. A town's point is added when the player first comes into the town's territory, and a new character has none. The server now keeps the towns each character has been in (world migration 0033) and sends their points with the retail position, name and cooldown. The shrine points now use the retail positions too: the old rule (2 m beside the teleporter) was wrong for 27 shrines of other teleporter models. Crow's nests are listed once charted. Not seen live yet.</li>
-    <li>Charted shrines and landmarks on the map (2026-11-06, seen live). A trace inside the client showed that the map counts a shrine charted only when the player's home point list holds a shrine point in its territory. The server now lists each charted shrine. A landmark is now charted at an entry after its discovery, as in 66 retail cases. Live: learned shrines show as discovered, and two landmarks changed from "?" to their icon.</li>
-    <li>The change mount screen opens (2026-11-06, seen live). A trace inside the client showed the cause: the screen asks for the store catalog while its script still loads, and the client skips a loading script when the "catalog ready" signal comes. The server answered in 12 to 18 ms; the screen finished loading about 30 ms after it asked. Retail answers over the internet and is slower. The login server now waits 1 second before the catalog and store answers.</li>
-    <li>Shrine and town names on the map (2026-11-06, seen live). A trace inside the client showed the map's hover script stop on every shrine and town icon: it asks for the territory's governance (taxes, upkeep) and got nothing, because the server never sent the land claim manager state. Retail sends it at login on a world entity it first creates with a spawn card (the same card in four retail captures): 13 claims, their positions and one tax set for all. The server now sends that card, its position and the same claims, positions and taxes once per client, with no company owner. The first try sent the claims without the card and changed nothing.</li>
-    <li>Character select shows the worn armor (2026-11-06, seen live). The screen draws the look the login server sends; it was always the character creation look, with the starter preview armor. Retail's look holds, per armor slot, the checksum of the appearance the character wears (skins too; 427 slots of retail login data checked). The game server now saves that look at every item save and leave (world migration 0032), and the login server writes it into the character select look.</li>
-    <li>Spirit shrines are sanctuaries (2026-11-06, tests only). Retail puts its <code>Sanctuary</code> effect on a player at a shrine: a scan of 1,080 retail captures found every fast travel to a shrine arriving with it on, and 878 walks across the edge (off at a median of 7.6 m, on at 5.4 m). The server's sanctuary rule (it holds back or takes off the PvP flag) now covers 6.5 m around each of the 133 shrine landmarks, as well as the towns. Still open: the server never sends the <code>Sanctuary</code> effect itself (not at towns either); retail sends it in the lightweight map, and which of its two data rows sets that is Unknown.</li>
-    <li>Play bot plays steps as a player (2026-11-06). It gathers a quest object or a gatherable for a step's item with a client's gather interaction (it named every node with an empty id before, so the server tied that id to one node: "Depleted", then "out of reach"). It fights the placed mobs when a step counts one spawn group (a GM mob is in no group), heals after <code>!god on</code> (a mob killed it at its landing place, and a dead player wakes no mob), and fights on while its hits land (a level 34 bear has 8,776 health; a starter weapon hits for 42). A kill step whose fights saw no mob or killed none is "not played", not "broken". Live: <code>04A_Side02_01_ObeliskNotes</code>, <code>04A_Side09_01_LostAlchemy</code>, <code>1111_0201_deluge</code>, <code>02A_Side06_01_Bears</code> and <code>1104_0201_waterfalls</code> turned in, and the harvest activity completed. The sim logs <code>mob hurt</code> and <code>mob healed at the end of its reset</code> at debug level.</li>
-    <li>Audit of the whole code and its fixes (2026-11-05, tests only). The audit looked for stubs, fake success answers, demo data and half-done features. The findings and the state of each one are in <code>local-data/findings/2026-11-05-honesty-audit.md</code>. Items now keep everything they had (perks, gear score, durability, dye) when they move in a trade, a trading post sale (world migration 0030), a drop or a loot bag, and a full bag no longer loses anything. The server checks what the client claims. A gather or a lore read needs a node or note of that kind nearby in the level data, and the trading post opens only at a settlement. Craft fees, standing points, camp skins and voice channels are checked as well, and music notes are judged against the game's 655 note charts (<code>content-tool music-charts</code>). A quest step the server cannot run now waits instead of finishing at once; a step with nothing in its data still finishes, as on retail. A ban ends a live session. Social saves retry instead of being dropped, company coins can no longer vanish (world migration 0031), and privacy settings are stored and followed (global migrations 0006 and 0007). Mobs react to stuns and to their own tree's buffs. The PvP flag waits and counts down as on retail. Worn armor and weapon gear score set damage, and each start rolls a new dice seed. Queues and war sign-ups are refused until the PvP modes and wars exist. Still open: attributes in damage (the formula the data suggests does not match retail hits), dungeon doors, four quest step kinds, and projectiles and beams fired by behavior trees.</li>
-    <li>Open world capture survey and the first fixes from it (2026-11-05, tests only). All 1,071 open world captures were read. 238 of 265 kinds of client calls reach a sim reader, 168 of 194 kinds of server messages are built, and 70 of 118 kinds of world states are filled. The charm slot call (6983) read 8 bytes too many and failed on all 17 retail calls; it is fixed. Leaving a queue (1066, 2385) and leaving a game mode (3309) now work. Dropping a quest (3836) takes it out of the journal without marking it done, in 6 bundles as on retail. Creature triggers (3135) now come from the mobs' behavior trees and action lists (971 slice trigger components, 1,141 trigger activities). The incapacitated state (670) is set at death's door. The mob copies were built again with every retail state, and the sim now reads a state that has no reader of its own by its layout.</li>
-    <li>Held-aim abilities and Mannequin tags (2026-11-04, tests only). A key press test (<code>IfActiveAbilityMoveName</code>) now counts back its own <code>BackTicks</code> frames; without the attribute it sees only the frame of the press (Observed: <code>FUN_142bec920</code> fills the new test with zeros). Before, every test saw a press for 680 ms, so Shooter's Stance left its aim at once. Each action's <code>SetMannequinTag</code> activities now start and end with their <code>IfThenElse</code> branch, pick their first named case that holds, and set or unset their tag on <code>OnEnter</code> and <code>OnExit</code>; a tag stays on until something unsets it. Before, every named tag counted as set while the action ran. Result: Shooter's Stance readies, aims, shoots on a click and starts its 18 s cooldown, then reloads; Stopping Power starts. The spear's Javelin throws on a click from 433 to 600 ms after the key, as its list says (it clears the press when its ready step starts). The ability table is made again (<code>content-tool player-abilities</code>). Checked against the retail musket capture: a key is a tap of about 130 ms (<code>ability3</code>, <code>ability3_hold</code>, <code>ability3_release</code>). Tests: <code>shooters_stance_aims_and_a_click_shoots_and_starts_its_cooldown</code>, <code>every_weapon_ability_starts_from_its_key</code>, <code>an_ability_move_test_counts_back_its_own_frames</code>, <code>tag_activities_keep_their_changes_branches_and_cases</code>.</li>
-    <li>Privacy settings service (2026-11-04, tests only): <code>game.&lt;domain&gt;</code> answers <code>POST /players/&lt;persona&gt;/games/new-world/privacy-settings</code> with the retail default of each known setting asked for, in the retail order (the retail request gets the retail reply byte for byte); the remote config fills <code>omni.privacy-settings.client-endpoint</code>. A change of a setting has no capture and no route. Notes: <code>docs/re/2026-11-02-shop-services.md</code> section 2.2.</li>
-    <li>Transmog token counter (2026-11-05, tests only): the inventory's token counter spun forever because the entitlement list had no <code>Transmog_Token</code>. The list now holds it with 0 tokens (Inferred: this server grants and charges none), and its last page carries <code>"paginationToken": null</code> as on retail.</li>
-    <li>Store answer for the change mount screen (2026-11-04, tests only): one empty static slot per hidden store, offers named by their mount's store product (47 of 52 store mounts have one), 99 % off on a free offer, <code>304</code> to the client's <code>x-amzn-if-none-match</code>. Live check still needed.</li>
-    <li>Lost progress after restarts (2026-11-04; tests, and the new build is on the local stack). The database held every place the server had seen you find: all 17 discoveries and charts in the logs are in Tium's saved bits. The places from the morning of 2026-11-03 (Brysedd Overlook Shrine, Withered Farm, Withered Mines, a camp) never reached the server. The client only sends "entered" for a place it does not have, and our phasing bug (fixed in <code>2beb44ee</code> that afternoon) kept it from sending one there, so visit them again. Four save gaps are fixed. First, every server program now stops cleanly on SIGTERM as well as Ctrl-C. Before, <code>kill</code>, systemd and Docker ended them at once and the sim skipped its last save round (live check: the sim exits with code 0 on SIGTERM). Second, a player moved to another sim after its sim was lost now keeps its achievement bits, so new finds are set and saved. Third, after a handoff the new sim saves the items and quests it took over, which the old sim never saved. Fourth, a handoff keeps the PvP flag and the quest auto-pin setting. Notes: findings/2026-11-04-lost-progress-audit.md.</li>
-    <li>Admin site redesign (2026-11-04, local build only, not on the VMs yet): every page now looks like the game's map screen. A dark tab bar on top; maps on parchment with dark edges; slate panels with a gold top edge and serif capital titles; square buttons. Live keeps the map full size, with a tool column on the left (Selected, Events, Players, GM tools, Server, Key) and the server standings at the top right. Home, GM, Studio, Records, Scripts, To-do, Captures, Map, Live 3D and the login page use the same panels. Night and day themes, system fonts only. How to use each page is in <code>docs/admin-site.md</code>.</li>
-    <li>Admin site fixes (2026-11-04, local build only, not on the VMs yet). Map: the Mob spawns, Gatherables and Landmarks boxes showed nothing until you zoomed in very close; now a zoomed-out map shows a square per 256 m cell where those points are (<code>/api/world/spawn-cells</code>), and zoomed in shows each point as before. GM page: it now lists the players online on every sim and gives the picked player the same controls as the Live page (teleport, heal, god mode, kill, kick, items, quests, level, mastery, coins), with a line on what each admin rank may do. Studio: a "How Studio works" panel. Live 3D: a low-poly wire world (ground from the height grid, rocks, buildings and props from the level collision file through <code>/api/world/shapes</code>, the biggest shapes first up to 200,000 triangles), "Go to x, y" so the page shows the world with no one online, and a switch for the map colours. Trees and bushes: the tree and bush gatherables of the world file, as low-poly cones sized by the size word of their name (our choice of heights). The <code>region.vegetation</code> files were decoded (note in the research repo) and hold only ground cover (grass, brambles, small rocks, ferns, ivy), no trees; trees that cannot be chopped are not shown.</li>
-    <li>Admin home page server figures (2026-11-04, local build only): a Server panel shows the memory used of the total, the memory use, the processor cores and the processor use of the machine the admin runs on (<code>/api/host</code>, read from <code>/proc</code> every 3 seconds), each with a bar.</li>
-    <li>Admin Live 3D look (2026-11-05, local build only, not on the VMs yet): the ground is now flat low-poly faces coloured by height and slope (seabed, shore, grass, highland, bare peaks, cliffs), with a soft wire on top and a small light/dark change per face. A coarse ground (32 m faces, 8 km square) goes out to the horizon around the fine one (6 m faces, 1 km square), with a sky that fades to a hazy horizon and fog. Rocks and buildings are lighter than the ground, trees have two tiers of leaves, and the Go to camera is lower so the horizon shows.</li>
-    <li>Admin site through a relay (2026-11-04, live: the user logged in with Discord at the public admin name): <code>blighted-admin relay</code> runs on another machine and takes the browsers; <code>blighted-admin serve</code> with <code>[access.relay]</code> runs on the game machine, connects out to it over TLS where each side checks the other's certificate (<code>blighted-admin relay-keys</code>), and serves every admin page and the live stream through it. No port opens into the game machine; a site behind a relay serves no capture data. Set up 2026-11-04: relay on VM 600 (port 9190 for browsers, 9191 for the agent), agent on VM 601; public at the admin name through NPMplus on OVH with a Let's Encrypt certificate; the login page, Discord login start, host check and login check answer from outside. A site with Discord login now offers only Discord: the name and password form is gone and its route answers "password login is off". The login page layout is fixed (it sat in the narrow menu column).</li>
-    <li>Store mounts and a Marks of Fortune wallet (2026-11-04, tests only). The in-game store lists the 52 store mounts from the game data. <code>[shop] enabled</code> turns the store on or off. With <code>[shop] free</code> on, every mount costs 0, as in retail's last weeks (the capture <code>mount-menu-buying-all-store-horses</code> shows 35 mounts bought that way). With it off, a mount costs <code>mount_price</code>, or its own price when one is set, paid from the account's Marks of Fortune. <code>blighted-admin give-marks</code> gives an account Marks. When the game buys a mount (898), the sim answers 5936 right away. It then pays and saves the unlock to the account in one transaction (<code>account_entitlement</code> and <code>account_wallet</code>, global migration 0005) and answers 1285. A wallet that is too low gets no answer. A bought mount works on every sim and after every login, and the store's entitlement list shows it. <code>content-tool store</code> writes the store table that <code>edge-http</code> reads (<code>[shop] store_table</code>). Each store call is logged with its header names, to find out what the change mount screen waits for. What retail sends for a refused purchase is Unknown.</li>
-    <li>Experience settings (2026-11-04, tests). Every experience multiplier is 1.0 by default, which is retail without an event. Every retail capture had the shutdown event running (character, trade skills and weapon masteries at 2, territory standing at 3), which is why a new character reached Riding 39 where the mount quests give Riding 20. The <code>[experience]</code> section of <code>edge.toml</code> sets each multiplier on its own, with a comment above each one: <code>character</code>, <code>umbral_crystals</code>, 19 trade skills, 16 weapon masteries and the standing of 14 territories. The server writes them into the remote config the game reads (<code>javelin.xp-multipliers</code>), and the sims read them from there. No settings file may set them itself. The local test server runs the live event values.</li>
-    <li>Saved servers in the launcher (2026-11-04, tests; the window was checked on Linux in the Night and Day themes). The Server section lists each saved server with its name and address, and the selected one is raised. A click connects. A new address is saved once it connects, under the server's own name. Each server keeps its own launcher login, so switching servers logs you out of nothing. "Saved as" renames the selected server, and Remove forgets it along with its login. An older <code>settings.json</code> with one server and token becomes the first saved server. Windows and Linux share one code path with no system-specific part, but the Windows build was not compiled on this PC (it has no MinGW C compiler for <code>ring</code>).</li>
-    <li>Admin tools for Discord accounts (2026-11-04, tests only): <code>blighted-admin grant-rank</code> and <code>revoke-rank</code>, and the ban and rank forms of the GM page, find an account by its login name, Discord user id or Discord username; the rank list shows the Discord username. A server-mode admin site with <code>[access.discord]</code> has <strong>Log in with Discord</strong>: only a Discord user with a game account and an admin rank gets in, and the login writes an audit row.</li>
-    <li>OpenSSL built into the programs (2026-11-04, tests only): edge-http, rep-gateway and nw-testclient no longer need the OpenSSL of the host, so one build runs on this PC (OpenSSL 4) and on an Ubuntu 26.04 game host (OpenSSL 3.5). The DTLS, edge and gateway tests pass.</li>
-    <li>Mount food from a quick slot (2026-11-03, tests only). Pressing quick slot key 1 to 4 (<code>Use_Quickslot_1</code> to <code>4</code>) uses the item in slot 14 to 17. Before, the server read only key 1, and through a different input. Mount food (<code>IsMountConsumable</code>) works only while riding and is used 690 ms after the press, as in retail (<code>9401_tutorialfood-Hungry-as-a-horse</code>: pressed at 67.12 s, used at 67.81 s). It ends any mount food already active (<code>RemoveStatusEffectCategories</code>), fires its game event (the quest step <code>9401_TutorialFood</code>, and <code>Riding</code> 2,500 for <code>MountConsum_GruelT1</code>) and plays its effect's visual script (608, as retail does; the rule that this follows the effect's <code>ShowTextInDamageNumbers</code> is Inferred). A game event with a <code>LootLimitID</code> counts toward that limit, and once the limit is reached it fires its limit-reached event instead. A consumable with a <code>RequiredInactiveLootLimitID</code> is refused at that limit, so mount food gives riding experience 3 times a day (<code>Mount_FoodDailyXP_Limit</code>).</li>
-    <li>Mount screen, rally checkpoints and riding (2026-11-03, tests only): the change mount screen gets the <code>isChangingMount</code> echo it waits for; a race task counts each checkpoint; a rider's server body stays on the floor, keeps its mount's speed and follows a rider's camera (retail ride replay: 1.11 m off instead of 2.95 m).</li>
-    <li>Mount summon after a login and quest gaps (2026-11-03, tests only): an ended summon cooldown is sent as 0; each store answer holds one hidden store, so the client's catalog finishes and the change mount screen can stop spinning. Quest steps that could never finish: food status effects fire their game event (the mount food step <code>9401_TutorialFood</code>, and its riding experience), a region gatherable's gather has its variant's interact tag (the Gawain crown of <code>12A_MSQ_24_DefeatGawain</code>), achievement steps read <code>A || B</code> and <code>!A</code> expressions (90 tasks), POI steps read a tag list (4), quest success events (2) and recipe game events (2) reach the quests, faction rank steps read the faction's progression (24). Still open from the audit: encounter result events (45 tasks), encounter-spawned gatherables (9), PvP kill and fort events (7), volumes in deferred slices (12), kill-contribution mobs with no spawn (51).</li>
-    <li>Discord allow list (2026-11-03, live for a listed user: Discord login with the list and the server check on, game start, characters there; a refused user is tests only): <code>[discord] allow_list</code> (off by default) with <code>allowed_user_ids</code>; while it is on, only those Discord users can log in and make accounts, and a user taken off the list is refused at Play even with an older launcher login. New Discord accounts have no staff rank (test). The <code>[auth]</code> and <code>[discord]</code> options of <code>config/edge.toml</code> now say how to turn each one on and off.</li>
-    <li>Password account to Discord (2026-11-03, live: a linked password account opened by Discord login with its characters; contact details saved): <code>edge-http link-discord --username &lt;name&gt; --discord-user-id &lt;id&gt;</code> points a Discord user at a password account, so Discord login opens its characters, ranks and account items; nothing is copied and the password login stays for the admin site. A Discord login whose new account has no characters moves over; one with characters is refused.</li>
-    <li>Discord login keeps contact details (2026-11-03, tests only): the login asks for <code>identify email</code> and saves the Discord username, email and email-verified flag of each Discord login, written again at every login, so staff can help a player get an account back (global migration 0004). A new <code>[discord] guild_id</code> lets in only the members of one Discord server: the login then also asks for <code>guilds.members.read</code> and refuses users outside it. Run <code>edge-http migrate</code> after this update.</li>
-    <li>Four live bugs (2026-11-03, tests only): the inn check in is answered (it uses the open's interaction id); the mount quest's torches light when the player walks within 9 m (the detection sphere of 238 quest objects); a water gather ends with the own done state, so its animation stops; shrines are charted, and every phasing area has a phasing entry so the client reports entering the areas inside them.</li>
-    <li>Server ports set in the config (2026-11-03, tests only): <code>public_https_port</code> and <code>public_ping_port</code> in <code>config/edge.toml</code> (default 443 and 80); the links to <code>login.&lt;domain&gt;</code> and <code>game.&lt;domain&gt;</code> name the HTTPS port when it is not 443; the launcher takes <code>example.org:8443</code>; the launcher's loopback proxy sends tunnels to that port and the region ping to the server's ping port, and now runs on Linux too for a client patched with <code>--aws-proxy</code>.</li>
-    <li>Mounts from the quest (2026-11-02, tests only): the mount quest runs to its end on the game data; a quest's success event now gives its categorical progression (Riding 500) and achievement; a game event's <code>AchievementId</code> is earned when it fires, so the reward box gives the horse; a jump on the mount sets the 1 s regen delay. A player taken from another sim keeps its achievements, so achievements set after a sim border reach the client (before: they were lost).</li>
-    <li>Janszoon and mob attack picks (2026-11-02, tests only): Janszoon slams his anchor up close (retail playthrough 819480 ms); a UtilitySelector keeps its last pick only while it is in the running plan (client <code>FUN_1426355b0</code>), so mobs mix their attacks again.</li>
-    <li>Shop services rerouted (2026-11-02, live-checked on Linux): remote config fills <code>omni.fcs.endpoints.catalog-service</code>, <code>entitlement-service</code> and <code>transaction-service</code> with <code>game.&lt;domain&gt;</code> (the same fill as the leaderboard endpoint); the game host serves an empty catalog, no stores, no entitlements and <code>202</code> for a sync, with retail ETags and <code>304</code>.</li>
-    <li>Region ping rerouted (2026-11-02, live-checked on Linux): <code>dynamodb.&lt;region&gt;.amazonaws.com</code> is a mirror host; edge-http answers <code>GET /ping</code> with the retail body on its plain HTTP listener; the Windows proxy passes the plain ping to the server's port 80; <code>--aws-proxy</code> patches the pinger's client too (fifth cave, found on our <code>NewWorld.exe</code>).</li>
-    <li>News hosts rerouted (2026-11-02, live-checked on Linux): the news host and its image host are mirror hosts; edge-http serves our own message of the day, news stories and menu tiles from <code>config/cms/</code> as S3 objects with ETags (shared with the remote config sets); the server refuses to start without both hosts in <code>[aws_mirror]</code>; <code>--aws-proxy</code> patches the news client too (fourth cave, found on our <code>NewWorld.exe</code>). The tracked files have no news.</li>
-    <li>Sim tick speed (2026-11-01, bots only): with 1,100 bots, the busiest sim went from about 33 to 36 ms a tick and 237 to 375 late ticks in 90 s down to 20.5 to 23 ms and 0 to 1 late ticks in 120 s. It is not fully fixed: in the last run, 9.6 % of its ticks still took longer than 33 ms. The test runs used 8 tick threads (<code>LIVE_STACK_TICK_THREADS=8</code>; the script default is still 4). A mob now keeps its reach answer until it or its target moves 0.5 m; an A/B run and a profile showed that check took half the mob time. Tick part times are in the metrics.</li>
-    <li>Gather bots (2026-11-01): <code>nw-testclient gather</code> logs in bots with an archetype and start tools, walks them to the level's trees, plants and ore, and gathers as the client does. In the last run (100 bots, 7 min, next to 1,000 walkers) every bot gathered, 1,917 times in all. Two of its checks still fail: tick time on the busiest sim, and moves the server refuses from the walker bots. The 30 min run before the tick fixes gathered 2,697 times, but 7 bots never gathered.</li>
-    <li>Blocks and status effects from the data (2026-11-01, tests only): unblockable attacks pass a block; empower buffs raise block stamina; weakness, stamina regen, food attributes, crits, heal mods, armor rend by damage category, health regen, stun, root and silence, death's door removals, death effects, first stacks.</li>
-    <li>More database saves (2026-11-01, tests on the database): camp rotation and blueprint, mount summon cooldown, potion and food cooldowns (migrations 0027 to 0029); trading post, trade and shop jobs save their players at once.</li>
-    <li>Overnight 2026-11-01 (tests only, not live-checked): food and potion buffs saved over a log out and a sim border; a first try at the status and dev sites (deleted 2026-11-02) and the player round trip time; the trading post's part buys, settlement ids and buy-order storage; all 15 weapons' abilities checked on the real lists (83 of 91 start; a crash with two-list weapons fixed); boss summons; the movement review.</li>
-    <li>Dodge, mobs and death's door (2026-11-01, not live-checked): a dodge in an attack waits for the attack's dodge cancel window while the key is held (retail sword: dodges at 17, 566, 1182 ms taken, at 252 to 414 ms refused; all fit); mobs respawn after 62 s (retail; the data says 360 s), play their spawn animation again when a player comes back to a mob that was left alone, and notice a player within 3.8 m from any side; a lethal hit puts the player at death's door for 120 s (1 s delay, a hit after it kills, a revive brings it back), not in outpost rush, capture the flag, 3v3 or battle royale, nor to a killer 10 levels above, with the retail vitals blocks.</li>
-    <li>Weapon abilities and mana (not live-checked): the server runs each weapon's ability list from the game files; a key press starts the mapped ability, its follow-up actions, cooldown (sent as the retail 2932 bytes) and mana spend; spells fly to the first target on their line, open areas that last their <code>Duration</code> and clear on exit or end, and open their second spell where they land; upgrades count from spent skill points, worn perks and Focus thresholds (Focus 100: mana max 110, as retail; Focus 25: cooldowns 3 % shorter). Fixed on the way: sword abilities took a knife tool's animations; Sacred Ground cast twice and started no cooldown (2026-10-31).</li>
-    <li>Hunt test passes all 11 checks with 30 bots (1,748 hits, 276 mob deaths; before: 0 hits). Fixed in the sim: every kept spawn keeps its own AI (the encounter filter had shifted profiles and patrol paths to other spawns, so mobs reset their fight all the time). Fixed in the test client: own hunt accounts, the start nearest where a bot appears, mobs kept until their slot stops, the bot's own place, aim at the mob, only real mobs (not rocks or nodes), mobs on the bot's ground, a mob left after 5 swings without a hit; new checks for the start and for messages that do not decode (2026-10-31).</li>
-    <li>Busy sim speed: the open map leaves out the encounter spawns of the encounters it does not run (the forts' invasion rosters, up to 2,226 mobs on one point, and the breaches' seven tier copies of each mob; 59,214 of 115,965 spawns), mob minds use all their threads from 128 awake mobs, and the collision rays lost a hash set per ray. With 28 bots: late ticks 500+ to about 4, every bot logs in and stays (2026-10-31).</li>
-    <li>Player max health grows with the level and Constitution as retail: 856 + 1.75 x level squared + the Constitution health (9 retail points of two characters fit); the client gets the new max after a level up or a spend (2026-10-31).</li>
-    <li>Storage and trading post: an item gets a new id on each move, the storage seen from afar and the storage notes match retail, and a trading post search less than 1 s after the last one is refused as retail (2026-10-31).</li>
-    <li>Fast travel costs azoth as retail (20, or 10 within the player's territory; inn and home travel free); a mount summon is refused in combat and cancelled in the air as retail (2026-10-31).</li>
-    <li>Crafting, dyes and salvage: the item notes carry the last storage search, a craft sends one note per item made, and the bag sync reasons match retail (2026-10-31).</li>
-    <li>Status effects: the out-of-combat regen stops at full health, a player gets no heal number for its own heals and potions, and food heals scale with the held effects as retail (2026-10-31).</li>
-    <li>Test client: <code>nw-testclient chat</code> says a line in area chat and checks the answer (a GM command's system lines, or the line itself); a test race in the view tests is fixed (2026-10-31).</li>
-    <li>Recipes: a salvaged schematic sets the achievement its recipe asks for; daily and weekly recipe cooldowns count crafts, refuse past the quantity, are saved and go to the client in the crafting state as retail (2026-10-30).</li>
-    <li>Gear perks: a worn item's perks hold their status effects (<code>PerkData.Affix</code> to <code>AffixStatData.StatusEffect</code>), potency 1 plus the scale per gear score from 100 (fits the retail bag perk 2.508 at gear score 430) (2026-10-30).</li>
-    <li>Factions: the faction pick (3161) joins or changes the faction, saved; the faction state change goes as retail; the join quest step ends; quests and missions check <code>RequiredFaction</code> (2026-10-30).</li>
-    <li>Quick courses: 86 course paths from the game paks (<code>content-tool quick-courses</code>); a course starts on a mount with its quest step, counts node hits, runs its timer and ends with 6065 as retail Hermit's Rally; the house quest step (2026-10-30).</li>
-    <li>Ranged block: a mob projectile passes a block without <code>CanBlockRanged</code>; a shield or weapon that can block it uses its ranged block scales (2026-10-30).</li>
-    <li>Quest steps: fishing (equip, cast, hook, reel, catch rules, quest fish), salvage, weapon and item family, refine, song and dungeon steps; go-to by location, give by interact; mission go-to, territory, patrol, timer and transport values. Skipped task rows: 146 to 85 (2026-10-30).</li>
-    <li>Gathering and crafting: the sickle slot for harvesting; held effects add gather speed (<code>EFF_*</code>) and craft gear score (<code>MGS_*</code>, <code>MaxGS_*</code>); recipes check their required, hiding and blocking achievements and set their unlock and first-craft achievements (2026-10-30).</li>
-    <li>Mob projectiles: a mob's <code>CAGE-RangedAttack</code> clip fires its weapon profile's ranged attack (range, radius) with its projectile slice's flight, led at a moving target; it hits where it lands. Janszoon's anchor now hits for his <code>Anchor_Toss</code> row (retail: 40 health, 1.53 s after the throw); 323 ranged attacks and 135 mob projectiles in the AI data (2026-10-30).</li>
-    <li>Chat probation: the world server sends <code>accountInProbation</code> after the spawn, as retail; an account younger than 72 hours is in probation unless it has a CSR, GM or head admin rank. Before, no account could use global chat (2026-10-30).</li>
-    <li>Player camps: a placed camp takes 5 wood and 1 flint, stands in the world as the retail capture shows, is a Camp crafting station and is the respawn point (its slice SpawnPoint, within 0.01 m of retail); placement fires <code>BindCamp</code>; <code>!mastery Camping 2</code> sets the rank for tests (<code>5e8240ad</code>, 2026-10-30).</li>
-    <li>Block stops mob hits: the hit that takes the last stamina breaks the guard (half damage, down until the key is released); no stamina regen while held; 2218 only in the tutorial; mob hits from another sim take the block (<code>7eae997a</code>, 2026-10-30).</li>
-    <li>Janszoon throws his anchor: his missing tree is built from the great axeman's tree and the undead officer's toss (6 to 10 m, 6 to 9 s cooldown; Inferred from the retail throw at 8.7 m); the toss hits with his table's <code>Anchor_Toss_Windup</code> row (<code>4ea518d8</code>, 2026-10-30).</li>
-    <li>Janszoon aggro and leash tests on the real beach ground: he aggroes on a player in his face and keeps a player 10 m away; the sim logs each mob target change (<code>7e2193e1</code>, 2026-10-30).</li>
-    <li>Mobs walk home after a lost fight on slopes: a distance check beyond its height limit now counts as far (Janszoon stood 37 m out, 2.3 m below his spawn) (<code>972b150a</code>, 2026-10-29).</li>
-    <li>Mob lunges follow the ground; mobs far from home stay awake and their trees leash them home (DoesLeash) (<code>3f6696dd</code>, 2026-10-29).</li>
-    <li>Janszoon fights: his tree gets its difficulty tier from his slice, and mob attacks take their hits from the weapon's animation database when the body's has none (450 creatures carry one) (<code>d33f65d1</code>, <code>6f76390f</code>, 2026-10-29).</li>
-    <li>Crafting: no "Crafting attempt failed" message; verified live on the skinning knife (<code>ba675453</code>, 2026-10-29).</li>
-    <li>Mobs walk around a rock or crate that blocks their straight way (Janszoon, Bridget); a target behind one solid counts as reachable (<code>6f76390f</code>, 2026-10-29).</li>
-    <li>Terrain cookies: the 5,244 height stamps of the open world's capitals are put into our terrain; retail player feet on our ground 586,786 to 615,209 samples in 34 captures (<code>4c1a219f</code>, 2026-10-29).</li>
-    <li>Admin live 3D map: /live3d orbits a selected player, shows terrain and every player and mob inside the 150 m render radius with name, HP and target lines (<code>01bc7e5b</code>, 2026-10-29).</li>
-    <li>Admin live 3D map rework: the map is no longer mirrored (north was drawn south), the in-game map picture lies on the ground, the sea shows at its level, mobs stand at their real height (the sim snapshot now sends mob z), markers glide between updates, the camera follows the player and a click follows another player; the Live map takes a click with up to 6 px of hand movement (was 2 px) (<code>282a0c74</code>, <code>a7ddae72</code>, 2026-10-29).</li>
-    <li>Records page lists all entries on load and reloads when you change kind (<code>8ff0e1da</code>, 2026-10-29).</li>
-    <li><strong>M0</strong> Project setup, licences, checks, Docker infrastructure.</li>
-    <li><strong>M1</strong> Game data pipeline: all 2,250 datasheets and 285,031 rows load back.</li>
-    <li><strong>M1b</strong> World data: 41 checked world files.</li>
-    <li><strong>M2</strong> Login server and launcher: the real client reaches character select.</li>
-    <li><strong>M3</strong> Gateway: the client completes DTLS and registration (exit test 2026-09-02).</li>
-    <li><strong>M4</strong> Sim: two clients see each other move (exit test 2026-09-04).</li>
-    <li><strong>M5</strong> World director: 1,000 bots cross cell borders with handoff (exit test 2026-09-04).</li>
-    <li><strong>M6-A</strong> Combat engine: 8 sims with every mob, 5,000 bots (exit test 2026-09-04).</li>
-    <li><strong>M6-B</strong> Combat on the wire: 0 codec differences on 695 ledgers, 90 bots (exit test 2026-09-04).</li>
-    <li>Rubber banding root cause fixed: own state numbers run 128 ahead (<code>6d508fc</code>, 2026-09-26).</li>
-    <li>Thorpe fight: arena teleport, grab pull, collision scale fix (2026-09-26).</li>
-    <li>Capture decoders read 99.993% of 25.3 million bundles (2026-09-26).</li>
-    <li>Corpses go at retail times (<code>20200c8</code>, 2026-09-26).</li>
-    <li>Tutorial chest marked looted (<code>04dd5d4</code>, 2026-09-29).</li>
-    <li>Journal auto pin works, you confirmed it live (<code>c21828b</code>, 2026-10-01).</li>
-    <li>Target lock works on mobs: lock, release, wheel cycling, you confirmed it live (<code>110ccc0</code>, 2026-10-01).</li>
-    <li>Demon Storm turn-in works live: the watchtower area ends in its point of interest (<code>d1ea27a</code>, 2026-10-02).</li>
-    <li>Select screen shows the saved level (<code>1073a00</code>, 2026-10-02).</li>
-    <li>Many quests at once, with the client's journal limit per quest type (<code>4e91ac7</code>, 2026-10-02).</li>
-    <li>Interact steps: quest objects and town buildings (<code>4e91ac7</code>, 2026-10-02).</li>
-    <li>Town board missions: take, the mission's items, kills and place, turn-in (<code>90340f6</code>, 2026-10-02).</li>
-    <li>Game mode, give item and carried item steps (<code>5d9afe6</code>, 2026-10-02); patrol steps (<code>d8a2b1f</code>).</li>
-    <li>Quest trigger volumes from the level data: 772 in the open world (<code>c0f5e5b</code>, 2026-10-02).</li>
-    <li>Level steps and talk steps (<code>bd33ce66</code>, 2026-10-02).</li>
-    <li>Gather steps that count only real gathers (<code>33cd74e2</code>, 2026-10-03).</li>
-    <li>Cyclic object steps: turned stones, staff rituals (<code>14a6125d</code>, 2026-10-03).</li>
-    <li>Temporary unlock steps (<code>0dbe1ac7</code>, 2026-10-03).</li>
-    <li>Multiple recipe craft steps (<code>7e4e45e3</code>, 2026-10-03).</li>
-    <li>Fix: map pin steps no longer skip the real step (<code>93fa629e</code>, 2026-10-03).</li>
-    <li>Objective, use item and territory steps (<code>d7886c1c</code>, <code>c26fde84</code>, <code>70f2533c</code>, 2026-10-03).</li>
-    <li>Fix: quest items from loot-container objects (Truffle Fever) and kills by spawner category (<code>ed5044db</code>, <code>956d6a8b</code>, 2026-10-03).</li>
-  </ul>
+  <ul class="done" id="done"></ul>
 
   <footer>
-    To change this page, edit the <code>AREAS</code> list in the script at the end of <code>docs/progress.html</code>. The cards and bars update from that list.
+    To change this page, edit <code>docs/progress.json</code>. This page only draws that file. Opened from the disk, the page asks for the file once (a browser does not let a page read the file next to it); through a web server it reads it by itself.
   </footer>
 </main>
 
 <script>
+// The data is in progress.json next to this page; this script only draws it.
+const DATA_FILE = "progress.json";
+
 const PROOF = {
   live: { label: "Live", css: "p-live" },
   bots: { label: "Bots", css: "p-bots" },
@@ -324,118 +153,10 @@ const GOOD_PERCENT = 70;
 const PART_PERCENT = 40;
 const NOT_STARTED_PERCENT = 0;
 
-const AREAS = [
-  {
-    name: "Foundation",
-    features: [
-      ["Project setup and checks (M0)", 100, "live", "Build, lint, tests, licence policy, Docker infrastructure.", "Nothing."],
-      ["Game data pipeline (M1, M1b)", 100, "tests", "All datasheets, text and 41 world files from your own install. The committed player attack table is the one of the paks again (it lacked the fields added since: aim, dodge cancel and block windows, root motion; refreshed 2026-11-01).", "Nothing."],
-      ["Collision, roads, water", 75, "live", "Tutorial and open world collision files. Bodies stand on decks, stairs, roofs.", "Temple door wall opens by a quest trigger: not done. Retail player feet on our ground at La Roussette: 83 % of samples. Mobs sunk in the ground or stuck in walls (Janszoon, the cave) need a live check."],
-      ["Capture decoders", 95, "tests", "99.993% of 25.3 million bundles read.", "Raid group data, a few classes."],
-      ["Client patch", 100, "live", "Cert bypass, Steam offline login.", "Nothing."],
-      ["Login server and launcher (M2)", 90, "live", "Saved servers in the launcher (2026-11-04; seen on Linux in both themes, not built for Windows here): a list of servers, each with its own name and login, and a click connects. Password or Discord login (live on Linux: Discord login with the server check and allow list, a linked password account; saves the Discord username and email), Linux Proton start, two worlds.", "Windows start is built. A live test on Windows: Unknown. News hosts rerouted (live on Linux); region ping rerouted (live on Linux); shop services rerouted (live on Linux); privacy settings service answered as retail (tests only). Windows not live-checked. Other server ports (public_https_port, public_ping_port) built, tests only."],
-      ["Gateway and registration (M3)", 100, "live", "DTLS and registration with the real client.", "Nothing."],
-      ["Many sims and handoff (M5)", 80, "bots", "1,000 bots cross cell borders. With 1,100 bots on 4 sims (2026-11-01), the busiest sim (about 365 players, 5,500 to 6,800 awake mobs) went from about 33 to 36 ms a tick (the limit is 33) to 20.5 to 23 ms, with 8 tick threads (<code>LIVE_STACK_TICK_THREADS=8</code>; the default is 4), a kept mob reach answer and a fast hash for the mob store. The metric <code>sim_tick_part_seconds{part}</code> times each part of a tick.", "Real clients crossing cell borders: Unknown. In the last run 9.6 % of the busiest sim's ticks were still over 33 ms (1 late tick in 120 s). The mob card part runs on one thread (about 6 ms at 6,000 awake mobs). A build or a screen recorder on the same PC slows the sims."],
-      ["Database saves", 60, "tests", "Accounts, characters, items, progression, quests, notifications, recipe cooldowns, faction. Food and potion buffs stay over a log out and a sim border (migration 0026; on retail a food buff still had 303.5 s left after a login). Their timer pauses while the player is away unless the data says it keeps running (Inferred), and their heals go on. Added 2026-11-01: a placed camp's rotation and blueprint (0027), the mount summon cooldown (0028), potion and food cooldowns (0029, Inferred: no retail login shows one), and a trading post, trade or shop job now saves its players right away instead of in the next 10 s save. Each save is round-trip tested on a real database; no real client has logged out and back in to check them. Added 2026-11-04: the servers stop cleanly on SIGTERM (before, a restart skipped the last save round), a resumed player keeps its achievements, and the new sim of a handoff saves the items and quests it took over.", "Health, mana and ability cooldowns at a log out, hit and ability effects, the PvP flag (no retail sample). World state a sim restart loses: node depletion, loot bags, war sign-ups. Notes: findings/2026-11-01-database-saves.md and findings/2026-11-04-lost-progress-audit.md. Run <code>edge-http migrate</code> after this update."],
-      ["Admin tools", 80, "tests", "Live panel, studio, GM commands, drop simulator, script editor; a new look (2026-11-04, local only). GM chat commands in the game (<code>!help</code>). <code>nw-testclient chat</code> says a GM line and checks the answer. The site can run behind a relay on another machine (tests only).", "Pages for systems that are not done. Relay: public, Discord login works live; live page stream not checked. GM chat commands: not checked live. In the 2026-10-30 camp test the client sent no chat line at all (cause: likely the chat probation flag, sent since c3c84794)."],
-      ["Server status page", 60, "bots", "New <code>status-reporter</code> (<code>config/status-reporter.toml</code>, 2026-11-08): one per world, on the game machine. Every 15 s it reads the metrics pages of login, gateway, director, sims and social and sends the world status (parts up or down, players online, the slowest gateway worker's p99 round trip) to the website; every 5 minutes it sends the 422 boards of the game data with their top 100 rows (values from the global database, character and company names from the world database). Each report is signed (HMAC-SHA256 of the time and the body, with the world's secret). Data only goes out: the website never reads a database or a metrics page. <code>content-tool leaderboards</code> writes the board table (English names and groups). Seen with a local copy of the website and the live servers: Online, then Players online 3 with 3 test bots. Since 2026-11-09 (tests only): each board also has its sub-group, value kind, order, reset time and what it ranks; ranks are shared like in the game; group rows name their members; edge-http pulls the message of the day from the site and names the launcher's news feed (docs/website-integration.md).", "Not on the game VM or the public website yet. Not seen with the real game client: the p99 round trip stayed 0 ms with the test bots, which send no ping echo. No board had values yet, so no leaderboard row was seen on the website."],
-    ],
-  },
-  {
-    name: "Player in the world",
-    features: [
-      ["Create, select, enter world", 95, "live", "New character goes in game. The select screen shows the saved level (not live-checked).", "Small login burst gaps."],
-      ["Own movement", 65, "live", "No more rubber banding (6d508fc). Every movement packet and note reviewed (findings/2026-11-01-movement-review.md); the replay guard passes (retail run: body 0.32 m median, 0.25 m open world; 0 pulls of the patched client).", "Attack windows: 1.27 m median after 1 s (attack root motion is built but not wired: it made the camera follow worse). Ship fights 0.94 m (to-do t1)."],
-      ["See other players", 70, "live", "Look, gear, health, facing, attacks.", "Full live test with many players: not done."],
-      ["Swim, water, falls", 70, "live", "Swim strokes, water hold, fall damage.", "Some swim states not checked."],
-      ["Ship deck", 75, "live", "Bodies stay on the deck, also in fights.", "Fight camera does not fit the model."],
-    ],
-  },
-  {
-    name: "Combat",
-    features: [
-      ["Melee hits", 75, "live", "Homing, lag help, retail damage messages.", "Boar hits miss sometimes (not seen in the 3 live logs of 2026-10-30: every swing with a mob within 2 m hit). Cause: Unknown."],
-      ["Target lock", 90, "live", "Lock, release and wheel cycling work live (110ccc0).", "Retail check of the nearest-in-circle pick; lock after a reconnect."],
-      ["Dodge and stamina", 60, "tests", "Match retail (review 2026-10-01). A dodge in an attack waits for its CanDodgeCancel window while the key is held (all 9 retail dodges fit).", "Live check. The buffer rule (key still held at the window) is Inferred."],
-      ["Block", 55, "tests", "Guard break, no regen while held, 2218 only in the tutorial, cross-sim hits. The block stays down in an attack's BlockDisabled window (data). From the data (2026-11-01): the 150 unblockable attacks (<code>Unblockable</code>, <code>CanBeBlocked</code>: boss wipes, howls, spells) pass a block and take no stamina; mob empower buffs raise what a block takes (<code>StaminaDamageModifier</code>); a stun keeps the block down and the dodge back, a root only the dodge.", "Live check. The rest of the retail 1 s rise delay, facing arc. Ranged block from the data only. Perk triggers on a block (<code>OnBlockedHitTaken</code>, <code>OnBlockBreak</code>) need a trigger engine; mobs do not block."],
-      ["Ranged and magic", 55, "tests", "Staffs, gauntlets, bows, muskets cast along the aim. Weapon abilities (keys 1 to 3) run the game's ability lists: cooldowns as retail, mana spend and regen, flying spells, lasting areas, second spells, upgrades (unit tests and one test on the real table).", "No live check of abilities yet. Every weapon ability a key starts, but 6, starts in a test on the real lists (all 15 weapons); fixed: a sim crash with two-list weapons, the tag-in-slot and client-setting tests, the mana compare, the transition clips, and (2026-11-04) each key press test's own <code>BackTicks</code> and the real start and end of tag activities (Shooter's Stance and Stopping Power start now). Open: the bow's Penetrating, Poison and Rain of Arrows shots, Meteor Shower and Ice Storm (their shot actions are reached by no parsed fragment transition; fragment options by tag: Unknown) and the Ice Pylon (needs its placed pylon). Part of the retail cooldown cut: Unknown."],
-      ["Status effects", 50, "tests", "Effects from game data. Checked against retail: the out-of-combat regen ends at full health, food heals 3 times as much while it runs, no heal number (4298) for the player's own heals. From the data (2026-11-01): weakness by damage type, stamina regen rate, food attributes (Constitution raises the max health), crit mods, heal mods (disease lowers heals, potions too), armor rend by damage category (and true damage takes no armor), health regen rate and no regen, stun, root and silence, the effects that end at death's door, effects added at death, first stacks.", "Mob effects now go to the client in the mob's remote map (tests only; the full map, not retail's deltas). Live check of most effects. Not read: movement speed, tradeskill XP and luck columns, the passive ability triggers. Notes: findings/2026-11-01-block-and-status-effect-columns.md."],
-      ["Death, respawn, revive", 85, "live", "Death screen, 38 respawn points, revive at 1 health. A drunk potion sends no heal number (retail). Death's door from the data (120 s, 1 s delay, off in the PvP modes and to a killer 10 levels above), retail vitals blocks (tests only). The incapacitated state (670) is on at death's door and off at its end, as retail (2026-11-05, tests only).", "Live check of death's door. Status effects that skip it. Some respawn points."],
-      ["PvP", 25, "tests", "PvP hits roll like retail. Faction join and change (3161), saved, sent as retail; quests check RequiredFaction. Since 2026-11-05 the PvP flag waits while you are in a settlement, then counts down 30 s, as on retail.", "Flag rules, PvP zones, rewards: not checked. Faction boards, forts."],
-    ],
-  },
-  {
-    name: "Mobs",
-    features: [
-      ["Spawns and health", 50, "tests", "99.3% of creature records explained. The open map leaves out the invasion and breach encounter spawns (no encounter runner there); each kept spawn keeps its own AI profile and patrol path (fixed 2026-10-31: they had shifted to other spawns).", "Since 2026-11-05 the mob copies keep every retail state of the captures (align to terrain on 782 creatures, status effects on 755, boss phase, timelines) and the sim reads all of them (it dropped 258 before). Respawn is now the retail 62 s (the data's 360 s rule is Unknown). A mob left alone plays its spawn again when a player comes back (radius = our wake radius; retail radius Unknown). Breaches and invasions need an encounter runner. A few odd records."],
-      ["Mob AI", 70, "live", "1,075 behavior trees from Server.pak. Thorpe fight fixed. Mob paths stop at walls and climb at most 0.6 m a step.", "Janszoon tree is built from held trees; he attacks, throws his anchor at 6 to 10 m (Inferred; the anchor is now a real projectile), his charge follows the slope and he leashes home (live check needed). He also slams his anchor up close (a second retail fight, 2026-11-02), and a mob's weighted attack pick is drawn again after each attack, as the client does, so his heavy attacks come back (before: one light swing for minutes). His spin (<code>Attack_Mid_2H_Axe_02</code>) is only in the hard attack tree; with it he got stuck in a walk-home loop in one test, so it is not on yet. Terrain cookies now in our ground; mobs walk around rocks and crates. Boss summons (ExecuteSpawn) built: 10 of 46 summon slices have a retail card (the others cannot show). Not run: beams, boss-to-helper triggers, orders, tree projectiles (no capture)."],
-      ["Mob animations", 60, "tests", "736 of 747 creature assets.", "11 assets."],
-      ["Patrols and waypoints", 55, "tests", "12,858 spawns get waypoint paths.", "Live check."],
-      ["Corpses", 60, "tests", "Retail times per creature. Skinned corpses go after 5.5 s.", "Boar times vary in retail."],
-    ],
-  },
-  {
-    name: "New player: tutorial and starting beach",
-    features: [
-      ["Tutorial flow (ftue_v2 level)", 80, "live", "Ship, quick time event, sailors, legionnaires, corruption, Thorpe, journal.", "Temple door and growth explode (level not yet checked)."],
-      ["Starting beach (open world)", 70, "live", "Beach quests 12-1 to 12-9 played live up to the Demon Storm turn-in; lock, skinning, crafting, crates, cutscenes, journal auto pin. Play test 2 (2026-10-29) reached Janszoon.", "Play test 2 fixes need a live check; hits from behind; the terrain cookie fix at La Roussette and the Satisfaction wreck needs a live check."],
-      ["Journal auto pin", 100, "live", "You confirmed it live (c21828b).", "Nothing."],
-      ["Tutorial skip and class gear", 60, "tests", "Skip completes Soul Survivor, gives class bag.", "Live check."],
-    ],
-  },
-  {
-    name: "Quests and progression",
-    features: [
-      ["Quest engine", 60, "tests", "Task types from task sheets, turn-in, rewards. Many quests at once, with the client's journal limit per quest type. Interact, game mode, give item, patrol, level, talk, gather, cyclic object, temporary unlock, craft, objective, use item, territory, fishing, salvage, item family, refine, song and dungeon steps. Town board missions. Drop a quest (3836, 2026-11-05: it leaves the journal and can be taken again). 772 quest trigger volumes from the level data. Done StayActive steps show as retail. Quest objects that are loot containers give their quest items; kills count by spawner category and category group. A quest object with a detection sphere (238 kinds, the mount quest's torches) sets off its event when a player on its quest walks in, as retail. Food status effects, quest success events and recipes fire their game events; achievement steps read expressions; POI steps read tag lists; faction rank steps count.", "Live check of the new steps (Truffle Fever failed live before the fix); pin limit Unknown. Open (audit 2026-11-03): encounter result events (45 tasks), encounter-spawned gatherables (9), PvP kill and fort events (7), volumes in deferred slices (12), kill-contribution mobs with no spawn (51); the mount food's daily experience limit is not checked. Live check of the races and the faction join. Puzzle scripts, the emote step, PvP faction mission steps (TaskDie, control points), trigger areas of instance levels (20)."],
-      ["Beach and wreck quests", 60, "tests", "Start beach chain and wreck quests 4 to 7.", "Full live run."],
-      ["Main story and side quests", 40, "tests", "The engine runs them from game data. Side quests with only supported steps: 526 of 528; main story: 354 of 358 (2 steps have no target in the data, 2 are puzzle scripts).", "Nobody played them live. The faction join works; the faction boards offer no missions yet."],
-      ["XP, levels, attribute points", 60, "tests", "Kill XP, level up, attribute and weapon points. Max health grows with the level and Constitution as retail (856 + 1.75 x level squared + the Constitution health: 9 retail points fit), and the client gets the new max after a level up or a spend.", "Live check after the tutorial. Attribute damage scaling and the attribute threshold effects (evidence conflicts). Gear health bonuses."],
-      ["Weapon mastery", 55, "tests", "Mastery XP and saves.", "Live check."],
-      ["Area charting, territory standing", 40, "tests", "Charting XP, standing rank 1.", "Higher ranks and their rewards."],
-      ["Achievements", 30, "code", "Achievement and meta achievement states.", "Live check."],
-    ],
-  },
-  {
-    name: "Items and economy",
-    features: [
-      ["Inventory, gear, paperdoll", 75, "live", "Inventory, slots, gear versions.", "Gear score rules, some item calls."],
-      ["Loot drops", 60, "tests", "Retail loot tables, drop chance, one bag per kill.", "Live check outside the tutorial."],
-      ["Gathering and skinning", 70, "live", "Skinning, nodules and gatherables work live. The sickle is the harvesting tool (slot 34). Held effects add their gather speed (food, music buffs). Worn perks hold their status effects, scaled by the item's gear score (tool, armour, amulet and bag perks). Gather bots (<code>nw-testclient gather</code>, 2026-11-01) wear start tools (<code>NW_SIM_START_TOOLS</code>; the data has no T1 logging axe, so <code>2hAxeT2</code> is the lowest) and gather trees, herbs, crops, ore and stone (82 kinds in the 30 min run). In the last run all 100 bots gathered. A water gather targets the player and ends with the own done state, as retail <code>Hive_Dye</code> (before: the gather animation never ended); a second press on the same interaction id runs again. Since 2026-11-05 a gather needs a level node of its kind in reach.", "Tool levels and node respawn, live. Gathering luck: how ROL values change a gather roll is Unknown (the roll is server only)."],
-      ["Crafting", 65, "live", "Campfire, recipes (the skinning knife crafts live with no error message), craft answers after the item change, and the bag reasons of a craft (2 used, 3 made, 2 on a used-up slot) as retail. Required, hiding and one-time recipe achievements. Held effects (crafting food) raise the gear score range. A salvaged schematic teaches its recipe. Daily and weekly recipe cooldowns, saved, sent as retail. Checked against 6 retail crafting and refining captures: one storage note per item made, with the last storage search.", "Live check of more recipes; higher stations and refining. Crafts take from storage in retail (which storage: Unknown); bonus items of another kind (their table: Unknown). The reset of the 79200 s cooldown and the colour gypsum orbs: Unknown."],
-      ["Fishing", 40, "tests", "Fishing code, one live run. Fishing quest steps and quest fish.", "Result of the live run: Unknown."],
-      ["Repair, salvage, transmog, dyes", 35, "tests", "Checked against retail salvage (4 captures) and dye captures: the salvaged slot goes out with reason 24, its items with 26 (containers) or 33 (gear); dye items and their emptied slots with 2.", "No retail repair capture. The storage note count of a salvage and a dye: Unknown. No live test."],
-      ["Shops and coins", 30, "code", "Coins state, shop code.", "Not checked live."],
-      ["Storage", 50, "tests", "Storage search code. Checked against the retail storage capture: new ids on a move, the view from afar, 2 storage notes per move.", "No live test. Weight limit, transfer fee and the notes after a view from afar are Unknown."],
-      ["Trading post", 60, "tests", "Part buys show the units left to both players (search, own lists, notices): a stack of 10 bought 1 then 9 ends with the buyer holding 10 and the seller paid (world test on the database). Retail event counts, ends, notice versions, completion times, sync reasons 19/10/0, the completer's own tax. Orders carry the retail settlement id (nearest settlement or outpost capital: 22 of 22 retail ids from data, 5 of 5 captures); a filled buy order's units go to that settlement's storage (retail 2 of 2). Search throttle (1 s). A part-filled bag no longer gives a delivery twice. Since 2026-11-05 the buyer gets the sold stack with its perks, gear score, durability and look, and the post opens only at a settlement.", "No live test (the bot client has no trading post). Posting fees (no formula fits the 9 retail fees). Buys at another settlement and expired sell orders go to the bag (Unknown)."],
-    ],
-  },
-  {
-    name: "World systems",
-    features: [
-      ["Fast travel, inns, recall", 45, "tests", "Travel rules and saves. Inn check in is answered (its open and check in share one interaction id, retail inn tutorial). A shrine is charted at its first entry (its <code>ChartedAchievement</code>, as retail <code>Playthrough_Part_01</code> 3210.7 s), a discoverable one at an entry after its discovery. The phasing updates name all 10 phasing areas, so the client reports entries into the areas inside them (Brysedd Overlook Shrine lies in Monarch's Bluffs settlement's area 30155).", "Live check of the inn recall (no used point named since 2026-11-08), the unstuck stand, the inn check in and a shrine in a settlement's area. The fast travel kneel plays live since 2026-11-08. Retail names only the phasing areas near the player; all of them go here (Inferred). Shrine travel needs no chart on the server."],
-      ["Player camps", 50, "tests", "Place a camp for its costs, the retail camp entity group, respawn at its SpawnPoint, Camp crafting station, BindCamp event, the camp stands again at login.", "Live check. PvP destruction, how a new character earns the Camping rank (Unknown), guild and faction."],
-      ["Mounts", 65, "live", "Summon, ride, dash, stamina, dismounts, cooldowns, mount screens and saves. The mount quest (My Kingdom for a Horse) ran live to its end (2026-11-03): the cave torches light within their 9 m sphere, the box gives Moonshadow, the summon and the ride work. A jump on the mount sets the 1 s stamina regen delay. Mount food from quick slots 1 to 4 while riding: riding experience, the quest step and the daily limit of 3 (tests only). The change mount screen gets its <code>isChangingMount</code> echo (retail slot 1 child 16; before: it spun). Quick courses (races, rallies, tours, time trials): start on a mount with the course task, node hits, timer, finish; the race task counts each section, 1/8 to 8/8, as retail (before: 0/8 until the finish). A rider's server body keeps the floor (its saddle camera is 3.91 m up, a walker's 1.685 m), steps at its mount's speed (the walking 0.36 m a record held it at 7.2 m/s) and its camera trails 0.45 s (Inferred fit): retail Hermit's Rally replay 1.11 m off (median), before 2.95 m and 2.0 m up.", "Live check of the change mount screen (store answer) and of mount food from a quick slot. Unknown: a dismount on a hit while idle (no retail capture shows one), town exclusion areas and forced walk, the trample message (6731), charm multipliers, the quest's required level (1 or 20). A failed course's result: Unknown."],
-      ["Social: chat, friends, groups, voice", 50, "live", "Chat, friends, groups, raids, voice option. Account probation (72 h, staff never). Own voice service: sign-in, map cell rooms, push-to-talk audio relay; one player heard itself live (2026-11-08).", "Live test with many players; voice between two players. Play time part of probation (180 min) not counted."],
-      ["Companies and territories", 20, "code", "Company code, standing.", "Ownership, taxes, upkeep."],
-      ["Expeditions and instances", 25, "code", "Instances, dungeon scripts, mutations.", "No live run of a dungeon."],
-      ["Game modes (queues, arenas, Outpost Rush)", 25, "code", "Queues and matches. Leave a queue (1066, and 2385 for all queues) with the retail 4970 answer, and leave a game mode (3309) back to the open world (2026-11-05, tests only). Since 2026-11-05 a queue join is refused at once (no fake local match).", "Mode rules, the game mode world states (2343, 363, 3105), live test."],
-      ["Wars, sieges, invasions", 15, "code", "Codecs and sign-ups only. Since 2026-11-05 sign-ups get the retail closed-war answer.", "No capture shows the war flow."],
-      ["Seasons and season pass", 15, "code", "Only the state the journal needs.", "Season pass rewards and progress."],
-      ["Leaderboards and analytics", 35, "tests", "Stats service with the retail reply shapes, boards counted by the sims, client analytics events stored (Kinesis and STS answered).", "Live check of the leaderboard screen. Only HercyneRaid_Reward boards count so far (docs/re/2026-09-18-leaderboards-and-analytics.md)."],
-      ["Music instruments", 25, "code", "Music code exists. Since 2026-11-05 the server judges notes against the game's note charts, and the picked reward pays out its event.", "Not checked live."],
-    ],
-  },
-  {
-    name: "Not started",
-    features: [
-      ["Housing", 25, "tests", "Buy a house, enter and leave the plot, place, move and remove furniture, taxes, travel home (travel module). All 19 kinds of retail housing calls read and all 10 kinds of answers are built (capture survey 2026-11-05).", "The house data (3663) and plot (3055) world states. Live test."],
-      ["Artifacts", 0, "none", "No code found.", "All."],
-      ["Heartrunes", 0, "none", "No code found.", "All."],
-      ["Town projects", 10, "tests", "Town board missions: take, the mission's items, kills and place, turn-in.", "Project progress, upgrades and the board's offer rules."],
-      ["Trophies", 0, "none", "No code found.", "All."],
-    ],
-  },
-];
+/** Link schemes a text may open. */
+const LINK_SCHEMES = ["http:", "https:", "mailto:"];
+const BULLET_ITEM = /^[-*] /;
+const NUMBERED_ITEM = /^\d+\. /;
 
 function barColor(percent) {
   if (percent >= DONE_PERCENT) return "var(--done)";
@@ -452,6 +173,91 @@ function element(tag, className, text) {
   return node;
 }
 
+/** The URL of a Markdown link when its scheme may be opened, else null. */
+function safeUrl(text) {
+  try {
+    const url = new URL(text);
+    return LINK_SCHEMES.includes(url.protocol) ? url.href : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The inline Markdown subset of progress.json as DOM nodes: `code`, **bold**, *italic*,
+ * [text](url) and backslash escapes. Everything else is text; nothing is read as HTML.
+ */
+function inline(text) {
+  const nodes = [];
+  let plain = "";
+  const flush = () => {
+    if (plain) nodes.push(document.createTextNode(plain));
+    plain = "";
+  };
+  let index = 0;
+  while (index < text.length) {
+    const rest = text.slice(index);
+    const code = rest.match(/^`([^`]+)`/);
+    const bold = rest.match(/^\*\*(.+?)\*\*/);
+    const italic = rest.match(/^\*([^*]+)\*/);
+    const link = rest.match(/^\[([^\]]+)\]\(([^)\s]+)\)/);
+    if (rest[0] === "\\" && rest.length > 1) {
+      plain += rest[1];
+      index += 2;
+    } else if (code) {
+      flush();
+      nodes.push(element("code", "", code[1]));
+      index += code[0].length;
+    } else if (bold) {
+      flush();
+      const strong = element("strong");
+      strong.append(...inline(bold[1]));
+      nodes.push(strong);
+      index += bold[0].length;
+    } else if (italic) {
+      flush();
+      const em = element("em");
+      em.append(...inline(italic[1]));
+      nodes.push(em);
+      index += italic[0].length;
+    } else if (link && safeUrl(link[2])) {
+      flush();
+      const anchor = element("a");
+      anchor.href = safeUrl(link[2]);
+      anchor.append(...inline(link[1]));
+      nodes.push(anchor);
+      index += link[0].length;
+    } else {
+      plain += rest[0];
+      index += 1;
+    }
+  }
+  flush();
+  return nodes;
+}
+
+/** The block Markdown subset as DOM nodes: paragraphs split by a blank line, and lists. */
+function markdown(text) {
+  return text.split(/\n\s*\n/).map((block) => {
+    const lines = block.split("\n");
+    const bullets = lines.every((line) => BULLET_ITEM.test(line));
+    const numbers = lines.every((line) => NUMBERED_ITEM.test(line));
+    if (bullets || numbers) {
+      const list = element(bullets ? "ul" : "ol");
+      const marker = bullets ? BULLET_ITEM : NUMBERED_ITEM;
+      lines.forEach((line) => {
+        const item = element("li");
+        item.append(...inline(line.replace(marker, "")));
+        list.append(item);
+      });
+      return list;
+    }
+    const paragraph = element("p");
+    paragraph.append(...inline(lines.join(" ")));
+    return paragraph;
+  });
+}
+
 function meter(percent) {
   const track = element("div", "meter");
   const fill = element("span");
@@ -465,23 +271,29 @@ function average(values) {
   return Math.round(values.reduce((sum, value) => sum + value, 0) / values.length);
 }
 
-function featureRow([name, percent, proof, works, missing]) {
+function textCell(className, text) {
+  const cell = element("td", className);
+  cell.append(...markdown(text));
+  return cell;
+}
+
+function featureRow(feature) {
   const row = element("tr");
-  row.append(element("td", "name", name));
+  row.append(element("td", "name", feature.name));
   const bar = element("td", "bar");
-  bar.append(element("span", "pct", `${percent}%`), meter(percent));
+  bar.append(element("span", "pct", `${feature.percent}%`), meter(feature.percent));
   row.append(bar);
+  const proof = PROOF[feature.proof];
   const proofCell = element("td");
-  proofCell.append(element("span", `badge ${PROOF[proof].css}`, PROOF[proof].label));
+  proofCell.append(element("span", `badge ${proof.css}`, proof.label));
   row.append(proofCell);
-  row.append(element("td", "works", works));
-  row.append(element("td", "missing", missing));
+  row.append(textCell("works", feature.works), textCell("missing", feature.missing));
   return row;
 }
 
 function areaSection(area) {
   const section = element("section");
-  const percent = average(area.features.map(([, value]) => value));
+  const percent = average(area.features.map((feature) => feature.percent));
   section.append(element("h2", "", `${area.name}: ${percent}%`));
   const wrap = element("div", "table-wrap");
   const table = element("table");
@@ -500,24 +312,85 @@ function summaryCard(big, label) {
   return card;
 }
 
-function render() {
-  const all = AREAS.flatMap((area) => area.features);
-  const percents = all.map(([, value]) => value);
+/** A next step: its first paragraph is the step, the others say why. */
+function nextStep(text) {
+  const item = element("li");
+  markdown(text).forEach((block, index) => {
+    if (index > 0) block.classList.add("why");
+    item.append(block);
+  });
+  return item;
+}
+
+function doneItem(text) {
+  const item = element("li");
+  item.append(...markdown(text));
+  return item;
+}
+
+function render(data) {
+  const sub = document.getElementById("sub");
+  sub.append(`Status on ${data.updated}. Client build ${data.clientBuild}.`);
+  if (data.lastCommit) sub.append(" Last commit ", element("code", "", data.lastCommit), ".");
+  const all = data.areas.flatMap((area) => area.features);
+  const percents = all.map((feature) => feature.percent);
   const done = percents.filter((value) => value >= DONE_PERCENT).length;
   const notStarted = percents.filter((value) => value === NOT_STARTED_PERCENT).length;
   const partial = all.length - done - notStarted;
-  const summary = document.getElementById("summary");
-  summary.append(
+  document.getElementById("summary").append(
     summaryCard(`${average(percents)}%`, "Overall (simple average)"),
     summaryCard(String(done), "Features done"),
     summaryCard(String(partial), "Features in progress"),
     summaryCard(String(notStarted), "Features not started"),
   );
+  data.nextSteps.forEach((text) => document.getElementById("next").append(nextStep(text)));
   const areas = document.getElementById("areas");
-  AREAS.forEach((area) => areas.append(areaSection(area)));
+  data.areas.forEach((area) => areas.append(areaSection(area)));
+  data.done.forEach((text) => document.getElementById("done").append(doneItem(text)));
 }
 
-render();
+/**
+ * Opened from the disk (`file://`), a browser does not let the page read the file next to it.
+ * Then the page asks for the file once: a button, or the file dropped on the page.
+ */
+function askForDataFile(reason) {
+  const note = element("div", "note warn");
+  const button = element("button", "", `Open ${DATA_FILE}`);
+  const picker = element("input");
+  picker.type = "file";
+  picker.accept = ".json,application/json";
+  picker.hidden = true;
+  const status = element("span", "", ` The browser did not let this page read ${DATA_FILE} (${reason}). Choose docs/${DATA_FILE}, or drop it on the page.`);
+  note.append(button, picker, status);
+  document.getElementById("summary").before(note);
+  const load = (file) => {
+    if (!file) return;
+    file.text()
+      .then((text) => {
+        const data = JSON.parse(text);
+        note.remove();
+        render(data);
+      })
+      .catch((error) => {
+        status.textContent = ` ${file.name} is not valid progress data (${error.message}).`;
+      });
+  };
+  button.addEventListener("click", () => picker.click());
+  picker.addEventListener("change", () => load(picker.files[0]));
+  document.addEventListener("dragover", (event) => event.preventDefault());
+  document.addEventListener("drop", (event) => {
+    event.preventDefault();
+    load(event.dataTransfer.files[0]);
+  });
+}
+
+fetch(DATA_FILE)
+  .then((response) => {
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.json();
+  })
+  .then(render)
+  .catch((error) => askForDataFile(error.message));
 </script>
 </body>
 </html>
